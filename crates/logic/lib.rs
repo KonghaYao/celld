@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub mod alarm;
 pub mod cache;
+pub mod cell;
 pub mod dead_node_reconciliation;
 pub mod gate;
 pub mod isolate;
@@ -153,6 +154,30 @@ pub enum Phase {
         capacity_sampled_ms: Option<u64>,
     },
     Fenced,
+}
+
+/// The reported name of a phase. Stable across internal renames, because
+/// `/state` and `celld diagnose` publish it.
+fn phase_name(phase: &Phase) -> &'static str {
+    match phase {
+        Phase::Inactive => "inactive",
+        Phase::WaitingActivation => "waiting_activation",
+        Phase::ReadingOwner { .. } => "reading_owner",
+        Phase::ReadingNodeLease { .. } => "reading_node_lease",
+        Phase::ReadingCapacity { .. } => "reading_capacity",
+        Phase::WaitingCapacity => "waiting_capacity",
+        Phase::Acquiring { .. } => "acquiring",
+        Phase::ReconcilingAcquire { .. } => "reconciling_acquire",
+        Phase::Restoring { .. } => "restoring",
+        Phase::Starting { .. } => "starting",
+        Phase::Publishing { .. } => "publishing",
+        Phase::EnsuringDurability { .. } => "ensuring_durability",
+        Phase::Cleaning { .. } => "cleaning",
+        Phase::Dormant { .. } => "dormant",
+        Phase::Resident { .. } => "resident",
+        Phase::Remote { .. } => "remote",
+        Phase::Fenced => "fenced",
+    }
 }
 
 /// One local write response held open by the output gate.
@@ -419,10 +444,18 @@ pub struct State {
     /// last measured rather than aiming at a cell count that means nothing to
     /// it.
     shed_floor: usize,
-    /// RSS measured when the current shed floor was set. A later latched
-    /// sample compares against this: a completed cut that left RSS flat
-    /// makes another cut futile.
-    shed_cut_rss: Option<u64>,
+    /// The measurement the current shed floor was set from, and its value. A
+    /// later latched sample compares against this: a completed cut that left
+    /// the number flat makes another cut futile.
+    ///
+    /// The measurement travels with the value because the two are not
+    /// comparable. When the latches change, so does the number the walk down
+    /// reads, and comparing a fresh resident set size against a stale in-use
+    /// figure finds them flat by coincidence.
+    shed_cut: Option<(pressure::Metric, u64, usize)>,
+    /// Which ceilings are latched. Held apart from `shed_reason`, which names
+    /// only the more serious crossing.
+    latches: pressure::Latches,
     /// The shedding latch. celld kept this in the executor, which meant the
     /// hysteresis -- the part with actual behaviour -- was the one piece the
     /// simulation could not reach. It is carried here so a sample
@@ -477,7 +510,8 @@ impl State {
             now_ms: 0,
             now_mono_ms: 0,
             shed_floor: 0,
-            shed_cut_rss: None,
+            shed_cut: None,
+            latches: pressure::Latches::default(),
             shedding: false,
             shed_reason: None,
         }
@@ -650,6 +684,25 @@ impl State {
     /// stop. During a drain this saturates at `max_releases`.
     pub fn evicting(&self) -> usize {
         self.eviction_permits.len()
+    }
+
+    /// How many cells sit in each phase, by a stable short name, omitting the
+    /// phases with no cells.
+    ///
+    /// A node that refuses cells is diagnosed by where its cells are, and
+    /// `occupied` cannot say: it counts residency, so a node holding thousands
+    /// of cells part-way through a cold start reports almost none. A fleet held
+    /// that state for fifteen minutes and the record could not say what the
+    /// cells were doing (issue #50).
+    ///
+    /// The names are part of the operator interface. A chart and a human read
+    /// them, so they do not change with an internal rename.
+    pub fn phase_census(&self) -> Vec<(&'static str, usize)> {
+        let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for cell in self.cells.values() {
+            *counts.entry(phase_name(&cell.phase)).or_default() += 1;
+        }
+        counts.into_iter().collect()
     }
 
     /// Cold routes that have not finished: cells that hold an activation
@@ -2060,6 +2113,26 @@ impl State {
             self.cell_ops.remove(&op);
             set_phase(&mut self.occupied, &mut cell, Phase::Resident { epoch });
         }
+        // A request that armed this alarm can finish its output gate after
+        // the alarm has started. Its activity report still carries the same
+        // cached deadline, but that is not a new arm: replacing `Firing`
+        // would retire the live op and schedule the due deadline again while
+        // its handler is still running. Keep the claim and only refresh its
+        // wake coverage. A real move to another deadline (or to no alarm)
+        // still replaces the firing state below, and the handler's own final
+        // observation settles an explicit re-arm to this same deadline.
+        if let Some(AlarmState::Firing {
+            at_ms: firing_at_ms,
+            covered: firing_covered,
+            ..
+        }) = &mut cell.alarm
+        {
+            if at_ms == Some(*firing_at_ms) {
+                *firing_covered = covered;
+                self.cells.insert(id.to_string(), cell);
+                return;
+            }
+        }
         let observed_before = match cell.alarm {
             Some(AlarmState::Armed { at_ms, .. }) | Some(AlarmState::Firing { at_ms, .. }) => at_ms,
             None => -1,
@@ -2855,10 +2928,15 @@ impl State {
                 (peer, projected)
             })
             .min_by_key(|(peer, projected)| {
+                // The third key is the memory the peer holds, which is what
+                // the peer decides its own pressure on. A peer from before that
+                // field existed reports nothing, and its resident set size is
+                // the only number available -- which reads as more loaded than
+                // it is, and is the conservative direction for a tiebreak.
                 (
                     *projected,
                     peer.host_websockets,
-                    peer.rss_bytes,
+                    peer.in_use_bytes.unwrap_or(peer.rss_bytes),
                     peer.node.clone(),
                 )
             });
@@ -3579,18 +3657,23 @@ impl State {
     /// until every configured low watermark clears, so the node walks down to
     /// its target instead of oscillating around its ceiling.
     fn load_sampled(&mut self, load: pressure::Load, now_mono_ms: u64, effects: &mut Vec<Effect>) {
-        self.shedding = self.config.pressure.shedding(load, self.shedding);
-        self.shed_reason = self.shedding.then_some("rss");
+        // Both latches are folded, and the reason names the more serious of the
+        // two. The latches are state of their own: derived from the reason
+        // instead, one crossing holds the node against the other's watermark.
+        let (latches, reason) = self.config.pressure.classify(load, self.latches);
+        self.latches = latches;
+        self.shed_reason = reason;
+        self.shedding = reason.is_some();
         if !self.shedding {
             // Relieved. Whatever was queued for capacity may proceed.
-            self.shed_cut_rss = None;
+            self.shed_cut = None;
             self.pump_capacity(effects);
             self.evict_idle(now_mono_ms, effects);
             return;
         }
         // Evicting only helps if it returns memory. When the last cut has
-        // fully landed and this sample's RSS sits within 5% of what that cut
-        // measured, another cut is futile: the latch holds -- the node
+        // fully landed and this sample's in-use bytes sit within 5% of what
+        // that cut measured, another cut is futile: the latch holds -- the node
         // genuinely is over its ceiling, so admission stays closed -- but the
         // walk down stops spending the working set. Without this stopping
         // condition an unsatisfiable ceiling (one below the process's memory
@@ -3599,20 +3682,70 @@ impl State {
         // condition, the same shape as demand shedding for a waiter that can
         // never be admitted. A
         // sample that moves either way re-arms the walk down.
-        if let Some(cut_rss) = self.shed_cut_rss {
+        //
+        // The comparison reads whichever measurement the walk down works
+        // against. The ordinary ceiling wins whenever it is latched, even if
+        // the cap is latched too: eviction relieves the ordinary ceiling and
+        // may do nothing at all for the cap, so reading the cap's number while
+        // the node is genuinely over its ordinary ceiling stops the walk down
+        // exactly when it is needed. Under the cap alone the in-use figure is
+        // small and moves freely, so reading it there would find every sample
+        // "not flat" and drain the working set against a condition eviction
+        // cannot relieve.
+        //
+        // A change of measurement discards the baseline. The two numbers are
+        // not comparable, and on this fleet they sit within 2% of each other,
+        // so comparing across them finds them flat by coincidence and
+        // suppresses every further cut.
+        let metric = pressure::PressureConfig::walk_metric(latches);
+        let sample_bytes = match metric {
+            pressure::Metric::InUse => load.in_use_bytes,
+            pressure::Metric::Rss => load.rss_bytes,
+        };
+        if self
+            .shed_cut
+            .is_some_and(|(previous, _, _)| previous != metric)
+        {
+            self.shed_cut = None;
+        }
+        if let Some((_, cut_bytes, cut_cells)) = self.shed_cut {
             let cut_landed = self.occupied() <= self.shed_floor && self.eviction_permits.is_empty();
-            let flat = load.rss_bytes.abs_diff(cut_rss) <= cut_rss / 20;
-            if cut_landed && flat {
+            // Did the last cut return anything? It is only evidence if it
+            // actually vacated cells: a walk down that has already stopped
+            // vacates nothing, and reading that as "no progress" would make the
+            // stop hold because it held.
+            let removed = cut_cells.saturating_sub(self.occupied());
+            // A tolerance, not a threshold. It absorbs the jitter of a live
+            // sample; it does not decide how much a cut must achieve. The old
+            // condition used 5% of the sample as a threshold, and that is the
+            // fault: a cut can help and still move a large sample by less.
+            let tolerance = cut_bytes / 100;
+            let fell = sample_bytes.saturating_add(tolerance) < cut_bytes;
+            let rose = sample_bytes > cut_bytes.saturating_add(tolerance);
+            if cut_landed && removed > 0 && !fell && !rose {
                 return;
             }
         }
         // How far this resource sample asks the node to come down: a proportion
-        // of what was just measured, because the effect of an eviction on RSS
-        // is not visible until the next sample.
+        // of what was just measured, because the effect of an eviction on the
+        // sample is not visible until the next one.
         self.shed_floor = pressure::PressureConfig::release_target(load.resident_cells);
-        self.shed_cut_rss = Some(load.rss_bytes);
+        self.shed_cut = Some((metric, sample_bytes, load.resident_cells));
         self.shed_toward_floor(effects);
     }
+
+    // The walk down's stopping condition lives in `load_sampled` above: a cut
+    // that vacated cells and did not lower the sample is futile, and the node
+    // holds what it has rather than spending the working set on a ceiling that
+    // eviction cannot satisfy.
+    //
+    // It asks whether the last cut *helped*, not whether it helped by some
+    // percentage. The cut is a proportion of the cells and the sample includes
+    // memory the cells do not own, so a cut that helps can still move the
+    // sample by very little -- and stopping there leaves the node above its own
+    // resume line with idle cells in hand, refusing every request for a cell.
+    // That is issue #50, measured on a fleet as nine hours of exactly that, and
+    // on one node as a walk down that stopped 14 MB short of its line.
 
     /// Continue a latched walk down as each eviction lands.
     ///

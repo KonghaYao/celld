@@ -1,0 +1,9 @@
+{
+  "name": "vectordb",
+  "main": "index.js",
+  "compatibility_date": "2026-01-01",
+  // sqlite-vec is pre-v1, so celld requires an explicit opt-in.
+  "compatibility_flags": ["sqlite_vec"],
+  "durable_objects": { "bindings": [{ "name": "PALETTE", "class_name": "Palette" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Palette"] }]
+}

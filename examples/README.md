@@ -6,6 +6,7 @@ Durable Object surface supported by `celld`:
 - `hello/` — a stateless Worker `fetch` handler
 - `webapi/` — common Web Platform APIs
 - `counter/` — a SQLite-backed Durable Object
+- `vectordb/` — nearest-color search with a per-object `vec0` index
 - `async/` — a timer, an outbound fetch, and asynchronous storage
 - `body/` — request and response bodies
 - `router/` — Worker-to-Durable-Object routing

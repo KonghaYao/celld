@@ -112,17 +112,23 @@ pub(crate) fn prune_watch(watch: &std::path::Path, max_bytes: u64) -> (usize, us
             }
         }
     }
+    let total: u64 = entries.iter().map(|entry| entry.bytes).sum();
     let evict = celld_logic::cache::plan_eviction(&entries, max_bytes);
+    // The kept bytes come out of the pass that already visits every evicted
+    // index, rather than from a membership test per entry. `evict` is a `Vec`,
+    // so asking it whether it holds each index made the accounting
+    // O(entries x evicted) -- 138 ms at 64k snapshots, on the blocking thread,
+    // every prune, to produce a number only the log line reads.
+    let mut freed = 0_u64;
     for &index in &evict {
+        freed = freed.saturating_add(entries[index].bytes);
         let _ = std::fs::remove_file(&paths[index]);
     }
-    let remaining: u64 = entries
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !evict.contains(index))
-        .map(|(_, entry)| entry.bytes)
-        .sum();
-    (entries.len() - evict.len(), evict.len(), remaining)
+    (
+        entries.len() - evict.len(),
+        evict.len(),
+        total.saturating_sub(freed),
+    )
 }
 
 /// Copy a live database into a standalone snapshot. SQLite's backup API

@@ -4,7 +4,7 @@ use crate::bucket::Bucket;
 use crate::protocol::{asset_blob_key, AssetIndex, DeployPointer, Manifest};
 use anyhow::{anyhow, Context};
 use celld_logic::PresenceSnapshot;
-use fastwebsockets::{FragmentCollector, Frame, OpCode};
+use fastwebsockets::{Frame, OpCode};
 use hyper::header::HeaderMap;
 use rand::RngCore;
 use rusqlite::{types::ValueRef, Connection, OpenFlags, OptionalExtension};
@@ -106,6 +106,10 @@ pub enum ManagedRuntimeState {
     ControlPlaneUnavailable,
     BucketUnavailable,
     CredentialRevoked,
+    /// The bucket answers, and the credential works, but the store does
+    /// not enforce the conditional write celld fences with. Distinct from
+    /// `BucketUnavailable`, which a retry can clear: this one never does.
+    StorageContractViolated,
 }
 
 impl ManagedRuntimeState {
@@ -115,6 +119,7 @@ impl ManagedRuntimeState {
             Self::ControlPlaneUnavailable => "control_plane_unavailable",
             Self::BucketUnavailable => "bucket_unavailable",
             Self::CredentialRevoked => "credential_revoked",
+            Self::StorageContractViolated => "storage_contract_violated",
         }
     }
 }
@@ -152,6 +157,15 @@ pub fn report_managed_runtime_state(state: ManagedRuntimeState) {
             managed_state,
             "managed storage credential was rejected; restart celld to fetch a \
              fresh one, or run `celld credentials refresh` if a rotation is pending"
+        ),
+        // No remedy on this node: the store itself cannot fence, so a
+        // restart repeats the refusal. Name the two exits an operator has.
+        ManagedRuntimeState::StorageContractViolated => warn!(
+            event = "managed_runtime_state",
+            managed_state,
+            "the fleet bucket does not enforce the conditional write celld fences \
+             with, so serving cannot start; move the fleet to a store that does, \
+             or set CELLD_STORAGE_PROBE=0 to start without this test"
         ),
     }
 }
@@ -899,8 +913,8 @@ async fn presence_session(
         &runtime.listen,
         hostname,
     )?;
-    let mut socket = match crate::ws_client::connect(&url, headers).await {
-        Ok(connection) => FragmentCollector::new(connection.socket),
+    let socket = match crate::ws_client::connect(&url, headers).await {
+        Ok(connection) => connection.socket,
         Err(crate::ws_client::Error::Declined(declined))
             if matches!(declined.status.as_u16(), 401 | 403) =>
         {
@@ -921,113 +935,201 @@ async fn presence_session(
         crate::env_vars::with_default("CELLD_PRESENCE_HEARTBEAT_MS", 30_000)
             .expect("validated CELLD_PRESENCE_HEARTBEAT_MS"),
     );
-    let mut heartbeat = tokio::time::interval(heartbeat_period);
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let shadow_presence = crate::env_vars::flag("CELLD_PRESENCE_SHADOW", false)
         .expect("validated CELLD_PRESENCE_SHADOW");
-    loop {
-        tokio::select! {
-            _ = heartbeat.tick() => {
-                let snapshot = (runtime.snapshot)()
-                    .await
-                    .context("celld core stopped before presence snapshot")?;
-                let lease_shadow = if shadow_presence {
-                    Some(lease_shadow_observation(runtime).await)
-                } else {
-                    None
-                };
-                let mut cells = snapshot
-                    .cells
-                    .iter()
-                    .filter(|cell| {
-                        !cell.id.is_empty()
-                            && cell.id.len() <= MAX_PRESENCE_CELL_ID_BYTES
-                            && !cell.id.chars().any(char::is_control)
-                    })
-                    .map(|cell| serde_json::json!({
+    pump_presence(
+        socket,
+        heartbeat_period,
+        move || async move {
+            let snapshot = (runtime.snapshot)()
+                .await
+                .context("celld core stopped before presence snapshot")?;
+            let lease_shadow = if shadow_presence {
+                Some(lease_shadow_observation(runtime).await)
+            } else {
+                None
+            };
+            let mut cells = snapshot
+                .cells
+                .iter()
+                .filter(|cell| {
+                    !cell.id.is_empty()
+                        && cell.id.len() <= MAX_PRESENCE_CELL_ID_BYTES
+                        && !cell.id.chars().any(char::is_control)
+                })
+                .map(|cell| {
+                    serde_json::json!({
                         "id": cell.id,
                         "epoch": cell.epoch,
-                    }))
-                    .collect::<Vec<_>>();
-                let cells_truncated = cells.len() < snapshot.cells.len()
-                    || cells.len() > MAX_PRESENCE_CELLS;
-                cells.truncate(MAX_PRESENCE_CELLS);
-                let mut message = serde_json::json!({
-                    "serving": snapshot.serving,
-                    "owned_cells": snapshot.owned_cells(),
-                    "cells": cells,
-                    "cells_truncated": cells_truncated,
-                    "activity": {
-                        "acquired": snapshot.activity.acquired,
-                        "proxied": snapshot.activity.proxied,
-                        "expired_owner_leases": snapshot.activity.expired_owner_leases,
-                        "restored": snapshot.activity.restored,
-                        "advanced_epochs": snapshot.activity.advanced_epochs,
-                    },
-                });
-                if let Some(observation) = lease_shadow {
-                    message["lease_shadow"] = observation;
-                }
-                if !snapshot.lazy_lease_shadow.decisions.is_empty()
-                    || snapshot.lazy_lease_shadow.dropped > 0
-                {
-                    message["lazy_lease_shadow"] =
-                        lazy_lease_shadow_json(&snapshot.lazy_lease_shadow);
-                }
-                socket
-                    .write_frame(Frame::text(message.to_string().into_bytes().into()))
-                    .await?;
+                    })
+                })
+                .collect::<Vec<_>>();
+            let cells_truncated =
+                cells.len() < snapshot.cells.len() || cells.len() > MAX_PRESENCE_CELLS;
+            cells.truncate(MAX_PRESENCE_CELLS);
+            let mut message = serde_json::json!({
+                "serving": snapshot.serving,
+                "owned_cells": snapshot.owned_cells(),
+                "cells": cells,
+                "cells_truncated": cells_truncated,
+                "activity": {
+                    "acquired": snapshot.activity.acquired,
+                    "proxied": snapshot.activity.proxied,
+                    "expired_owner_leases": snapshot.activity.expired_owner_leases,
+                    "restored": snapshot.activity.restored,
+                    "advanced_epochs": snapshot.activity.advanced_epochs,
+                },
+            });
+            if let Some(observation) = lease_shadow {
+                message["lease_shadow"] = observation;
             }
-            // Ping and Close are answered by the collector's auto-pong and
-            // auto-close; only Text carries anything to act on.
-            frame = socket.read_frame() => {
-                match frame {
-                    Ok(frame) if frame.opcode == OpCode::Text => {
-                        let text = String::from_utf8_lossy(&frame.payload);
-                        let message = serde_json::from_str::<serde_json::Value>(&text).ok();
-                        let message_type = message.as_ref()
-                            .and_then(|value| value.get("type"))
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string);
-                        match message_type.as_deref() {
-                            Some("explorer_request") => {
-                                let response = handle_explorer_request(
-                                    message.as_ref().unwrap(),
-                                    runtime,
-                                ).await;
-                                socket
-                                    .write_frame(Frame::text(
-                                        response.to_string().into_bytes().into(),
-                                    ))
-                                    .await?;
-                            }
-                            Some("deployment") => {
-                                let client = reqwest::Client::builder()
-                                    .timeout(Duration::from_secs(30))
-                                    .build()?;
-                                if poll_and_apply(
-                                    &client,
-                                    config,
-                                    &runtime.s3,
-                                ).await?.is_some() && restart_on_deployment_enabled() {
-                                    restart_for_deployment();
-                                }
-                            }
-                            Some("deployment_current") if restart_on_deployment_enabled() => {
-                                restart_for_deployment();
-                            }
-                            _ => {}
-                        }
-                    }
-                    Ok(frame) if frame.opcode == OpCode::Close => {
-                        return Err(anyhow!("Managed Control Plane closed presence"));
-                    }
-                    Ok(_) => {}
-                    Err(error) => return Err(anyhow!("{error}"))
-                        .context("read Managed Control Plane presence"),
+            if !snapshot.lazy_lease_shadow.decisions.is_empty()
+                || snapshot.lazy_lease_shadow.dropped > 0
+            {
+                message["lazy_lease_shadow"] = lazy_lease_shadow_json(&snapshot.lazy_lease_shadow);
+            }
+            Ok(message.to_string())
+        },
+        move |text| async move {
+            let message = serde_json::from_str::<serde_json::Value>(&text).ok();
+            let message_type = message
+                .as_ref()
+                .and_then(|value| value.get("type"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            match message_type.as_deref() {
+                Some("explorer_request") => {
+                    let response =
+                        handle_explorer_request(message.as_ref().unwrap(), runtime).await;
+                    return Ok(Some(response.to_string()));
                 }
+                Some("deployment") => {
+                    let client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(30))
+                        .build()?;
+                    if poll_and_apply(&client, config, &runtime.s3)
+                        .await?
+                        .is_some()
+                        && restart_on_deployment_enabled()
+                    {
+                        restart_for_deployment();
+                    }
+                }
+                Some("deployment_current") if restart_on_deployment_enabled() => {
+                    restart_for_deployment();
+                }
+                _ => {}
+            }
+            Ok(None)
+        },
+    )
+    .await
+}
+
+/// Run a presence session until the heartbeat or the socket stops it.
+///
+/// The read is never cancelled. `fastwebsockets::read_frame` consumes header
+/// bytes from its buffer and then awaits for the payload, holding what it parsed
+/// in local variables, so dropping that future keeps the buffer advanced and
+/// loses the header. The next read then treats a payload byte as a frame header
+/// and the stream never realigns. An earlier version of this session read the
+/// socket in the same `tokio::select!` as the heartbeat timer, so every tick
+/// dropped a read in progress; `tests/p0/runtime/presence_cancel.rs` fails
+/// against that shape.
+///
+/// One async block therefore owns each direction, and the socket is split so
+/// that the heartbeat can write while the reader reads. The select at the end
+/// drops the direction that did not finish, which is safe because the session is
+/// over and the caller reconnects with a new socket.
+///
+/// The two directions are not independent. Both write to the one socket, so they
+/// share the writer behind a mutex, and `write_frame` is awaited while that mutex
+/// is held. A control plane that stops reading therefore blocks the heartbeat and
+/// the automatic replies of the reader alike. The cancelling `select!` had the
+/// same head-of-line property, so this is not a regression, but the split shape
+/// must not be read as two isolated pipes.
+///
+/// `heartbeat` returns the message for one tick. `text` handles one text message
+/// and returns an optional reply. Ping and Close keep the automatic reply of the
+/// reader, so only Text reaches `text`.
+async fn pump_presence<S, H, HFut, T, TFut>(
+    socket: fastwebsockets::WebSocket<S>,
+    heartbeat_period: Duration,
+    mut heartbeat: H,
+    mut text: T,
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    H: FnMut() -> HFut,
+    HFut: Future<Output = anyhow::Result<String>>,
+    T: FnMut(String) -> TFut,
+    TFut: Future<Output = anyhow::Result<Option<String>>>,
+{
+    use fastwebsockets::{FragmentCollectorRead, Payload};
+
+    let (reader, writer) = socket.split(tokio::io::split);
+    let mut reader = FragmentCollectorRead::new(reader);
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+
+    let mut ticker = tokio::time::interval(heartbeat_period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let beat_writer = writer.clone();
+    let beat = async {
+        loop {
+            ticker.tick().await;
+            let message = heartbeat().await?;
+            beat_writer
+                .lock()
+                .await
+                .write_frame(Frame::text(message.into_bytes().into()))
+                .await?;
+        }
+    };
+
+    let obligated_writer = writer.clone();
+    let mut obligated = move |frame: Frame<'_>| {
+        let writer = obligated_writer.clone();
+        // The reply borrows the reader's buffer, and the write outlives the
+        // callback, so the payload is copied out. The reader builds a pong or a
+        // close echo unmasked, exactly as the unsplit collector did.
+        let reply = Frame::new(
+            frame.fin,
+            frame.opcode,
+            None,
+            Payload::Owned(frame.payload.to_vec()),
+        );
+        async move { writer.lock().await.write_frame(reply).await }
+    };
+    let read = async {
+        loop {
+            let frame = reader
+                .read_frame(&mut obligated)
+                .await
+                .map_err(|error| anyhow!("{error}"))
+                .context("read Managed Control Plane presence")?;
+            match frame.opcode {
+                OpCode::Text => {
+                    let message = String::from_utf8_lossy(&frame.payload).into_owned();
+                    if let Some(reply) = text(message).await? {
+                        writer
+                            .lock()
+                            .await
+                            .write_frame(Frame::text(reply.into_bytes().into()))
+                            .await?;
+                    }
+                }
+                OpCode::Close => return Err(anyhow!("Managed Control Plane closed presence")),
+                _ => {}
             }
         }
+    };
+
+    let mut beat = std::pin::pin!(beat);
+    let mut read = std::pin::pin!(read);
+    tokio::select! {
+        result = &mut beat => result,
+        result = &mut read => result,
     }
 }
 
@@ -2765,6 +2867,15 @@ fn machine_hostname() -> String {
                 && !value.chars().any(char::is_control)
         })
         .unwrap_or_else(|| "celld".to_string())
+}
+
+// The presence session read the socket in the same select! as the heartbeat
+// timer, so every tick dropped a read in progress. The fault is invisible from
+// outside: the session reconnects and only the messages in the window are gone,
+// so it takes a test that watches the frames themselves.
+#[cfg(all(test, celld_internal_tests))]
+mod presence_cancel_private {
+    include!(env!("CELLD_CONFORMANCE_PRESENCE_CANCEL_TESTS"));
 }
 
 fn print_connect_help() {

@@ -20,6 +20,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_LTX_COMPACTION",
         "CELLD_OUTPUT_GATE",
         "CELLD_PRESENCE_SHADOW",
+        "CELLD_TRUST_FORWARDED_HEADERS",
         "CELLD_UNSAFE_PUBLIC_ADVERTISE",
     ] {
         flag(name, false)?;

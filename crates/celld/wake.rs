@@ -218,6 +218,13 @@ impl WakeFlusher {
     pub async fn await_no_inflight_delete(&self, cell: &str) {
         loop {
             let notified = self.quiesce.notified();
+            tokio::pin!(notified);
+            // Register the waiter BEFORE the check. `notified()` only enrolls
+            // when the future is first polled, so a delete settling between
+            // the check and the first poll would notify no one and this wait
+            // would hang until some unrelated delete settled — with the arm
+            // gate holding the response that waits on it.
+            notified.as_mut().enable();
             if !self.core.lock().unwrap().delete_in_flight(cell) {
                 return;
             }

@@ -2,7 +2,7 @@
 
 //! Production bucket deployment adapters reused by the clean-sheet host.
 
-use crate::bucket::Bucket;
+use crate::bucket::{Bucket, CasVerdict};
 use crate::deploy;
 use crate::js::{ModuleSource, WorkerConfigOptions};
 use crate::ownership_store::NodeLeaseWire;
@@ -124,13 +124,95 @@ async fn validate_managed_bucket_once(bucket: &Bucket, report: bool) -> anyhow::
     }
 }
 
+/// Test the one bucket capability a fleet cannot run without.
+///
+/// A list proves the bucket answers a request. It does not prove the
+/// store keeps the conditional write, and some stores accept the
+/// precondition header and then ignore it. A fleet on such a store loses
+/// a cell to two owners, or dies in a self-fence loop, minutes after an
+/// operator read `ok bucket`. So diagnose provokes the rejections a
+/// conforming store must produce.
+///
+/// The probe writes and deletes one small object, which a read-only
+/// credential cannot do; `--read-only` skips it for that operator.
+async fn probe_storage(bucket: &Bucket, read_only: bool) -> anyhow::Result<()> {
+    if read_only {
+        println!("skip bucket write probe (--read-only)");
+        return Ok(());
+    }
+    match bucket.probe_cas().await {
+        Ok(()) => {
+            println!("ok bucket conditional write (create, reject-create, update, reject-stale)");
+            Ok(())
+        }
+        Err(error) => {
+            if crate::bucket::is_unauthorized(&error) {
+                eprintln!(
+                    "fail bucket conditional write: the credential cannot write to the bucket, \
+                     and a celld node requires write access; pass --read-only to diagnose with a \
+                     read-only credential"
+                );
+            } else {
+                eprintln!("fail bucket conditional write: {error:#}");
+            }
+            bail!("bucket failed the storage conformance probe")
+        }
+    }
+}
+
+/// Test the conditional write before a node serves, and refuse to start
+/// when the store proves it cannot fence.
+///
+/// The two probe outcomes get different answers on purpose. A violation
+/// is a property of the store: it never clears, and a node that serves
+/// anyway can share a cell with a second owner. Refusing to start turns
+/// the restart loop such a store otherwise produces into one message.
+///
+/// An ambiguous error is not that. `put_cas` runs with retries off, so a
+/// single slow or dropped connection at boot answers `Err`. The lease
+/// machinery already handles a transient fault, and a node must not
+/// refuse to start over one.
+///
+/// `managed` reports the refusal to the Managed Control Plane, the way
+/// [`validate_managed_bucket`] reports its own failures. Without it an
+/// enrolled installation that refuses to serve leaves only local stderr
+/// behind, so the operator who most needs the reason cannot read it.
+pub async fn probe_storage_before_serving(bucket: &Bucket, managed: bool) -> anyhow::Result<()> {
+    match bucket.probe_cas_steps().await {
+        Ok(CasVerdict::Conformant) => Ok(()),
+        Ok(CasVerdict::Violation(reason)) => {
+            if managed {
+                crate::control_plane::report_managed_runtime_state(
+                    crate::control_plane::ManagedRuntimeState::StorageContractViolated,
+                );
+            }
+            bail!(
+                "the bucket does not keep the conditional-write contract, so celld cannot own \
+                 cells safely on it: {reason}. Set CELLD_STORAGE_PROBE=0 to start without this \
+                 test"
+            )
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "could not verify the bucket conditional write; starting anyway"
+            );
+            Ok(())
+        }
+    }
+}
+
 pub async fn diagnose(
     bucket: &Bucket,
     peers: Vec<String>,
     unsafe_public_advertise: bool,
+    read_only: bool,
 ) -> anyhow::Result<()> {
     validate_bucket(bucket).await?;
     println!("ok bucket {}://{}", bucket.scheme(), bucket.name);
+    // A store that cannot fence makes every peer result moot, so the
+    // storage verdict comes before the fleet walk.
+    probe_storage(bucket, read_only).await?;
 
     let enumerated = peers.is_empty();
     let peers = if enumerated {
@@ -213,16 +295,25 @@ pub async fn diagnose(
         } else {
             node.load.rss_bytes.to_string()
         };
+        // The shedding decision reads the in-use figure, not the resident set
+        // size, so a diagnosis that prints only the latter cannot explain why
+        // a node sheds. A node from before this field reports nothing, which
+        // is not the same as zero.
+        let in_use_bytes = node
+            .load
+            .in_use_bytes
+            .map_or_else(|| "unknown".to_string(), |bytes| bytes.to_string());
         println!(
             "ok peer {} at {} (signed direct probe) protocol={} resident_cells={} \
-             websockets={} rss_bytes={} cpu_percent={:.2} fds={}/{} pressured={} \
-             shed_cells={} restoring={} load_age_ms={}",
+             websockets={} rss_bytes={} in_use_bytes={} cpu_percent={:.2} fds={}/{} \
+             pressured={} shed_cells={} restoring={} load_age_ms={}",
             node.node,
             node.addr,
             node.peer_protocol,
             node.load.resident_cells,
             node.load.host_websockets,
             rss_bytes,
+            in_use_bytes,
             node.load.cpu_percent_x100 as f64 / 100.0,
             node.load.open_fds,
             node.load.fd_limit,

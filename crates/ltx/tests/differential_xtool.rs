@@ -26,13 +26,13 @@
 //! actually runs. The skip is a runtime guard, not a compile-time ignore
 //! attribute, and no assertion is weakened (AGENTS.md rules 1-2).
 //!
-//! ## Why a file replica (not MinIO)
+//! ## Why a file replica (not S3)
 //! D1–D3 exercise the *format* and the *restore algorithm*, which are transport
 //! agnostic. The file `ReplicaClient` is byte-for-byte the same object layout the
 //! S3 client uses (`<root>/ltx/<level>/<min>-<max>.ltx`), and the real binary's
 //! `file://` backend reads/writes that identical tree — so a file replica is the
-//! cleanest, hermetic way to put both tools on the *same* bytes. The S3/MinIO
-//! transport is separately proven end-to-end by T7 (`integration_minio.rs`).
+//! cleanest, hermetic way to put both tools on the *same* bytes. The S3
+//! transport is separately proven end-to-end by T7 (`integration_s3.rs`).
 
 use celld_ltx::client::file::FileReplicaClient;
 use celld_ltx::db::Db;

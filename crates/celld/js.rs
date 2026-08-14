@@ -1098,6 +1098,9 @@ pub struct Compat {
     /// default on for dates >= 2024-03-26): the deprecated `get()`/`put()`/
     /// `delete()` HTTP helpers on stubs (Workerd http.c++ Fetcher).
     pub fetcher_get_put_delete: bool,
+    /// `sqlite_vec`: expose the pre-v1 sqlite-vec extension to SQLite-backed
+    /// Durable Objects. This switch is explicit and has no date default.
+    pub sqlite_vec: bool,
     /// `websocket_standard_binary_type`: `binaryType` defaults to `"blob"` and
     /// a binary message arrives as a `Blob`, per the WHATWG default. Without
     /// it celld keeps the historical `"arraybuffer"`.
@@ -1227,8 +1230,7 @@ pub struct Worker {
 
 pub struct WorkerIsolate {
     /// Shared rather than owned: under D1 an isolate belongs to no thread,
-    /// and a worker enters it by taking its `v8::Locker`
-    /// (wiki/designs/isolate-threading.md).
+    /// and a worker enters it by taking its `v8::Locker`.
     ///
     /// Every `lock()` below blocks until the current holder releases. That is
     /// only safe because the pool takes an async permit for this isolate
@@ -1246,6 +1248,7 @@ pub struct WorkerIsolate {
     /// cell, which is most of what sharing an isolate saves.
     realm: Realm,
     original_heap_limit: usize,
+    compat: Compat,
     /// The storage of the cells this isolate hosts.
     ///
     /// It lives here, and not in a thread-local, because a driven cell's
@@ -1783,10 +1786,10 @@ fn set_cped(scope: &mut v8::PinScope, frame: v8::Local<v8::Value>, trace: v8::Lo
 /// reaction is registered and restores it while the reaction runs. That
 /// is the exactness `console.log` correlation needs: a continuation
 /// belonging to a *different* entry that runs during this turn's
-/// microtask checkpoint carries its own context, not this turn's
-/// (wiki/designs/otel.md). The layout is 16 trace-id bytes then 8
-/// span-id bytes in one 24-byte ArrayBuffer, fresh per turn — cheap at
-/// sampled rates, and nothing outlives V8's own snapshots.
+/// microtask checkpoint carries its own context, not this turn's. The
+/// layout is 16 trace-id bytes then 8 span-id bytes in one 24-byte
+/// ArrayBuffer, fresh per turn — cheap at sampled rates, and nothing
+/// outlives V8's own snapshots.
 ///
 /// Returns the previous slot value *only when something was installed*;
 /// the caller restores it before releasing the isolate. An untraced
@@ -1848,7 +1851,7 @@ pub(crate) fn current_trace_ids(scope: &mut v8::PinScope) -> Option<crate::telem
 /// The isolate, entered for one turn. Everything a request does to a shared
 /// isolate goes through one of these, and none of them may be held across an
 /// await: the caller takes the pool's async permit first, runs a turn, and
-/// leaves. See `wiki/designs/isolate-threading.md`.
+/// leaves.
 impl Worker {
     /// Run a request's first turn.
     ///
@@ -2305,7 +2308,7 @@ fn dispatcher<'s>(
 /// blocking loop ran each of these to completion inside one call — and
 /// serviced other cells' events inside *that* — each is now an entry a tokio
 /// task drives, so two events of one cell interleave by suspending rather
-/// than by nesting. See `wiki/designs/deleting-the-pump.md`.
+/// than by nesting.
 fn begin_cell(tc: &mut v8::PinScope, job: CellJob) -> Begun {
     match job {
         CellJob::Fetch {
@@ -2905,6 +2908,7 @@ impl Worker {
                     .unwrap_or_else(|error| panic!("cell isolate cannot be shared: {error}")),
                 realm: Realm { context, fetch },
                 original_heap_limit,
+                compat,
                 cells: storage::Cells::default(),
             }),
         })
@@ -2933,13 +2937,14 @@ impl Worker {
         db_path: Option<&str>,
         owned: bool,
     ) -> Result<Option<i64>> {
+        let compat = self.inner.as_ref().expect("live worker isolate").compat;
         let (mut locker, _cells) = self.lock();
         v8::scope!(let hs, &mut *locker);
         let realm = self.realm(hs);
         let context = realm.context;
         let cs = &mut v8::ContextScope::new(hs, context);
         let tc = std::pin::pin!(v8::TryCatch::new(cs));
-        adopt_cell(&mut tc.init(), cell, db_path, owned)
+        adopt_cell(&mut tc.init(), cell, db_path, owned, compat)
     }
 
     /// Drain the alarm moves the last turn committed in this isolate.

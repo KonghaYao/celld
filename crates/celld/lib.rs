@@ -24,6 +24,7 @@ mod fault;
 pub mod fleet;
 pub mod js;
 pub mod ltx_repl;
+pub mod memory;
 mod otlp;
 pub mod ownership_store;
 pub mod peer_auth;
@@ -129,6 +130,7 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
             "fetcher_has_get_put_delete",
             "2024-03-26",
         ),
+        sqlite_vec: has_flag("sqlite_vec"),
         websocket_standard_binary_type: has_flag("websocket_standard_binary_type"),
     }
 }

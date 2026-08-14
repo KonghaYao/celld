@@ -16,6 +16,13 @@ pub(crate) struct Settings {
     pub(crate) internal_listen: celld::startup::Listen,
     pub(crate) advertise: Option<String>,
     pub(crate) unsafe_public_advertise: bool,
+    /// Whether forwarded scheme and host headers can set `request.url`.
+    /// This option is off unless a trusted proxy replaces both headers.
+    pub(crate) trust_forwarded_headers: bool,
+    /// Whether a node tests the bucket's conditional write before it
+    /// serves. On by default, because a store that accepts the
+    /// precondition and ignores it makes the node self-fence in a loop.
+    pub(crate) storage_probe: bool,
 }
 
 pub(crate) enum Action {
@@ -23,6 +30,9 @@ pub(crate) enum Action {
     Diagnose {
         settings: Settings,
         peers: Vec<String>,
+        /// Skip the write probe, for an operator who diagnoses with a
+        /// credential that cannot write.
+        read_only: bool,
     },
     Deploy(Vec<String>),
     Connect(Vec<String>),
@@ -87,6 +97,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
     let mut listen_configured = configured_listen.is_some();
     let mut internal_listen_configured = configured_internal_listen.is_some();
     let mut peers = Vec::new();
+    let mut read_only = false;
     let mut settings = Settings {
         control_plane,
         bucket: fixture_bucket
@@ -109,6 +120,8 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             .unwrap_or(celld::startup::Listen::LoopbackEphemeral),
         advertise: configured_advertise,
         unsafe_public_advertise: celld::env_vars::flag("CELLD_UNSAFE_PUBLIC_ADVERTISE", false)?,
+        trust_forwarded_headers: celld::env_vars::flag("CELLD_TRUST_FORWARDED_HEADERS", false)?,
+        storage_probe: celld::env_vars::flag("CELLD_STORAGE_PROBE", true)?,
     };
     let mut args = arguments.into_iter();
     while let Some(argument) = args.next() {
@@ -153,6 +166,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
                 );
             }
             "--unsafe-public-advertise" => settings.unsafe_public_advertise = true,
+            "--trust-forwarded-headers" => settings.trust_forwarded_headers = true,
             "--peer" if diagnose => {
                 let peer = args
                     .next()
@@ -160,6 +174,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
                 celld::startup::validate_peer_id(&peer)?;
                 peers.push(peer);
             }
+            "--read-only" if diagnose => read_only = true,
             "--no-control-plane" => settings.control_plane = false,
             other => {
                 anyhow::bail!("unknown command or option: {other}; run `celld --help` for usage")
@@ -192,7 +207,11 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
         );
     }
     Ok(if diagnose {
-        Action::Diagnose { settings, peers }
+        Action::Diagnose {
+            settings,
+            peers,
+            read_only,
+        }
     } else {
         Action::Run(settings)
     })
@@ -228,12 +247,19 @@ OPTIONS:
   --advertise ADDR:PORT  Address peers can reach: IP:PORT or HOST:PORT
                          (requires --internal-listen or CELLD_INTERNAL_ADDR)
   --peer NODE_ID         Diagnose one node with a signed direct probe; repeatable
+  --read-only            Skip the bucket write probe. celld diagnose otherwise
+                         tests the conditional write, which writes and deletes a
+                         small object under the probe/ prefix
   --unsafe-public-advertise
                          Permit a literal public IP in --advertise. The flag does
                          not resolve hostnames or restrict --internal-listen.
                          Peer traffic has no built-in TLS, and operator routes
                          permit unauthenticated work, eviction, state inspection,
                          and shutdown
+  --trust-forwarded-headers
+                         Let X-Forwarded-Host and X-Forwarded-Proto set the
+                         scheme and host in request.url. Set this option only
+                         when a trusted proxy replaces both headers
   -h, --help             Show this help
   -V, --version          Show the celld version
 
@@ -250,6 +276,8 @@ ENVIRONMENT:
   CELLD_UNSAFE_PUBLIC_ADVERTISE   `1` permits a literal public IP in
                                   CELLD_ADVERTISE; it does not resolve hostnames
                                   or restrict CELLD_INTERNAL_ADDR
+  CELLD_TRUST_FORWARDED_HEADERS   `1` trusts X-Forwarded-Host and
+                                  X-Forwarded-Proto
   CELLD_NODE                      Node-session ID (default: generated)
   CELLD_WATCH                     Local SQLite/replication working directory
   CELLD_ESBUILD                   Override esbuild executable path
@@ -260,6 +288,8 @@ ENVIRONMENT:
   CELLD_ASSET_CACHE_BYTES         Asset cache limit
 
 TUNING:
+  CELLD_STORAGE_PROBE             `0` skips the startup conditional-write test
+                                  (default: on)
   CELLD_TTL_MS                    Node lease lifetime (default: 10000)
   CELLD_OPERATION_DEADLINE_MS     Non-restore operation deadline (default: 15000)
   CELLD_IDLE_EVICT_S              Idle-cell eviction age (disabled unless set)

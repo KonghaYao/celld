@@ -9,8 +9,6 @@
 //! isolate, when to grow, what to shed and what to retire is made by
 //! `celld_logic::isolate` and merely performed here.
 //!
-//! See `wiki/designs/isolate-threading.md`.
-//!
 //! **The gate exists so nothing blocks.** `SharedIsolate::lock()` blocks
 //! until its holder releases. Every path here takes the slot's async permit
 //! first, so that blocking lock is uncontended by construction. A `lock()`

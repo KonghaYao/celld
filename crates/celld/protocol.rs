@@ -39,9 +39,11 @@ fn legacy_manifest_schema_version() -> u32 {
 /// requiring anything else must be rejected up front: `ModuleRef` tolerates
 /// unknown fields, so an older node would otherwise deserialize the manifest
 /// partially and fail (or misbehave) at worker load instead.
-pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[FEATURE_ASSETS_V1, FEATURE_WASM_V1];
+pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] =
+    &[FEATURE_ASSETS_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1];
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
+pub const FEATURE_SQLITE_VEC_V1: &str = "sqlite-vec-v1";
 pub const FEATURE_WASM_V1: &str = "wasm-v1";
 
 /// Reject a manifest requiring any feature this build does not support. Both

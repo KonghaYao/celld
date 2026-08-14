@@ -169,7 +169,6 @@ pub(crate) async fn outbound_websocket_task(
     app: AppHandle,
     request: celld::js::OutboundWsReq,
 ) -> anyhow::Result<()> {
-    use fastwebsockets::OpCode;
     use hyper::header::{HeaderMap, HeaderName, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
 
     let celld::js::OutboundWsReq {
@@ -254,7 +253,7 @@ pub(crate) async fn outbound_websocket_task(
             return Ok(());
         }
     };
-    let mut socket = fastwebsockets::FragmentCollector::new(connection.socket);
+    let socket = connection.socket;
     let protocol = connection
         .headers
         .get(SEC_WEBSOCKET_PROTOCOL)
@@ -297,41 +296,16 @@ pub(crate) async fn outbound_websocket_task(
         return Ok(());
     }
 
-    let mut close = (1006, String::new(), false);
-    loop {
-        tokio::select! {
-            // Ping is answered by the collector's auto-pong, as the previous
-            // client library also did unprompted.
-            incoming = socket.read_frame() => {
-                let Ok(frame) = incoming else { break };
-                let delivered = match frame.opcode {
-                    OpCode::Text => sink.message(
-                        id,
-                        celld::js::WsIn::Text(
-                            String::from_utf8_lossy(&frame.payload).into_owned(),
-                        ),
-                    ).await,
-                    OpCode::Binary => sink.message(
-                        id,
-                        celld::js::WsIn::Binary(frame.payload.to_vec()),
-                    ).await,
-                    OpCode::Close => {
-                        close = websocket_close_details(&frame.payload);
-                        break;
-                    }
-                    _ => Ok(()),
-                };
-                if delivered.is_err() { break; }
-            }
-            output = outputs.recv() => {
-                let Some(output) = output else { break };
-                if let celld::js::WsOut::Close(code, reason) = &output {
-                    close = (*code, reason.clone(), true);
-                }
-                if !write_ws_out(&mut socket, output).await { break; }
-            }
-        }
-    }
+    // Ping and Close are answered by the reader's auto-pong and auto-close, as
+    // the previous client library also did unprompted. The pump writes those
+    // replies on the same socket, so nothing about that changes here.
+    let (close, _writer) = {
+        let sink = &sink;
+        pump_cell_socket(socket, &mut outputs, true, move |data| {
+            sink.message(id, data)
+        })
+        .await
+    };
     let _ = sink.closed(id, close.0, close.1, close.2).await;
     celld::js::ws_unregister(id);
     Ok(())
@@ -352,12 +326,20 @@ fn websocket_close_details(payload: &[u8]) -> (u16, String, bool) {
     }
 }
 
-async fn write_ws_out<S>(
-    ws: &mut fastwebsockets::FragmentCollector<S>,
-    out: celld::js::WsOut,
-) -> bool
+/// The write half of a cell socket, shared by the reader and the writer.
+///
+/// The reader needs it because auto-pong and auto-close hand their reply back to
+/// the caller once a socket is split. The writer needs it for the cell's own
+/// frames, and the close path needs it after both directions stop.
+type SocketWriter<S> =
+    std::sync::Arc<tokio::sync::Mutex<fastwebsockets::WebSocketWrite<tokio::io::WriteHalf<S>>>>;
+
+/// Close details: the code, the reason, and whether the close was clean.
+type CloseState = (u16, String, bool);
+
+async fn write_ws_out<S>(ws: &SocketWriter<S>, out: celld::js::WsOut) -> bool
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncWrite + Unpin,
 {
     use fastwebsockets::Frame;
     let keep_open = matches!(out, celld::js::WsOut::Text(_) | celld::js::WsOut::Binary(_));
@@ -366,7 +348,134 @@ where
         celld::js::WsOut::Binary(data) => Frame::binary(data.into()),
         celld::js::WsOut::Close(code, reason) => Frame::close(code, reason.as_bytes()),
     };
-    ws.write_frame(frame).await.is_ok() && keep_open
+    ws.lock().await.write_frame(frame).await.is_ok() && keep_open
+}
+
+/// Carry frames between a socket and the cell behind it until one side stops.
+///
+/// The read is never cancelled. `fastwebsockets::read_frame` consumes header
+/// bytes from its buffer and then awaits for the payload, holding what it parsed
+/// in local variables, so dropping that future keeps the buffer advanced and
+/// loses the header. The next read then treats a payload byte as a frame header
+/// and the stream never realigns. Earlier versions of both callers read the
+/// socket in the same `tokio::select!` as the cell's outbound queue, which drops
+/// the losing future on every iteration; `tests/p0/runtime/socket_cancel.rs`
+/// fails against that shape.
+///
+/// One async block therefore owns each direction. The halves are split so that
+/// the writer can write while the reader reads, and the writer stops on a signal
+/// instead of being dropped, because dropping it can leave a partial frame on
+/// the socket.
+///
+/// The caller sets `auto_close` and `auto_pong` on the socket before the pump
+/// runs, and the pump keeps that choice: an automatic reply is written on the
+/// same socket, exactly as the unsplit collector wrote it.
+///
+/// `outbound_close_is_clean` reports a close that the cell sends as the close
+/// state of the socket. The local path leaves that false, because it answers an
+/// unclean end with its own protocol echo after the pump returns.
+///
+/// The returned writer is still live, so the caller can write the close frames
+/// that follow.
+async fn pump_cell_socket<S, F, Fut>(
+    socket: fastwebsockets::WebSocket<S>,
+    outputs: &mut mpsc::UnboundedReceiver<celld::js::WsOut>,
+    outbound_close_is_clean: bool,
+    mut inbound: F,
+) -> (CloseState, SocketWriter<S>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    F: FnMut(celld::js::WsIn) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    use fastwebsockets::{FragmentCollectorRead, Frame as WsFrame, OpCode, Payload};
+
+    let (reader, writer) = socket.split(tokio::io::split);
+    let mut reader = FragmentCollectorRead::new(reader);
+    let writer: SocketWriter<S> = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
+
+    let mut close: CloseState = (1006, String::new(), false);
+    let (stop_writer, mut stopped) = tokio::sync::oneshot::channel::<()>();
+    {
+        let obligated_writer = writer.clone();
+        let mut obligated = move |frame: WsFrame<'_>| {
+            let writer = obligated_writer.clone();
+            // The reply borrows the reader's buffer, and the write outlives the
+            // callback, so the payload is copied out. The reader builds a pong
+            // or a close echo unmasked, and `write_frame` masks it if the role
+            // needs it, exactly as the unsplit collector did.
+            let reply = WsFrame::new(
+                frame.fin,
+                frame.opcode,
+                None,
+                Payload::Owned(frame.payload.to_vec()),
+            );
+            async move { writer.lock().await.write_frame(reply).await }
+        };
+
+        let read = async {
+            loop {
+                let Ok(frame) = reader.read_frame(&mut obligated).await else {
+                    return None;
+                };
+                let delivered = match frame.opcode {
+                    OpCode::Text => {
+                        inbound(celld::js::WsIn::Text(
+                            String::from_utf8_lossy(&frame.payload).into_owned(),
+                        ))
+                        .await
+                    }
+                    OpCode::Binary => {
+                        inbound(celld::js::WsIn::Binary(frame.payload.to_vec())).await
+                    }
+                    OpCode::Close => return Some(websocket_close_details(&frame.payload)),
+                    _ => Ok(()),
+                };
+                if delivered.is_err() {
+                    return None;
+                }
+            }
+        };
+
+        // `recv` and the stop signal are both cancel-safe, and the write runs in
+        // the branch body, so no write is ever cancelled either.
+        let write = async {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut stopped => return None,
+                    output = outputs.recv() => {
+                        let output = output?;
+                        let closed = match &output {
+                            celld::js::WsOut::Close(code, reason) if outbound_close_is_clean => {
+                                Some((*code, reason.clone(), true))
+                            }
+                            _ => None,
+                        };
+                        if !write_ws_out(&writer, output).await { return closed; }
+                    }
+                }
+            }
+        };
+
+        let mut read = std::pin::pin!(read);
+        let mut write = std::pin::pin!(write);
+        tokio::select! {
+            result = &mut read => {
+                if let Some(details) = result { close = details; }
+                // Stop the writer between frames rather than dropping it, so a
+                // frame it started reaches the socket whole.
+                let _ = stop_writer.send(());
+                let _ = write.await;
+            }
+            result = &mut write => {
+                if let Some(details) = result { close = details; }
+                // The read is dropped here. That is safe only because the pump
+                // is over and the socket is never read again.
+            }
+        }
+    }
+    (close, writer)
 }
 
 async fn websocket_task<S>(
@@ -376,43 +485,21 @@ async fn websocket_task<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use fastwebsockets::OpCode;
     socket.set_auto_close(false);
-    let mut socket = fastwebsockets::FragmentCollector::new(socket);
     let (outbound, mut outputs) = mpsc::unbounded_channel();
     celld::js::ws_register(target.id, outbound);
-    let mut close = (1006, String::new(), false);
-    loop {
-        tokio::select! {
-            frame = socket.read_frame() => {
-                let Ok(frame) = frame else { break };
-                let result = match frame.opcode {
-                    OpCode::Text => dispatch_ws_message(
-                        &app,
-                        &target.scope,
-                        target.id,
-                        celld::js::WsIn::Text(String::from_utf8_lossy(&frame.payload).into_owned()),
-                    ).await,
-                    OpCode::Binary => dispatch_ws_message(
-                        &app,
-                        &target.scope,
-                        target.id,
-                        celld::js::WsIn::Binary(frame.payload.to_vec()),
-                    ).await,
-                    OpCode::Close => {
-                        close = websocket_close_details(&frame.payload);
-                        break;
-                    }
-                    _ => Ok(()),
-                };
-                if result.is_err() { break; }
-            }
-            output = outputs.recv() => {
-                let Some(output) = output else { break };
-                if !write_ws_out(&mut socket, output).await { break; }
-            }
-        }
-    }
+    // A close the cell sends does not become the close state here: the echo
+    // below decides what the peer observes, so the pump must not claim the
+    // close was clean.
+    let (close, writer) = {
+        let app = &app;
+        let scope = target.scope.as_str();
+        let id = target.id;
+        pump_cell_socket(socket, &mut outputs, false, move |data| {
+            dispatch_ws_message(app, scope, id, data)
+        })
+        .await
+    };
     if let Err(error) = dispatch_ws_closed(
         &app,
         &target.scope,
@@ -437,14 +524,14 @@ async fn websocket_task<S>(
     let mut handler_sent_close = false;
     while let Ok(output) = outputs.try_recv() {
         handler_sent_close |= matches!(output, celld::js::WsOut::Close(_, _));
-        if !write_ws_out(&mut socket, output).await {
+        if !write_ws_out(&writer, output).await {
             break;
         }
     }
     if let Some(code) =
         celld_logic::schedule::websocket_echo_close(close.0, close.2, handler_sent_close)
     {
-        let _ = write_ws_out(&mut socket, celld::js::WsOut::Close(code, close.1)).await;
+        let _ = write_ws_out(&writer, celld::js::WsOut::Close(code, close.1)).await;
     }
     app.websocket_closed(target.scope.clone(), target.id);
     celld::js::ws_unregister(target.id);
@@ -453,13 +540,11 @@ async fn websocket_task<S>(
 async fn remote_websocket_task<S>(
     app: AppHandle,
     target: celld::js::WsTarget,
-    mut client: fastwebsockets::WebSocket<S>,
+    client: fastwebsockets::WebSocket<S>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use fastwebsockets::{FragmentCollector, Frame as WsFrame, OpCode};
-
     let mut node = target
         .peer_node
         .clone()
@@ -472,7 +557,7 @@ where
         .peer_epoch
         .context("remote WebSocket target has no owner epoch")?;
     let mut dispatcher = celld_logic::routing::Dispatcher::default();
-    let mut peer = loop {
+    let peer = loop {
         let path = format!("/__ws/{}?id={}&epoch={epoch}", target.scope, target.id);
         let signed = app.peer_auth.signed_headers("GET", &path, &[], &node)?;
         match celld::ws_client::connect(&format!("ws://{addr}{path}"), signed).await {
@@ -528,64 +613,150 @@ where
     // Both halves speak the same implementation, so a frame crosses the hop
     // as itself. The one rewrite left is the close code: 1005 means "no code
     // was sent" and is not transmissible, so it becomes a plain 1000.
+    pump_tunnel(client, peer).await
+}
+
+/// Carry frames both ways between a client and the node that owns its cell.
+///
+/// The read halves are never cancelled. `fastwebsockets::read_frame` consumes
+/// header bytes from its buffer and then awaits for the payload, holding what
+/// it parsed in local variables, so dropping that future keeps the buffer
+/// advanced and loses the header. The next read then treats a payload byte as
+/// a frame header and the stream never realigns. An earlier version of this
+/// function ran both reads in one `tokio::select!`, which drops the losing
+/// future on every iteration; `tests/p0/runtime/tunnel_cancel.rs` fails against
+/// that shape.
+///
+/// One task therefore owns each direction. The halves are split so that a task
+/// can write to a socket while the other task reads it, and neither read is
+/// ever interrupted.
+///
+/// The two directions are not independent. Both can write to the client, so
+/// they share one writer behind a mutex, and `write_frame` is awaited while
+/// that mutex is held. A client that stops reading therefore blocks the other
+/// direction as well. The cancelling `select!` had the same head-of-line
+/// property, so this is not a regression, but the split shape must not be read
+/// as two isolated pipes.
+async fn pump_tunnel<C, P>(
+    mut client: fastwebsockets::WebSocket<C>,
+    mut peer: fastwebsockets::WebSocket<P>,
+) -> anyhow::Result<()>
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    P: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use fastwebsockets::{FragmentCollectorRead, Frame as WsFrame, OpCode, WebSocketError};
+    use std::sync::Arc;
+
+    // celld forwards a ping, a pong and a close as ordinary frames, so the
+    // reader must not answer any of them itself. With both automatic replies
+    // off, the obligated-send callback below never runs.
     client.set_auto_close(false);
+    client.set_auto_pong(false);
     peer.set_auto_close(false);
-    let mut client = FragmentCollector::new(client);
-    let mut peer = FragmentCollector::new(peer);
-    let mut client_open = true;
-    loop {
-        tokio::select! {
-            frame = client.read_frame(), if client_open => {
-                let frame = frame.context("read client WebSocket frame")?;
-                let frame = match frame.opcode {
-                    OpCode::Text | OpCode::Binary | OpCode::Ping | OpCode::Pong => frame,
-                    OpCode::Close => {
-                        client_open = false;
-                        let (code, reason, _) = websocket_close_details(&frame.payload);
-                        WsFrame::close(if code == 1005 { 1000 } else { code }, reason.as_bytes())
-                    }
-                    _ => continue,
-                };
-                if peer.write_frame(frame).await.is_err() {
-                    if client_open {
-                        let _ = client
-                            .write_frame(WsFrame::close(1012, b"owner unavailable"))
-                            .await;
-                    }
-                    break;
-                }
-            }
-            frame = peer.read_frame() => {
-                let frame = match frame {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        if client_open {
-                            let _ = client
-                                .write_frame(WsFrame::close(1012, b"owner unavailable"))
-                                .await;
-                        }
-                        return Err(anyhow::anyhow!("{error}"))
-                            .context("read owner WebSocket frame");
-                    }
-                };
-                let closing = frame.opcode == OpCode::Close;
-                let frame = if closing {
-                    let (code, reason, _) = websocket_close_details(&frame.payload);
-                    WsFrame::close(if code == 1005 { 1000 } else { code }, reason.as_bytes())
-                } else {
-                    frame
-                };
-                client
-                    .write_frame(frame)
+    peer.set_auto_pong(false);
+
+    let (client_rx, client_tx) = client.split(tokio::io::split);
+    let (peer_rx, peer_tx) = peer.split(tokio::io::split);
+    let mut client_rx = FragmentCollectorRead::new(client_rx);
+    let mut peer_rx = FragmentCollectorRead::new(peer_rx);
+
+    // Both directions can need to tell the client that the owner is gone, so
+    // the client writer is shared. The peer writer has one user.
+    let client_tx = Arc::new(tokio::sync::Mutex::new(client_tx));
+    let peer_tx = Arc::new(tokio::sync::Mutex::new(peer_tx));
+
+    let close_code = |payload: &[u8]| {
+        let (code, reason, _) = websocket_close_details(payload);
+        WsFrame::close(if code == 1005 { 1000 } else { code }, reason.as_bytes())
+    };
+
+    // Why the client direction ended. A close from the client is a half close:
+    // the owner still has to answer it, and that answer carries the close code
+    // the client must see. Ending the hop here would drop it.
+    enum ClientEnd {
+        Closed,
+        OwnerUnavailable,
+    }
+
+    let to_peer_client_tx = client_tx.clone();
+    let to_peer = async move {
+        let mut obligated = |_: WsFrame| async { Ok::<(), WebSocketError>(()) };
+        loop {
+            let frame = client_rx
+                .read_frame(&mut obligated)
+                .await
+                .context("read client WebSocket frame")?;
+            let closing = frame.opcode == OpCode::Close;
+            let frame = match frame.opcode {
+                OpCode::Text | OpCode::Binary | OpCode::Ping | OpCode::Pong => frame,
+                OpCode::Close => close_code(&frame.payload),
+                _ => continue,
+            };
+            if peer_tx.lock().await.write_frame(frame).await.is_err() {
+                let _ = to_peer_client_tx
+                    .lock()
                     .await
-                    .context("write client WebSocket frame")?;
-                if closing {
-                    break;
-                }
+                    .write_frame(WsFrame::close(1012, b"owner unavailable"))
+                    .await;
+                return anyhow::Ok(ClientEnd::OwnerUnavailable);
+            }
+            if closing {
+                return anyhow::Ok(ClientEnd::Closed);
             }
         }
+    };
+
+    let to_client_tx = client_tx.clone();
+    let to_client = async move {
+        let mut obligated = |_: WsFrame| async { Ok::<(), WebSocketError>(()) };
+        loop {
+            let frame = match peer_rx.read_frame(&mut obligated).await {
+                Ok(frame) => frame,
+                Err(error) => {
+                    let _ = to_client_tx
+                        .lock()
+                        .await
+                        .write_frame(WsFrame::close(1012, b"owner unavailable"))
+                        .await;
+                    return Err(anyhow::anyhow!("{error}")).context("read owner WebSocket frame");
+                }
+            };
+            let closing = frame.opcode == OpCode::Close;
+            let frame = if closing {
+                close_code(&frame.payload)
+            } else {
+                frame
+            };
+            to_client_tx
+                .lock()
+                .await
+                .write_frame(frame)
+                .await
+                .context("write client WebSocket frame")?;
+            if closing {
+                return Ok(());
+            }
+        }
+    };
+
+    // The owner direction ends the hop. The client direction ends it only when
+    // the owner is gone, because a client close still needs the owner's answer:
+    // that answer carries the close code the client must observe.
+    //
+    // This select drops the direction that did not finish, which cancels a read
+    // that may be in progress. That is safe only because the hop is over and
+    // neither socket is read again. It must not be copied into a steady-state
+    // loop.
+    let mut to_peer = std::pin::pin!(to_peer);
+    let mut to_client = std::pin::pin!(to_client);
+    tokio::select! {
+        result = &mut to_peer => match result? {
+            ClientEnd::Closed => to_client.await,
+            ClientEnd::OwnerUnavailable => Ok(()),
+        },
+        result = &mut to_client => result,
     }
-    Ok(())
 }
 
 pub(crate) async fn handle_peer_websocket(
@@ -684,10 +855,11 @@ pub(crate) async fn handle_websocket(mut request: Request<Incoming>, app: AppHan
     };
     let runtime = app.runtime.as_ref().expect("WebSocket runtime checked");
     let body_started = Instant::now();
-    let (url, method, body, headers) = match request_payload(request).await {
-        Ok(payload) => payload,
-        Err(response) => return response,
-    };
+    let (url, method, body, headers) =
+        match request_payload(request, app.trust_forwarded_headers).await {
+            Ok(payload) => payload,
+            Err(response) => return response,
+        };
     let body_read_us = body_started.elapsed().as_micros() as u64;
     let worker_started = Instant::now();
     let worker_response = match runtime
@@ -828,4 +1000,23 @@ fn emit_websocket_connection_timing(
         worker_dispatch_us,
         "WebSocket connection resolved"
     );
+}
+
+// The tunnel reads both directions in one select!, so it drops a read future on
+// every iteration. Proving the drop is not safe takes a test that watches the
+// frames, because a workload oracle cannot see the fault: a lost frame keeps
+// the ledger exact while delivery is not.
+#[cfg(all(test, celld_internal_tests))]
+mod tunnel_cancel_private {
+    include!(env!("CELLD_CONFORMANCE_TUNNEL_CANCEL_TESTS"));
+}
+
+// Both cell socket loops had the same hazard as the tunnel: they read the socket
+// in the same select! as the cell's outbound queue, so an outbound frame that
+// won the race dropped a read in progress. A workload oracle cannot see the
+// fault: a lost frame keeps the ledger exact while delivery is not, so the
+// test has to watch the frames.
+#[cfg(all(test, celld_internal_tests))]
+mod socket_cancel_private {
+    include!(env!("CELLD_CONFORMANCE_SOCKET_CANCEL_TESTS"));
 }

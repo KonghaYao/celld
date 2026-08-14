@@ -288,8 +288,7 @@ impl LtxRepl {
     }
 
     /// Read the source epoch's seal, writing it first if this activation is
-    /// the first to restore from `from` (Cellarium §5.6, tracker item 1 in
-    /// wiki/designs/coordination-hardening.md).
+    /// the first to restore from `from` (Cellarium §5.6).
     ///
     /// Restore's rule is "highest non-empty epoch", so if a takeover's new
     /// epoch stays empty (it dies before its first sync) while the fenced old

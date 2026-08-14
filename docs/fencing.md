@@ -103,5 +103,40 @@ edition), Backblaze B2, Hetzner Object Storage, and DigitalOcean
 Spaces do not implement the required conditional writes. celld is not
 correct on such a store: two nodes can then own one cell. A store can
 also accept the conditional headers and not apply the condition, and
-that store fails late and silently, so test a store before you trust
-a fleet to it.
+that store fails late and silently.
+
+## The storage test
+
+No object store publishes the answer, therefore celld asks the store
+directly. The command `celld diagnose` sends four conditional writes to
+your bucket, and it reports the result:
+
+```
+ok bucket conditional write (create, reject-create, update, reject-stale)
+```
+
+Two of the four writes must fail. A create over an existing object must
+fail, and an update that carries a stale token must fail. A store that
+applies either write cannot fence a cell, so celld names the store as
+the fault and the command exits with an error.
+
+Each node runs the same test one time at startup. A node that finds a
+broken store stops, because a node that serves on such a store can
+share a cell with a second owner. The value `0` in the
+`CELLD_STORAGE_PROBE` variable disables the startup test.
+
+The test writes one small object, and then it deletes the object. The
+object uses the `probe/` prefix. celld reserves that prefix together
+with `cells/`, `nodes/`, `node-cells/`, `fleet/`, `deploy/`,
+`deploy-blobs/`, `wake/` and `telemetry/`, so an application must not
+write under any of them. celld deletes objects under some of them. A
+process that stops during the test does not delete the object. The
+object is small, and celld never reads it.
+
+The test writes, so a credential that cannot write fails it. An
+operator who diagnoses with a read-only credential runs
+`celld diagnose --read-only`, and celld then skips the test.
+
+celld does not require a ranged read today, so a store that ignores the
+`Range` header can still run a fleet. A later compaction level can hold
+large snapshots, and such a level can need a ranged read again.

@@ -2,9 +2,9 @@
 
 //! Telemetry: wide events out of the shell, Parquet into the bucket.
 //!
-//! `wiki/designs/otel.md` is the design; this is v1's substrate. Off by
-//! default, and off is structural: `init` never runs, `start_trace`
-//! finds no globals and answers `None`, and no event is ever built.
+//! This is v1's substrate. Off by default, and off is structural: `init`
+//! never runs, `start_trace` finds no globals and answers `None`, and no
+//! event is ever built.
 //! Sampling is decided at trace creation for the same reason — an
 //! unsampled request builds nothing.
 //!

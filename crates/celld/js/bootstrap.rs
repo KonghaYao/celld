@@ -239,6 +239,7 @@ pub(super) fn inject_compatibility_flags(scope: &mut v8::PinScope, compat: Compa
         compat.delete_all_deletes_alarm,
     );
     set_flag(scope, "js_rpc", compat.js_rpc);
+    set_flag(scope, "sqlite_vec", compat.sqlite_vec);
     set_flag(
         scope,
         "fetcher_no_get_put_delete",
@@ -444,10 +445,12 @@ pub(super) fn adopt_cell(
     cell: &str,
     db_path: Option<&str>,
     owned: bool,
+    compat: Compat,
 ) -> Result<Option<i64>> {
     if owned {
         if let Some(path) = db_path {
-            storage::open(cell, path).context("cell storage open failed")?;
+            storage::open_with_compat(cell, path, compat.sqlite_vec)
+                .context("cell storage open failed")?;
         }
     }
     // NOT marked local, deliberately. `__cell.owned[scope]` turns a cell

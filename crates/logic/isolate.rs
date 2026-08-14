@@ -22,8 +22,7 @@
 //!   CPU, and is what admission and shedding care about.
 //!
 //! Everything here is a predicate over observed load. The shell reports what
-//! it sees and performs what it is told; it never decides. See
-//! `wiki/designs/isolate-threading.md`.
+//! it sees and performs what it is told; it never decides.
 
 /// Which isolate. An index the shell keeps, stable for that isolate's life.
 /// Never a thread id — an isolate has no thread.

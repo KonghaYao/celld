@@ -27,7 +27,7 @@ use std::sync::Arc;
 /// Nothing here is synchronised, and it does not need to be: a turn holds
 /// the isolate lock, so exactly one thread can reach these maps at a time.
 /// That is the same guarantee the thread gave, obtained from the isolate
-/// instead. See `wiki/designs/deleting-the-pump.md`.
+/// instead.
 #[derive(Default)]
 pub struct Cells {
     dbs: RefCell<HashMap<String, Connection>>,
@@ -443,9 +443,13 @@ fn authorize_sql(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::
             pragma_name,
             pragma_value,
         } => !allowed_sql_pragma(pragma_name, pragma_value),
+        // A virtual-table module runs native code, so each module needs an
+        // explicit entry in this allowlist. vec0 uses ordinary shadow tables,
+        // and the reserved-name checks below apply to their table actions.
         AuthAction::CreateVtable { module_name, .. } => {
             !module_name.eq_ignore_ascii_case("fts5")
                 && !module_name.eq_ignore_ascii_case("fts5vocab")
+                && !module_name.eq_ignore_ascii_case("vec0")
         }
         AuthAction::Function { function_name } => matches!(
             function_name.to_ascii_lowercase().as_str(),
@@ -563,18 +567,69 @@ fn without_sql_authorizer_mut<T>(
     result
 }
 
+/// Install sqlite-vec on one cell connection. Other SQLite users in the
+/// process do not need the module and must not inherit it through a global
+/// `sqlite3_auto_extension` hook.
+fn register_vec0_extension(connection: &Connection) -> anyhow::Result<()> {
+    type ExtensionInit = unsafe extern "C" fn(
+        *mut rusqlite::ffi::sqlite3,
+        *mut *mut std::os::raw::c_char,
+        *const rusqlite::ffi::sqlite3_api_routines,
+    ) -> std::os::raw::c_int;
+
+    // sqlite-vec exposes the symbol as a zero-argument function, although the
+    // linked C entry point has SQLite's extension-init signature.
+    let initialize = unsafe {
+        std::mem::transmute::<*const (), ExtensionInit>(sqlite_vec::sqlite3_vec_init as *const ())
+    };
+    let mut error = std::ptr::null_mut();
+    // SAFETY: `connection` owns a live SQLite handle. sqlite-vec builds with
+    // `SQLITE_CORE`, so the entry point uses the linked SQLite API directly
+    // and does not read the null extension API table.
+    let result = unsafe {
+        initialize(
+            connection.handle(),
+            &mut error,
+            std::ptr::null::<rusqlite::ffi::sqlite3_api_routines>(),
+        )
+    };
+    if result == rusqlite::ffi::SQLITE_OK {
+        return Ok(());
+    }
+
+    let message = if error.is_null() {
+        format!("SQLite error {result}")
+    } else {
+        // SAFETY: an extension error is a NUL-terminated SQLite allocation.
+        let message = unsafe { std::ffi::CStr::from_ptr(error) }
+            .to_string_lossy()
+            .into_owned();
+        // SAFETY: sqlite-vec allocated the message with sqlite3_mprintf.
+        unsafe { rusqlite::ffi::sqlite3_free(error.cast()) };
+        message
+    };
+    anyhow::bail!("sqlite-vec initialization failed: {message}")
+}
+
 /// Open (or replace) the connection for `scope`'s db file.
 pub fn open(scope: &str, path: &str) -> anyhow::Result<()> {
-    finish_open(scope, Connection::open(path)?)
+    open_with_compat(scope, path, false)
+}
+
+pub fn open_with_compat(scope: &str, path: &str, sqlite_vec: bool) -> anyhow::Result<()> {
+    finish_open(scope, Connection::open(path)?, sqlite_vec)
 }
 
 /// Open `scope` through the fault-injection VFS so tests can fail its writes.
 #[cfg(all(test, celld_internal_tests))]
 pub fn open_with_fault_vfs_for_test(scope: &str, path: &str) -> anyhow::Result<()> {
-    finish_open(scope, crate::fault::open_database(path)?)
+    finish_open(scope, crate::fault::open_database(path)?, false)
 }
 
-fn finish_open(scope: &str, c: Connection) -> anyhow::Result<()> {
+fn finish_open(scope: &str, c: Connection, sqlite_vec: bool) -> anyhow::Result<()> {
+    if sqlite_vec {
+        register_vec0_extension(&c)?;
+    }
     schema(&c)?;
     // Match Workerd's SQLite security budgets. Applying native connection
     // limits once here avoids request-path parsing and keeps rejected queries

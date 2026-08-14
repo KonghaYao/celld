@@ -6,10 +6,9 @@
 //! OTLP proto — flat spans and log records with scalar attributes — and
 //! protobuf's wire format is varints and length-delimited fields. Hand
 //! encoding keeps prost, tonic, and the generated proto crates out of
-//! the binary, the same trade the Parquet sink made by skipping arrow
-//! (`wiki/designs/otel.md`). Field numbers follow
-//! opentelemetry-proto v1: trace/v1/trace.proto, logs/v1/logs.proto,
-//! common/v1/common.proto, resource/v1/resource.proto.
+//! the binary, the same trade the Parquet sink made by skipping arrow.
+//! Field numbers follow opentelemetry-proto v1: trace/v1/trace.proto,
+//! logs/v1/logs.proto, common/v1/common.proto, resource/v1/resource.proto.
 
 use crate::telemetry::Log;
 use crate::telemetry::Span;

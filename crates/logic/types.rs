@@ -172,6 +172,9 @@ pub struct CapacityPeer {
     pub resident_cells: usize,
     pub host_websockets: usize,
     pub rss_bytes: u64,
+    /// The memory this peer's cells hold, which is what it decides its own
+    /// pressure on. `None` from a peer that predates the field.
+    pub in_use_bytes: Option<u64>,
     pub pressured: bool,
 }
 

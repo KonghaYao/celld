@@ -306,7 +306,7 @@ For the full list, run `celld -h`. This table shows the primary settings:
 | `CELLD_WORKER_LOADER` | Bind a Worker Loader (Code Mode) at this `env` name. A Worker can then start isolates at runtime. Off unless set (experimental) |
 | `CELLD_MAX_LOADED_WORKERS` | The limit for concurrent loaded workers (default: 256) |
 | `CELLD_MAX_RESIDENT_CELLS` | The hard limit for resident cells, enforced at admission |
-| `CELLD_MAX_RSS_MB` | The memory threshold for pressure shedding (default: 80% of the available memory; 0 disables it) |
+| `CELLD_MAX_RSS_MB` | The memory threshold for pressure shedding, applied to the memory that the cells hold (default: 80% of the available memory; 0 disables the threshold and the absolute cap) |
 | `CELLD_OUTPUT_GATE` | The default is `1`, so celld proves each write durable before it acknowledges the write. Set `0` to remove the replication wait and accept possible loss of an acknowledged write |
 | `CELLD_LTX_COMPACTION` | The default is `1`: celld creates additive L1 objects, and a takeover reads tens of objects instead of thousands. Set `0` on every node of a mixed fleet until all nodes can read v0.5.2 block objects, because an old reader cannot take over a cell after its first L1 publication |
 | `CELLD_LTX_COMPACTION_MIN_TXIDS` | The durable TXID distance that queues an L1 attempt (default: 256) |

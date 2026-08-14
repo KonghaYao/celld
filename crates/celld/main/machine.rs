@@ -96,49 +96,6 @@ fn clock_ticks_per_second() -> u64 {
     100
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn resident_memory_bytes() -> u64 {
-    std::fs::read_to_string("/proc/self/statm")
-        .ok()
-        .and_then(|stat| stat.split_whitespace().nth(1)?.parse::<u64>().ok())
-        .map(|pages| pages.saturating_mul(page_size()))
-        .unwrap_or(0)
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn resident_memory_bytes() -> u64 {
-    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
-    let got = unsafe {
-        libc::proc_pidinfo(
-            std::process::id() as libc::c_int,
-            libc::PROC_PIDTASKINFO,
-            0,
-            (&raw mut info).cast(),
-            size,
-        )
-    };
-    if got == size {
-        info.pti_resident_size
-    } else {
-        0
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn resident_memory_bytes() -> u64 {
-    0
-}
-
-#[cfg(target_os = "linux")]
-fn page_size() -> u64 {
-    let bytes = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    u64::try_from(bytes)
-        .ok()
-        .filter(|bytes| *bytes > 0)
-        .unwrap_or(4096)
-}
-
 /// Watermarks from celld's public environment contract.
 /// `CELLD_PRESSURE_OWNERSHIP`: `release` (the default) or `sticky`.
 /// The lease lifetime, as the capacity listing needs it to decide which node
@@ -224,16 +181,23 @@ pub(crate) fn pressure_config_from_environment(
 ) -> anyhow::Result<celld_logic::pressure::PressureConfig> {
     // Residency is a hard cap (`CELLD_MAX_RESIDENT_CELLS` -> `Config::max_resident`),
     // enforced at admission -- not a pressure watermark, so it is not built here.
-    // RSS shedding is on by default: a node that runs into its memory ceiling
-    // must give cells back, not OOM. The default ceiling is 80% of what the
-    // process may use; an explicit CELLD_MAX_RSS_MB overrides it, and 0
-    // disables shedding entirely.
-    let rss_high_bytes = match celld::env_vars::optional::<u64>("CELLD_MAX_RSS_MB")? {
-        None => total_memory_bytes().map(|total| total / 5 * 4),
-        Some(0) => None,
-        Some(megabytes) => Some(megabytes.saturating_mul(1024 * 1024)),
-    };
-    Ok(celld_logic::pressure::PressureConfig { rss_high_bytes })
+    // Memory shedding is on by default: a node that runs into its memory ceiling
+    // must give cells back, not be killed. The arithmetic lives in the core,
+    // where it is tested; the shell supplies only the two facts it can read.
+    let config = celld_logic::pressure::PressureConfig::from_limits(
+        total_memory_bytes(),
+        celld::env_vars::optional::<u64>("CELLD_MAX_RSS_MB")?,
+    );
+    if config.ceiling_above_cap() {
+        tracing::warn!(
+            high_bytes = config.high_bytes,
+            rss_hard_bytes = config.rss_hard_bytes,
+            "CELLD_MAX_RSS_MB is at or above the absolute cap, so the node \
+             decides on its resident set size and cannot recover from allocator \
+             retention alone"
+        );
+    }
+    Ok(config)
 }
 
 pub(crate) fn local_cache_max_bytes_from_environment() -> anyhow::Result<Option<u64>> {

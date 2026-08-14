@@ -669,6 +669,9 @@ struct AppHandle {
     /// Set the instant a graceful shutdown begins, so `/__celld/health` reports
     /// unhealthy and a load balancer stops routing here before teardown.
     draining: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether forwarded scheme and host headers can set `request.url`.
+    /// The default is false because a direct client controls both headers.
+    trust_forwarded_headers: bool,
 }
 
 impl AppHandle {
@@ -967,6 +970,9 @@ struct Actor {
     /// The counters peers rank this node by, when there is a bucket to
     /// publish them to.
     live_load: Option<Arc<celld::ownership_store::LiveLoad>>,
+    /// The shed reason last reported to the log, so a latch that holds for
+    /// minutes is reported once rather than on every sample.
+    logged_shed_reason: Option<&'static str>,
     started_at: Instant,
     fence: mpsc::UnboundedSender<i32>,
     timers: DelayQueue<Timer>,
@@ -1107,6 +1113,7 @@ impl Actor {
             stops: 0,
             lease_spec,
             live_load,
+            logged_shed_reason: None,
             load_sampler: ProcessLoadSampler::default(),
             validate_invariants: cfg!(debug_assertions),
             started_at: Instant::now(),
@@ -1266,12 +1273,37 @@ impl Actor {
                 // the number peers rank this node by must agree anyway.
                 let occupied = self.state.occupied();
                 let cpu = self.load_sampler.sample_cpu_percent_x100();
+                let memory = celld::memory::sample();
                 let load = celld_logic::pressure::Load {
                     resident_cells: occupied,
-                    rss_bytes: resident_memory_bytes(),
+                    rss_bytes: memory.rss_bytes,
+                    in_use_bytes: memory.in_use_bytes,
                 };
                 let now_mono_ms = self.started_at.elapsed().as_millis() as u64;
                 self.drive(Event::LoadSampled { load, now_mono_ms }, in_flight);
+                // Report a change of shed reason once. `rss-hard` is the one
+                // that needs an operator: it says the resident set size crossed
+                // the absolute cap, so the allocator is holding memory that
+                // shedding may not return, and the process is near a kill.
+                let reason = self.state.shed_reason();
+                if reason != self.logged_shed_reason {
+                    self.logged_shed_reason = reason;
+                    match reason {
+                        Some(celld_logic::pressure::SHED_RSS_HARD) => tracing::warn!(
+                            rss_bytes = load.rss_bytes,
+                            in_use_bytes = load.in_use_bytes,
+                            "shedding on the absolute resident-set cap: the \
+                             allocator holds memory that shedding cannot return"
+                        ),
+                        Some(reason) => tracing::info!(
+                            reason,
+                            rss_bytes = load.rss_bytes,
+                            in_use_bytes = load.in_use_bytes,
+                            "shedding"
+                        ),
+                        None => tracing::info!("no longer shedding"),
+                    }
+                }
                 // Republish what peers rank this node by. The same numbers the
                 // latch just saw: a node that reports last tick's residency
                 // attracts work it has already refused.
@@ -1855,8 +1887,7 @@ impl Actor {
                             // asked the same question a second way and was
                             // wrong more often: it refused for any database
                             // the replicator never registered, leaving the
-                            // entry to outlive its alarm forever
-                            // (wiki/designs/wake-entry-consume.md).
+                            // entry to outlive its alarm forever.
                             celld::js::reconcile_wake_entry(&cell, next_alarm_ms, true).await;
                         });
                     }
@@ -2121,10 +2152,9 @@ impl Actor {
                         // still the owner — before the core learns the alarm
                         // settled. The consume-side wake-entry delete the core
                         // then orders always follows a proven commit, which is
-                        // what lets the shell drop the old sync_refused probe
-                        // (wiki/designs/wake-entry-consume.md). On failure the
-                        // core re-arms the alarm: at-least-once holds and the
-                        // entry stays discoverable.
+                        // what lets the shell drop the old sync_refused probe.
+                        // On failure the core re-arms the alarm: at-least-once
+                        // holds and the entry stays discoverable.
                         if let Ok((_, _, Some(position))) = result {
                             let proven = match runtime.await_durable(&cell, epoch, position).await {
                                 Ok(_) => match ownership.read_owner(&cell).await {
@@ -2254,15 +2284,38 @@ impl Actor {
             .map(|cell| format!("{cell:?}"))
             .collect::<Vec<_>>()
             .join(",");
+        // Both numbers: a gap between them is memory the allocator kept, which
+        // no eviction returns. One sample, so they cannot disagree.
+        let memory = celld::memory::sample();
+        // `restoring` is a sum, and a node that refuses cells for a quarter of
+        // an hour needs its parts. `activating` holds a permit and is doing
+        // work; `activation_waiting` is queued behind the activation ceiling;
+        // `capacity_waiting` is queued behind residency. The census says where
+        // every cell is, which `occupied` cannot: it counts residency, so a
+        // node part-way through thousands of cold starts reports almost none.
+        // Issue #50 is open because none of this was recorded at the time.
+        let phases = self
+            .state
+            .phase_census()
+            .into_iter()
+            .map(|(phase, count)| format!("{phase:?}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
-            "{{\"ownership\":{:?},\"occupied\":{},\"evicting\":{},\"restoring\":{},\"shedding\":{},\"residents\":[{}],\"published\":[{}],\"publishes\":{},\"stops\":{}}}",
+            "{{\"ownership\":{:?},\"occupied\":{},\"evicting\":{},\"restoring\":{},\"activating\":{},\"activation_waiting\":{},\"capacity_waiting\":{},\"phases\":{{{}}},\"shedding\":{},\"rss_bytes\":{},\"in_use_bytes\":{},\"residents\":[{}],\"published\":[{}],\"publishes\":{},\"stops\":{}}}",
             self.ownership.name(),
             self.state.occupied(),
             self.state.evicting(),
             self.state.activation_backlog(),
+            self.state.activating(),
+            self.state.activation_waiting().len(),
+            self.state.waiting().len(),
+            phases,
             self.state
                 .shed_reason()
                 .map_or_else(|| "null".to_string(), |reason| format!("{reason:?}")),
+            memory.rss_bytes,
+            memory.in_use_bytes,
             residents,
             published,
             self.publishes,
@@ -3023,6 +3076,7 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
 
 async fn request_payload(
     request: Request<Incoming>,
+    trust_forwarded_headers: bool,
 ) -> Result<(String, String, Vec<u8>, Vec<(String, String)>), HttpReply> {
     let (parts, body) = request.into_parts();
     let body = body.collect().await.map_err(|error| {
@@ -3042,36 +3096,66 @@ async fn request_payload(
         })
         .collect();
     Ok((
-        request_url(&parts),
+        request_url(&parts, trust_forwarded_headers),
         parts.method.to_string(),
         body.to_bytes().to_vec(),
         headers,
     ))
 }
 
-/// `request.url` must name the URL the client asked for, because applications
-/// route on its hostname and build absolute redirects from it. Cloudflare
-/// reports the real scheme and host, so celld reads the same sources: the
-/// absolute-form URI, then the pair an ingress proxy forwards, then Host.
-/// `celld.local` remains the fallback for a request that carries none of them.
-fn request_url(parts: &hyper::http::request::Parts) -> String {
-    if parts.uri.authority().is_some() {
-        return parts.uri.to_string();
-    }
-    let first = |name| {
+/// The refusal every path arm gives a cell scope that fails the charset gate.
+///
+/// A scope taken from a URL segment reaches `db_path`, which joins it under the
+/// data directory, and the replication client, which builds a bucket key from
+/// it, so a scope carrying its own path segments walks out of both. The gate
+/// itself is reified in `celld_logic::cell`, next to the peer-identity gate it
+/// mirrors.
+fn malformed_scope() -> HttpReply {
+    response(
+        StatusCode::BAD_REQUEST,
+        "{\"error\":\"malformed_cell_scope\"}",
+    )
+}
+
+/// `request.url` controls application routing and absolute links, so celld
+/// does not let an untrusted forwarding header or request-target authority set
+/// its scheme or host. The path and query always come from the request target.
+/// The host comes from `Host`, and the scheme is `http` because celld does not
+/// terminate TLS.
+///
+/// An operator can set `--trust-forwarded-headers` when a trusted proxy
+/// replaces both forwarded headers. The trusted read takes the last value
+/// because a proxy can append its value after a client-supplied value.
+fn request_url(parts: &hyper::http::request::Parts, trust_forwarded_headers: bool) -> String {
+    let header = |name: &str, take_last: bool| {
         parts
             .headers
             .get(name)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(',').next())
+            .and_then(|value| {
+                if take_last {
+                    value.split(',').next_back()
+                } else {
+                    value.split(',').next()
+                }
+            })
             .map(str::trim)
             .filter(|value| !value.is_empty())
     };
-    let host = first("x-forwarded-host")
-        .or_else(|| first("host"))
+    let forwarded = |name: &str| {
+        trust_forwarded_headers
+            .then(|| header(name, true))
+            .flatten()
+    };
+    let host = forwarded("x-forwarded-host")
+        .or_else(|| header("host", false))
         .unwrap_or("celld.local");
-    let scheme = first("x-forwarded-proto").unwrap_or("http");
-    format!("{scheme}://{host}{}", parts.uri)
+    let scheme = forwarded("x-forwarded-proto").unwrap_or("http");
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or("/", hyper::http::uri::PathAndQuery::as_str);
+    format!("{scheme}://{host}{path_and_query}")
 }
 
 async fn internal_do(request: Request<Incoming>, app: AppHandle, scope: String) -> HttpReply {
@@ -3311,6 +3395,9 @@ async fn internal_abort(request: Request<Incoming>, app: AppHandle, path: String
         Ok(scope) => scope.into_owned(),
         Err(_) => return peer_response(response(StatusCode::BAD_REQUEST, "invalid abort scope")),
     };
+    if !celld_logic::cell::valid_cell_scope(&scope) {
+        return peer_response(malformed_scope());
+    }
     let Some(request_id) = celld::js::parse_request_id(encoded_request) else {
         return peer_response(response(StatusCode::BAD_REQUEST, "invalid request id"));
     };
@@ -3520,10 +3607,11 @@ async fn handle_ingress(
         }
     }
 
-    let (url, method, body, headers) = match request_payload(request).await {
-        Ok(payload) => payload,
-        Err(response) => return response,
-    };
+    let (url, method, body, headers) =
+        match request_payload(request, app.trust_forwarded_headers).await {
+            Ok(payload) => payload,
+            Err(response) => return response,
+        };
     match app
         .fetch_worker(url, method, body, headers, connection)
         .await
@@ -3739,10 +3827,18 @@ async fn handle_internal(
             internal_abort(request, app, path).await
         }
         _ if path.starts_with("/__do/") && app.runtime.is_some() => {
-            internal_do(request, app, path[6..].to_string()).await
+            if celld_logic::cell::valid_cell_scope(&path[6..]) {
+                internal_do(request, app, path[6..].to_string()).await
+            } else {
+                peer_response(malformed_scope())
+            }
         }
         _ if path.starts_with("/__rpc/") && app.runtime.is_some() => {
-            internal_rpc(request, app, path[7..].to_string()).await
+            if celld_logic::cell::valid_cell_scope(&path[7..]) {
+                internal_rpc(request, app, path[7..].to_string()).await
+            } else {
+                peer_response(malformed_scope())
+            }
         }
         _ if path.starts_with("/do/") && app.runtime.is_some() => {
             let runtime = app.runtime.as_ref().expect("checked runtime");
@@ -3752,10 +3848,11 @@ async fn handle_internal(
                     return Ok(response(StatusCode::BAD_REQUEST, format!("{error:#}")));
                 }
             };
-            let (url, method, body, headers) = match request_payload(request).await {
-                Ok(payload) => payload,
-                Err(response) => return Ok(response),
-            };
+            let (url, method, body, headers) =
+                match request_payload(request, app.trust_forwarded_headers).await {
+                    Ok(payload) => payload,
+                    Err(response) => return Ok(response),
+                };
             // The same dispatcher a Durable Object call from inside a Worker
             // goes through. Public ingress used to resolve the route itself
             // and, on finding another owner, answer with a 307 and a JSON
@@ -3817,6 +3914,9 @@ async fn handle_internal(
                 ),
             }
         }
+        _ if path.starts_with("/cell/") && !celld_logic::cell::valid_cell_scope(&path[6..]) => {
+            malformed_scope()
+        }
         _ if path.starts_with("/cell/") => {
             let cell = path[6..].to_string();
             match app.request(cell.clone()).await {
@@ -3850,6 +3950,9 @@ async fn handle_internal(
                     format!("{{\"error\":\"{error:?}\"}}"),
                 ),
             }
+        }
+        _ if path.starts_with("/evict/") && !celld_logic::cell::valid_cell_scope(&path[7..]) => {
+            malformed_scope()
         }
         _ if path.starts_with("/evict/") => {
             app.evict(path[7..].to_string()).await;
@@ -4001,6 +4104,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    // After the subscriber, because this reports whether the allocator agreed
+    // to return freed pages on a timer. A node without that thread holds
+    // retention until a thread allocates again, which is the condition behind
+    // issue #36, so the operator has to be able to read the answer.
+    celld::memory::tune_allocator();
     let mut settings = match action_from_process()? {
         Action::Deploy(arguments) => return fleet::run_deploy(arguments).await,
         Action::Connect(arguments) => {
@@ -4031,6 +4139,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         Action::Diagnose {
             mut settings,
             peers,
+            read_only,
         } => {
             let ingress = celld::startup::bind_ingress_listener(&settings.listen).await?;
             let internal =
@@ -4084,7 +4193,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 &settings.region,
                 managed_storage.as_ref(),
             )?;
-            return fleet::diagnose(&client, peers, settings.unsafe_public_advertise).await;
+            return fleet::diagnose(&client, peers, settings.unsafe_public_advertise, read_only)
+                .await;
         }
         Action::Run(settings) => settings,
     };
@@ -4211,6 +4321,13 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 fleet::validate_managed_bucket(&client).await?;
             } else {
                 fleet::validate_bucket(&client).await?;
+            }
+            // The list above proves the bucket answers; it does not prove
+            // the store enforces the conditional write this node fences
+            // with. A store that ignores it makes the node self-fence in
+            // a restart loop, so test it once, here, before serving.
+            if settings.storage_probe {
+                fleet::probe_storage_before_serving(&client, settings.control_plane).await?;
             }
             let lease_client = fleet::lease_bucket_client_with_credentials(
                 &bucket,
@@ -4498,6 +4615,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         advertise: advertise.clone(),
         websockets: websocket_tx,
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        trust_forwarded_headers: settings.trust_forwarded_headers,
         // RPO=0 is the default. An operator can disable the output gate to
         // remove object-store replication latency from the write response,
         // explicitly accepting that an acknowledged write can be lost.
@@ -4973,7 +5091,7 @@ mod machine;
 use machine::{
     lease_ttl_ms_from_environment, local_cache_max_bytes_from_environment,
     ownership_on_evict_from_environment, pressure_config_from_environment, random_node_session_id,
-    random_peer_key, random_process_generation, resident_memory_bytes, ProcessLoadSampler,
+    random_peer_key, random_process_generation, ProcessLoadSampler,
     DEFAULT_MAX_OUTBOUND_WEBSOCKETS, PEER_CONNECT_TIMEOUT,
 };
 

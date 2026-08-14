@@ -36,8 +36,7 @@ ported and then removed on 2026-08-06, unused. celld fences cell ownership
 with a conditional-write record carrying an epoch, and fences the data path by
 stamping that epoch into the LTX prefix; a lease file under the replica prefix
 would be a second, competing layer. Upstream's own leaser is unwired for the
-same reason (`wiki/engine/ownership.md`). Recover it from git if a future
-design needs it.
+same reason. Recover it from git if a future design needs it.
 
 The full Apache License, Version 2.0 text is in [LICENSE](LICENSE). The full
 BSD 3-Clause License text is in

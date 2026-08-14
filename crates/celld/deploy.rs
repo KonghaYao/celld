@@ -9,7 +9,8 @@
 use crate::bucket::Bucket;
 use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
-    ModuleKind, ModuleRef, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_WASM_V1,
+    ModuleKind, ModuleRef, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_SQLITE_VEC_V1,
+    FEATURE_WASM_V1,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -322,6 +323,11 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         file_count: assets.file_count,
         total_bytes: assets.total_bytes,
     });
+    let sqlite_vec = project
+        .metadata
+        .get("compatibility_flags")
+        .and_then(Value::as_array)
+        .is_some_and(|flags| flags.iter().any(|flag| flag.as_str() == Some("sqlite_vec")));
     let manifest = Manifest {
         schema_version: if asset_reference.is_some() { 2 } else { 1 },
         version: version.clone(),
@@ -346,6 +352,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             let mut features = Vec::new();
             if built_assets.is_some() {
                 features.push(FEATURE_ASSETS_V1.to_string());
+            }
+            if sqlite_vec {
+                features.push(FEATURE_SQLITE_VEC_V1.to_string());
             }
             if !wasm_names.is_empty() {
                 features.push(FEATURE_WASM_V1.to_string());

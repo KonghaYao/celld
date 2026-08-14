@@ -51,6 +51,15 @@ pub struct NodeLoadWire {
     pub resident_cells: usize,
     pub host_websockets: usize,
     pub rss_bytes: u64,
+    /// What the pressure classifier reads, published next to `rss_bytes` so a
+    /// gap between the two is visible.
+    ///
+    /// `None` means the node did not report it, which a node before this field
+    /// existed does not. That is not the same as zero, and a consumer that
+    /// ranks nodes must not read a silent zero as the emptiest node in the
+    /// fleet for the length of a rolling upgrade.
+    #[serde(default)]
+    pub in_use_bytes: Option<u64>,
     pub cpu_percent_x100: u64,
     pub open_fds: u64,
     pub fd_limit: u64,
@@ -246,6 +255,7 @@ impl BucketOwnership {
                     resident_cells: lease.load.resident_cells,
                     host_websockets: lease.load.host_websockets,
                     rss_bytes: lease.load.rss_bytes,
+                    in_use_bytes: lease.load.in_use_bytes,
                     pressured: lease.load.pressured,
                 },
             ))
@@ -364,14 +374,17 @@ async fn load_json<T: for<'de> Deserialize<'de>>(
 }
 
 fn process_load(live: &LiveLoad) -> NodeLoadWire {
-    #[cfg(target_os = "linux")]
-    let rss_bytes = std::fs::read_to_string("/proc/self/statm")
-        .ok()
-        .and_then(|statm| statm.split_whitespace().nth(1)?.parse::<u64>().ok())
-        .map(|pages| pages.saturating_mul(4_096))
-        .unwrap_or(1);
-    #[cfg(not(target_os = "linux"))]
-    let rss_bytes = 1;
+    // One sample for both numbers. Reading the resident set size here and the
+    // in-use figure from a value the actor wrote on its own timer would publish
+    // a pair from two instants, and before the first sample it would publish a
+    // real resident set size beside an in-use figure of zero -- which reads as
+    // total allocator retention.
+    let memory = crate::memory::sample();
+    // A 1-byte floor is the sentinel a platform without /proc leaves behind.
+    // Both numbers take it, so the in-use figure can never read as zero beside
+    // a real resident set size.
+    let rss_bytes = memory.rss_bytes.max(1);
+    let in_use_bytes = memory.in_use_bytes.max(1).min(rss_bytes);
 
     #[cfg(target_os = "linux")]
     let open_fds = std::fs::read_dir("/proc/self/fd")
@@ -398,6 +411,7 @@ fn process_load(live: &LiveLoad) -> NodeLoadWire {
     NodeLoadWire {
         sampled_ms: now_ms(),
         rss_bytes,
+        in_use_bytes: Some(in_use_bytes),
         open_fds,
         fd_limit,
         cpu_percent_x100: live.cpu_percent_x100.load(Ordering::Relaxed),

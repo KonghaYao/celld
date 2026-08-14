@@ -74,7 +74,7 @@ fn prune_remote_aborts(aborts: &mut HashMap<js::RequestId, Instant>) {
 }
 
 /// The isolate pool's limits, built from the environment here because the
-/// decision core never reads it (wiki/designs/isolate-threading.md).
+/// decision core never reads it.
 ///
 /// `max_requests` is the node's only bound on stateless memory, and it is
 /// live: `Slot::affiliate` counts an affiliation for a request's whole life,
@@ -122,7 +122,7 @@ struct StatelessRuntime {
     node: Arc<str>,
     region: Arc<str>,
     /// The isolates fetch runs on, entered one turn at a time from whichever
-    /// tokio worker is driving the request (wiki/designs/isolate-threading.md).
+    /// tokio worker is driving the request.
     isolates: Arc<crate::pool::Pool>,
 }
 
@@ -492,7 +492,16 @@ impl RuntimeManager {
         })
     }
 
+    /// Resolve a client-supplied cell id to a scope.
+    ///
+    /// The id arrives from the network, and the scope it becomes is used as a
+    /// path component and as an object-store key, so the charset gate runs
+    /// first. Without it a scope carries its own path segments and `db_path`
+    /// walks out of the data directory through them.
     pub fn cell_scope(&self, id: &str) -> anyhow::Result<String> {
+        if !celld_logic::cell::valid_cell_scope(id) {
+            return Err(anyhow!("cell id is not a well-formed scope"));
+        }
         if id.contains(':') {
             return Ok(id.to_string());
         }
@@ -1395,7 +1404,7 @@ struct FetchTiming {
     admitted: Instant,
     emitted: bool,
     /// Sampled at creation: `None` is off or unsampled, and nothing more
-    /// is ever built for this request (wiki/designs/otel.md).
+    /// is ever built for this request.
     trace: Option<crate::telemetry::TraceIds>,
     /// The caller's span, when the request arrived with a traceparent.
     remote_parent: Option<crate::telemetry::ParentContext>,
@@ -1495,8 +1504,7 @@ impl FetchTiming {
 /// `PKRU` register granting access to that key is per-thread and inherited
 /// at thread creation. A thread created before this runs never receives
 /// access, so its first read of a dispatch table traps with `SEGV_PKUERR`
-/// on any CPU that supports protection keys. See
-/// `wiki/designs/segfault-on-zen4.md`.
+/// on any CPU that supports protection keys.
 pub fn init_v8() {
     static V8_INIT: Once = Once::new();
     V8_INIT.call_once(js::Engine::init);
@@ -1551,7 +1559,7 @@ impl StatelessRuntime {
     /// The request drives itself: it is admitted and placed, runs its first
     /// turn, then awaits its *own* ops with no isolate held, re-entering for
     /// each completion. Nothing multiplexes and nothing demultiplexes, which
-    /// is what deleting the pump buys (wiki/designs/deleting-the-pump.md).
+    /// is what deleting the pump buys.
     async fn fetch(
         &self,
         url: String,

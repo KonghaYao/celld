@@ -44,7 +44,10 @@ Not planned: **KV** (a different consistency model), **R2** (celld runs
 platform services; an experimental HTTP adapter for an AI binding exists
 behind `CELLD_AI_URL`), **cron triggers, custom domains, TLS
 termination** (platform surface; celld has its own durable alarms; put
-TLS in your ingress proxy).
+TLS in your ingress proxy), **Python Workers** (workerd supplies the
+Pyodide runtime and the Python module shim; that layer is platform
+surface, not a function on Durable Objects; celld can add support if
+demand appears).
 
 ## Runtime APIs
 
@@ -148,8 +151,10 @@ use the Wrangler-style unenv polyfills):
 
 `compatibility_date` and `compatibility_flags` are honored for the
 switches that celld models: `delete_all_deletes_alarm`, `js_rpc`,
-`fetcher_no_get_put_delete`, `websocket_standard_binary_type`, and the
-assets navigation behavior. `Cloudflare.compatibilityFlags` reports only
+`fetcher_no_get_put_delete`, `sqlite_vec`, `websocket_standard_binary_type`,
+and the assets navigation behavior. The `sqlite_vec` flag enables the pre-v1
+sqlite-vec extension, and a compatibility date never enables it.
+`Cloudflare.compatibilityFlags` reports only
 the flags that celld honors. A flag that celld does not model is absent
 rather than reported as enabled, and celld accepts it without effect.
 

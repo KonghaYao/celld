@@ -35,6 +35,21 @@ The deployed Worker owns `/health` and every other public path.
 The internal listener does not pass an unknown path to the Worker. It returns a
 404 response, so an operator request cannot become an application request.
 
+## Set the forwarded-header policy
+
+A Worker reads the request URL from `request.url`. An application can route on
+the hostname and build an absolute link from this URL. Therefore, celld ignores
+`X-Forwarded-Host` and `X-Forwarded-Proto` by default.
+
+Set `--trust-forwarded-headers` only when a trusted proxy replaces both headers.
+celld then reads the last value in each header, so an earlier client value does
+not override the proxy value. The equivalent environment variable is
+`CELLD_TRUST_FORWARDED_HEADERS=1`.
+
+celld always takes the path and query from the request target. It ignores an
+absolute-form request target's scheme and authority, so a direct client cannot
+bypass the host policy through the request line.
+
 ## Protect the internal listener
 
 The operator API does not authenticate its requests. A client that can reach

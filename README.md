@@ -153,15 +153,40 @@ celld --bucket s3://my-cells-bucket --listen 0.0.0.0:8080 \
   --internal-listen 10.0.0.12:8081 --advertise node-a.internal:8081
 ```
 
-celld enables an RSS threshold at 80% of the available memory by default. Set
+celld enables a memory threshold at 80% of the available memory by default. Set
 `CELLD_MAX_RSS_MB` to change the threshold, or set it to `0` to disable memory
-pressure shedding. Under pressure, celld durably replicates and fences the
-least-recently used idle cells. It then publishes the cells as unowned without
-resetting their epochs. Those cells become inactive, and celld refuses to
-reacquire new unowned cells until RSS reaches 80% of the threshold. A spare
-receives no assignment. It acquires a released cell through the same bucket
-protocol when normal traffic reaches it. celld does not shed a cell with active
-work or a live host WebSocket.
+pressure shedding. celld measures the memory that the cells hold, and not the
+resident set size of the process. The two differ, because the memory allocator
+keeps some freed pages instead of returning them to the operating system.
+Shedding a cell cannot return those pages, so a threshold on the resident set
+size holds a node in pressure after the node gives every cell back. The `/state`
+route reports both numbers.
+
+celld also applies an absolute cap to the resident set size of the process. The
+cap is 95% of the available memory. It protects the node when the allocator
+holds memory that shedding cannot return, because the operating system stops a
+process that uses more memory than the machine has. The node logs a warning when
+this cap applies.
+
+The cap is a share of the machine, and celld does not derive it from the
+threshold. A `CELLD_MAX_RSS_MB` at or above 95% of the available memory therefore reaches
+the cap. The cap is then the effective limit. The node decides on its resident
+set size, and celld reports this at startup. `CELLD_MAX_RSS_MB=0`
+disables the threshold and the cap together. When celld cannot read the size of
+the available memory, it applies a cap of 125% of an explicit threshold.
+
+Under pressure, celld durably replicates and fences the least-recently used idle
+cells. It then publishes the cells as unowned without resetting their epochs.
+Those cells become inactive, and celld refuses to reacquire new unowned cells.
+
+Each limit releases separately. The threshold releases when the memory in use
+falls to 80% of the threshold. The cap releases when the resident set size falls
+to 80% of the cap. A crossing of one limit therefore does not hold the node
+against the other.
+
+A spare receives no assignment. It acquires a released cell through the same
+bucket protocol when normal traffic reaches it. celld does not shed a cell with
+active work or a live host WebSocket.
 
 ## Contributions
 

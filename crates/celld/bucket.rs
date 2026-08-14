@@ -101,6 +101,17 @@ impl StorageBackend {
             },
         }
     }
+
+    /// What a conditional write sends on the wire, named for an operator
+    /// reading a probe failure. The dialects use different headers, so a
+    /// message that names only one sends half the fleet looking in the
+    /// wrong place.
+    fn precondition(self) -> &'static str {
+        match self {
+            StorageBackend::S3 => "If-Match / If-None-Match",
+            StorageBackend::Gcs => "x-goog-if-generation-match",
+        }
+    }
 }
 
 /// One object-store bucket, optionally scoped to a key prefix. Cheap to
@@ -539,6 +550,135 @@ impl Bucket {
             }
         }
     }
+
+    /// Run the conditional-write contract against the live bucket.
+    ///
+    /// A store can accept a precondition header and then ignore it, and no
+    /// capability API answers whether it does. So the probe provokes the
+    /// two rejections a conforming store must produce, and checks it
+    /// produced them. celld decides which node owns a cell with a
+    /// conditional write, so a store that applies a write it must reject
+    /// lets two nodes own one cell (denoland/celld#137).
+    ///
+    /// The two outcomes are separated because they need different
+    /// responses. A `Violation` is a property of the store and never
+    /// clears, so it can stop a node. An `Err` is ambiguous — a network
+    /// fault, a rejected credential — and a retry can clear it, so a
+    /// caller that must not fail on a transient blip keeps serving.
+    pub(crate) async fn probe_cas_steps(&self) -> anyhow::Result<CasVerdict> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+        // Unique per probe, so several nodes probing at once touch
+        // disjoint keys and no probe reads another one's object as the
+        // store misbehaving — a collision surfaces as a false `Violation`,
+        // which stops a node. The random half carries that alone, because
+        // a container fleet shares pid 1 and a clock before the epoch
+        // leaves `nanos` at zero.
+        let key = format!(
+            "probe/cas-{nanos}-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        );
+        let verdict = self.cas_contract(&key).await;
+        // The object is debris on every path, so retire it before the
+        // verdict. A delete that fails leaves one tiny object under
+        // `probe/`, which nothing lists and nothing reads — but a
+        // credential that cannot delete accrues one per boot, so say so.
+        if let Err(error) = self.delete(&key).await {
+            tracing::warn!(%error, "the conditional-write probe could not delete its object");
+        }
+        verdict
+    }
+
+    /// [`Self::probe_cas_steps`] collapsed to one answer, where any wrong
+    /// answer fails the check.
+    pub async fn probe_cas(&self) -> anyhow::Result<()> {
+        match self.probe_cas_steps().await? {
+            CasVerdict::Conformant => Ok(()),
+            CasVerdict::Violation(reason) => Err(anyhow!(reason)),
+        }
+    }
+
+    /// The four steps, against one key. Steps 2 and 4 must be rejected;
+    /// a store that applies either one cannot fence.
+    async fn cas_contract(&self, key: &str) -> anyhow::Result<CasVerdict> {
+        let precondition = self.backend.precondition();
+        let ambiguous = || {
+            format!(
+                "the store answered a conditional write with an error where celld requires a \
+                 clean rejection, so celld cannot tell a lost race from a failed write and \
+                 reconciles forever; the store must answer {precondition} with a rejection"
+            )
+        };
+
+        // 1. A create on an absent key applies, and answers the token that
+        //    steps 3 and 4 need.
+        let Some(token) = self
+            .put_cas(key, b"probe-create".to_vec(), None)
+            .await
+            .context("the conditional-write probe could not create its object")?
+        else {
+            return Ok(CasVerdict::Violation(
+                "the store rejected a conditional create of an object that does not exist"
+                    .to_string(),
+            ));
+        };
+
+        // 2. A create over the object step 1 wrote must be rejected.
+        if self
+            .put_cas(key, b"probe-recreate".to_vec(), None)
+            .await
+            .with_context(ambiguous)?
+            .is_some()
+        {
+            return Ok(CasVerdict::Violation(format!(
+                "the store overwrote an object although the write was conditional on that object \
+                 being absent; the store accepts {precondition} and does not enforce it, so two \
+                 nodes can own one cell"
+            )));
+        }
+
+        // 3. An update that carries the current token applies, and that
+        //    retires the token step 4 reuses.
+        if self
+            .put_cas(key, b"probe-update".to_vec(), Some(&token))
+            .await
+            .context("the conditional-write probe could not update its object")?
+            .is_none()
+        {
+            return Ok(CasVerdict::Violation(
+                "the store rejected a conditional update that carried the current token"
+                    .to_string(),
+            ));
+        }
+
+        // 4. The token is stale now, so the update must be rejected. This
+        //    step is the fencing contract itself.
+        if self
+            .put_cas(key, b"probe-stale".to_vec(), Some(&token))
+            .await
+            .with_context(ambiguous)?
+            .is_some()
+        {
+            return Ok(CasVerdict::Violation(format!(
+                "the store applied a conditional write that carried a stale token; the store \
+                 accepts {precondition} and does not enforce it, so two nodes can own one cell"
+            )));
+        }
+
+        Ok(CasVerdict::Conformant)
+    }
+}
+
+/// What [`Bucket::probe_cas_steps`] found.
+pub(crate) enum CasVerdict {
+    /// The store rejected both writes it had to reject.
+    Conformant,
+    /// The store answered wrongly, and the string says how. This never
+    /// clears on a retry, so a caller can act on it.
+    Violation(String),
 }
 
 /// The replica-lane store for a `gs://` fleet bucket: its own transport
@@ -613,43 +753,15 @@ mod live_cas {
             });
         let bucket = Bucket::open(&name, endpoint.as_deref(), &region, creds, Some("cas-test"))
             .expect("open bucket");
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let key = format!("cas-probe/{nanos}");
 
-        // 1. Create on an absent key applies.
-        let e1 = bucket
-            .put_cas(&key, b"v1".to_vec(), None)
-            .await
-            .expect("create must not error")
-            .expect("fresh create must apply (Ok(Some))");
-        // 2. Create over an existing key is cleanly rejected.
-        assert!(
-            bucket
-                .put_cas(&key, b"v1b".to_vec(), None)
-                .await
-                .expect("create-again must not error")
-                .is_none(),
-            "create over an existing key must be Ok(None)"
-        );
-        // 3. Update with the current etag applies.
+        // The four steps live in `Bucket::probe_cas`, which `celld
+        // diagnose` and node startup run against an operator's bucket.
+        // This test points the same code at a real provider, which is the
+        // one question a mock cannot answer.
         bucket
-            .put_cas(&key, b"v3".to_vec(), Some(&e1))
+            .probe_cas()
             .await
-            .expect("update must not error")
-            .expect("update with current etag must apply (Ok(Some))");
-        // 4. Update with the now-stale etag is cleanly rejected — the fencing case.
-        assert!(
-            bucket
-                .put_cas(&key, b"v4".to_vec(), Some(&e1))
-                .await
-                .expect("stale update must not error")
-                .is_none(),
-            "update with a stale etag must be Ok(None) — the fencing contract"
-        );
-        bucket.delete(&key).await.expect("cleanup delete");
+            .expect("the store must keep the conditional-write contract");
         eprintln!("CAS verified on {name}: create / reject-create / update / reject-stale");
     }
 }

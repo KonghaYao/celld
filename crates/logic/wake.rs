@@ -10,6 +10,7 @@
 //! definition.
 use super::Ms;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 /// Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -84,23 +85,37 @@ struct Entry {
     /// durable entry (the SIGKILL deep-gate failure). An arm during the
     /// window cancels the delete instead.
     delete_pending: bool,
-    /// The consume-delete was HANDED OUT (`take_delete` passed) and its
-    /// store call is in flight. Past this point nothing can cancel it, so
-    /// an arm must not ride on the entry either — it pays a PUT, which the
-    /// executor sequences after the delete settles (concurrent same-key
-    /// writes have no order at the store).
-    deleting: bool,
 }
 
 /// The reified `WakeFlusher`: owned state, no lock, no I/O.
 #[derive(Default)]
 pub struct WakeCore {
     flushed: HashMap<String, Entry>,
+    /// Keys whose DELETE was HANDED OUT (`take_delete` passed) and whose
+    /// store call has not reported back, per cell. Past the handout nothing
+    /// can cancel the delete, so an arm must not ride on the key either — it
+    /// pays a PUT, which the executor sequences after the delete settles
+    /// (concurrent same-key writes have no order at the store).
+    ///
+    /// Per cell rather than per entry: a MOVE-delete targets the key the
+    /// replacement PUT has already replaced in `flushed`, so the entry that
+    /// could carry the flag is gone by the time the delete is handed out. It
+    /// is exactly that delete which raced the arm PUT that re-tightened the
+    /// alarm back onto the old minute, deleting the entry of an alarm this
+    /// node had already acknowledged.
+    deleting: HashMap<String, HashSet<String>>,
 }
 
 impl WakeCore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Is a DELETE of this exact key on the wire for this cell?
+    fn deleting_key(&self, cell: &str, key: &str) -> bool {
+        self.deleting
+            .get(cell)
+            .is_some_and(|keys| keys.contains(key))
     }
 
     /// Arm-time decision: the PUT that must land before this arm is acked to
@@ -114,11 +129,15 @@ impl WakeCore {
             return None; // deletes are never synchronous
         }
         let want = entry_key(next_alarm_ms, cell);
+        let vanishing = self
+            .flushed
+            .get(cell)
+            .is_some_and(|e| self.deleting_key(cell, &e.key));
         match self.flushed.get_mut(cell) {
             // The entry's delete is already on the wire: nothing can cancel
             // it, so the entry covers nothing. Pay the PUT; the executor
             // sequences it after the in-flight delete settles.
-            Some(e) if e.deleting => Some(Op::Put {
+            Some(_) if vanishing => Some(Op::Put {
                 key: want,
                 due_ms: next_alarm_ms,
             }),
@@ -162,10 +181,14 @@ impl WakeCore {
     /// no entry, the one unrecoverable state.
     pub fn decide(&mut self, cell: &str, next_alarm_ms: Ms, consume_durable: bool) -> Vec<Op> {
         if next_alarm_ms < 0 {
+            let on_the_wire = self
+                .flushed
+                .get(cell)
+                .is_some_and(|e| self.deleting_key(cell, &e.key));
             return match self.flushed.get_mut(cell) {
-                // `!deleting`: the delete is already on the wire; a second
+                // `!on_the_wire`: the delete is already on the wire; a second
                 // one would race the first for nothing.
-                Some(e) if consume_durable && !e.deleting => {
+                Some(e) if consume_durable && !on_the_wire => {
                     // Arm the guard: an arm before this delete lands cancels
                     // it, and `take_delete` re-checks at execution time.
                     e.delete_pending = true;
@@ -183,7 +206,7 @@ impl WakeCore {
             }],
             // The tracked entry is vanishing: whatever its key, the armed
             // alarm must be re-asserted. No delete op — one is in flight.
-            Some(e) if e.deleting => vec![Op::Put {
+            Some(e) if self.deleting_key(cell, &e.key) => vec![Op::Put {
                 key: want,
                 due_ms: next_alarm_ms,
             }],
@@ -220,24 +243,26 @@ impl WakeCore {
                 key: entry_key(due_ms, cell),
                 verified: false,
                 delete_pending: false,
-                deleting: false,
             });
     }
 
     /// Is this exact committed alarm durably covered by a proven entry? The
     /// fail-closed gate: eviction of an alarm-bearing cell requires it.
     pub fn covered(&self, cell: &str, next_alarm_ms: Ms) -> bool {
-        self.flushed
-            .get(cell)
-            .is_some_and(|e| e.verified && !e.deleting && e.key == entry_key(next_alarm_ms, cell))
+        self.flushed.get(cell).is_some_and(|e| {
+            e.verified
+                && e.key == entry_key(next_alarm_ms, cell)
+                && !self.deleting_key(cell, &e.key)
+        })
     }
 
-    /// Is a consume-delete for this cell's tracked entry on the wire? Any
-    /// PUT for the cell must be sequenced after it settles: the store gives
-    /// concurrent same-key writes no order, so a PUT racing the DELETE can
-    /// lose and leave a confirmed belief with no entry.
+    /// Is any delete for this cell on the wire — a consume of the tracked
+    /// entry or a move-delete of a key it no longer tracks? Any PUT for the
+    /// cell must be sequenced after it settles: the store gives concurrent
+    /// same-key writes no order, so a PUT racing the DELETE can lose and
+    /// leave a confirmed belief with no entry.
     pub fn delete_in_flight(&self, cell: &str) -> bool {
-        self.flushed.get(cell).is_some_and(|e| e.deleting)
+        self.deleting.get(cell).is_some_and(|keys| !keys.is_empty())
     }
 
     /// Entries whose cells this node evicted and whose due time has arrived.
@@ -269,26 +294,36 @@ impl WakeCore {
                 key,
                 verified: true,
                 delete_pending: false,
-                deleting: false,
             },
         );
     }
 
-    /// Immediately before performing a consume-delete: is it still wanted?
-    /// False when an arm rode in during the async window and cancelled it —
-    /// performing the delete then would strand that acked alarm.
+    /// Immediately before performing a delete: is it still wanted? False when
+    /// an arm rode in during the async window and cancelled it — performing
+    /// the delete then would strand that acked alarm.
+    ///
+    /// Every delete this answers for goes on the wire, so every one of them
+    /// is recorded: the move-delete below is safe only in the sense that the
+    /// replacement entry already exists, never in the sense that its key may
+    /// be written concurrently.
     pub fn take_delete(&mut self, cell: &str, key: &str) -> bool {
-        match self.flushed.get_mut(cell) {
+        let perform = match self.flushed.get_mut(cell) {
             Some(e) if e.key == key && e.delete_pending => {
                 e.delete_pending = false;
-                e.deleting = true;
                 true
             }
             // No entry (already retired) or a different key: the move-delete
             // path, which is always safe — a new entry was PUT first.
             None => true,
             Some(e) => e.key != key,
+        };
+        if perform {
+            self.deleting
+                .entry(cell.to_string())
+                .or_default()
+                .insert(key.to_string());
         }
+        perform
     }
 
     /// Stop tracking this cell — after a delete, or when a wake resolved to a
@@ -297,11 +332,21 @@ impl WakeCore {
         self.flushed.remove(cell);
     }
 
-    /// A delete of `key` was performed. Forget the cell only if that key is
-    /// still the tracked entry: with put-before-delete ordering, a moved
-    /// entry's confirm already replaced the tracked key, and deleting the old
-    /// key must not drop belief in the new one.
+    /// A delete of `key` settled — landed, or failed past its retries, which
+    /// is the same thing here: it is off the wire either way, and a PUT of
+    /// that key can no longer lose to it.
+    ///
+    /// Forget the cell only if that key is still the tracked entry: with
+    /// put-before-delete ordering, a moved entry's confirm already replaced
+    /// the tracked key, and deleting the old key must not drop belief in the
+    /// new one.
     pub fn retire(&mut self, cell: &str, key: &str) {
+        if let Some(keys) = self.deleting.get_mut(cell) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.deleting.remove(cell);
+            }
+        }
         if self.flushed.get(cell).is_some_and(|e| e.key == key) {
             self.flushed.remove(cell);
         }

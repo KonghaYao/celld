@@ -236,7 +236,7 @@ impl ObjectStoreConfig {
             // answers PutMode::Create with NotImplemented. The epoch seal is a
             // conditional create (first restorer wins), and every provider on
             // the support matrix speaks the If-None-Match/If-Match headers
-            // this enables (wiki/engine/ownership.md's CAS matrix).
+            // this enables.
             .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch);
 
         if !self.endpoint.is_empty() {
