@@ -9,6 +9,7 @@ use crate::compactor::Compactor;
 use crate::error::{Error, Result};
 use crate::ltx::{FileInfo, HEADER_FLAG_NO_CHECKSUM};
 use crate::ltx_file_path;
+use crate::LtxHost;
 use crate::TXID;
 use std::io::Cursor;
 use std::path::Path;
@@ -34,6 +35,7 @@ pub struct ReplicaCompactor<'a, C> {
     max_files: usize,
     max_input_bytes: u64,
     local_path: Option<PathBuf>,
+    host: LtxHost,
 }
 
 impl<'a, C: ReplicaClient> ReplicaCompactor<'a, C> {
@@ -44,6 +46,7 @@ impl<'a, C: ReplicaClient> ReplicaCompactor<'a, C> {
             max_files: usize::MAX,
             max_input_bytes: u64::MAX,
             local_path: None,
+            host: LtxHost::default(),
         }
     }
 
@@ -63,6 +66,12 @@ impl<'a, C: ReplicaClient> ReplicaCompactor<'a, C> {
     /// Uses the local LTX directory before it reads an object from the replica.
     pub fn with_local_path(mut self, path: impl AsRef<Path>) -> Self {
         self.local_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Uses an injected clock and executor host.
+    pub fn with_host(mut self, host: LtxHost) -> Self {
+        self.host = host;
         self
     }
 
@@ -141,7 +150,7 @@ impl<'a, C: ReplicaClient> ReplicaCompactor<'a, C> {
                         file.min_txid,
                         file.max_txid,
                     );
-                    match tokio::fs::read(filename).await {
+                    match self.host.read_file(filename).await {
                         Ok(bytes) => {
                             local_input_files += 1;
                             bytes
@@ -167,14 +176,27 @@ impl<'a, C: ReplicaClient> ReplicaCompactor<'a, C> {
         // runtime worker: a restart drain runs rounds back-to-back, and on a
         // 4-vCPU node two pegged workers starved co-owned cells' durable
         // writes (2026-08-12 fleet roll).
-        let (header, output) = tokio::task::spawn_blocking(move || {
-            let mut compactor = Compactor::new(Vec::new(), readers);
-            compactor.header_flags = HEADER_FLAG_NO_CHECKSUM;
-            compactor.compact()?;
-            Ok::<_, Error>((compactor.header(), compactor.into_writer()))
-        })
-        .await
-        .map_err(|_| invalid("the compaction merge task panicked"))??;
+        #[cfg(celld_internal_tests)]
+        let drop_input = self.host.drop_compaction_input() && readers.len() >= 3;
+        #[cfg(celld_internal_tests)]
+        if drop_input {
+            let interior = readers.len() / 2;
+            readers.remove(interior);
+        }
+        let (header, output) = self
+            .host
+            .run_blocking(move || {
+                let mut compactor = Compactor::new(Vec::new(), readers);
+                compactor.header_flags = HEADER_FLAG_NO_CHECKSUM;
+                #[cfg(celld_internal_tests)]
+                if drop_input {
+                    compactor.allow_non_contiguous_txids = true;
+                }
+                compactor.compact()?;
+                Ok::<_, Error>((compactor.header(), compactor.into_writer()))
+            })
+            .await
+            .map_err(|_| invalid("the compaction merge task panicked"))??;
         if header.min_txid != min_txid || header.max_txid != max_txid {
             return Err(invalid(
                 "a compaction source key does not match its LTX header",

@@ -1,5 +1,8 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
+// Isolate admission and deadlines are in the V8 arm outside the World.
+#![allow(clippy::disallowed_macros, clippy::disallowed_methods)]
+
 //! The isolate pool: the shell around `celld_logic::isolate`.
 //!
 //! One multi-threaded tokio runtime owns every socket and timer. Isolates
@@ -128,7 +131,7 @@ impl Slot {
 
     fn is_reusable(&self) -> bool {
         let load = self.observe();
-        if !load.retiring || load.turns != 0 || load.requests != 0 || load.cells != 0 {
+        if !celld_logic::isolate::may_free(&load) || load.cells != 0 {
             return false;
         }
         self.worker.try_lock().is_ok_and(|worker| worker.is_none())
@@ -403,8 +406,7 @@ impl Pool {
         // rather than blocking: if a turn holds it, it is not drained and
         // this pass has nothing to do.
         for slot in self.slots.read().expect("pool poisoned").iter() {
-            let load = slot.observe();
-            if !slot.is_retiring() || load.turns > 0 || load.requests > 0 {
+            if !celld_logic::isolate::may_free(&slot.observe()) {
                 continue;
             }
             let Ok(mut worker) = slot.worker.try_lock() else {

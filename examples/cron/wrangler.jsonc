@@ -1,0 +1,11 @@
+{
+  "name": "cron",
+  "main": "index.js",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": { "bindings": [{ "name": "TICKS", "class_name": "Ticks" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Ticks"] }],
+  // Five standard fields, UTC, one-minute resolution. A deadline that both
+  // expressions match calls `scheduled` two times, one for each, as on
+  // Cloudflare.
+  "triggers": { "crons": ["* * * * *", "*/5 * * * *"] }
+}

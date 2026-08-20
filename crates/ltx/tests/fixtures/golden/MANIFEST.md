@@ -1,7 +1,7 @@
 # Golden fixtures — provenance (IMMUTABLE)
 
-Captured from the **real** upstream tooling. DO NOT edit or regenerate from
-rustyriver. A mismatch means rustyriver is wrong (AGENTS.md rule 3 / PLAN.md §6.2).
+Captured from the **real** upstream tooling. Do not edit or regenerate these
+fixtures from celld-ltx. A mismatch means the implementation is wrong.
 
 | Source tool | Version | Provenance |
 |-------------|---------|-----------|
@@ -14,7 +14,7 @@ rustyriver. A mismatch means rustyriver is wrong (AGENTS.md rule 3 / PLAN.md §6
   (deterministic, no background timing). Layout: `ltx/<level>/<minTXID>-<maxTXID>.ltx`.
   Contents are **L0-only** (level `0`): a snapshot at TXID 1 plus 5 single-txn L0
   files (TXIDs 2–6). The real binary restores this tree and the result equals the
-  source under Oracle A — see the U-2 resolution in `OPEN_QUESTIONS.md`.
+  source under the logical equality oracle.
   - SQL sequence: `PRAGMA journal_mode=WAL`; `CREATE TABLE kv(k TEXT PRIMARY KEY,
     v TEXT NOT NULL)`; seed `('a','1'),('b','2'),('c','3')`; then 5 iterations each
     `INSERT ('k$i','v$i')` + `UPDATE kv SET v='upd$i' WHERE k='a'`, each flushed
@@ -26,12 +26,11 @@ rustyriver. A mismatch means rustyriver is wrong (AGENTS.md rule 3 / PLAN.md §6
   read transaction (so the close-time checkpoint could not truncate it). Header
   magic `0x377f0682` (big-endian salt variant), page size 4096.
 
-## How rustyriver uses these
+## How celld-ltx uses these
 Reader tests **decode** these bytes and assert structural fields (TXIDs, page
 numbers, checksums, frame counts). Writer byte-fidelity is **not** asserted by
-comparison against these files (LTX headers embed timestamps and are not
-bit-reproducible) — it is proven by differential test D1 against the real binary
-(PLAN.md §6.3).
+comparison against these files because LTX headers embed timestamps and are not
+bit-reproducible. Differential test D1 proves it against the real binary.
 
 ## Reproduce
 `scripts/capture-golden.sh` regenerates an equivalent tree from a `litestream`

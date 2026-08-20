@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Capture IMMUTABLE golden fixtures from the REAL litestream binary + sqlite3.
-# (PLAN.md §6.2, AGENTS.md rule 3.) Run ONCE; then commit tests/fixtures/golden/.
+# Capture immutable golden fixtures from the real Litestream binary and sqlite3.
+# Run this only to replace the complete committed tests/fixtures/golden/ set.
 #
-# These are READER fixtures: rustyriver's parser must decode them and assert
+# These are reader fixtures: the celld-ltx parser must decode them and assert
 # their fields. Writer byte-fidelity is verified by differential test D1, NOT by
 # byte comparison — LTX headers embed timestamps, so bytes are not reproducible.
 #
 # Deterministic method: drive replication with `replicate -once` (no background
-# timing/sleep races). Produces an L0-only tree (the round-trip property is what
-# matters, see OPEN_QUESTIONS U-2). The binary may be an official release OR built
+# timing/sleep races). Produces an L0-only tree because the round-trip property is
+# what matters. The binary can be an official release or a build
 # from the pinned tag (reference/litestream-go) — both are "the real v0.5.11".
 set -euo pipefail
 
-REQ_VERSION="0.5.11"          # PLAN.md D-2
+REQ_VERSION="0.5.11"
 OUT_DIR="tests/fixtures/golden"
 
 command -v litestream >/dev/null || { echo "litestream not on PATH"; exit 1; }

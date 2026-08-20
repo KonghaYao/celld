@@ -5,9 +5,12 @@ durable before celld acknowledges it. This page gives the mechanism
 behind each claim, so you can check the argument against the code.
 
 A short version first. The ownership records use conditional writes.
-The replication stream uses plain writes, because the epoch in the key
-is the fence. The acknowledgement path re-reads the ownership record,
-so a stale node cannot make a promise that the fleet does not keep.
+The bucket replication path uses plain writes, because the epoch in the key
+is the fence. After a bucket proof, celld re-reads the ownership record and
+acknowledges the write only if the record still names this node. Every
+follower must fsync the write for a fleet proof. During a cold activation,
+celld recovers the prior node log before it reads the bucket. These paths
+stop a stale node from acknowledging a write that the fleet does not store.
 
 ## The ownership record
 
@@ -23,56 +26,115 @@ fresh epoch, and an epoch never has two writers.
 
 ## Replication and the epoch prefix
 
-The replicator copies the SQLite data of each cell to the bucket under
-an epoch prefix: `cells/<cell>/ltx/e<epoch>/`. These segment writes
-are plain, unconditional PUTs. That is intentional: the fence is the
-epoch in the key, not a condition on the request. A node that lost its
-ownership can continue to write, but its writes land in a superseded
-prefix. A restore selects the current lineage, so the stale node
-cannot corrupt the data of the new owner, and the data path pays no
-conditional-write cost.
+The replicator copies the SQLite data of each cell to the bucket under an
+epoch prefix: `cells/<cell>/ltx/e<epoch>/`. These segment writes are plain,
+unconditional PUTs. The tiering path can first combine segments from many
+cells into a node bundle, and it later drains each segment into its per-cell
+prefix.
 
-The prefix protects the data. It does not, alone, protect the promise
-to the client. The next two mechanisms close that gap.
+The epoch in the key is the fence, so the data path needs no conditional
+write. A node that lost ownership can continue to write, but its writes land
+in a superseded prefix. A restore selects the current lineage, so the stale
+node cannot corrupt the data of the new owner.
+
+The prefix protects the current owner from stale writes. The acknowledgement
+rule and the takeover recovery gate protect the durability promise.
 
 ## The acknowledgement rule (RPO=0)
 
-A gate holds the response of each write until the replicator proves
-that the write is in the bucket. After the proof, celld reads the
-ownership record one time, and celld acknowledges only if the record
-still names this node at this epoch. A partitioned node can commit
-locally and replicate into its own superseded prefix, but its
-ownership read shows the new owner, so the client never receives an
-acknowledgement for a write that the surviving lineage does not
-contain. The check is a read of the record, not a clock comparison, so
-a paused process or a skewed clock cannot pass it.
+A gate holds each write response until a durability proof covers the write.
+After a bucket proof, celld reads the ownership record one time. celld
+acknowledges only if the record still names this node at this epoch. A
+partitioned node can commit locally and replicate into its superseded prefix.
+The ownership read then shows the new owner, so celld does not acknowledge the
+write. The check reads the record instead of comparing a clock, so a paused
+process or a skewed clock cannot pass it.
 
-## The epoch seal
+A fleet proof does not require this read. Every member of the follower
+ensemble must fsync the write. A takeover seals the prior node-log session
+before it restores, so the stale owner cannot complete another fleet proof.
 
-A restore selects the newest epoch prefix that contains data. A fenced
-node can append to that prefix after the takeover, because the segment
-writes are unconditional. Without a further rule, a later restore
-could read that appended tail: writes that no client saw acknowledged.
+## The takeover recovery gate
 
-The seal closes this hole. The first activation that restores from an
-epoch writes a seal object (`e<epoch>.seal.json`) with a conditional
-create, and the seal fixes the highest transaction that any restore of
-that epoch can read. The conditional create means that the first
-restorer wins, so every later restore reads the same cut. Every
-acknowledged write sits at or below the seal, because the
-acknowledgement required an ownership read, and the takeover preceded
-the seal. The later writes of the fenced node sit above the seal, so
-they never return. If the seal write fails, the activation fails,
-because a restore of an unsealed prefix reopens the hole.
+The default fleet mode can acknowledge a write after all members of a node
+log ensemble store the write. The bucket upload can complete later. Each
+process session therefore creates a conditional node log record before its
+first fleet-durable acknowledgement.
+
+A cold activation checks the log records of the prior owner before it reads
+the bucket. An absent record proves that the session never acknowledged past
+the bucket, and a sealed record proves that recovery completed. An open or
+recovering record makes the activation run recovery.
+
+Recovery uses compare-and-swap writes to fence the record. It seals the
+reachable followers, gathers their retained segments and bundles, and uploads
+the missing segments into the per-cell prefixes. Recovery then marks the log
+record as sealed with another compare-and-swap write. The activation cannot
+restore until this sequence completes.
+
+## Full-prefix restore
+
+celld no longer writes an epoch seal object. A restore selects the newest
+epoch prefix that contains LTX data, and it reads the full contiguous chain
+from transaction zero. A legacy `e<epoch>.seal.json` object does not limit
+this chain.
+
+A fenced node can append an unacknowledged tail to an older prefix. A later
+restore can expose that tail if it selects the prefix. This result does not
+violate the acknowledgement contract, because a failed or absent
+acknowledgement does not prove that the write is absent.
+
+A node-log recovery or a bundle drain can add an acknowledged follower tail
+after an earlier restore. A fixed restore cut stops at the transaction of that
+earlier restore, therefore it hides the recovered tail and loses acknowledged
+data. celld does not use a fixed restore cut. The full-prefix rule reads the
+complete chain, so a later restore returns the recovered tail and the
+acknowledgement contract holds.
 
 ## Self-fencing
 
-A node that cannot reach the bucket cannot renew its lease, and it
-cannot replicate. Such a node must not own cells, so it fences itself:
-it stops the writes and releases its residency. A different node can
-then acquire the cells through the ownership records. The failure of a
-node is a normal input, not a recovery procedure; the [testing
-page](testing.md) shows the kill tests that exercise this path.
+Each node holds a node lease in the bucket. The lease carries an expiry, and
+the node renews the lease after one third of the lease lifetime. The
+`CELLD_TTL_MS` variable sets that lifetime, and the default is 10000 ms. A
+renewal that does not reach the bucket does not fence the node, because the
+node retries while the published expiry has not passed.
+
+A node that cannot reach the bucket cannot renew its lease, and it cannot
+replicate. Such a node must not own cells, so it fences itself when its
+published expiry passes. It stops each active cell, and it fails every
+request that it has not completed. A node whose lease record another writer
+replaced or removed fences at once, because that record proves the authority
+moved.
+
+The fence writes nothing to the bucket. Each peer already reads the lease
+record as dead or as replaced, therefore a peer can acquire the cells through
+the ownership records. The handover comes from the lease record itself, not
+from a release that the fenced node performs.
+
+A request is safe even before the fence runs. celld compares the current time
+against the published expiry each time it routes a request, so a node with a
+lapsed lease refuses the request. The fence stops the process, and the
+dispatch check keeps one owner per cell.
+
+A fenced node logs a line that starts with `SELF-FENCE:`, and then the process
+stops with the exit code 3. The line names the cause, because celld reports
+other internal failures with the same prefix and the same exit code. The
+fenced state is terminal, so the process cannot take a new lease, and only a
+restart returns the node to the fleet. A restart uses the same cold activation
+path that a peer failure already uses, therefore celld needs no second
+recovery procedure.
+
+You must run celld under a supervisor that restarts the process, such as
+systemd, Docker with a restart policy, or Kubernetes. A node without such a
+supervisor does not return after a fence, and the fleet loses that capacity
+until an operator intervenes. The supervisor must restart the process without
+an attempt limit, and it must wait at least one lease lifetime between
+attempts. A node that cannot acquire a lease at startup retries and does not
+exit, so a repeated fence needs a node that acquires a lease and then loses
+it, and the wait keeps that cycle slow enough to observe.
+
+The failure of a node is a normal input, not a recovery procedure; the
+[testing page](testing.md) shows the kill tests that exercise this path.
 
 ## What the bucket must provide
 
@@ -84,6 +146,11 @@ celld needs three properties from the object store:
   after the read.
 - Read-after-write consistency. A read after a successful write must
   return that write.
+
+The bucket adapter treats `AlreadyExists` and `Precondition` as clean
+conditional-write rejections. Azure uses `Precondition` for an HTTP 412
+response. The adapter keeps every other error ambiguous. A caller must
+reconcile an ambiguous error because the write can have changed the object.
 
 On an S3-compatible bucket, celld sends the `If-None-Match: *` and
 `If-Match` headers, and the condition compares the etag. Amazon S3,
@@ -97,6 +164,28 @@ precondition and OAuth credentials, and the condition compares the
 object generation. celld does not send the S3 request dialect to
 Cloud Storage, because Cloud Storage does not apply `If-Match` to a
 PUT.
+
+An `az://` bucket selects Azure Blob Storage, where the NAME is the
+container. celld then sends the same `If-None-Match: *` and `If-Match`
+headers, and the condition compares the etag, because Put Blob applies
+both headers. Microsoft documents these operations.
+
+The qualified stores are Amazon S3, Cloudflare R2, Tigris, Google Cloud
+Storage, and Azure Blob Storage.
+
+Azure was qualified on 2026-08-18, against the shipped revision. The
+four-step matrix passes under each credential family celld supports —
+an account key, a VM managed identity, and an AKS workload identity —
+and a node restores a cell from an Azure replica alone after its local
+state is destroyed. An LTX file above the 5 MiB threshold, where celld
+switches to block-blob multipart, uploads and reads back byte-for-byte;
+Azure's own committed block list shows the parts.
+
+What that qualification does not cover: a managed identity on Azure App
+Service or Azure Container Apps (see [limitations](limitations.md)),
+per-blob write rate limits shaping lease cadence under sustained load,
+and multi-node contention. Each run was single-node, and its conditions
+are recorded with it.
 
 Some S3-compatible stores do not qualify. MinIO (the community
 edition), Backblaze B2, Hetzner Object Storage, and DigitalOcean

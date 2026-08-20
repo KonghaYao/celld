@@ -1,5 +1,13 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
+// The raw V8 adapter and its child modules remain outside the World. The
+// Actor-reachable wake and WebSocket state is injected through HostServices.
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::disallowed_types
+)]
+
 //! The JS engine: rusty_v8 directly. One isolate per cell.
 //!
 //! This slice runs actual Durable Objects: the worker's default-export `fetch`
@@ -19,6 +27,50 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use v8::{ValueDeserializerHelper, ValueSerializerHelper};
+
+/// Bare Node builtin specifiers that the bundler leaves for the runtime.
+/// Root entries also match subpaths in esbuild and in module resolution.
+pub(crate) const BARE_NODE_BUILTINS: &[&str] = &[
+    "assert",
+    "async_hooks",
+    "buffer",
+    "child_process",
+    "cluster",
+    "constants",
+    "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "events",
+    "fs",
+    "fs/promises",
+    "http",
+    "http2",
+    "https",
+    "inspector",
+    "module",
+    "net",
+    "os",
+    "path",
+    "perf_hooks",
+    "process",
+    "punycode",
+    "querystring",
+    "readline",
+    "sqlite",
+    "stream",
+    "string_decoder",
+    "timers",
+    "tls",
+    "tty",
+    "url",
+    "util",
+    "util/types",
+    "v8",
+    "vm",
+    "worker_threads",
+    "zlib",
+];
 
 /// The pending exception text from a TryCatch scope (a macro so it needs no
 /// bound on the crate-private scope traits).
@@ -182,12 +234,11 @@ fn enter_call_order(caller: Arc<IoContext>, cell: &str) -> CallOrder {
 /// An output-gate request for the co-hosted (same-isolate) Durable Object fast
 /// path. That path runs a resident DO's `fetch` inline, bypassing
 /// `dispatch_do_call` where the gate lives; the inline handler samples the
-/// cell's committed-write position and, on a write, asks the actor to hold the
-/// inline response here until the cell is durable. `position` is the sampled
-/// committed-write position (the same signal the routed gate uses).
+/// cell's committed-write position and asks the actor whether the response can
+/// leave. `position` is present for a write and absent for a read.
 pub struct GateReq {
     pub scope: String,
-    pub position: u64,
+    pub position: Option<u64>,
     pub reply: tokio::sync::oneshot::Sender<Result<(), celld_logic::RequestError>>,
 }
 static GATE_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<GateReq>> = OnceLock::new();
@@ -264,14 +315,26 @@ pub struct ArmGate {
     pub bucket: crate::bucket::Bucket,
     pub flusher: Arc<crate::wake::WakeFlusher>,
 }
-static ARM_GATE: OnceLock<ArmGate> = OnceLock::new();
+
+type ArmGateRx = tokio::sync::oneshot::Receiver<Result<(), String>>;
+
+#[derive(Default)]
+pub(crate) struct WakeEntryService {
+    gate: OnceLock<ArmGate>,
+    pending: Mutex<HashMap<String, Vec<ArmGateRx>>>,
+}
+
 pub fn set_arm_gate(gate: ArmGate) {
-    let _ = ARM_GATE.set(gate);
+    let _ = asyncrt::services().wake_entry().gate.set(gate);
 }
 
 /// Whether this node still holds a wake entry for `cell`.
 pub fn wake_entry_tracked(cell: &str) -> bool {
-    ARM_GATE.get().is_some_and(|gate| gate.flusher.tracks(cell))
+    asyncrt::services()
+        .wake_entry()
+        .gate
+        .get()
+        .is_some_and(|gate| gate.flusher.tracks(cell))
 }
 
 /// Drop this node's belief about `cell`'s wake entry — the cell fenced or
@@ -279,7 +342,8 @@ pub fn wake_entry_tracked(cell: &str) -> bool {
 /// Defined since the wake audit and now actually called (it was dead code,
 /// which meant a node that lost a cell kept believing in its entry).
 pub fn forget_wake_entry(cell: &str) {
-    if let Some(gate) = ARM_GATE.get() {
+    let services = asyncrt::services();
+    if let Some(gate) = services.wake_entry().gate.get() {
         gate.flusher.forget(cell);
     }
 }
@@ -287,7 +351,8 @@ pub fn forget_wake_entry(cell: &str) {
 /// Adopt the wake entry a restored alarm implies, so consuming that alarm
 /// deletes it rather than orphaning it.
 pub fn adopt_wake_entry(cell: &str, at_ms: i64) {
-    if let Some(gate) = ARM_GATE.get() {
+    let services = asyncrt::services();
+    if let Some(gate) = services.wake_entry().gate.get() {
         gate.flusher.adopt(cell, at_ms);
     }
 }
@@ -301,7 +366,8 @@ pub fn adopt_wake_entry(cell: &str, at_ms: i64) {
 /// while the commit that consumed the alarm is still only local would lose
 /// both the alarm and the record that could have revived it.
 pub async fn reconcile_wake_entry(cell: &str, next_alarm_ms: i64, consume_durable: bool) {
-    let Some(gate) = ARM_GATE.get() else {
+    let services = asyncrt::services();
+    let Some(gate) = services.wake_entry().gate.get() else {
         return;
     };
     gate.flusher
@@ -309,24 +375,25 @@ pub async fn reconcile_wake_entry(cell: &str, next_alarm_ms: i64, consume_durabl
         .await;
 }
 
-type ArmGateRx = tokio::sync::oneshot::Receiver<Result<(), String>>;
-static PENDING_ARM_GATES: OnceLock<Mutex<HashMap<String, Vec<ArmGateRx>>>> = OnceLock::new();
-fn pending_arm_gates() -> &'static Mutex<HashMap<String, Vec<ArmGateRx>>> {
-    PENDING_ARM_GATES.get_or_init(Default::default)
-}
-
 /// A committed alarm tightened the durable wake bound: launch the entry PUT
 /// and register it against the cell's output gate. No-op when the bound
 /// already covers it or no gate is configured (unit tests).
 fn spawn_arm_gate(cell: &str, at_ms: i64) {
-    let Some(gate) = ARM_GATE.get() else { return };
+    #[cfg(all(test, celld_internal_tests))]
+    if asyncrt::sabotage_active(crate::host_services::EngineSabotage::SkipArmTimeWakePut) {
+        return;
+    }
+    let services = asyncrt::services();
+    let Some(gate) = services.wake_entry().gate.get() else {
+        return;
+    };
     let Some(celld_logic::wake::Op::Put { key, due_ms }) = gate.flusher.arm_op(cell, at_ms) else {
         return;
     };
     let cell_ = cell.to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
     {
-        let mut pending = pending_arm_gates().lock().unwrap();
+        let mut pending = services.wake_entry().pending.lock().unwrap();
         let gates = pending.entry(cell_.clone()).or_default();
         // Arms with no response edge to drain them (alarm handlers,
         // WebSocket events) must not accumulate: drop already-settled gates.
@@ -338,13 +405,15 @@ fn spawn_arm_gate(cell: &str, at_ms: i64) {
         });
         gates.push(rx);
     }
-    asyncrt::op_handle().spawn(async move {
-        let gate = ARM_GATE.get().unwrap();
-        // The core may have demanded this PUT because the tracked entry's
-        // consume-delete is already on the wire; the PUT must land after
-        // that delete, not race it (S3 orders concurrent same-key writes
-        // arbitrarily).
-        gate.flusher.await_no_inflight_delete(&cell_).await;
+    asyncrt::spawn(async move {
+        let gate = services.wake_entry().gate.get().unwrap();
+        // A delete of this exact key may already be on the wire — the tracked
+        // entry's consume-delete, or the move-delete of a key this arm is
+        // about to re-PUT. Either way the PUT must land after that delete,
+        // not race it (S3 orders concurrent same-key writes arbitrarily).
+        // Deletes of the cell's OTHER keys cannot touch this PUT, and waiting
+        // on them would hold the response behind unrelated store latency.
+        gate.flusher.await_key_deletable(&cell_, &key).await;
         let body = format!("{{\"cell\":{cell_:?},\"due_ms\":{due_ms}}}");
         let result = gate
             .bucket
@@ -353,7 +422,13 @@ fn spawn_arm_gate(cell: &str, at_ms: i64) {
             .map(|_| gate.flusher.confirm_arm(&cell_, due_ms, key))
             .map_err(|e| format!("setAlarm wake entry: {e}"));
         let _ = tx.send(result);
-    });
+    })
+    .detach();
+}
+
+#[cfg(all(test, celld_internal_tests))]
+pub(crate) fn spawn_arm_gate_for_test(cell: &str, at_ms: i64) {
+    spawn_arm_gate(cell, at_ms);
 }
 
 /// Await the cell's pending wake-entry PUTs — the output-gate drain a
@@ -361,7 +436,8 @@ fn spawn_arm_gate(cell: &str, at_ms: i64) {
 /// the response would acknowledge is not durably covered; the caller must
 /// fail the response rather than lie (the flusher retries the entry).
 pub async fn drain_arm_gates(cell: &str) -> Result<(), String> {
-    let gates = pending_arm_gates().lock().unwrap().remove(cell);
+    let services = asyncrt::services();
+    let gates = services.wake_entry().pending.lock().unwrap().remove(cell);
     let Some(gates) = gates else { return Ok(()) };
     for gate in gates {
         match gate.await {
@@ -479,6 +555,12 @@ pub struct OutboundWsReq {
     /// A `fetch()` upgrade wants the whole handshake outcome, including the
     /// ordinary response a server that declines to upgrade sent instead.
     pub want_response: bool,
+    /// A socket already upgraded in this process, which this request joins
+    /// instead of dialing `url`. It is the cell end of a Durable Object
+    /// subrequest whose caller kept the client end, so there is no handshake
+    /// to run and no connection to open: the host only has to carry frames
+    /// between two isolates.
+    pub target: Option<WsTarget>,
     pub reply: tokio::sync::oneshot::Sender<Result<OutboundWsOpen>>,
 }
 
@@ -508,6 +590,13 @@ fn timer_cancels() -> &'static std::sync::Mutex<HashMap<u64, tokio::sync::onesho
     TIMER_CANCELS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 static NEXT_HTTP_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+/// What `__http_stream_read` resolves with at end of stream.
+///
+/// The reader identifies the end by type, not by value. A chunk always
+/// resolves as a `Uint8Array`, therefore body bytes can never look like
+/// this marker. The value stays distinctive, so a reader that does compare
+/// the value cannot match a plausible body.
+const HTTP_STREAM_DONE: &str = "__celld_http_stream_end__";
 enum HttpStreamSource {
     Response(reqwest::Response),
     Receiver(tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>),
@@ -564,7 +653,8 @@ pub struct WsTarget {
 /// Encode a host response for the JS side. A text body crosses as a
 /// JS string (cheap, lossless), binary as a byte array, and a streaming body
 /// by id — serializing a Vec<u8> as a JSON number array is the dominant cost
-/// for real DO responses. `ws_target` is carried only by the DO path.
+/// for real DO responses. `ws_target` is carried by the paths that can answer
+/// with a WebSocket upgrade: a Durable Object call and a service-binding call.
 fn encode_http_response(mut response: HttpResponse, ws_target: bool) -> String {
     let mut obj = serde_json::json!({
         "status": response.status,
@@ -722,6 +812,7 @@ thread_local! {
 }
 
 mod websocket;
+pub(crate) use websocket::WebSocketService;
 pub use websocket::*;
 use websocket::{ws_capture_begin, ws_capture_take};
 
@@ -743,28 +834,74 @@ pub fn egress_gate_enter(cell: &str, position: Option<u64>) -> EgressGateScope {
     EgressGateScope
 }
 
-/// What an outbound effect must wait for, if the running handler has written
-/// anything this event. `None` means there is nothing outstanding and the
-/// effect may go straight out -- the ordinary read-only case, which must not
-/// pay a durability round trip.
-fn egress_gate_pending() -> Option<(String, u64)> {
-    let context = current_context();
-    let stack = context.egress.lock().unwrap();
-    let (cell, before) = stack.last()?;
-    let position = storage::write_position(cell)?;
-    (position > *before).then(|| (cell.clone(), position))
+/// What an outbound effect must trail before it leaves the process.
+///
+/// The three cases are named rather than nested inside one another because
+/// two of them once shared a representation, and that is what issue #144 was:
+/// a reader that starts after another request committed samples the new
+/// position as its own baseline and advances nothing, so a two-state gate read
+/// it as code that owns no cell at all and let its side effect out ungated.
+/// A variant per case makes the distinction one the compiler keeps.
+enum EgressGate {
+    /// No cell event is running. Stateless Worker code owns no cell state, so
+    /// its egress reveals nothing that can still be lost and leaves directly.
+    NoCell,
+    /// This event wrote through the position. The effect waits for that write.
+    Wrote(String, u64),
+    /// A read-only output. It reveals whatever the cell holds, so it trails
+    /// the newest write barrier still open on the cell. Only the core knows
+    /// which writes are outstanding, so this asks rather than guesses.
+    ReadOnly(String),
 }
 
-/// Wait for the cell's outstanding write to be proven durable before an
-/// outbound effect leaves the process.
+impl EgressGate {
+    /// Whether the effect must consult the gate before it leaves. True for a
+    /// read as well as a write: a read whose cell has no barrier is released
+    /// at once, but only the core can say so.
+    fn is_gated(&self) -> bool {
+        !matches!(self, EgressGate::NoCell)
+    }
+}
+
+/// Sample what the running handler's outbound effects must trail. Answers for
+/// every active cell event, including a read whose core lookup can settle
+/// immediately.
+fn egress_gate_request() -> EgressGate {
+    let context = current_context();
+    let stack = context.egress.lock().unwrap();
+    let Some((cell, before)) = stack.last() else {
+        return EgressGate::NoCell;
+    };
+    match storage::write_position(cell).filter(|position| position > before) {
+        Some(position) => EgressGate::Wrote(cell.clone(), position),
+        // A read-only output in a process that configured no output gate has
+        // nothing to trail. Such a process cannot acknowledge a write either
+        // -- `op_gate_write` refuses one for want of the same channel -- so no
+        // committed-but-unproven write exists for a read to reveal. Answer as
+        // if no cell event were running, which keeps the effect on the direct,
+        // synchronous path it has always taken; a WebSocket frame in
+        // particular must not join a deferred queue whose flush needs a gate
+        // to release it. A write still takes a ticket and still fails closed.
+        None if GATE_TX.get().is_none() => EgressGate::NoCell,
+        None => EgressGate::ReadOnly(cell.clone()),
+    }
+}
+
+/// Wait for the writes an outbound effect can reveal to be proven durable
+/// before it leaves the process.
 ///
 /// This is the output gate applied to egress rather than to the response.
 /// It cannot deadlock the handler that is awaiting it: the ticket is served by
 /// `dispatch_gate` on the host's own loop and resolved by the replicator's
 /// independent task, neither of which needs the isolate's event loop to run.
-async fn await_egress_gate(pending: Option<(String, u64)>) -> std::result::Result<(), String> {
-    let Some((cell, position)) = pending else {
-        return Ok(());
+/// A read-only ticket carries `None` and the core releases it at once when the
+/// cell has no barrier open, so an ordinary read pays one actor hop and no
+/// replica write.
+async fn await_egress_gate(gate: EgressGate) -> std::result::Result<(), String> {
+    let (cell, position) = match gate {
+        EgressGate::NoCell => return Ok(()),
+        EgressGate::Wrote(cell, position) => (cell, Some(position)),
+        EgressGate::ReadOnly(cell) => (cell, None),
     };
     let (tx, receive) = tokio::sync::oneshot::channel();
     let sent = GATE_TX
@@ -798,7 +935,7 @@ async fn await_egress_gate(pending: Option<(String, u64)>) -> std::result::Resul
 /// leave first -- the request would already be on its way while the caller
 /// waited for a durability answer that no longer decides anything.
 async fn gated_channel_send<T>(
-    gate: Option<(String, u64)>,
+    gate: EgressGate,
     channel: &'static OnceLock<tokio::sync::mpsc::UnboundedSender<T>>,
     request: T,
     missing: &'static str,
@@ -1128,6 +1265,9 @@ pub struct WorkerConfig {
     do_classes: Vec<String>,
     bindings: Vec<(String, String)>,
     r2_bindings: Vec<String>,
+    /// `d1_databases`: (environment name, stable database identity). The
+    /// identity addresses the cell that holds the database; see [[d1]].
+    d1_bindings: Vec<(String, String)>,
     ai_binding: Option<String>,
     vars: Vec<(String, String)>,
     node: String,
@@ -1146,6 +1286,9 @@ pub struct WorkerConfig {
     /// Extra `env` values a loaded worker was handed, as a JSON object string
     /// merged onto its `env`. Loader-only; empty for normal workers.
     loader_env: Option<String>,
+    /// `triggers.crons` from the deployment. Empty for a loaded worker and for
+    /// any script without cron triggers.
+    pub crons: Vec<String>,
 }
 
 pub struct WorkerConfigOptions {
@@ -1154,6 +1297,7 @@ pub struct WorkerConfigOptions {
     pub do_classes: Vec<String>,
     pub bindings: Vec<(String, String)>,
     pub r2_bindings: Vec<String>,
+    pub d1_bindings: Vec<(String, String)>,
     pub ai_binding: Option<String>,
     pub vars: Vec<(String, String)>,
     pub node: String,
@@ -1169,6 +1313,7 @@ impl WorkerConfig {
             do_classes,
             bindings,
             r2_bindings,
+            d1_bindings,
             ai_binding,
             vars,
             node,
@@ -1181,6 +1326,7 @@ impl WorkerConfig {
             do_classes,
             bindings,
             r2_bindings,
+            d1_bindings,
             ai_binding,
             vars,
             node,
@@ -1191,7 +1337,14 @@ impl WorkerConfig {
             loader_binding: None,
             egress: EgressPolicy::Allow,
             loader_env: None,
+            crons: Vec::new(),
         }
+    }
+
+    /// Give this Worker the deployment's cron trigger expressions.
+    pub fn with_crons(mut self, crons: Vec<String>) -> Self {
+        self.crons = crons;
+        self
     }
 
     /// Grant this Worker a Worker Loader binding at `env` name `binding`.
@@ -1279,6 +1432,49 @@ impl WorkerIsolate {
         (self.isolate.lock(), self.cells.install())
     }
 
+    /// Lift condemnation from an isolate whose heap has drained.
+    ///
+    /// `near_heap_limit` latches a flag that nothing used to clear, so a cell
+    /// that reached its limit once stayed condemned until the process
+    /// restarted. The flag is re-read here, between turns rather than inside
+    /// one, because a handler must not see the isolate recover halfway
+    /// through.
+    ///
+    /// A heap still over the line buys one `low_memory_notification` and a
+    /// second reading. V8 stops collecting once it is past the limit, so a
+    /// drained isolate holds the dead heap until something allocates again —
+    /// without the forced collection the reading that decides recovery is a
+    /// reading of garbage. `HEAP_GC_NUDGE_INTERVAL` bounds the cost.
+    ///
+    /// Removing the callback with the original limit puts back the limit
+    /// `near_heap_limit` raised; re-adding it re-arms the guard.
+    fn recover_heap(&self, locker: &mut v8::Locker<'_>) {
+        let Some(state) = locker.get_slot::<Arc<HeapLimitState>>().cloned() else {
+            return;
+        };
+        if !state.excessively_exceeded.load(Ordering::Relaxed) {
+            return;
+        }
+        if heap_share(locker, state.limit) >= HEAP_RECOVERY_SHARE {
+            if !state.due_for_gc_nudge() {
+                return;
+            }
+            locker.low_memory_notification();
+            if heap_share(locker, state.limit) >= HEAP_RECOVERY_SHARE {
+                return;
+            }
+        }
+        state.excessively_exceeded.store(false, Ordering::Relaxed);
+        let data = Arc::as_ptr(&state) as *mut HeapLimitState as *mut std::ffi::c_void;
+        locker.remove_near_heap_limit_callback(near_heap_limit, state.limit);
+        locker.add_near_heap_limit_callback(near_heap_limit, data);
+        tracing::info!(
+            event = "isolate_heap_recovered",
+            limit_bytes = state.limit,
+            "isolate heap fell back under its limit, so it serves again"
+        );
+    }
+
     /// Localise the realm for one turn.
     ///
     /// **Taking the scope is the point.** Reaching a realm means touching
@@ -1321,9 +1517,64 @@ impl std::ops::DerefMut for Worker {
 const DEFAULT_V8_HEAP_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 const V8_HEAP_EMERGENCY_BYTES: usize = 16 * 1024 * 1024;
 
-#[derive(Default)]
+/// Share of the heap limit past which an isolate takes on no more retained
+/// state. It sits below the near-limit callback on purpose: this refuses one
+/// hibernatable socket while the isolate still works, where the callback
+/// fires once it no longer does.
+const HEAP_ADMISSION_SHARE: f64 = 0.9;
+
+/// Share of the heap limit under which a condemned isolate is condemned no
+/// more. Under `HEAP_ADMISSION_SHARE` by enough that recovery does not
+/// immediately re-admit into a heap that is about to fail again.
+const HEAP_RECOVERY_SHARE: f64 = 0.75;
+
+/// The shortest gap between two collections forced by `recover_heap`. A full
+/// collection of a 128 MB heap costs tens of milliseconds and a loaded cell
+/// begins many turns each second, so an unbounded nudge would spend more of a
+/// condemned isolate on collecting than on serving.
+const HEAP_GC_NUDGE_INTERVAL: Duration = Duration::from_secs(1);
+
 struct HeapLimitState {
     excessively_exceeded: AtomicBool,
+    /// The limit V8 gave this isolate, before any emergency extension.
+    /// Recovery measures against this one because `near_heap_limit` raises
+    /// the current one.
+    limit: usize,
+    last_gc_nudge: Mutex<Option<Instant>>,
+    /// Test-only: a real heap over the admission share is unreachable from a
+    /// test, and the condemnation flag cannot stand in for it because
+    /// recovery clears that one at the next turn.
+    #[cfg(all(test, celld_internal_tests))]
+    forced_admission_refusal: AtomicBool,
+}
+
+impl HeapLimitState {
+    /// Whether a condemned isolate can pay for another forced collection.
+    ///
+    /// Rate-limited rather than once for each condemnation: the load can
+    /// still be live at the first reading and gone by the second, so a
+    /// one-shot nudge would leave the cell condemned exactly as before.
+    fn due_for_gc_nudge(&self) -> bool {
+        let Ok(mut last) = self.last_gc_nudge.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        if last.is_some_and(|at| now.duration_since(at) < HEAP_GC_NUDGE_INTERVAL) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+}
+
+#[cfg(all(test, celld_internal_tests))]
+fn admission_refusal_forced(state: &HeapLimitState) -> bool {
+    state.forced_admission_refusal.load(Ordering::Relaxed)
+}
+
+#[cfg(not(all(test, celld_internal_tests)))]
+fn admission_refusal_forced(_state: &HeapLimitState) -> bool {
+    false
 }
 
 type SerializedPut = (String, Vec<u8>);
@@ -1433,7 +1684,25 @@ extern "C" fn near_heap_limit(
     state.excessively_exceeded.store(true, Ordering::Relaxed);
     // V8 fatally aborts the process if a near-limit callback does not extend
     // the limit. This reserve lets JS observe condemnation and unwind.
-    current_heap_limit.saturating_add(V8_HEAP_EMERGENCY_BYTES)
+    //
+    // The extension must also cover one allocation as large as the limit
+    // itself: flattening a 128 MiB cons string asks V8 for a single 128 MiB
+    // block, and V8 re-invokes this callback across last-resort GC rounds
+    // only unreliably (under parallel load it often stops after one round
+    // and aborts the process). Doubling the original limit makes the first
+    // invocation sufficient on its own; `recover_heap` and `Drop` still
+    // restore the original limit, so nothing else changes.
+    current_heap_limit
+        .saturating_add(V8_HEAP_EMERGENCY_BYTES)
+        .max(state.limit.saturating_mul(2))
+}
+
+/// Live heap use, as a share of `limit`.
+fn heap_share(isolate: &mut v8::Isolate, limit: usize) -> f64 {
+    if limit == 0 {
+        return 0.0;
+    }
+    isolate.get_heap_statistics().used_heap_size() as f64 / limit as f64
 }
 
 fn v8_heap_limit_bytes() -> usize {
@@ -1867,6 +2136,7 @@ impl Worker {
             return (None, Vec::new());
         };
         let (mut locker, _cells) = inner.lock();
+        inner.recover_heap(&mut locker);
         v8::scope!(let hs, &mut *locker);
         let realm = inner.realm(hs);
         let context = realm.context;
@@ -2631,13 +2901,13 @@ fn start_fetch<'s>(
     fetch: v8::Local<'s, v8::Function>,
     url: &str,
     method: &str,
-    body: &[u8],
+    body: &RequestBody,
     headers: &[(String, String)],
     request_id: Option<RequestId>,
 ) -> Result<Started<'s>> {
     let req = match request_id {
         Some(_) => make_incoming_request(tc, url, method, body, headers),
-        None => make_request(tc, url, method, body, headers),
+        None => make_request(tc, url, method, body.bytes(), headers),
     }?;
     let env = harness_env(tc)?;
     let recv = v8::undefined(tc).into();
@@ -2714,7 +2984,13 @@ impl Worker {
         // Dynamic `import()` of builtin specifiers; per-import()-call only.
         isolate.set_host_import_module_dynamically_callback(host_import_module_dynamically);
         let original_heap_limit = isolate.get_heap_statistics().heap_size_limit();
-        let heap_limit_state = Arc::new(HeapLimitState::default());
+        let heap_limit_state = Arc::new(HeapLimitState {
+            excessively_exceeded: AtomicBool::new(false),
+            limit: original_heap_limit,
+            last_gc_nudge: Mutex::new(None),
+            #[cfg(all(test, celld_internal_tests))]
+            forced_admission_refusal: AtomicBool::new(false),
+        });
         let runtime_state = Arc::new(ActorRuntimeState {
             promises: std::sync::Mutex::new(PromiseMap::new()),
             egress: config.egress,
@@ -2790,6 +3066,13 @@ impl Worker {
 
             // register each exported DO class into the harness registry
             for cn in do_classes {
+                // The D1 class is the runtime's own and is never a worker
+                // export. It is in `do_classes` so that it gets a namespace
+                // key; reading it off the module namespace would find
+                // `undefined` and overwrite the harness's registration.
+                if cn == crate::deploy::D1_CLASS {
+                    continue;
+                }
                 let key = v8::String::new(scope, cn).unwrap();
                 let cls = ns
                     .get(scope, key.into())
@@ -2797,6 +3080,7 @@ impl Worker {
                 register_class(scope, cn, cls)?;
             }
             inject_namespace_keys(scope, script_name, do_classes)?;
+            inject_crons(scope, &config.crons)?;
             populate_cf_exports(scope, ns, do_classes)?;
             register_entrypoints(scope, ns)?;
             // build env from bindings and stash it in the harness
@@ -2986,6 +3270,7 @@ impl Worker {
             return (None, Vec::new());
         };
         let (mut locker, _cells) = inner.lock();
+        inner.recover_heap(&mut locker);
         v8::scope!(let hs, &mut *locker);
         let realm = inner.realm(hs);
         let context = realm.context;
@@ -3071,6 +3356,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
     ops! { scope, global,
         "__heap_limit_excessively_exceeded" =>
             op_heap_limit_excessively_exceeded,
+        "__heap_over_admission_share" => op_heap_over_admission_share,
         "__ws_send" => websocket::op_ws_send,
         "__ws_send_binary" => websocket::op_ws_send_binary,
         "__ws_close" => websocket::op_ws_close,
@@ -3083,6 +3369,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__ws_auto_response_get" => websocket::op_ws_auto_response_get,
         "__ws_auto_response_ts" => websocket::op_ws_auto_response_ts,
         "__ws_connect" => websocket::op_ws_connect,
+        "__ws_bind_target" => websocket::op_ws_bind_target,
         "__ws_next" => websocket::op_ws_next,
         "__ws_upgrade" => websocket::op_ws_upgrade,
         "__storage_get" => storage_ops::op_storage_get,
@@ -3093,6 +3380,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__sql_cursor_next" => storage_ops::op_sql_cursor_next,
         "__sql_cursor_close" => storage_ops::op_sql_cursor_close,
         "__sql_database_size" => storage_ops::op_sql_database_size,
+        "__d1_run" => storage_ops::op_d1_run,
         "__storage_transaction_control" => storage_ops::op_storage_transaction_control,
         "__log" => op_log,
         "__storage_put" => storage_ops::op_storage_put,
@@ -3104,6 +3392,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__storage_flush_pending_puts" => storage_ops::op_storage_flush_pending_puts,
         "__storage_cancel_pending_puts" => storage_ops::op_storage_cancel_pending_puts,
         "__actor_abort" => op_actor_abort,
+        "__cron_plan" => op_cron_plan,
         "__process_exit" => op_process_exit,
         "__storage_delete" => storage_ops::op_storage_delete,
         "__storage_delete_many" => storage_ops::op_storage_delete_many,
@@ -3119,6 +3408,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "$$textDecoderLabel" => op_text_decoder_label,
         "$$textDecoderNew" => op_text_decoder_new,
         "$$textDecoderDecode" => op_text_decoder_decode,
+        "$$textDecoderDecodeOnce" => op_text_decoder_decode_once,
         "$$textDecoderFree" => op_text_decoder_free,
         "__alarm_set" => op_alarm_set,
         "__alarm_get" => op_alarm_get,
@@ -3188,6 +3478,9 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__loader_count" => op_loader_count,
         "__test_set_heap_limit_excessively_exceeded" =>
             op_test_set_heap_limit_excessively_exceeded,
+        "__test_force_heap_admission_refusal" =>
+            op_test_force_heap_admission_refusal,
+        "__test_heap_share" => op_test_heap_share,
         "__sql_set_max_page_count_for_test" =>
             storage_ops::op_sql_set_max_page_count_for_test,
         "__sql_set_write_fault_for_test" => storage_ops::op_sql_set_write_fault_for_test,
@@ -3222,7 +3515,7 @@ fn op_svc_rpc(
     let method = args.get(2).to_rust_string_lossy(scope);
     let call_args = view_bytes(args.get(3)).unwrap_or_default();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let gate = egress_gate_pending();
+    let gate = egress_gate_request();
     let request = SvcRpcReq {
         script,
         entrypoint,
@@ -3290,7 +3583,7 @@ fn op_svc_call_impl(
     } else {
         (None, None, None)
     };
-    let gate = egress_gate_pending();
+    let gate = egress_gate_request();
     let request = SvcCallReq {
         cancel,
         script,
@@ -3304,7 +3597,7 @@ fn op_svc_call_impl(
         let mut cancel_guard = cancel_guard;
         gated_channel_send(gate, &SVC_CALL_TX, request, "no service binding channel").await?;
         let result = match rx.await {
-            Ok(Ok(response)) => Ok(encode_http_response(response, false)),
+            Ok(Ok(response)) => Ok(encode_http_response(response, true)),
             Ok(Err(error)) => Err(format!("{error}")),
             Err(error) => Err(format!("service dropped: {error}")),
         };
@@ -3525,6 +3818,9 @@ fn op_loader_load(
             do_classes: Vec::new(),
             bindings: Vec::new(),
             r2_bindings: Vec::new(),
+            // A loaded worker reaches D1 only if its parent injects a stub;
+            // ambient bindings are exactly what Code Mode withholds.
+            d1_bindings: Vec::new(),
             ai_binding: None,
             vars: Vec::new(),
             node: String::new(),
@@ -3576,7 +3872,7 @@ fn op_loader_fetch(
             queued_at: Instant::now(),
             url,
             method,
-            body,
+            body: body.into(),
             headers,
             request_id: None,
             reply,
@@ -3649,17 +3945,6 @@ fn op_loader_drop(
     }
 }
 
-/// `__loader_count()` -> live loaded-worker count, for eviction tests.
-#[cfg(all(test, celld_internal_tests))]
-fn op_loader_count(
-    scope: &mut v8::PinScope,
-    _args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let n = loader_registry().lock().unwrap().len();
-    rv.set(v8::Number::new(scope, n as f64).into());
-}
-
 /// `__writePosition(scope)` -> the cell's committed-write position (a number),
 /// or `null` when the scope has no open connection. The co-hosted DO fast path
 /// samples this around an inline `fetch` to tell a write from a read.
@@ -3675,22 +3960,20 @@ fn op_write_position(
     }
 }
 
-/// `__gateWrite(scope, position)` -> a promise that resolves once the cell is
-/// durable and rejects if durability cannot be proved. The co-hosted DO fast
-/// path awaits this before returning an inline write's response, so the caller
-/// never observes a write the node cannot prove durable — the routed output
-/// gate, applied where the inline write actually happens.
+/// `__gateWrite(scope, positionOrNull)` -> a promise that resolves once every
+/// write the response can reveal is durable. A null position identifies a
+/// read-only response, which trails any barrier already open for the cell.
 fn op_gate_write(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
-    let position = args
-        .get(1)
-        .to_integer(scope)
-        .map(|n| n.value() as u64)
-        .unwrap_or(0);
+    let value = args.get(1);
+    let position = (!value.is_null_or_undefined())
+        .then(|| value.to_integer(scope).map(|n| n.value() as u64))
+        .flatten();
+    let read_only = position.is_none();
     let (tx, receive) = tokio::sync::oneshot::channel();
     let sent = GATE_TX
         .get()
@@ -3705,6 +3988,9 @@ fn op_gate_write(
         .unwrap_or(false);
     let id = asyncrt::enqueue(async move {
         if !sent {
+            if read_only {
+                return Ok(String::new());
+            }
             return Err("no output-gate channel".into());
         }
         match receive.await {
@@ -3760,7 +4046,7 @@ fn op_do_call_impl(
         .unwrap()
         .insert(request_id, cancel_sender);
     let mut cancel_guard = DoCallCancelGuard::new(request_id);
-    let gate = egress_gate_pending();
+    let gate = egress_gate_request();
     let request = DoCallReq {
         request_id: Some(request_id),
         cancel: Some(cancel),
@@ -3823,7 +4109,7 @@ fn op_rpc_call(
     let method = args.get(2).to_rust_string_lossy(scope);
     let args = RpcData::V8(view_bytes(args.get(3)).unwrap_or_default());
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let gate = egress_gate_pending();
+    let gate = egress_gate_request();
     let request = RpcCallReq {
         scope: cell,
         name,
@@ -3893,10 +4179,11 @@ fn op_fetch(
         }
     }
     let span_url = trace.as_ref().map(|_| url.clone());
-    // Whatever this handler has written must be durable before the request
-    // leaves: a third party that has acted on a write celld then loses cannot
-    // be told to un-act.
-    let gate = egress_gate_pending();
+    // Whatever this request can reveal must be durable before it leaves: a
+    // third party that has acted on a write celld then loses cannot be told to
+    // un-act. That covers a write this handler made and a value it only read,
+    // because the third party cannot tell the two apart.
+    let gate = egress_gate_request();
     let id = asyncrt::enqueue(async move {
         let span_started = trace.as_ref().map(|_| crate::telemetry::now_unix_us());
         let mut span = trace.as_ref().zip(child).map(|(parent, child)| {
@@ -4082,24 +4369,24 @@ fn op_http_stream_read(
         });
     let id = asyncrt::enqueue(async move {
         let Some((mut source, mut cancelled)) = source else {
-            return Ok(serde_json::json!({ "done": true }).to_string());
+            return Ok(asyncrt::OpOut::Str(HTTP_STREAM_DONE.into()));
         };
         let next = tokio::select! {
             result = next_http_stream_chunk(&mut source) => Some(result),
             _ = cancelled.changed() => None,
         };
         match next {
-            None => Ok(serde_json::json!({ "done": true }).to_string()),
+            None => Ok(asyncrt::OpOut::Str(HTTP_STREAM_DONE.into())),
             Some(Ok(Some(bytes))) => {
                 if let Some(stream) = http_streams().lock().unwrap().get_mut(&stream_id) {
                     stream.created = Instant::now();
                     stream.source = Some(source);
                 }
-                Ok(serde_json::json!({ "done": false, "bytes": bytes }).to_string())
+                Ok(asyncrt::OpOut::Bytes(bytes))
             }
             Some(Ok(None)) => {
                 http_streams().lock().unwrap().remove(&stream_id);
-                Ok(serde_json::json!({ "done": true }).to_string())
+                Ok(asyncrt::OpOut::Str(HTTP_STREAM_DONE.into()))
             }
             Some(Err(error)) => {
                 http_streams().lock().unwrap().remove(&stream_id);
@@ -4257,6 +4544,43 @@ fn op_response_stream_close(
 
 pub fn reqwest_response_stream(response: reqwest::Response) -> HttpChunkStream {
     http_chunk_stream(HttpStreamSource::Response(response))
+}
+
+/// Hand a request body to the isolate as a stream rather than as bytes.
+/// The returned id names the stream for `__http_stream_read`, so the
+/// Worker pulls each chunk off the socket as it asks for it and the host
+/// never holds the whole body.
+pub fn register_body_stream(stream: HttpChunkStream) -> u64 {
+    let stream_id = NEXT_HTTP_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+    register_http_stream(stream_id, HttpStreamSource::Stream(stream));
+    stream_id
+}
+
+/// How an incoming request body reaches the isolate.
+///
+/// A small body crosses as bytes. This costs one copy and no asynchronous
+/// operations, so a common request pays nothing for a stream that it does
+/// not need. A large body, or a body of unknown length, crosses as a
+/// stream id. The peak cost of that body is one chunk, not its length.
+pub enum RequestBody {
+    Bytes(Vec<u8>),
+    Stream(u64),
+}
+
+impl RequestBody {
+    /// The bytes already in hand, for the paths that hold a whole body.
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Stream(_) => &[],
+        }
+    }
+}
+
+impl From<Vec<u8>> for RequestBody {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Bytes(bytes)
+    }
 }
 
 /// Timer op behind `setTimeout`: a promise resolving after `ms`.
@@ -4495,6 +4819,28 @@ fn durable_object_id_for_name(namespace_key: &str, name: &str) -> [u8; 32] {
         ids.insert((namespace_key.to_string(), name.to_string()), id);
     });
     id
+}
+
+/// The key a Durable Object namespace derives its IDs from. D1 uses one
+/// fleet-wide namespace because the database is a resource that several
+/// Workers can bind, and a Worker rename must not rename that database.
+const D1_NAMESPACE_KEY: &str = "cells:v1:d1:__D1Database";
+
+pub(crate) fn namespace_key(script_name: &str, class_name: &str) -> String {
+    if class_name == crate::deploy::D1_CLASS {
+        D1_NAMESPACE_KEY.to_string()
+    } else {
+        format!("cells:v1:{}:{script_name}:{class_name}", script_name.len())
+    }
+}
+
+/// The cell scope a D1 database lives at, for a caller outside any isolate.
+/// `celld d1` addresses a database over the operator route, which takes a
+/// scope, so this derives what `getByName` derives in the harness, from the
+/// same key and the same HMAC.
+pub fn d1_cell_scope(database_identity: &str) -> String {
+    let id = durable_object_id_for_name(D1_NAMESPACE_KEY, database_identity);
+    format!("{}:{}", crate::deploy::D1_CLASS, durable_object_id_hex(&id))
 }
 
 fn durable_object_id_hex(bytes: &[u8; 32]) -> String {
@@ -4771,6 +5117,26 @@ fn op_heap_limit_excessively_exceeded(
         .is_some_and(|state| state.excessively_exceeded.load(Ordering::Relaxed));
     rv.set(v8::Boolean::new(scope, exceeded).into());
 }
+/// Whether this isolate is too close to its heap limit to retain more state.
+fn op_heap_over_admission_share(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let state = scope.get_slot::<Arc<HeapLimitState>>().cloned();
+    let over = match state {
+        // A condemned isolate admits nothing, whatever the heap now reads.
+        Some(state)
+            if state.excessively_exceeded.load(Ordering::Relaxed)
+                || admission_refusal_forced(&state) =>
+        {
+            true
+        }
+        Some(state) => heap_share(scope, state.limit) >= HEAP_ADMISSION_SHARE,
+        None => false,
+    };
+    rv.set(v8::Boolean::new(scope, over).into());
+}
 #[cfg(all(test, celld_internal_tests))]
 fn op_test_set_heap_limit_excessively_exceeded(
     scope: &mut v8::PinScope,
@@ -4780,6 +5146,18 @@ fn op_test_set_heap_limit_excessively_exceeded(
     if let Some(state) = scope.get_slot::<Arc<HeapLimitState>>() {
         state
             .excessively_exceeded
+            .store(args.get(0).boolean_value(scope), Ordering::Relaxed);
+    }
+}
+#[cfg(all(test, celld_internal_tests))]
+fn op_test_force_heap_admission_refusal(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    if let Some(state) = scope.get_slot::<Arc<HeapLimitState>>() {
+        state
+            .forced_admission_refusal
             .store(args.get(0).boolean_value(scope), Ordering::Relaxed);
     }
 }
@@ -5368,6 +5746,91 @@ fn op_alarm_delete(
     }
 }
 
+/// The reserved cron cell's whole schedule decision, in one call so the policy
+/// has one home in `celld_logic::cron` rather than a JavaScript copy that can
+/// drift from it.
+///
+/// `firedMs` is the occurrence being handled, or negative when the cell is
+/// only arming. Returns `{ matching, armAt, armIsRetry }`: which expressions
+/// the occurrence belongs to, by index into the list passed in, when to arm
+/// next — `null` when the schedule is exhausted and the cell should retire —
+/// and whether that deadline is the failure backoff rather than the next
+/// occurrence.
+fn op_cron_plan(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Ok(list) = v8::Local::<v8::Array>::try_from(args.get(0)) else {
+        return;
+    };
+    let mut crons = Vec::with_capacity(list.length() as usize);
+    // Where each parsed expression sits in the list the caller passed. A
+    // malformed expression is already refused by `celld deploy`, but the
+    // control plane checks only the field count, so one can still arrive here.
+    // Skipping it keeps one bad entry from silencing a script's other crons,
+    // and this map is what keeps the skip from renumbering them: the caller
+    // reports `controller.cron` by index, so a shifted index names the wrong
+    // expression for every entry after the bad one.
+    let mut positions = Vec::with_capacity(list.length() as usize);
+    for index in 0..list.length() {
+        let Some(value) = list.get_index(scope, index) else {
+            continue;
+        };
+        if let Ok(cron) = celld_logic::cron::parse(&value.to_rust_string_lossy(scope)) {
+            crons.push(cron);
+            positions.push(index as usize);
+        }
+    }
+    let fired_ms = args.get(1).number_value(scope).unwrap_or(-1.0) as i64;
+    let now_ms = args.get(2).number_value(scope).unwrap_or(0.0) as i64;
+    let retry = args.get(3).number_value(scope).unwrap_or(0.0) as i64;
+    let failed = args.get(4).boolean_value(scope);
+
+    let matching = if fired_ms >= 0 {
+        celld_logic::cron::matching(&crons, fired_ms)
+    } else {
+        Vec::new()
+    };
+    let next = celld_logic::cron::next_across(&crons, now_ms);
+    // The retry backoff is `alarm::alarm_retry`'s, not a second schedule:
+    // a cron that fails behaves like any other failing alarm, except that
+    // `cron_rearm` never lets the backoff outlast the next occurrence.
+    let retry_at = failed
+        .then(|| celld_logic::alarm::alarm_retry(now_ms, retry, retry, true))
+        .flatten();
+    let arm_at = celld_logic::cron::cron_rearm(next, retry_at);
+    // Which of the two the deadline belongs to. `cron_rearm` takes the earlier
+    // and gives a tie to the occurrence, so `armAt` alone cannot say — and the
+    // caller has to know, because a retry owes the expressions of the
+    // occurrence that failed, while a deadline that is an occurrence owes the
+    // expressions that match it.
+    let arm_is_retry = match (arm_at, next) {
+        (Some(at), Some(occurrence)) => at < occurrence,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+
+    let indices = v8::Array::new(scope, matching.len() as i32);
+    for (slot, index) in matching.iter().enumerate() {
+        let value = v8::Number::new(scope, positions[*index] as f64);
+        indices.set_index(scope, slot as u32, value.into());
+    }
+    let result = v8::Object::new(scope);
+    let key = v8::String::new(scope, "matching").unwrap();
+    result.set(scope, key.into(), indices.into());
+    let key = v8::String::new(scope, "armAt").unwrap();
+    let value: v8::Local<v8::Value> = match arm_at {
+        Some(at) => v8::Number::new(scope, at as f64).into(),
+        None => v8::null(scope).into(),
+    };
+    result.set(scope, key.into(), value);
+    let key = v8::String::new(scope, "armIsRetry").unwrap();
+    let value = v8::Boolean::new(scope, arm_is_retry);
+    result.set(scope, key.into(), value.into());
+    rv.set(result.into());
+}
+
 fn op_btoa(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -5380,28 +5843,59 @@ fn op_btoa(
     rv.set(v8::String::new(scope, &s).unwrap().into());
 }
 
-// ---- WHATWG legacy text decoders (encoding_rs) ----
+// ---- WHATWG text decoders (encoding_rs) ----
 //
-// TextDecoder's utf-8/utf-16 hot path stays pure JS in
-// src/js/text_encoding.js; these ops back every other WHATWG label
-// (windows-1252, Big5, GBK/GB18030, ISO-2022-JP, x-user-defined, …).
-// Streaming decoders live in a thread-local table keyed by id; JS frees
+// These ops back every TextDecoder decode. src/js/text_encoding.js
+// resolves the label and owns the decoder's lifetime, and encoding_rs
+// does the decoding — for utf-8 and utf-16 as much as for every other
+// WHATWG label (windows-1252, Big5, GBK/GB18030, ISO-2022-JP,
+// x-user-defined, …). Previous utf-8 and utf-16 JS decoders were slower
+// than these ops at every measured size.
+// Streaming decoders live in a per-isolate table keyed by id; JS frees
 // one on the final decode (last=true), on a fatal error (encoding_rs
 // poisons an errored decoder), or via FinalizationRegistry when a
 // mid-stream decoder is abandoned. Ids are never reused, so a late
 // finalizer free of an already-closed id is a no-op.
 
-/// Live streaming decoders, keyed by an id JS holds across awaits.
+/// Live streaming decoders for one isolate, keyed by an id JS holds across
+/// awaits.
 ///
-/// Process-wide for the same reason as [`zlib_streams`]: a `TextDecoder` in
-/// streaming mode outlives the turn that made it, and under D1 the next turn
-/// can run on a different tokio worker. A per-thread counter would also hand
-/// the same id to two requests.
-static TEXT_DECODERS: OnceLock<Mutex<HashMap<u64, encoding_rs::Decoder>>> = OnceLock::new();
+/// An isolate slot rather than a process-wide `Mutex<HashMap<..>>` like
+/// [`zlib_streams`]. The reason that one is process-wide holds here too — a
+/// `TextDecoder` in streaming mode outlives the turn that made it, and the
+/// next turn can run on a different tokio worker — but it argues against a
+/// *thread-local*, not against this. A `TextDecoder` is a JS object, so it
+/// never leaves the isolate that made it, and every op that touches its
+/// decoder runs under that isolate's `v8::Locker`. The lock the embedder
+/// already holds is what makes the access exclusive, which `&mut Isolate`
+/// on the slot then proves. A second lock inside it buys nothing.
+///
+/// This removes a ceiling rather than a measured regression, and the
+/// difference matters. In isolation the pattern does collapse: replayed on
+/// its own — remove, decode outside the lock, insert — 256-byte chunks
+/// peaked at two threads and then went *backwards*, 8 threads serving
+/// 0.46x what 1 thread served against 6.7x for the same decoding with no
+/// table. But celld end to end shows no difference between the two, at any
+/// concurrency this hardware can drive, because a chunk costs about 42us
+/// of stream and turn machinery around a lock held for about 100ns. So the
+/// mutex was not what any cell was waiting on. It was a process-wide
+/// serialisation point on a path that every stream now takes, and it went
+/// because it does not need to exist, not because it was costing anything
+/// yet.
+///
+/// Dropping the isolate drops the table, so a decoder abandoned by a cell
+/// that goes away needs no finalizer to run.
+#[derive(Default)]
+struct TextDecoders(HashMap<u64, encoding_rs::Decoder>);
+
 static TEXT_DECODER_NEXT: AtomicU64 = AtomicU64::new(1);
 
-fn text_decoders() -> &'static Mutex<HashMap<u64, encoding_rs::Decoder>> {
-    TEXT_DECODERS.get_or_init(|| Mutex::new(HashMap::new()))
+/// The calling isolate's decoder table, created on first use.
+fn text_decoders<'a>(scope: &'a mut v8::PinScope) -> &'a mut HashMap<u64, encoding_rs::Decoder> {
+    if scope.get_slot::<TextDecoders>().is_none() {
+        scope.set_slot(TextDecoders::default());
+    }
+    &mut scope.get_slot_mut::<TextDecoders>().expect("just set").0
 }
 
 /// `$$textDecoderLabel(label)` -> canonical lowercase name, or undefined
@@ -5433,7 +5927,7 @@ fn op_text_decoder_new(
         enc.new_decoder_with_bom_removal()
     };
     let id = TEXT_DECODER_NEXT.fetch_add(1, Ordering::Relaxed);
-    text_decoders().lock().unwrap().insert(id, dec);
+    text_decoders(scope).insert(id, dec);
     rv.set(v8::Number::new(scope, id as f64).into());
 }
 
@@ -5457,37 +5951,83 @@ fn op_text_decoder_decode(
         rv.set(v8::String::empty(scope).into());
         return;
     }
-    let mut dec = text_decoders()
-        .lock()
-        .unwrap()
+    let mut dec = text_decoders(scope)
         .remove(&id)
         .expect("JS holds the only live id");
+    let Ok(out) = run_decoder(&mut dec, &bytes, fatal, last) else {
+        throw_invalid_encoded_data(scope);
+        return;
+    };
+    if !last {
+        text_decoders(scope).insert(id, dec);
+    }
+    rv.set(v8::String::new(scope, &out).unwrap().into());
+}
+
+/// `$$textDecoderDecodeOnce(name, view, fatal, ignoreBOM)` -> string, for
+/// a complete buffer.
+///
+/// The whole decode is one call, so the decoder never outlives it and
+/// never reaches [`text_decoders`]. That saves an insert and a remove,
+/// and it keeps every non-streaming decode on the node off a table that
+/// is one mutex for the whole process — which is most decodes, because
+/// `request.text()` and `response.text()` are not streams. A stream
+/// still takes that lock twice per chunk, which is a cost per chunk
+/// rather than per byte, and it has not been measured under load;
+/// sharding the table is the answer if it ever shows.
+fn op_text_decoder_decode_once(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let name = args.get(0).to_rust_string_lossy(scope);
+    let bytes = view_bytes(args.get(1)).unwrap_or_default();
+    let fatal = args.get(2).boolean_value(scope);
+    let ignore_bom = args.get(3).boolean_value(scope);
+    let enc = encoding_rs::Encoding::for_label(name.as_bytes()).expect("JS resolved the label");
+    let mut dec = if ignore_bom {
+        enc.new_decoder_without_bom_handling()
+    } else {
+        enc.new_decoder_with_bom_removal()
+    };
+    match run_decoder(&mut dec, &bytes, fatal, true) {
+        Ok(out) => rv.set(v8::String::new(scope, &out).unwrap().into()),
+        Err(()) => throw_invalid_encoded_data(scope),
+    }
+}
+
+/// Feeds `bytes` to `dec` and answers the text. `Err` means `fatal` was
+/// set and the input was malformed.
+fn run_decoder(
+    dec: &mut encoding_rs::Decoder,
+    bytes: &[u8],
+    fatal: bool,
+    last: bool,
+) -> Result<String, ()> {
     let mut out = String::new();
-    let ok = if fatal {
+    if fatal {
         let cap = dec
             .max_utf8_buffer_length_without_replacement(bytes.len())
             .unwrap();
         out.reserve(cap);
-        matches!(
-            dec.decode_to_string_without_replacement(&bytes, &mut out, last),
+        if !matches!(
+            dec.decode_to_string_without_replacement(bytes, &mut out, last),
             (encoding_rs::DecoderResult::InputEmpty, _),
-        )
+        ) {
+            return Err(());
+        }
     } else {
         let cap = dec.max_utf8_buffer_length(bytes.len()).unwrap();
         out.reserve(cap);
-        let _ = dec.decode_to_string(&bytes, &mut out, last);
-        true
-    };
-    if !ok {
-        let msg = v8::String::new(scope, "The encoded data was not valid.").unwrap();
-        let exc = v8::Exception::type_error(scope, msg);
-        scope.throw_exception(exc);
-        return;
+        let _ = dec.decode_to_string(bytes, &mut out, last);
     }
-    if !last {
-        text_decoders().lock().unwrap().insert(id, dec);
-    }
-    rv.set(v8::String::new(scope, &out).unwrap().into());
+    Ok(out)
+}
+
+fn throw_invalid_encoded_data(scope: &mut v8::PinScope) {
+    let msg = v8::String::new(scope, "The encoded data was not valid.").unwrap();
+    let exc = v8::Exception::type_error(scope, msg);
+    scope.throw_exception(exc);
 }
 
 /// `$$textDecoderFree(id)` — FinalizationRegistry cleanup for a decoder
@@ -5498,7 +6038,7 @@ fn op_text_decoder_free(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
-    text_decoders().lock().unwrap().remove(&id);
+    text_decoders(scope).remove(&id);
 }
 
 // ---- the JS harness: Web API + the DO object model ----
@@ -5507,7 +6047,7 @@ mod bootstrap;
 mod modules;
 use bootstrap::{
     adopt_cell, begin_event_context, build_env, end_event_context, harness_env,
-    inject_compatibility_flags, inject_namespace_keys, inject_routing,
+    inject_compatibility_flags, inject_crons, inject_namespace_keys, inject_routing,
     inject_storage_compatibility, install_harness, install_prelude, populate_cf_exports,
     register_class, register_entrypoints,
 };
@@ -5523,7 +6063,7 @@ fn make_incoming_request<'s>(
     tc: &mut v8::PinScope<'s, '_>,
     url: &str,
     method: &str,
-    body: &[u8],
+    body: &RequestBody,
     headers: &[(String, String)],
 ) -> Result<v8::Local<'s, v8::Value>> {
     let global = tc.get_current_context().global(tc);
@@ -5535,15 +6075,27 @@ fn make_incoming_request<'s>(
         .map_err(|_| anyhow!("not fn"))?;
     let url = v8::String::new(tc, url).unwrap();
     let method = v8::String::new(tc, method).unwrap();
-    let body = bytes_value(tc, body.to_vec());
     let headers = v8::String::new(
         tc,
         &serde_json::to_string(headers).unwrap_or_else(|_| "[]".into()),
     )
     .unwrap();
+    // A streamed body passes its id, and the harness builds the body
+    // stream around that id. A held body passes the bytes.
+    let (body, stream_id) = match body {
+        RequestBody::Bytes(bytes) => (bytes_value(tc, bytes.clone()), v8::undefined(tc).into()),
+        RequestBody::Stream(id) => (
+            v8::undefined(tc).into(),
+            v8::Number::new(tc, *id as f64).into(),
+        ),
+    };
     let recv = v8::undefined(tc).into();
-    f.call(tc, recv, &[url.into(), method.into(), body, headers.into()])
-        .ok_or_else(|| anyhow!("__makeIncomingRequest threw"))
+    f.call(
+        tc,
+        recv,
+        &[url.into(), method.into(), body, headers.into(), stream_id],
+    )
+    .ok_or_else(|| anyhow!("__makeIncomingRequest threw"))
 }
 
 fn register_incoming_request(
@@ -5690,9 +6242,12 @@ fn init_engine_for_tests() {
     });
 }
 
+#[cfg(all(test, celld_internal_tests))]
+include!(env!("CELLD_INTERNAL_JS_OBSERVERS"));
+
 /// Externally injected Web-platform tests.
 #[cfg(all(test, celld_internal_tests))]
-mod conformance_runtime_tests {
+pub(crate) mod conformance_runtime_tests {
     include!(env!("CELLD_CONFORMANCE_JS_RUNTIME_TESTS"));
 }
 

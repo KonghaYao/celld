@@ -60,52 +60,12 @@ fn modreg(scope: &mut v8::PinScope) -> Arc<ModuleRegistry> {
 /// builtin)? esbuild bundles every npm dep inline and leaves only builtins
 /// external, so a remaining bare specifier is a node builtin.
 fn is_external(spec: &str) -> bool {
-    const BARE: &[&str] = &[
-        "path",
-        "os",
-        "fs",
-        "fs/promises",
-        "crypto",
-        "stream",
-        "util",
-        "util/types",
-        "assert",
-        "module",
-        "process",
-        "tty",
-        "url",
-        "v8",
-        "constants",
-        "buffer",
-        "events",
-        "zlib",
-        "child_process",
-        "http",
-        "https",
-        "http2",
-        "net",
-        "tls",
-        "dns",
-        "readline",
-        "string_decoder",
-        "querystring",
-        "async_hooks",
-        "perf_hooks",
-        "worker_threads",
-        "vm",
-        "diagnostics_channel",
-        "timers",
-        "inspector",
-        "dgram",
-        "cluster",
-        "punycode",
-        "sqlite",
-    ];
     if spec.starts_with("node:") || spec.starts_with("cloudflare:") {
         return true;
     }
     // bare builtin, or a builtin submodule like `stream/promises`
-    BARE.contains(&spec) || BARE.contains(&spec.split('/').next().unwrap_or(""))
+    BARE_NODE_BUILTINS.contains(&spec)
+        || BARE_NODE_BUILTINS.contains(&spec.split('/').next().unwrap_or(""))
 }
 
 fn scan_external_imports(

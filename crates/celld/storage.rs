@@ -1,5 +1,8 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
+// This is V8-thread SQLite plumbing, not the Actor/LTX World boundary.
+#![allow(clippy::disallowed_methods)]
+
 //! Cell storage: SQLite backing for the Durable Object storage API.
 //!
 //! DO's `ctx.storage` is async in JS but synchronous underneath (local SQLite).
@@ -1306,9 +1309,8 @@ pub fn sql_cursor_start(
                         ));
                     }
                     for (offset, value) in binds.iter().map(json_to_sql).enumerate() {
-                        if let Err(error) =
-                            bind_cursor_value(database, statement, offset as i32 + 1, &value)
-                        {
+                        if bind_cursor_value(statement, offset as i32 + 1, &value).is_err() {
+                            let error = sqlite_failure(database, "bind sync KV cursor");
                             discard_in_use_sql_statement(scope, cache_query.as_deref(), statement);
                             return Err(error);
                         }
@@ -1458,6 +1460,1039 @@ pub fn sql_database_size(scope: &str) -> Result<u64, String> {
         })
     })
     .unwrap_or_else(|| Err(format!("no db for {scope}")))
+}
+
+// ---- D1 -------------------------------------------------------------------
+// The D1 binding's one execution primitive. The first version of the binding
+// was assembled out of the DO `SqlStorage` ops -- cursor start, cursor next, a
+// separate `sql_write_meta` read, a JS remainder parser -- and each seam
+// between them carried a contract nothing enforced: the meta read was only
+// correct if no other statement ran on the connection in between, blob binds
+// rode a sentinel object that anything else silently turned into NULL, and JS
+// re-derived "is this SQL complete" beside SQLite's own answer. `d1_run` is
+// the replacement: one typed request in, one typed result out, rows and the
+// metadata snapshot taken from the same execution on the same connection, and
+// SQLite alone deciding what is and is not a statement.
+
+/// Rows one D1 result set can carry across the binding. In-cell iteration
+/// streams; a `.all()` from a Worker materializes the whole result set and
+/// structured-clones it into the calling isolate. The bound exists so that
+/// "the query was too large" and "the isolate died" are different messages.
+pub const D1_MAX_ROWS: usize = 100_000;
+
+/// Bytes one D1 result set can carry across the binding. The result exists in
+/// two heaps at once -- materialized in the database cell's isolate, then
+/// cloned into the caller's -- and the default isolate heap is 128 MiB, so
+/// 32 MiB keeps both copies inside it with room for the application's own
+/// state. The row cap bounds ordinary rows; this bounds wide ones, which
+/// 100,000 rows of TEXT or BLOB would otherwise not.
+pub const D1_MAX_RESULT_BYTES: usize = 32 * 1024 * 1024;
+
+/// One D1 request. The modes are explicit because their contracts differ:
+/// a prepared statement is exactly one statement with binds, an exec is many
+/// statements with none, and a migration is an exec plus its bookkeeping row
+/// inside one transaction. The first adapter multiplexed all three through
+/// the general SQL ops, and the differences lived as conventions in JS.
+#[derive(serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum D1Request {
+    /// `prepare(sql)` with positional binds: one statement, no more.
+    Prepared {
+        sql: String,
+        #[serde(default)]
+        params: Vec<serde_json::Value>,
+        /// `first()` keeps one row on this side of the boundary, so a first()
+        /// over a large table neither clones the table nor trips a cap.
+        #[serde(default)]
+        first: bool,
+    },
+    /// `batch(statements)`: prepared statements in one transaction.
+    Batch { statements: Vec<D1PreparedRequest> },
+    /// `exec(sql)`: multi-statement, SQLite decides where statements end.
+    Exec {
+        sql: String,
+        /// The Worker binding's `exec()` reports counts only, as upstream
+        /// does; `celld d1 execute` asks for the rows too.
+        #[serde(default)]
+        rows: bool,
+    },
+    /// One migration file plus its bookkeeping row, in one transaction.
+    Migrate {
+        name: String,
+        sql: String,
+        /// The wrangler bookkeeping table, per binding
+        /// (`migrations_table`). Joined into SQL as an identifier, so it is
+        /// refused unless it is a plain identifier.
+        table: String,
+    },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct D1PreparedRequest {
+    sql: String,
+    #[serde(default)]
+    params: Vec<serde_json::Value>,
+}
+
+/// D1 `meta`, snapshotted inside the same execution that produced the rows.
+/// `last_row_id` and `changes` are connection-level in SQLite, so reading
+/// them in a second call was only correct while nothing else ran on the
+/// cell's connection in between -- an invariant no code enforced.
+#[derive(serde::Serialize)]
+pub struct D1Meta {
+    duration: f64,
+    rows_read: u64,
+    rows_written: u64,
+    last_row_id: i64,
+    changes: u64,
+    changed_db: bool,
+    size_after: u64,
+    served_by: &'static str,
+    served_by_region: &'static str,
+    /// One writer, no replicas: every read is served by the primary, and
+    /// saying so honestly beats omitting the field.
+    served_by_primary: bool,
+}
+
+/// One result set: positional rows plus the column names to shape them with.
+/// Rows stay positional on the wire so `.all()` and `.raw()` share one copy.
+#[derive(serde::Serialize)]
+pub struct D1Rows {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+}
+
+#[derive(serde::Serialize)]
+pub struct D1PreparedResult {
+    columns: Vec<String>,
+    rows: Vec<Vec<serde_json::Value>>,
+    meta: D1Meta,
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+pub enum D1Response {
+    Prepared(D1PreparedResult),
+    Batch(Vec<D1PreparedResult>),
+    Exec {
+        count: u64,
+        duration: f64,
+        results: Vec<D1Rows>,
+    },
+    Migrate {
+        count: u64,
+        duration: f64,
+    },
+}
+
+/// A typed refusal. `family` is the prefix applications match on
+/// (`D1_ERROR`, `D1_TYPE_ERROR`, `D1_EXEC_ERROR`), kept apart from the
+/// message so the JS client builds the error and its `.cause` without
+/// parsing its own wire format.
+pub struct D1Failure {
+    pub family: &'static str,
+    pub message: String,
+}
+
+fn d1_error(message: impl Into<String>) -> D1Failure {
+    D1Failure {
+        family: "D1_ERROR",
+        message: message.into(),
+    }
+}
+
+fn d1_exec_error(message: impl Into<String>) -> D1Failure {
+    D1Failure {
+        family: "D1_EXEC_ERROR",
+        message: message.into(),
+    }
+}
+
+/// The refusal for SQL whose tail SQLite could not parse into a statement.
+/// It is loud on purpose: the statements before the tail have already run,
+/// so silence here is how a truncated migration once recorded itself as
+/// applied.
+const D1_INCOMPLETE: &str =
+    "the SQL ends in an incomplete statement, which did not run: terminate \
+     the last statement with a semicolon, or close an open quote";
+
+/// Encode one bind value, refusing what it cannot represent. The JS client
+/// validates at the public boundary (`bind()` throws `D1_TYPE_ERROR` as
+/// upstream does); this is the second lock on the same door, because the CLI
+/// route reaches this function without that client. The previous adapter
+/// mapped anything unrecognized to SQL NULL, so a `Uint8Array` bind stored
+/// NULL and nothing said so.
+fn d1_bind_value(value: &serde_json::Value) -> Result<rusqlite::types::Value, D1Failure> {
+    use rusqlite::types::Value;
+    match value {
+        serde_json::Value::Null => Ok(Value::Null),
+        serde_json::Value::Bool(flag) => Ok(Value::Integer(*flag as i64)),
+        serde_json::Value::Number(number) if number.is_i64() => {
+            Ok(Value::Integer(number.as_i64().expect("checked i64")))
+        }
+        serde_json::Value::Number(number) => Ok(Value::Real(number.as_f64().unwrap_or(0.0))),
+        serde_json::Value::String(text) => Ok(Value::Text(text.clone())),
+        serde_json::Value::Array(items) => {
+            // Upstream's wire format for a BLOB bind: an array of bytes.
+            let mut bytes = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_u64().filter(|byte| *byte < 256) {
+                    Some(byte) => bytes.push(byte as u8),
+                    None => {
+                        return Err(D1Failure {
+                            family: "D1_TYPE_ERROR",
+                            message: format!(
+                                "Type 'object' not supported for value '{item}': an array bind \
+                                 must hold bytes 0-255"
+                            ),
+                        })
+                    }
+                }
+            }
+            Ok(Value::Blob(bytes))
+        }
+        other => Err(D1Failure {
+            family: "D1_TYPE_ERROR",
+            message: format!("Type 'object' not supported for value '{other}'"),
+        }),
+    }
+}
+
+fn d1_json_string_len(value: &str) -> usize {
+    value.chars().fold(2usize, |length, character| {
+        let escaped = match character {
+            '"' | '\\' | '\u{0008}' | '\t' | '\n' | '\u{000c}' | '\r' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            other => other.len_utf8(),
+        };
+        length.saturating_add(escaped)
+    })
+}
+
+/// One result cell as JSON, plus the approximate bytes it will occupy in the
+/// caller's heap, for the result-bytes cap. BLOBs cross as arrays of bytes --
+/// the shape upstream D1 returns them in -- which is what retired the
+/// `__celld_bytes` sentinel on this path.
+unsafe fn d1_row_value(
+    statement: *mut rusqlite::ffi::sqlite3_stmt,
+    index: i32,
+    available: usize,
+) -> Result<(serde_json::Value, usize), usize> {
+    let scalar_bytes = std::mem::size_of::<serde_json::Value>();
+    match rusqlite::ffi::sqlite3_column_type(statement, index) {
+        rusqlite::ffi::SQLITE_INTEGER => {
+            if scalar_bytes > available {
+                return Err(scalar_bytes);
+            }
+            Ok((
+                serde_json::json!(rusqlite::ffi::sqlite3_column_int64(statement, index)),
+                scalar_bytes,
+            ))
+        }
+        rusqlite::ffi::SQLITE_FLOAT => {
+            if scalar_bytes > available {
+                return Err(scalar_bytes);
+            }
+            Ok((
+                serde_json::json!(rusqlite::ffi::sqlite3_column_double(statement, index)),
+                scalar_bytes,
+            ))
+        }
+        rusqlite::ffi::SQLITE_TEXT => {
+            let length = rusqlite::ffi::sqlite3_column_bytes(statement, index) as usize;
+            let pointer = rusqlite::ffi::sqlite3_column_text(statement, index);
+            let bytes = if length == 0 {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(pointer, length)
+            };
+            let value = if bytes.is_empty() {
+                String::new()
+            } else {
+                String::from_utf8_lossy(bytes).into_owned()
+            };
+            // serde_json escapes quotes, backslashes, and controls when the
+            // response crosses into V8. Charge that wire shape now: decoded
+            // bytes let NUL-heavy TEXT expand sixfold after the cap passed.
+            let expanded = scalar_bytes.saturating_add(d1_json_string_len(&value));
+            if expanded > available {
+                return Err(expanded);
+            }
+            Ok((serde_json::Value::String(value), expanded))
+        }
+        rusqlite::ffi::SQLITE_BLOB => {
+            let length = rusqlite::ffi::sqlite3_column_bytes(statement, index) as usize;
+            // A BLOB becomes one serde_json::Value per byte before it reaches
+            // JSON or V8. Charge that expansion before allocating it. Raw
+            // byte length let a sub-limit BLOB allocate hundreds of MiB and
+            // defeat the result cap itself.
+            let expanded = length
+                .saturating_mul(std::mem::size_of::<serde_json::Value>())
+                .saturating_add(scalar_bytes)
+                .saturating_add(2);
+            if expanded > available {
+                return Err(expanded);
+            }
+            let pointer: *const u8 = rusqlite::ffi::sqlite3_column_blob(statement, index).cast();
+            let bytes = if length == 0 {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(pointer, length)
+            };
+            Ok((
+                serde_json::Value::Array(
+                    bytes.iter().map(|byte| serde_json::json!(byte)).collect(),
+                ),
+                expanded,
+            ))
+        }
+        _ => {
+            if scalar_bytes > available {
+                return Err(scalar_bytes);
+            }
+            Ok((serde_json::Value::Null, scalar_bytes))
+        }
+    }
+}
+
+/// What stepping one statement to completion left behind.
+struct D1Stepped {
+    rows: Vec<Vec<serde_json::Value>>,
+    rows_read: u64,
+    /// The cap message, when one fired. The statement still ran to
+    /// completion: a statement's effects happen as its steps do
+    /// (`INSERT ... RETURNING`), so stopping at the cap would silently lose
+    /// the writes the remaining steps carry. Drain first, refuse after.
+    over: Option<String>,
+}
+
+/// Step a prepared statement to completion, keeping at most `keep` rows and
+/// charging kept bytes against `budget`. The caller finalizes the statement
+/// on every path. `keep` below the row cap means the caller asked for fewer
+/// rows (`first()` keeps one), so rows past it are dropped without an error;
+/// at the cap, overflow is a refusal.
+unsafe fn d1_step_to_done(
+    scope: &str,
+    database: *mut rusqlite::ffi::sqlite3,
+    statement: *mut rusqlite::ffi::sqlite3_stmt,
+    started_in_transaction: bool,
+    keep: usize,
+    budget: &mut usize,
+) -> Result<D1Stepped, String> {
+    let column_count = rusqlite::ffi::sqlite3_column_count(statement);
+    let mut stepped = D1Stepped {
+        rows: Vec::new(),
+        rows_read: 0,
+        over: None,
+    };
+    loop {
+        match rusqlite::ffi::sqlite3_step(statement) {
+            rusqlite::ffi::SQLITE_ROW => {
+                stepped.rows_read += 1;
+                if stepped.over.is_some() || keep == 0 {
+                    continue;
+                }
+                if stepped.rows.len() >= keep {
+                    if keep >= D1_MAX_ROWS {
+                        stepped.over = Some(format!(
+                            "query returned more than {D1_MAX_ROWS} rows, which is more than \
+                             one D1 result set can carry across a binding; narrow the query, \
+                             or iterate inside a Durable Object where the cursor streams"
+                        ));
+                    }
+                    continue;
+                }
+                let mut row = Vec::with_capacity(column_count as usize);
+                let mut row_bytes = 0usize;
+                let mut row_over = false;
+                for index in 0..column_count {
+                    let available = budget.saturating_sub(row_bytes);
+                    let (value, size) = match d1_row_value(statement, index, available) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            row_over = true;
+                            break;
+                        }
+                    };
+                    row_bytes += size;
+                    row.push(value);
+                }
+                let Some(remaining) = budget.checked_sub(row_bytes).filter(|_| !row_over) else {
+                    stepped.over = Some(format!(
+                        "query result exceeds {} bytes, which is more than one D1 result \
+                         set can carry across a binding; narrow the query, or iterate \
+                         inside a Durable Object where the cursor streams",
+                        D1_MAX_RESULT_BYTES
+                    ));
+                    continue;
+                };
+                *budget = remaining;
+                stepped.rows.push(row);
+            }
+            rusqlite::ffi::SQLITE_DONE => return Ok(stepped),
+            code => {
+                return Err(d1_sqlite_failure(
+                    scope,
+                    database,
+                    started_in_transaction,
+                    code,
+                ))
+            }
+        }
+    }
+}
+
+unsafe fn d1_rows_read(statement: *mut rusqlite::ffi::sqlite3_stmt, emitted: u64) -> u64 {
+    let full_scan_steps = rusqlite::ffi::sqlite3_stmt_status(
+        statement,
+        rusqlite::ffi::SQLITE_STMTSTATUS_FULLSCAN_STEP,
+        0,
+    ) as u64;
+    let scanned = full_scan_steps.saturating_add(u64::from(full_scan_steps > 0));
+    emitted.max(scanned)
+}
+
+/// The schema cookie, which moves on every DDL statement. `total_changes`
+/// cannot see DDL — a CREATE TABLE writes no counted row — so `changed_db`
+/// compares this across the statement instead of trusting
+/// `sqlite3_stmt_readonly` alone, which reported `changed_db: true` for
+/// `UPDATE ... WHERE 0` where upstream reports the false its name promises.
+fn d1_schema_version(connection: &Connection) -> i64 {
+    without_sql_authorizer(connection, || {
+        connection
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap_or(0)
+    })
+}
+
+/// SQLite's own message for a failed D1 operation, with the poison
+/// classification the other storage ops apply. The message carries no
+/// operation prefix, because applications match on it -- upstream reports
+/// `D1_ERROR: no such table: x`, not the name of the internal step that
+/// noticed.
+fn d1_sqlite_failure(
+    scope: &str,
+    database: *mut rusqlite::ffi::sqlite3,
+    started_in_transaction: bool,
+    result_code: i32,
+) -> String {
+    let _ = sqlite_operation_failure(scope, database, started_in_transaction, result_code, "d1");
+    // SAFETY: database is the live handle owned by the scope's Connection.
+    unsafe {
+        CStr::from_ptr(rusqlite::ffi::sqlite3_errmsg(database))
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// Whether `tail` holds another statement. Trivia -- whitespace and comments,
+/// terminated or not -- prepares to a null statement, so SQLite's tokenizer
+/// answers this rather than a re-implementation of it in JS.
+unsafe fn d1_tail_has_statement(
+    database: *mut rusqlite::ffi::sqlite3,
+    tail: *const std::ffi::c_char,
+) -> bool {
+    if tail.is_null() {
+        return false;
+    }
+    let mut statement = std::ptr::null_mut();
+    let prepare =
+        rusqlite::ffi::sqlite3_prepare_v2(database, tail, -1, &mut statement, std::ptr::null_mut());
+    if !statement.is_null() {
+        rusqlite::ffi::sqlite3_finalize(statement);
+        return true;
+    }
+    // A tail that fails to prepare is not trivia either: it is a statement
+    // SQLite refused, and the refusal belongs to the caller's error, not to
+    // a silent drop.
+    prepare != rusqlite::ffi::SQLITE_OK
+}
+
+/// The count and rows of an exec-style run over `source`. On success the
+/// whole source ran; the caller owns any surrounding transaction.
+unsafe fn d1_run_statements(
+    scope: &str,
+    connection: &Connection,
+    source: &CString,
+    input: &str,
+    keep_rows: bool,
+    failure: fn(String) -> D1Failure,
+) -> Result<(u64, Vec<D1Rows>), D1Failure> {
+    let database = connection.handle();
+    let started_in_transaction = rusqlite::ffi::sqlite3_get_autocommit(database) == 0;
+    let mut budget = D1_MAX_RESULT_BYTES;
+    let mut source_ptr = source.as_ptr();
+    let mut count = 0_u64;
+    let mut results = Vec::new();
+    loop {
+        let mut statement = std::ptr::null_mut();
+        let mut tail = std::ptr::null();
+        let prepare =
+            rusqlite::ffi::sqlite3_prepare_v2(database, source_ptr, -1, &mut statement, &mut tail);
+        if prepare != rusqlite::ffi::SQLITE_OK {
+            if !statement.is_null() {
+                rusqlite::ffi::sqlite3_finalize(statement);
+            }
+            // An unterminated construct -- an open quote, a statement cut
+            // mid-token -- is refused as incomplete rather than reported as
+            // whatever syntax error the cut happened to produce, because the
+            // statements before it have already run and the operator needs
+            // to know work was dropped, not to parse SQLite's guess.
+            if rusqlite::ffi::sqlite3_complete(source_ptr) == 0 {
+                return Err(failure(D1_INCOMPLETE.to_string()));
+            }
+            return Err(failure(d1_sqlite_failure(
+                scope,
+                database,
+                started_in_transaction,
+                prepare,
+            )));
+        }
+        if statement.is_null() {
+            // Nothing but trivia remains. Unlike `sql_ingest`, nothing here
+            // re-checks `sqlite3_complete` on what was consumed: exec input
+            // is whole, not a stream, so a final statement without its
+            // semicolon is a statement, not a fragment (upstream runs
+            // `exec("select 1")`).
+            return Ok((count, results));
+        }
+        let offset = tail.offset_from(source.as_ptr()) as usize;
+        if input.get(offset..).is_none() {
+            rusqlite::ffi::sqlite3_finalize(statement);
+            return Err(failure("SQLite returned an invalid SQL tail".to_string()));
+        }
+        let columns = sql_cursor_columns(statement);
+        let keep = if keep_rows && !columns.is_empty() {
+            D1_MAX_ROWS
+        } else {
+            0
+        };
+        let stepped = d1_step_to_done(
+            scope,
+            database,
+            statement,
+            started_in_transaction,
+            keep,
+            &mut budget,
+        );
+        rusqlite::ffi::sqlite3_finalize(statement);
+        let stepped = stepped.map_err(&failure)?;
+        if let Some(over) = stepped.over {
+            return Err(failure(over));
+        }
+        count += 1;
+        if keep > 0 {
+            results.push(D1Rows {
+                columns,
+                rows: stepped.rows,
+            });
+        }
+        source_ptr = tail;
+    }
+}
+
+unsafe fn d1_run_prepared(
+    scope: &str,
+    connection: &Connection,
+    sql: &str,
+    params: &[serde_json::Value],
+    keep: usize,
+    budget: &mut usize,
+    started: std::time::Instant,
+) -> Result<D1PreparedResult, D1Failure> {
+    let mut binds = Vec::with_capacity(params.len());
+    for value in params {
+        binds.push(d1_bind_value(value)?);
+    }
+    let source =
+        CString::new(sql).map_err(|error| d1_error(format!("invalid SQL text: {error}")))?;
+    let database = connection.handle();
+    let started_in_transaction = rusqlite::ffi::sqlite3_get_autocommit(database) == 0;
+    let changes_before = total_changes_for_handle(database);
+    let schema_before = d1_schema_version(connection);
+    let mut statement = std::ptr::null_mut();
+    let mut tail = std::ptr::null();
+    let prepare =
+        rusqlite::ffi::sqlite3_prepare_v2(database, source.as_ptr(), -1, &mut statement, &mut tail);
+    if prepare != rusqlite::ffi::SQLITE_OK {
+        if !statement.is_null() {
+            rusqlite::ffi::sqlite3_finalize(statement);
+        }
+        return Err(d1_error(d1_sqlite_failure(
+            scope,
+            database,
+            started_in_transaction,
+            prepare,
+        )));
+    }
+    if statement.is_null() {
+        return Err(d1_error("No SQL statements detected."));
+    }
+    if d1_tail_has_statement(database, tail) {
+        rusqlite::ffi::sqlite3_finalize(statement);
+        return Err(d1_error(
+            "A prepared SQL statement must contain only one statement.",
+        ));
+    }
+    let expected = rusqlite::ffi::sqlite3_bind_parameter_count(statement) as usize;
+    if expected != binds.len() {
+        rusqlite::ffi::sqlite3_finalize(statement);
+        return Err(d1_error(
+            "Wrong number of parameter bindings for SQL query.",
+        ));
+    }
+    for (offset, value) in binds.iter().enumerate() {
+        if let Err(code) = bind_cursor_value(statement, offset as i32 + 1, value) {
+            let failure = d1_sqlite_failure(scope, database, started_in_transaction, code);
+            rusqlite::ffi::sqlite3_finalize(statement);
+            return Err(d1_error(failure));
+        }
+    }
+    let readonly = rusqlite::ffi::sqlite3_stmt_readonly(statement) != 0;
+    let columns = sql_cursor_columns(statement);
+    let stepped = d1_step_to_done(
+        scope,
+        database,
+        statement,
+        started_in_transaction,
+        keep,
+        budget,
+    );
+    let rows_read = stepped
+        .as_ref()
+        .ok()
+        .map(|stepped| d1_rows_read(statement, stepped.rows_read));
+    rusqlite::ffi::sqlite3_finalize(statement);
+    let stepped = stepped.map_err(d1_error)?;
+    if let Some(over) = stepped.over {
+        return Err(d1_error(over));
+    }
+    let rows_written = total_changes_for_handle(database).saturating_sub(changes_before);
+    let (last_row_id, changes) = if readonly {
+        (0, 0)
+    } else {
+        (connection.last_insert_rowid(), connection.changes())
+    };
+    let changed_db =
+        !readonly && (rows_written > 0 || d1_schema_version(connection) != schema_before);
+    Ok(D1PreparedResult {
+        columns,
+        rows: stepped.rows,
+        meta: D1Meta {
+            duration: started.elapsed().as_secs_f64() * 1000.0,
+            rows_read: rows_read.unwrap_or(stepped.rows_read),
+            rows_written,
+            last_row_id,
+            changes,
+            changed_db,
+            size_after: d1_database_size(connection),
+            served_by: "celld",
+            served_by_region: "local",
+            served_by_primary: true,
+        },
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum D1TransactionOperation {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+impl D1TransactionOperation {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Begin => "BEGIN IMMEDIATE",
+            Self::Commit => "COMMIT",
+            Self::Rollback => "ROLLBACK",
+        }
+    }
+}
+
+fn d1_poison_transaction(scope: &str, error: String) {
+    sql_critical_errors(|errors| {
+        errors
+            .borrow_mut()
+            .entry(scope.to_string())
+            .or_insert(error);
+    });
+}
+
+fn d1_rollback_after_commit_failure(scope: &str, connection: &Connection) -> Result<(), String> {
+    #[cfg(all(test, celld_internal_tests))]
+    if let Some(result_code) = D1_ROLLBACK_FAULT.with(std::cell::Cell::take) {
+        // SAFETY: the handle belongs to this live connection.
+        let database = unsafe { connection.handle() };
+        return Err(d1_critical_transaction_failure(
+            scope,
+            database,
+            result_code,
+        ));
+    }
+    without_sql_authorizer(connection, || connection.execute_batch("ROLLBACK")).map_err(|error| {
+        if let rusqlite::Error::SqliteFailure(sqlite, _) = &error {
+            // SAFETY: the handle belongs to this live connection.
+            let database = unsafe { connection.handle() };
+            d1_critical_transaction_failure(scope, database, sqlite.extended_code)
+        } else {
+            error.to_string()
+        }
+    })
+}
+
+fn d1_transaction_control(
+    scope: &str,
+    connection: &Connection,
+    operation: D1TransactionOperation,
+    failure: fn(String) -> D1Failure,
+) -> Result<(), D1Failure> {
+    #[cfg(all(test, celld_internal_tests))]
+    let injected = if operation == D1TransactionOperation::Commit {
+        D1_COMMIT_FAULT.with(std::cell::Cell::take)
+    } else {
+        None
+    };
+    #[cfg(not(all(test, celld_internal_tests)))]
+    let injected: Option<i32> = None;
+
+    let result = if let Some(result_code) = injected {
+        Err((result_code, None))
+    } else {
+        without_sql_authorizer(connection, || connection.execute_batch(operation.sql())).map_err(
+            |error| {
+                let code = match &error {
+                    rusqlite::Error::SqliteFailure(sqlite, _) => Some(sqlite.extended_code),
+                    _ => None,
+                };
+                (code.unwrap_or(rusqlite::ffi::SQLITE_ERROR), Some(error))
+            },
+        )
+    };
+
+    result.map_err(|(result_code, error)| {
+        let message = match error {
+            Some(error) if operation == D1TransactionOperation::Begin => error.to_string(),
+            Some(error) if !matches!(error, rusqlite::Error::SqliteFailure(_, _)) => {
+                error.to_string()
+            }
+            _ => {
+                // SAFETY: the handle belongs to this live connection. A failed
+                // COMMIT or ROLLBACK can leave transaction state uncertain.
+                let database = unsafe { connection.handle() };
+                d1_critical_transaction_failure(scope, database, result_code)
+            }
+        };
+
+        if operation == D1TransactionOperation::Commit && !connection.is_autocommit() {
+            if let Err(rollback) = d1_rollback_after_commit_failure(scope, connection) {
+                d1_poison_transaction(
+                    scope,
+                    format!("failed to roll back after COMMIT failure: {rollback}"),
+                );
+            }
+        }
+
+        failure(message)
+    })
+}
+
+fn d1_critical_transaction_failure(
+    scope: &str,
+    database: *mut rusqlite::ffi::sqlite3,
+    result_code: i32,
+) -> String {
+    let error =
+        sqlite_operation_failure(scope, database, true, result_code, "control D1 transaction")
+            .to_string();
+    let primary = result_code & 0xff;
+    if matches!(
+        primary,
+        rusqlite::ffi::SQLITE_FULL
+            | rusqlite::ffi::SQLITE_IOERR
+            | rusqlite::ffi::SQLITE_NOMEM
+            | rusqlite::ffi::SQLITE_INTERRUPT
+    ) {
+        // A D1 call owns its transaction bracket and cannot hand an open or
+        // ambiguous one back to application code. Fail closed even when
+        // SQLite did not re-enable autocommit after the control failure.
+        sql_critical_errors(|errors| {
+            errors
+                .borrow_mut()
+                .entry(scope.to_string())
+                .or_insert_with(|| error.clone());
+        });
+    }
+    error
+}
+
+#[cfg(all(test, celld_internal_tests))]
+thread_local! {
+    static D1_COMMIT_FAULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    static D1_ROLLBACK_FAULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, celld_internal_tests))]
+pub fn set_d1_commit_fault_for_test(result_code: i32) {
+    D1_COMMIT_FAULT.with(|fault| fault.set(Some(result_code)));
+}
+
+#[cfg(all(test, celld_internal_tests))]
+pub fn set_d1_rollback_fault_for_test(result_code: i32) {
+    D1_ROLLBACK_FAULT.with(|fault| fault.set(Some(result_code)));
+}
+
+/// Run one D1 request against a cell's SQLite: the binding's single seam
+/// into the engine. Everything a statement's `meta` needs is read here,
+/// inside the same execution, on the same connection.
+pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure> {
+    require_sql_healthy(scope).map_err(d1_error)?;
+    let started = std::time::Instant::now();
+    match request {
+        D1Request::Prepared { sql, params, first } => {
+            let keep = if *first { 1 } else { D1_MAX_ROWS };
+            with(scope, |connection| {
+                as_user_sql(|| {
+                    let mut budget = D1_MAX_RESULT_BYTES;
+                    // SAFETY: the connection lives in DBS until close(), and
+                    // the helper finalizes its statement on every path.
+                    unsafe {
+                        d1_run_prepared(scope, connection, sql, params, keep, &mut budget, started)
+                    }
+                    .map(D1Response::Prepared)
+                })
+            })
+            .unwrap_or_else(|| Err(d1_error(format!("no db for {scope}"))))
+        }
+        D1Request::Batch { statements } => with(scope, |connection| {
+            if !connection.is_autocommit() {
+                return Err(d1_error("batch cannot start inside an open transaction"));
+            }
+            d1_transaction_control(scope, connection, D1TransactionOperation::Begin, d1_error)?;
+            let ran = as_user_sql(|| {
+                let mut results = Vec::with_capacity(statements.len());
+                let mut budget = D1_MAX_RESULT_BYTES;
+                for statement in statements {
+                    let statement_started = std::time::Instant::now();
+                    // SAFETY: as for the prepared mode above. Every statement
+                    // uses this connection inside the same transaction.
+                    results.push(unsafe {
+                        d1_run_prepared(
+                            scope,
+                            connection,
+                            &statement.sql,
+                            &statement.params,
+                            D1_MAX_ROWS,
+                            &mut budget,
+                            statement_started,
+                        )
+                    }?);
+                }
+                Ok(results)
+            });
+            match ran {
+                Ok(results) => {
+                    d1_transaction_control(
+                        scope,
+                        connection,
+                        D1TransactionOperation::Commit,
+                        d1_error,
+                    )?;
+                    Ok(D1Response::Batch(results))
+                }
+                Err(failure) => {
+                    if !connection.is_autocommit() {
+                        let _ = d1_transaction_control(
+                            scope,
+                            connection,
+                            D1TransactionOperation::Rollback,
+                            d1_error,
+                        );
+                    }
+                    Err(failure)
+                }
+            }
+        })
+        .unwrap_or_else(|| Err(d1_error(format!("no db for {scope}")))),
+        D1Request::Exec { sql, rows } => {
+            let source = CString::new(sql.as_str())
+                .map_err(|error| d1_exec_error(format!("invalid SQL text: {error}")))?;
+            with(scope, |connection| {
+                // One transaction per exec, as upstream D1 runs it (verified
+                // against workerd's D1 under miniflare: a failing line rolls
+                // the whole call back). Without the bracket the statements
+                // before a failure land, so "the exec failed" and "half the
+                // exec happened" were both true at once — the worst reading
+                // for an operator importing a dump.
+                if !connection.is_autocommit() {
+                    return Err(d1_exec_error(
+                        "exec cannot start inside an open transaction",
+                    ));
+                }
+                d1_transaction_control(
+                    scope,
+                    connection,
+                    D1TransactionOperation::Begin,
+                    d1_exec_error,
+                )?;
+                let ran = as_user_sql(|| {
+                    // SAFETY: the connection lives in DBS until close();
+                    // every prepared statement is finalized on all paths.
+                    unsafe {
+                        d1_run_statements(scope, connection, &source, sql, *rows, d1_exec_error)
+                    }
+                });
+                match ran {
+                    Ok((count, results)) => {
+                        d1_transaction_control(
+                            scope,
+                            connection,
+                            D1TransactionOperation::Commit,
+                            d1_exec_error,
+                        )?;
+                        Ok(D1Response::Exec {
+                            count,
+                            duration: started.elapsed().as_secs_f64() * 1000.0,
+                            results,
+                        })
+                    }
+                    Err(failure) => {
+                        if !connection.is_autocommit() {
+                            let _ = d1_transaction_control(
+                                scope,
+                                connection,
+                                D1TransactionOperation::Rollback,
+                                d1_exec_error,
+                            );
+                        }
+                        Err(failure)
+                    }
+                }
+            })
+            .unwrap_or_else(|| Err(d1_exec_error(format!("no db for {scope}"))))
+        }
+        D1Request::Migrate { name, sql, table } => {
+            if !d1_plain_identifier(table) {
+                return Err(d1_error(format!(
+                    "migrations_table {table:?} is not a plain identifier"
+                )));
+            }
+            let source = CString::new(sql.as_str())
+                .map_err(|error| d1_error(format!("invalid SQL text: {error}")))?;
+            with(scope, |connection| {
+                // The transaction is what makes the durability claim true:
+                // a migration that fails part-way rolls back whole, and the
+                // operator fixes the file and re-runs. Without it the
+                // statements that DID land are exactly the ones a re-run
+                // trips over. BEGIN/COMMIT run outside `as_user_sql` -- they
+                // are the engine's own bracket, not application SQL.
+                if !connection.is_autocommit() {
+                    return Err(d1_error(
+                        "a migration cannot start inside an open transaction",
+                    ));
+                }
+                // The authorizer denies Transaction actions outright -- that
+                // is what keeps BEGIN out of application SQL -- so the
+                // engine's own bracket must step around it, exactly as
+                // `transaction_control` does.
+                d1_transaction_control(scope, connection, D1TransactionOperation::Begin, d1_error)?;
+                let applied = as_user_sql(|| {
+                    // SAFETY: as for the exec mode above.
+                    let (count, _) = unsafe {
+                        d1_run_statements(scope, connection, &source, sql, false, d1_error)
+                    }?;
+                    // The bookkeeping row rides the same transaction. The
+                    // name is a bound parameter, so a file name never
+                    // reaches the SQL text.
+                    connection
+                        .execute(
+                            &format!(
+                                "CREATE TABLE IF NOT EXISTS \"{table}\" (\
+                                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                                 name TEXT UNIQUE, \
+                                 applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+                            ),
+                            [],
+                        )
+                        .map_err(|error| d1_error(error.to_string()))?;
+                    connection
+                        .execute(
+                            &format!("INSERT INTO \"{table}\" (name) VALUES (?)"),
+                            [name],
+                        )
+                        .map_err(|error| d1_error(error.to_string()))?;
+                    Ok(count)
+                });
+                match applied {
+                    Ok(count) => {
+                        d1_transaction_control(
+                            scope,
+                            connection,
+                            D1TransactionOperation::Commit,
+                            d1_error,
+                        )?;
+                        Ok(D1Response::Migrate {
+                            count,
+                            duration: started.elapsed().as_secs_f64() * 1000.0,
+                        })
+                    }
+                    Err(failure) => {
+                        // Keep the statement error. SQLite can already have
+                        // rolled the transaction back, and a real rollback
+                        // failure goes through the critical-error classifier.
+                        if !connection.is_autocommit() {
+                            let _ = d1_transaction_control(
+                                scope,
+                                connection,
+                                D1TransactionOperation::Rollback,
+                                d1_error,
+                            );
+                        }
+                        Err(failure)
+                    }
+                }
+            })
+            .unwrap_or_else(|| Err(d1_error(format!("no db for {scope}"))))
+        }
+    }
+}
+
+fn d1_plain_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn d1_database_size(connection: &Connection) -> u64 {
+    without_sql_authorizer(connection, || {
+        connection
+            .query_row(
+                "SELECT (page_count - freelist_count) * page_size \
+                 FROM pragma_page_count(), pragma_freelist_count(), pragma_page_size()",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap_or(0)
+    })
+}
+
+/// The string-in, string-out wrapper the V8 op calls: `{ok: ...}` or
+/// `{error: {family, message}}`.
+pub fn d1_run_json(scope: &str, request: &str) -> String {
+    let response = match serde_json::from_str::<D1Request>(request) {
+        Ok(request) => d1_run(scope, &request),
+        Err(error) => Err(d1_error(format!("invalid D1 request: {error}"))),
+    };
+    match response {
+        Ok(response) => serde_json::json!({ "ok": response }).to_string(),
+        Err(failure) => serde_json::json!({
+            "error": { "family": failure.family, "message": failure.message },
+        })
+        .to_string(),
+    }
 }
 
 /// `Ok(Some(at_ms))` when an outermost commit published a dirty committed
@@ -1649,33 +2684,6 @@ pub fn register_nomem_function_for_test(scope: &str) -> anyhow::Result<()> {
         Ok(())
     })
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
-}
-
-#[cfg(all(test, celld_internal_tests))]
-pub fn sql_limit_for_test(scope: &str, category: i32) -> anyhow::Result<i32> {
-    with(scope, |connection| {
-        // SAFETY: a negative new value queries the live connection's current
-        // limit without changing it.
-        Ok(unsafe { rusqlite::ffi::sqlite3_limit(connection.handle(), category, -1) })
-    })
-    .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
-}
-
-#[cfg(all(test, celld_internal_tests))]
-pub fn sql_statement_cache_stats(scope: &str) -> (usize, usize, usize) {
-    sql_statement_caches(|caches| {
-        caches.borrow().get(scope).map_or((0, 0, 0), |cache| {
-            (
-                cache.entries.len(),
-                cache.total_size,
-                cache
-                    .entries
-                    .values()
-                    .filter(|entry| !entry.statement.is_null())
-                    .count(),
-            )
-        })
-    })
 }
 
 // Test-only single-key helpers; the runtime goes through the batched forms.
@@ -2022,12 +3030,16 @@ fn sqlite_operation_failure(
     error
 }
 
+/// On failure this returns the raw result code and formats nothing, because
+/// its callers disagree on message shape: the KV cursor paths prefix the
+/// internal step, and D1 must not — applications match on SQLite's text, and
+/// a D1 bind that surfaced "bind sync KV cursor: ..." pointed the reader at
+/// a KV cursor no D1 request ever touches.
 unsafe fn bind_cursor_value(
-    database: *mut rusqlite::ffi::sqlite3,
     statement: *mut rusqlite::ffi::sqlite3_stmt,
     index: i32,
     value: &rusqlite::types::Value,
-) -> anyhow::Result<()> {
+) -> Result<(), i32> {
     use rusqlite::types::Value;
     let result = match value {
         Value::Null => rusqlite::ffi::sqlite3_bind_null(statement, index),
@@ -2051,7 +3063,7 @@ unsafe fn bind_cursor_value(
     if result == rusqlite::ffi::SQLITE_OK {
         Ok(())
     } else {
-        Err(sqlite_failure(database, "bind sync KV cursor"))
+        Err(result)
     }
 }
 
@@ -2100,8 +3112,8 @@ pub fn sync_list_start(
                 return Err(sqlite_failure(database, "prepare sync KV cursor"));
             }
             for (offset, value) in parameters.iter().enumerate() {
-                if let Err(error) = bind_cursor_value(database, statement, offset as i32 + 1, value)
-                {
+                if bind_cursor_value(statement, offset as i32 + 1, value).is_err() {
+                    let error = sqlite_failure(database, "bind sync KV cursor");
                     rusqlite::ffi::sqlite3_finalize(statement);
                     return Err(error);
                 }
@@ -2548,13 +3560,6 @@ fn publish_alarm_if_transaction_dirty(scope: &str) -> Option<i64> {
     }
 }
 
-/// Retry count of `scope`'s alarm if it is due at/before `now_ms` (each cell
-/// thread self-polls its own db between requests — no central scheduler).
-#[cfg(all(test, celld_internal_tests))]
-pub fn due_alarm(scope: &str, now_ms: i64) -> Option<i64> {
-    due_alarm_entry(scope, now_ms).map(|(_, retry)| retry)
-}
-
 /// Scheduled time and retry count for an alarm due at/before `now_ms`.
 pub fn due_alarm_entry(scope: &str, now_ms: i64) -> Option<(i64, i64)> {
     with(scope, |c| {
@@ -2696,6 +3701,9 @@ pub fn bump_alarm_with_policy(scope: &str, now_ms: i64, counts_against_limit: bo
     });
     publish_alarm(scope);
 }
+
+#[cfg(all(test, celld_internal_tests))]
+include!(env!("CELLD_INTERNAL_STORAGE_OBSERVERS"));
 
 /// Externally injected storage tests.
 ///

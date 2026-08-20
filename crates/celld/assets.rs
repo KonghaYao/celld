@@ -1,5 +1,9 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
+// Asset download and cache maintenance execute in the V8/process arm, which
+// the World replaces with scripted client and cell-host boundaries.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use crate::bucket::Bucket;
 use crate::js;
 use crate::protocol::{asset_blob_key, AssetEntry, AssetIndex, AssetManifestRef, RunWorkerFirst};

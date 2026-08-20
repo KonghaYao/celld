@@ -164,8 +164,8 @@ fn test_ltx_level_dir() {
 // Why this matters: these helpers compute LTX object-store keys. On S3-style
 // stores "foo//ltx/0/..." and "foo/ltx/0/..." are DIFFERENT keys, so a root
 // carrying a trailing slash (a common prefix form) makes rustyriver read/write a
-// different key than the real binary — breaking the differential oracle (G3,
-// PLAN.md §6.3 D1/D3). A faithful port must replicate path.Join's cleaning.
+// different key than the real binary, which breaks the differential oracle.
+// A faithful port must replicate path.Join's cleaning.
 #[test]
 fn test_ltx_dir_normalizes_like_path_join() {
     // Trailing slash on the root: path.Join collapses the doubled separator.
@@ -202,9 +202,8 @@ fn test_ltx_dir_normalizes_like_path_join() {
 // observed via the public helper:
 //   ltx_dir("a/b/../c")   = "a//c/ltx"   (must be "a/c/ltx")
 //
-// EXPECTED VALUES ARE FROM THE REAL GO `path.Join` (the upstream oracle, run
-// with go1.25 against `path.Join(root, "ltx")`), never from rustyriver — per
-// AGENTS.md rule 3:
+// Expected values come from the real Go `path.Join` upstream oracle, run with
+// go1.25 against `path.Join(root, "ltx")`, never from the Rust implementation:
 //   path.Join("a/b/../c","ltx")   = "a/c/ltx"
 //   path.Join("x/y/../z","ltx")   = "x/z/ltx"
 //   path.Join("a/b/c/../d","ltx") = "a/b/d/ltx"
@@ -214,8 +213,8 @@ fn test_ltx_dir_normalizes_like_path_join() {
 // 184-197). Any `root` whose cleaned form contains an interior `..` over a
 // surviving prefix (e.g. a configured prefix like "bucket/db/../ltxroot") yields
 // a doubled-slash S3 key ("bucket//ltxroot/...") — a DIFFERENT object than the
-// real binary writes/reads, silently breaking the differential oracle (G3,
-// PLAN.md §6.3 D1/D3). A faithful port must match Go's `path.Clean` exactly.
+// real binary writes or reads, silently breaking the differential oracle. A
+// faithful port must match Go's `path.Clean` exactly.
 #[test]
 fn test_ltx_dir_cleans_dotdot_over_surviving_prefix() {
     // Interior ".." that backtracks over one element, leaving a prefix.

@@ -1,5 +1,9 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
+// Authentication entropy and signature timestamps belong to the real peer
+// wire, which the World does not execute.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use crate::bucket::Bucket;
 use anyhow::{anyhow, Context};
 use hmac::{Hmac, Mac};

@@ -1,5 +1,8 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
+// The real peer WebSocket transport is outside the World.
+#![allow(clippy::disallowed_methods)]
+
 //! Outbound WebSocket client.
 //!
 //! celld serves WebSockets with fastwebsockets, and connects with it too. That

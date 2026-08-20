@@ -186,14 +186,30 @@ impl WsRegistry {
         }
     }
 }
-static WS_REGISTRY: OnceLock<std::sync::Mutex<WsRegistry>> = OnceLock::new();
-static REGULAR_WS_COUNTS: OnceLock<std::sync::Mutex<HashMap<String, usize>>> = OnceLock::new();
-static NEXT_WS_ID: AtomicU64 = AtomicU64::new(1);
-fn ws_registry() -> &'static std::sync::Mutex<WsRegistry> {
-    WS_REGISTRY.get_or_init(|| std::sync::Mutex::new(WsRegistry::default()))
+pub(crate) struct WebSocketService {
+    registry: Arc<std::sync::Mutex<WsRegistry>>,
+    regular_counts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    next_id: AtomicU64,
+    auto_responses: Arc<std::sync::Mutex<HashMap<String, (String, String)>>>,
 }
-fn regular_ws_counts() -> &'static std::sync::Mutex<HashMap<String, usize>> {
-    REGULAR_WS_COUNTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+
+impl Default for WebSocketService {
+    fn default() -> Self {
+        Self {
+            registry: Arc::new(std::sync::Mutex::new(WsRegistry::default())),
+            regular_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(1),
+            auto_responses: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+fn ws_registry() -> Arc<std::sync::Mutex<WsRegistry>> {
+    asyncrt::services().websockets().registry.clone()
+}
+
+fn regular_ws_counts() -> Arc<std::sync::Mutex<HashMap<String, usize>>> {
+    asyncrt::services().websockets().regular_counts.clone()
 }
 fn increment_regular_ws(scope: &str) {
     *regular_ws_counts()
@@ -203,7 +219,8 @@ fn increment_regular_ws(scope: &str) {
         .or_default() += 1;
 }
 fn decrement_regular_ws(scope: &str) {
-    let mut counts = regular_ws_counts().lock().unwrap();
+    let counts = regular_ws_counts();
+    let mut counts = counts.lock().unwrap();
     let Some(count) = counts.get_mut(scope) else {
         return;
     };
@@ -223,11 +240,8 @@ pub fn has_regular_websocket(scope: &str) -> bool {
 /// `state.setWebSocketAutoResponse`. Shell state, like the socket registry:
 /// the whole point of the feature is answering a matched message while the
 /// cell is not resident, so the isolate cannot hold it.
-static WS_AUTO_RESPONSE: OnceLock<std::sync::Mutex<HashMap<String, (String, String)>>> =
-    OnceLock::new();
-
-fn ws_auto_responses() -> &'static std::sync::Mutex<HashMap<String, (String, String)>> {
-    WS_AUTO_RESPONSE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+fn ws_auto_responses() -> Arc<std::sync::Mutex<HashMap<String, (String, String)>>> {
+    asyncrt::services().websockets().auto_responses.clone()
 }
 
 /// The shell's read path asks here before dispatching a text frame. A match
@@ -237,14 +251,16 @@ fn ws_auto_responses() -> &'static std::sync::Mutex<HashMap<String, (String, Str
 /// lives in the hibernation manager's read loop.
 pub fn ws_auto_response(scope: &str, id: u64, text: &str) -> Option<String> {
     let response = {
-        let pairs = ws_auto_responses().lock().unwrap();
+        let pairs = ws_auto_responses();
+        let pairs = pairs.lock().unwrap();
         let (request, response) = pairs.get(scope)?;
         if request != text {
             return None;
         }
         response.clone()
     };
-    let mut registry = ws_registry().lock().unwrap();
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
     let meta = registry.metadata.get_mut(&id)?;
     if !meta.hibernatable {
         return None;
@@ -254,10 +270,7 @@ pub fn ws_auto_response(scope: &str, id: u64, text: &str) -> Option<String> {
 }
 
 fn unix_ms() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as f64
+    asyncrt::wall_ms() as f64
 }
 
 pub fn ws_hibernatable(id: u64) -> Option<bool> {
@@ -269,14 +282,41 @@ pub fn ws_hibernatable(id: u64) -> Option<bool> {
         .map(|meta| meta.hibernatable)
 }
 pub fn ws_next_id() -> u64 {
-    NEXT_WS_ID.fetch_add(1, Ordering::Relaxed)
+    asyncrt::services()
+        .websockets()
+        .next_id
+        .fetch_add(1, Ordering::Relaxed)
 }
 pub fn ws_register(id: u64, tx: tokio::sync::mpsc::UnboundedSender<WsOut>) {
     ws_registry().lock().unwrap().register(id, tx);
 }
+
+/// Install one hibernatable socket in a private deterministic World.
+#[cfg(all(test, celld_internal_tests))]
+pub(crate) fn ws_register_hibernatable_for_test(
+    id: u64,
+    scope: &str,
+    tx: tokio::sync::mpsc::UnboundedSender<WsOut>,
+) {
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    registry.register(id, tx);
+    registry.metadata.insert(
+        id,
+        WsMeta {
+            scope: scope.to_string(),
+            hibernatable: true,
+            tags: Vec::new(),
+            attachment: None,
+            pending: Vec::new(),
+            auto_response_at: None,
+        },
+    );
+}
 pub fn ws_register_outbound(id: u64, scope: &str) {
     let inserted = {
-        let mut registry = ws_registry().lock().unwrap();
+        let registry = ws_registry();
+        let mut registry = registry.lock().unwrap();
         if let std::collections::hash_map::Entry::Vacant(entry) = registry.metadata.entry(id) {
             entry.insert(WsMeta {
                 scope: scope.to_string(),
@@ -328,7 +368,8 @@ pub(super) fn ws_capture_take() -> Vec<(u64, WsOut)> {
 /// the loop never finishes, so the frame is never released. Frames from those
 /// sockets go straight out, as they did before the gate existed.
 fn ws_gate_may_hold(id: u64) -> bool {
-    let registry = ws_registry().lock().unwrap();
+    let registry = ws_registry();
+    let registry = registry.lock().unwrap();
     registry
         .metadata
         .get(&id)
@@ -354,6 +395,67 @@ fn ws_deferred() -> &'static std::sync::Mutex<HashMap<u64, Vec<WsOut>>> {
     WS_DEFERRED.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+static WS_FLUSHES: OnceLock<std::sync::Mutex<HashMap<u64, usize>>> = OnceLock::new();
+
+/// How many flushes still hold frames for a socket. A count, not a flag: one
+/// flush can finish and drain its queue while a later frame starts another.
+fn ws_flushes() -> &'static std::sync::Mutex<HashMap<u64, usize>> {
+    WS_FLUSHES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+static WS_FLUSH_DONE: OnceLock<tokio::sync::Notify> = OnceLock::new();
+fn ws_flush_done() -> &'static tokio::sync::Notify {
+    WS_FLUSH_DONE.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Counts one flush out on every exit path, including the ones that run no
+/// code: a flush spawned onto a runtime that is already shutting down is
+/// dropped unpolled, and a panic unwinds through it. A count left behind by
+/// either would park the socket's teardown. Held by the flush, so the count
+/// falls whether it finished, failed, or never ran. It cannot help a flush
+/// that is merely parked -- nothing drops, so nothing runs -- which is what
+/// the teardown wait is bounded for.
+struct WsFlushGuard(u64);
+
+impl Drop for WsFlushGuard {
+    fn drop(&mut self) {
+        {
+            let mut flushes = ws_flushes().lock().unwrap();
+            if let Some(count) = flushes.get_mut(&self.0) {
+                *count -= 1;
+                if *count == 0 {
+                    flushes.remove(&self.0);
+                }
+            }
+        }
+        ws_flush_done().notify_waiters();
+    }
+}
+
+/// Wait until no flush holds frames for `id` any more.
+///
+/// The socket's own teardown calls this. Closing reads the handler's output
+/// with a non-blocking drain and, finding none, answers the peer with the
+/// protocol echo of the close the peer itself sent -- so a close frame still
+/// behind the gate is not merely late, it is replaced. The wait is bounded by
+/// the gate: a cell with no barrier answers at once, a barrier settles when
+/// its proof does, and an unprovable one still resolves the flush through its
+/// fail-closed arm.
+pub async fn ws_await_flushes(id: u64) {
+    loop {
+        // Registered before the count is read. A flush that finishes in
+        // between must find a waiter to wake, or this parks forever on a
+        // notification that already happened.
+        let notified = ws_flush_done().notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !ws_flushes().lock().unwrap().contains_key(&id) {
+            return;
+        }
+        notified.await;
+    }
+}
+
 fn ws_emit(id: u64, out: WsOut) {
     let context = current_context();
     let mut capture = context.ws_capture.lock().unwrap();
@@ -368,15 +470,23 @@ fn ws_emit(id: u64, out: WsOut) {
     // held. Waiting on the DURABILITY ticket instead has no such cycle -- it
     // is resolved by the replicator, which does not need this event loop -- so
     // the frame can be held without deadlocking the script that sent it.
-    let pending = egress_gate_pending();
+    let gate = egress_gate_request();
     // Held until this frame is either queued or sent. A flush runs on another
     // thread, so releasing here would let it drain its queue between the test
     // below and the send, putting a later frame ahead of an earlier one.
     let mut deferred = ws_deferred().lock().unwrap();
     let already_deferring = deferred.contains_key(&id);
-    if pending.is_some() || already_deferring {
+    // Gated for a read-only frame as well, and deliberately: the frame reveals
+    // what the cell holds, so it has to ask the core whether a barrier is open
+    // rather than assume its own event opened one. A cell with nothing
+    // outstanding answers at once and the queue flushes on the same tick.
+    if gate.is_gated() || already_deferring {
         deferred.entry(id).or_default().push(out);
         if !already_deferring {
+            // Counted in while `deferred` is held, so a teardown that reads
+            // the count cannot observe a queued frame with no flush behind it.
+            *ws_flushes().lock().unwrap().entry(id).or_default() += 1;
+            let counted = WsFlushGuard(id);
             // Detached onto the HOST runtime (`op_handle`) deliberately:
             // this flush exists precisely to outlive the dispatch that
             // produced the frames — a writing connect handler's ready frame,
@@ -388,7 +498,8 @@ fn ws_emit(id: u64, out: WsOut) {
             // dispatch returns. Either way the frames never left the
             // process.
             asyncrt::op_handle().spawn(async move {
-                let held = await_egress_gate(pending).await;
+                let _counted = counted;
+                let held = await_egress_gate(gate).await;
                 let mut deferred = ws_deferred().lock().unwrap();
                 let frames = deferred.remove(&id).unwrap_or_default();
                 match held {
@@ -428,7 +539,8 @@ fn ws_emit(id: u64, out: WsOut) {
 /// Flush frames the output gate held: send each to its socket's task. Called
 /// from the actor thread once the gating write is proved durable.
 pub fn ws_emit_batch(frames: Vec<(u64, WsOut)>) {
-    let mut registry = ws_registry().lock().unwrap();
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
     for (id, out) in frames {
         registry.emit(id, out);
     }
@@ -441,7 +553,8 @@ pub fn ws_close_scope(scope: &str, code: u16, reason: &str) {
     // A reset cell is a new actor; workerd's hibernation manager dies with
     // the old one and takes the auto-response pair with it.
     ws_auto_responses().lock().unwrap().remove(scope);
-    let mut registry = ws_registry().lock().unwrap();
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
     let ids: Vec<u64> = registry
         .metadata
         .iter()
@@ -545,6 +658,7 @@ pub(super) fn op_ws_upgrade(
                 pull,
                 headers,
                 want_response: true,
+                target: None,
                 reply: tx,
             })
             .is_ok()
@@ -643,6 +757,7 @@ pub(super) fn op_ws_connect(
                 pull,
                 headers: Vec::new(),
                 want_response: false,
+                target: None,
                 reply: tx,
             })
             .is_ok()
@@ -659,6 +774,73 @@ pub(super) fn op_ws_connect(
     });
     rv.set(promise_for(scope, async_id));
 }
+
+/// Join this isolate's client socket to a Durable Object socket that a
+/// subrequest already upgraded. The cell end lives in another isolate, so
+/// the host carries each direction: it is the same route an external client
+/// takes, with a pull queue in place of a TCP connection.
+///
+/// Called from `accept()`, never from the upgrade itself. A Worker that
+/// passes the response straight back out never accepts the socket, and the
+/// host binds that 101 to the real client instead — binding here as well
+/// would give one cell socket two readers.
+pub(super) fn op_ws_bind_target(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args
+        .get(0)
+        .to_integer(scope)
+        .map(|n| n.value() as u64)
+        .unwrap_or(0);
+    let Ok(target) = serde_json::from_str::<WsTarget>(&args.get(1).to_rust_string_lossy(scope))
+    else {
+        return loader_throw(scope, "WebSocket target is not valid");
+    };
+    // The caller's scope, which is empty for a Worker — the socket is
+    // accounted against the isolate holding it, exactly as `op_ws_connect`
+    // accounts an outbound one.
+    let cell = args.get(2).to_rust_string_lossy(scope);
+    let (pull_tx, pull_rx) = tokio::sync::mpsc::unbounded_channel();
+    ws_pull_register(id, pull_rx);
+    ws_region_track(id);
+    // Registered here, on the JS thread, so a frame sent between this op and
+    // the pipe task buffers as a pending frame instead of being dropped for
+    // a socket the registry has never heard of. `accept()` opens the socket
+    // synchronously, so that window is reachable by an ordinary `send()`.
+    ws_register_outbound(id, &cell);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let sent = OUTBOUND_WS_TX.get().is_some_and(|sender| {
+        sender
+            .send(OutboundWsReq {
+                scope: target.scope.clone(),
+                id,
+                url: String::new(),
+                protocols: Vec::new(),
+                pull: Some(pull_tx),
+                headers: Vec::new(),
+                want_response: false,
+                target: Some(target),
+                reply: tx,
+            })
+            .is_ok()
+    });
+    // Nothing observes the outcome: the socket is already open, so there is
+    // no handshake for JS to await. The task keeps the reply receiver alive
+    // until the connector answers. A bind failure drops the pull sender, so
+    // `op_ws_next` reports the caller socket as abnormally closed.
+    asyncrt::enqueue(async move {
+        if !sent {
+            return Err::<String, String>("no outbound WebSocket channel".into());
+        }
+        match rx.await {
+            Ok(Ok(_)) => Ok(String::new()),
+            Ok(Err(error)) => Err(format!("WebSocket bind failed: {error}")),
+            Err(error) => Err(format!("WebSocket connector dropped: {error}")),
+        }
+    });
+}
 pub(super) fn op_ws_accept(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -673,7 +855,8 @@ pub(super) fn op_ws_accept(
     let tags: Vec<String> =
         serde_json::from_str(&args.get(2).to_rust_string_lossy(scope)).unwrap_or_default();
     let replaced_regular_scope = {
-        let mut registry = ws_registry().lock().unwrap();
+        let registry = ws_registry();
+        let mut registry = registry.lock().unwrap();
         let sockets = &mut registry.metadata;
         let replaced_regular_scope = sockets
             .get(&id)
@@ -713,7 +896,8 @@ pub(super) fn op_ws_accept_regular(
         .unwrap_or(0);
     let cell = args.get(1).to_rust_string_lossy(scope);
     let inserted = {
-        let mut registry = ws_registry().lock().unwrap();
+        let registry = ws_registry();
+        let mut registry = registry.lock().unwrap();
         let sockets = &mut registry.metadata;
         if let std::collections::hash_map::Entry::Vacant(entry) = sockets.entry(id) {
             entry.insert(WsMeta {

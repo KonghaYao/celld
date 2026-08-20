@@ -1,25 +1,28 @@
-//! `rustyriver` — embeddable streaming replication of a SQLite database to
+#![warn(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::disallowed_types
+)]
+
+//! `celld-ltx` — embeddable streaming replication of a SQLite database to
 //! object storage, with point-in-time restore and object-storage lease fencing.
 //!
 //! A from-scratch Rust reimplementation of **Litestream v0.5** (pinned
-//! `v0.5.11`). See `PLAN.md` for the full specification and `AGENTS.md` for the
-//! non-negotiable operating rules.
-//!
-//! The public surface (`Db`, `Replica`, `Config`, `restore`) is
-//! defined incrementally by the task DAG in `PLAN.md` §5; module bodies are
-//! filled by their owning tasks and are scaffold placeholders until then.
+//! `v0.5.11`). The public surface includes `Db`, `Replica`, and `restore`.
 //!
 //! # Core position/identity helpers  (T4)
 //!
 //! Ported from litestream@v0.5.11 litestream.go:18-203 and
 //! ltx@v0.5.2 ltx.go:66-145.
 
+pub mod bundle;
 pub mod client;
 mod codec;
 pub mod compaction_level;
 pub mod compactor;
 pub mod db;
 pub mod error;
+pub mod host;
 pub mod ltx;
 mod lz4_block;
 pub mod replica;
@@ -27,15 +30,18 @@ pub mod replica_compactor;
 pub mod replica_url;
 pub mod wal;
 
-// ── Crate-root re-exports — the ergonomic public surface (PLAN.md §4) ─────────
+// ── Crate-root re-exports — the ergonomic public surface ────────────────
 //
-// These `pub use` aliases let a host write `rustyriver::Db`, `rustyriver::Replica`,
-// `rustyriver::restore`, `rustyriver::Db`, etc. without naming the owning
-// module. The original module paths (`rustyriver::db::Db`, …) remain valid; these
-// are additive aliases, not a relocation.
+// These `pub use` aliases let a host use `celld_ltx::Db`, `celld_ltx::Replica`,
+// and `celld_ltx::restore` without naming the owning module. The original module
+// paths, such as `celld_ltx::db::Db`, remain valid.
 
 // Re-export the error model at the crate root.
 pub use error::{new_ltx_error, Error, LTXError, Result};
+pub use host::{
+    DirectFileSystem, FileSystem, HostDirEntry, HostFile, HostFileIo, HostMetadata, HostTaskError,
+    LtxHost,
+};
 
 /// A SQLite database managed for replication (WAL-mode checkpoint takeover plus
 /// the WAL→LTX capture loop). Re-exported from [`crate::db::Db`].
@@ -65,6 +71,12 @@ pub use ltx::FileInfo;
 /// Re-exported from [`crate::client::file::FileReplicaClient`].
 pub use client::file::FileReplicaClient;
 
+/// The bundle overlay (celld-original, self-contained).
+/// Re-exported from [`crate::client::bundle`].
+pub use client::bundle::BundleFetcher;
+pub use client::bundle::BundleOverlayClient;
+pub use client::bundle::LocatedRow;
+
 /// The S3/R2/MinIO [`ReplicaClient`], behind the `s3` feature.
 /// Re-exported from [`crate::client::object_store::ObjectStoreClient`].
 #[cfg(feature = "s3")]
@@ -74,6 +86,12 @@ pub use client::object_store::ObjectStoreClient;
 /// Re-exported from [`crate::client::object_store::ObjectStoreConfig`].
 #[cfg(feature = "s3")]
 pub use client::object_store::ObjectStoreConfig;
+
+/// Which object-metadata name carries an LTX header timestamp, behind the
+/// `s3` feature. Re-exported from
+/// [`crate::client::object_store::TimestampMetadataKey`].
+#[cfg(feature = "s3")]
+pub use client::object_store::TimestampMetadataKey;
 
 /// The underlying `object_store` crate, re-exported so a host can name the
 /// shared `Arc<dyn ObjectStore>` that [`ObjectStoreConfig::build_store`] returns
@@ -272,8 +290,8 @@ pub fn parse_pos(s: &str) -> Result<Pos> {
     // "0000000000000001X8000000000000001".  We keep the stricter check because:
     // (a) the '/' is mandated by the format doc and Pos.String() always emits it,
     // (b) silently accepting a malformed separator would hide caller bugs, and
-    // (c) no production caller or test exercises that path.
-    // This is the conservative/least-data-loss interpretation per AGENTS.md §9.
+    // (c) no production caller requires compatibility with the malformed form.
+    // This is the conservative interpretation because it rejects bad input.
     if s.as_bytes()[16] != b'/' {
         return Err(Error::Other(
             format!("invalid formatted position (missing /): {:?}", s).into(),

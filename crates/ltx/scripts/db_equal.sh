@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The equality oracle (PLAN.md §6.1): is a restored DB correct vs. a source DB?
+# The equality oracle: is a restored database correct relative to a source?
 #
 #   db_equal.sh A <db1> <db2>   # logical equality (default, version-robust)
 #   db_equal.sh B <db1> <db2>   # physical equality (byte-identical main file)

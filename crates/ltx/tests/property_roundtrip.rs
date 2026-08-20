@@ -1,7 +1,7 @@
 //! property_roundtrip — T12: a property test (proptest) that replicate→restore
 //! reproduces the source database for *random* transaction sequences.
 //!
-//! This is **Oracle A** (`scripts/db_equal.sh A`, PLAN.md §6.1) lifted to a
+//! This lifts the logical equality oracle (`scripts/db_equal.sh A`) to a
 //! generative setting: for each randomly-generated sequence of SQL transactions,
 //! we open a managed [`Db`], capture every transaction into L0 LTX files, upload
 //! them to a file replica, restore into a fresh path, and assert the restored DB

@@ -1,16 +1,20 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
+#![warn(clippy::disallowed_macros)]
+
 //! The engine's single object-store client: the `object_store` crate
 //! `celld-ltx` already links, bound to one bucket. Replaces aws-sdk-s3.
 //! No call site streamed a body, so everything is in-memory `Bytes`.
 //!
 //! Two conditional-write dialects share the surface. An `s3://` (or
 //! bare) spec speaks the S3 dialect: the CAS token is the etag, sent as
-//! If-Match / If-None-Match with SigV4 credentials. A `gs://` spec
-//! speaks the Cloud Storage XML API dialect: the CAS token is the
-//! object generation, sent as x-goog-if-generation-match with OAuth
-//! credentials. The distinction is the dialect, not the endpoint — GCS
-//! accepts S3-style requests on the same host but does not apply
+//! If-Match / If-None-Match with SigV4 credentials. An `az://` spec
+//! speaks the same etag dialect on Azure Blob Storage: Put Blob honors
+//! both headers, so only the client and the credentials differ. A
+//! `gs://` spec speaks the Cloud Storage XML API dialect: the CAS token
+//! is the object generation, sent as x-goog-if-generation-match with
+//! OAuth credentials. The distinction is the dialect, not the endpoint —
+//! GCS accepts S3-style requests on the same host but does not apply
 //! If-Match to a PUT, so only the generation dialect can fence there.
 //! Callers never see the difference: the token is an opaque `String` a
 //! read answers and a conditional write consumes.
@@ -27,6 +31,9 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::aws::S3ConditionalPut;
+use object_store::azure::authority_hosts;
+use object_store::azure::AzureConfigKey;
+use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
 use object_store::Attribute;
@@ -54,13 +61,17 @@ pub struct StaticCredentials {
 }
 
 /// Which conditional-write dialect the bucket speaks, and therefore
-/// what the opaque CAS token holds: the etag on S3, the object
-/// generation on GCS. GCS ignores etags on writes, so its tokens must
-/// come from the generation everywhere — reads, heads, and put results.
+/// what the opaque CAS token holds: the etag on S3 and on Azure Blob
+/// Storage, the object generation on GCS. GCS ignores etags on writes,
+/// so its tokens must come from the generation everywhere — reads,
+/// heads, and put results. Azure needs no third dialect: Put Blob
+/// applies If-None-Match and If-Match to the etag, exactly as S3 does,
+/// so the two share [`Self::token`] and [`Self::update`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StorageBackend {
     S3,
     Gcs,
+    Azure,
 }
 
 impl StorageBackend {
@@ -68,6 +79,7 @@ impl StorageBackend {
         match self {
             StorageBackend::S3 => "s3",
             StorageBackend::Gcs => "gs",
+            StorageBackend::Azure => "az",
         }
     }
 
@@ -77,7 +89,7 @@ impl StorageBackend {
     /// conditional write would send as a real precondition.
     fn token(self, e_tag: Option<String>, version: Option<String>) -> anyhow::Result<String> {
         let (token, header) = match self {
-            StorageBackend::S3 => (e_tag, "ETag"),
+            StorageBackend::S3 | StorageBackend::Azure => (e_tag, "ETag"),
             StorageBackend::Gcs => (version, "x-goog-generation"),
         };
         match token {
@@ -91,7 +103,7 @@ impl StorageBackend {
     /// The precondition a conditional update sends for a held token.
     fn update(self, token: &str) -> UpdateVersion {
         match self {
-            StorageBackend::S3 => UpdateVersion {
+            StorageBackend::S3 | StorageBackend::Azure => UpdateVersion {
                 e_tag: Some(token.to_string()),
                 version: None,
             },
@@ -108,7 +120,7 @@ impl StorageBackend {
     /// wrong place.
     fn precondition(self) -> &'static str {
         match self {
-            StorageBackend::S3 => "If-Match / If-None-Match",
+            StorageBackend::S3 | StorageBackend::Azure => "If-Match / If-None-Match",
             StorageBackend::Gcs => "x-goog-if-generation-match",
         }
     }
@@ -134,15 +146,32 @@ pub struct Bucket {
     pub prefix: String,
 }
 
-/// Split a `[s3://|gs://]NAME[/PREFIX]` bucket spec into the backend, the
-/// bucket name and a normalized key prefix: empty, or slash-terminated. A
-/// spec without a scheme stays S3-compatible, and a spec without a PREFIX
-/// keeps every key at the bucket root, so a fleet provisioned before
-/// either existed never moves its objects.
+/// Whether a conditional write reached a provider-enforced conflict.
+/// Azure reports a failed `If-None-Match` as `Precondition`, while some
+/// stores report the same create conflict as `AlreadyExists`. Both are a
+/// clean lost race. Every other error remains ambiguous.
+fn is_clean_cas_rejection(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Precondition { .. } | Error::AlreadyExists { .. }
+    )
+}
+
+/// Split a `[s3://|gs://|az://]NAME[/PREFIX]` bucket spec into the
+/// backend, the bucket name and a normalized key prefix: empty, or
+/// slash-terminated. A spec without a scheme stays S3-compatible, and a
+/// spec without a PREFIX keeps every key at the bucket root, so a fleet
+/// provisioned before either existed never moves its objects.
+///
+/// On `az://` the NAME is the container, and the storage account comes
+/// from `AZURE_STORAGE_ACCOUNT_NAME`. The second path segment is the key
+/// prefix on all three schemes, so the account cannot live there without
+/// making `az://` parse differently from the other two.
 fn split_spec(spec: &str) -> (StorageBackend, &str, String) {
-    let (backend, spec) = match spec.strip_prefix("gs://") {
-        Some(rest) => (StorageBackend::Gcs, rest),
-        None => (StorageBackend::S3, spec.trim_start_matches("s3://")),
+    let (backend, spec) = match (spec.strip_prefix("gs://"), spec.strip_prefix("az://")) {
+        (Some(rest), _) => (StorageBackend::Gcs, rest),
+        (_, Some(rest)) => (StorageBackend::Azure, rest),
+        _ => (StorageBackend::S3, spec.trim_start_matches("s3://")),
     };
     let (name, prefix) = spec.split_once('/').unwrap_or((spec, ""));
     let parts = prefix.split('/').filter(|part| !part.is_empty());
@@ -154,14 +183,37 @@ fn split_spec(spec: &str) -> (StorageBackend, &str, String) {
 }
 
 impl Bucket {
-    /// `bucket` is `[s3://|gs://]NAME[/PREFIX]`. With a PREFIX every key
-    /// this client reads or writes lives under `PREFIX/`, so several
+    /// Builds a bucket over injected ordinary and conditional-write stores.
+    #[cfg(all(test, celld_internal_tests))]
+    pub(crate) fn with_stores(
+        store: Arc<dyn ObjectStore>,
+        cas_store: Arc<dyn ObjectStore>,
+        backend: StorageBackend,
+        name: String,
+        prefix: String,
+    ) -> Self {
+        Self {
+            store,
+            cas_store,
+            backend,
+            name,
+            prefix,
+        }
+    }
+
+    /// `bucket` is `[s3://|gs://|az://]NAME[/PREFIX]`. With a PREFIX every
+    /// key this client reads or writes lives under `PREFIX/`, so several
     /// fleets can share one bucket without colliding.
     ///
     /// A `gs://` bucket authenticates through Google Application Default
     /// Credentials (or the `GOOGLE_*` service-account environment) and
     /// takes no S3 endpoint, static credentials, or region — the bucket
     /// carries its own location.
+    ///
+    /// An `az://` bucket names an Azure Blob Storage container, takes its
+    /// account from `AZURE_STORAGE_ACCOUNT_NAME`, and authenticates with a
+    /// storage account key, a managed identity, or a workload identity. It
+    /// takes no S3 endpoint, static credentials, or region either.
     ///
     /// `app` labels this client's traffic in the User-Agent (the aws
     /// AppName format, `app/<name>`), keeping e.g. the lease safety lane
@@ -173,27 +225,32 @@ impl Bucket {
         credentials: Option<StaticCredentials>,
         app: Option<&str>,
     ) -> anyhow::Result<Bucket> {
-        Self::open_with_gcs_builder(
+        Self::open_with_sources(
             bucket,
             endpoint,
             region,
             credentials,
             app,
-            GoogleCloudStorageBuilder::from_env(),
+            CloudSources::from_process(),
         )
     }
 
-    /// The body of [`Self::open`], taking the base GCS builder instead of
-    /// deriving it from the `GOOGLE_*` environment. A caller that passes
-    /// an explicit builder is independent of that environment.
-    fn open_with_gcs_builder(
+    /// The body of [`Self::open`], taking the cloud configuration instead
+    /// of deriving it from the `GOOGLE_*` and `AZURE_*` environments. A
+    /// caller that passes explicit sources is independent of that
+    /// environment.
+    fn open_with_sources(
         bucket: &str,
         endpoint: Option<&str>,
         region: &str,
         credentials: Option<StaticCredentials>,
         app: Option<&str>,
-        gcs_builder: GoogleCloudStorageBuilder,
+        sources: CloudSources,
     ) -> anyhow::Result<Bucket> {
+        let CloudSources {
+            gcs: gcs_builder,
+            azure: azure_env,
+        } = sources;
         let (backend, bucket, prefix) = split_spec(bucket);
         // The prefix is spliced into keys as plain text and stripped off
         // listed keys the same way. A character `object_store` would
@@ -286,6 +343,33 @@ impl Bucket {
                     Arc::new(cas_builder.build().context("build gcs cas client")?),
                 )
             }
+            StorageBackend::Azure => {
+                // The etag dialect again — Put Blob applies If-None-Match
+                // and If-Match — but a different client and different
+                // credentials. So an S3 endpoint or S3 static credentials
+                // with az:// is a configuration error, exactly as it is
+                // with gs://, and not something to quietly reinterpret.
+                if endpoint.is_some() {
+                    anyhow::bail!(
+                        "an az:// bucket takes no S3 endpoint; unset --endpoint / S3_ENDPOINT"
+                    );
+                }
+                if credentials.is_some() {
+                    anyhow::bail!(
+                        "an az:// bucket cannot use S3 static credentials; it authenticates \
+                         with an Azure storage account key, a managed identity, or a \
+                         workload identity"
+                    );
+                }
+                let builder = azure_builder_for(&azure_env, bucket)?
+                    .with_retry(retry)
+                    .with_client_options(options);
+                let cas_builder = builder.clone().with_retry(cas_retry);
+                (
+                    Arc::new(builder.build().context("build azure client")?),
+                    Arc::new(cas_builder.build().context("build azure cas client")?),
+                )
+            }
         };
         Ok(Bucket {
             store,
@@ -296,7 +380,7 @@ impl Bucket {
         })
     }
 
-    /// The bucket's URL scheme, `s3` or `gs`, for operator-facing
+    /// The bucket's URL scheme, `s3`, `gs` or `az`, for operator-facing
     /// messages.
     pub fn scheme(&self) -> &'static str {
         self.backend.scheme()
@@ -426,8 +510,9 @@ impl Bucket {
     }
 
     /// Conditional write. `token: None` requires the key to be absent;
-    /// `Some` requires the current CAS token — the etag on S3 (If-Match),
-    /// the generation on GCS (x-goog-if-generation-match).
+    /// `Some` requires the current CAS token — the etag on S3 and on
+    /// Azure Blob Storage (If-Match), the generation on GCS
+    /// (x-goog-if-generation-match).
     /// `Ok(Some(new_token))` applied, `Ok(None)` cleanly rejected; any
     /// other failure is ambiguous and stays an error.
     pub async fn put_cas(
@@ -440,6 +525,15 @@ impl Bucket {
         let mode = match token {
             None => PutMode::Create,
             Some(token) => PutMode::Update(self.backend.update(token)),
+        };
+        #[cfg(all(test, celld_internal_tests))]
+        let mode = if token.is_none()
+            && crate::asyncrt::sabotage_active(
+                crate::host_services::EngineSabotage::FreshCreateOverwrites,
+            ) {
+            PutMode::Overwrite
+        } else {
+            mode
         };
         match self
             .cas_store
@@ -466,7 +560,7 @@ impl Bucket {
                     })?;
                 Ok(Some(token))
             }
-            Err(Error::Precondition { .. } | Error::AlreadyExists { .. }) => Ok(None),
+            Err(error) if is_clean_cas_rejection(&error) => Ok(None),
             Err(error) => Err(anyhow!(error).context(format!(
                 "conditional write {}://{}/{key} may have committed",
                 self.scheme(),
@@ -486,6 +580,34 @@ impl Bucket {
                 self.name
             ))),
         }
+    }
+
+    /// Batched delete: the S3-family backends fold this into DeleteObjects
+    /// requests (up to 1,000 keys per class A operation) — the lab priced
+    /// bundle GC's one-key-at-a-time deletes at 9k operations an hour.
+    /// Returns the keys that are now gone; an absent key counts as gone,
+    /// and a key that fails stays listed for the next pass.
+    pub async fn delete_many(&self, keys: &[String]) -> Vec<String> {
+        let locations = futures_util::stream::iter(
+            keys.iter()
+                .map(|key| Ok(Path::from(self.key(key).as_str())))
+                .collect::<Vec<_>>(),
+        )
+        .boxed();
+        let mut gone = Vec::with_capacity(keys.len());
+        let mut results = self.store.delete_stream(locations);
+        while let Some(result) = results.next().await {
+            match result {
+                Ok(path) => gone.push(self.unkey(path.as_ref()).to_string()),
+                Err(Error::NotFound { path, .. }) => {
+                    gone.push(self.unkey(&path).to_string());
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "batched delete left a key for the next pass");
+                }
+            }
+        }
+        gone
     }
 
     /// Every object under `prefix/`; the client paginates internally.
@@ -566,10 +688,7 @@ impl Bucket {
     /// fault, a rejected credential — and a retry can clear it, so a
     /// caller that must not fail on a transient blip keeps serving.
     pub(crate) async fn probe_cas_steps(&self) -> anyhow::Result<CasVerdict> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_nanos())
-            .unwrap_or_default();
+        let nanos = crate::asyncrt::wall_ms().max(0) as u128 * 1_000_000;
         // Unique per probe, so several nodes probing at once touch
         // disjoint keys and no probe reads another one's object as the
         // store misbehaving — a collision surfaces as a false `Violation`,
@@ -578,8 +697,8 @@ impl Bucket {
         // leaves `nanos` at zero.
         let key = format!(
             "probe/cas-{nanos}-{}-{:016x}",
-            std::process::id(),
-            rand::random::<u64>()
+            crate::asyncrt::process_tag(),
+            rand::RngCore::next_u64(&mut crate::asyncrt::rng("cas_probe"))
         );
         let verdict = self.cas_contract(&key).await;
         // The object is debris on every path, so retire it before the
@@ -684,15 +803,14 @@ pub(crate) enum CasVerdict {
 /// The replica-lane store for a `gs://` fleet bucket: its own transport
 /// and connection pool, authenticated like [`Bucket::open`]'s gs:// path
 /// (OAuth via Application Default Credentials or the `GOOGLE_*` env),
-/// with the same default retry policy the S3 replica lane gets from its
-/// litestream-ported config in `ltx_repl`. Replica writes are plain puts,
-/// so retries stay on.
+/// with the same bounded retry policy the S3 replica lane uses. Replica
+/// writes are plain puts, so retries stay on.
 pub(crate) fn gcs_replica_store(bucket: &str) -> anyhow::Result<Arc<dyn ObjectStore>> {
     gcs_replica_store_with_builder(GoogleCloudStorageBuilder::from_env(), bucket)
 }
 
 /// The body of [`gcs_replica_store`], taking the base builder for the same
-/// reason [`Bucket::open_with_gcs_builder`] does.
+/// reason [`Bucket::open_with_sources`] does.
 fn gcs_replica_store_with_builder(
     builder: GoogleCloudStorageBuilder,
     bucket: &str,
@@ -700,9 +818,266 @@ fn gcs_replica_store_with_builder(
     Ok(Arc::new(
         builder
             .with_bucket_name(bucket)
+            .with_retry(celld_ltx::client::object_store::replica_retry_config())
             .build()
             .context("build gcs replica store")?,
     ))
+}
+
+/// The replica-lane store for an `az://` fleet bucket: its own transport
+/// and connection pool, authenticated like [`Bucket::open`]'s az:// path,
+/// with the same bounded retry policy the S3 replica lane uses. Replica
+/// writes are plain puts, so retries stay on.
+pub(crate) fn azure_replica_store(container: &str) -> anyhow::Result<Arc<dyn ObjectStore>> {
+    azure_replica_store_with_env(&AzureEnv::from_process(), container)
+}
+
+/// The body of [`azure_replica_store`], taking the environment for the
+/// same reason [`Bucket::open_with_sources`] does.
+fn azure_replica_store_with_env(
+    env: &AzureEnv,
+    container: &str,
+) -> anyhow::Result<Arc<dyn ObjectStore>> {
+    Ok(Arc::new(
+        azure_builder_for(env, container)?
+            .with_retry(celld_ltx::client::object_store::replica_retry_config())
+            .build()
+            .context("build azure replica store")?,
+    ))
+}
+
+/// The `AZURE_*` variables an `az://` bucket can inspect. celld captures
+/// them instead of letting `MicrosoftAzureBuilder::from_env` read the
+/// process environment, because the fleet client must decide which
+/// recognized settings it honors, and a test must be able to supply a
+/// set of its own. Names that `AzureConfigKey` does not parse are inert
+/// and stay ignored, as they are in `from_env`.
+#[derive(Clone, Default)]
+pub(crate) struct AzureEnv {
+    variables: Vec<(String, String)>,
+}
+
+impl AzureEnv {
+    /// Every `AZURE_*` variable in the process environment.
+    fn from_process() -> AzureEnv {
+        AzureEnv::from_pairs(std::env::vars().filter(|(name, _)| name.starts_with("AZURE_")))
+    }
+
+    fn from_pairs<K, V>(pairs: impl IntoIterator<Item = (K, V)>) -> AzureEnv
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        AzureEnv {
+            variables: pairs
+                .into_iter()
+                .map(|(name, value)| (name.into(), value.into()))
+                .filter(|(_, value)| !value.is_empty())
+                .collect(),
+        }
+    }
+}
+
+/// The cloud configuration [`Bucket::open`] derives from the process
+/// environment: the GCS builder, and the `AZURE_*` variables. Bundled so
+/// the seam that makes construction environment-independent stays one
+/// parameter as backends are added.
+pub(crate) struct CloudSources {
+    gcs: GoogleCloudStorageBuilder,
+    azure: AzureEnv,
+}
+
+impl CloudSources {
+    fn from_process() -> CloudSources {
+        CloudSources {
+            gcs: GoogleCloudStorageBuilder::from_env(),
+            azure: AzureEnv::from_process(),
+        }
+    }
+}
+
+/// Is this a setting an `az://` bucket accepts? celld supports three
+/// credential families — a storage account key, a managed identity, and
+/// a workload identity — on the public Azure cloud, and no other
+/// recognized Azure setting.
+///
+/// This is an allowlist, and the wildcard arm is the point of it.
+/// `AzureConfigKey` is `#[non_exhaustive]`, so a key that a later
+/// `object_store` adds falls to `false` and refuses, instead of reaching
+/// the client unexamined. A denylist gave the opposite default and let
+/// three settings through: `AZURE_USE_FABRIC_ENDPOINT` retargets the
+/// client at OneLake, the four `AZURE_FABRIC_*` variables form a fourth
+/// credential that wins ahead of the account key, and
+/// `AZURE_SKIP_SIGNATURE` makes every request anonymous.
+fn accepts_azure_config_key(key: &AzureConfigKey) -> bool {
+    matches!(
+        key,
+        // The account, and the account-key credential.
+        AzureConfigKey::AccountName
+            | AzureConfigKey::AccessKey
+            // A managed identity: the defaults reach IMDS, and any one
+            // of these three selects a user-assigned identity.
+            | AzureConfigKey::ClientId
+            | AzureConfigKey::ObjectId
+            | AzureConfigKey::MsiResourceId
+            // A workload identity, with ClientId above.
+            | AzureConfigKey::AuthorityId
+            | AzureConfigKey::AuthorityHost
+            | AzureConfigKey::FederatedTokenFile
+            // Azurite, handled separately below.
+            | AzureConfigKey::UseEmulator
+    )
+}
+
+/// Build the Azure client configuration for `container` from the accepted
+/// part of `env`, and refuse every other recognized Azure setting.
+///
+/// `object_store`'s builder accepts every source the Azure chain offers.
+/// celld accepts three, which mirrors the deliberate narrowness of the S3
+/// path, where celld reads the `AWS_*` environment but no `~/.aws`
+/// profile and no SSO login. Both the fleet client and the replica store
+/// come through here, so they cannot narrow differently.
+///
+/// A refused variable fails at startup with a message that names it. A
+/// silently ignored credential surfaces much later as a permission
+/// error, and it points at the container instead of the configuration.
+fn azure_builder_for(env: &AzureEnv, container: &str) -> anyhow::Result<MicrosoftAzureBuilder> {
+    let mut parsed: Vec<(AzureConfigKey, &str, &str)> = Vec::new();
+    let mut seen: Vec<(AzureConfigKey, &str)> = Vec::new();
+    for (name, value) in &env.variables {
+        // `from_env` parses each AZURE_* name into a config key and drops
+        // the ones that do not parse, so a name this parse rejects is a
+        // name object_store would have ignored anyway.
+        let Ok(key) = name.to_ascii_lowercase().parse::<AzureConfigKey>() else {
+            continue;
+        };
+        if !accepts_azure_config_key(&key) {
+            anyhow::bail!(
+                "an az:// bucket does not accept {name}; celld authenticates with an Azure \
+                 storage account key, a managed identity, or a workload identity on the \
+                public Azure cloud, and it refuses every other Azure setting"
+            );
+        }
+        let value = if key == AzureConfigKey::AuthorityHost {
+            let public = authority_hosts::AZURE_PUBLIC_CLOUD;
+            if value != public && value != &format!("{public}/") {
+                anyhow::bail!(
+                    "an az:// bucket accepts {name} only for the public Azure authority \
+                     {public}; sovereign and custom authority hosts are not supported"
+                );
+            }
+            // The webhook value has a trailing slash, but object_store
+            // inserts its own separator. Pass one canonical spelling.
+            public
+        } else {
+            value.as_str()
+        };
+        if let Some((_, first)) = seen.iter().find(|(candidate, _)| *candidate == key) {
+            anyhow::bail!(
+                "an az:// bucket does not accept both {first} and {name}; they are aliases for \
+                 the same Azure setting"
+            );
+        }
+        seen.push((key, name));
+        parsed.push((key, name.as_str(), value));
+    }
+
+    let has = |wanted| seen.iter().any(|(key, _)| *key == wanted);
+    let account_key = has(AzureConfigKey::AccessKey);
+    let client_id = has(AzureConfigKey::ClientId);
+    let workload_specific = has(AzureConfigKey::AuthorityId)
+        || has(AzureConfigKey::AuthorityHost)
+        || has(AzureConfigKey::FederatedTokenFile);
+    let managed_specific = has(AzureConfigKey::ObjectId) || has(AzureConfigKey::MsiResourceId);
+    let managed_selectors: Vec<&str> = seen
+        .iter()
+        .filter(|(key, _)| {
+            matches!(
+                key,
+                AzureConfigKey::ClientId | AzureConfigKey::ObjectId | AzureConfigKey::MsiResourceId
+            )
+        })
+        .map(|(_, name)| *name)
+        .collect();
+
+    if (account_key && (client_id || workload_specific || managed_specific))
+        || (workload_specific && managed_specific)
+    {
+        anyhow::bail!(
+            "an az:// bucket does not accept mixed Azure credential families; select exactly \
+             one storage account key, workload identity, or managed identity"
+        );
+    }
+    // Two selectors inside the managed-identity family are not an alias
+    // pair, so the duplicate check above does not see them. object_store
+    // resolves them by precedence instead — client_id, then object_id,
+    // then msi_res_id (`azure/credential.rs`) — so the node authenticates
+    // as an identity the operator did not choose, and the mistake
+    // surfaces as a permission error against the container. That is the
+    // late, misdirected failure this whole seam exists to prevent.
+    if !workload_specific && managed_selectors.len() > 1 {
+        anyhow::bail!(
+            "an az:// bucket accepts one managed-identity selector, but {} name different \
+             identities; set exactly one of AZURE_CLIENT_ID, AZURE_OBJECT_ID, or \
+             AZURE_MSI_RESOURCE_ID",
+            managed_selectors.join(" and ")
+        );
+    }
+    if workload_specific
+        && !(client_id
+            && has(AzureConfigKey::AuthorityId)
+            && has(AzureConfigKey::FederatedTokenFile))
+    {
+        anyhow::bail!(
+            "an Azure workload identity requires AZURE_CLIENT_ID, AZURE_TENANT_ID, and \
+             AZURE_FEDERATED_TOKEN_FILE"
+        );
+    }
+
+    let mut builder = MicrosoftAzureBuilder::new();
+    let mut account = false;
+    let mut emulator = None;
+    for (key, name, value) in parsed {
+        match key {
+            // Never handed on as a string. object_store would parse it
+            // itself, and its parse accepts y/n as well as true/false, so
+            // a second parse here could disagree with it — and a
+            // disagreement over this key means celld validates a
+            // production configuration while the client talks to a local
+            // Azurite. Two such nodes each own every cell. The name
+            // travels with the value so the refusal below names what the
+            // operator set. Today one AZURE_ spelling parses to this key,
+            // so the two can not differ; carrying the name keeps that
+            // true if object_store adds an alias.
+            AzureConfigKey::UseEmulator => emulator = Some((name, value)),
+            AzureConfigKey::AccountName => {
+                account = true;
+                builder = builder.with_config(key, value);
+            }
+            _ => builder = builder.with_config(key, value),
+        }
+    }
+    // Azurite is the one endpoint override celld allows, and it arrives
+    // as a parsed bool, so object_store re-parses nothing. Its
+    // conditional-write behavior is not qualified for a production fleet.
+    if let Some((name, value)) = emulator {
+        let on = match value.to_ascii_lowercase().as_str() {
+            "true" | "1" => true,
+            "false" | "0" => false,
+            other => anyhow::bail!("{name} accepts true or false, not {other:?}"),
+        };
+        builder = builder.with_use_emulator(on);
+        if on {
+            return Ok(builder.with_container_name(container));
+        }
+    }
+    if !account {
+        anyhow::bail!(
+            "an az:// bucket names a container, so the storage account must come from \
+             AZURE_STORAGE_ACCOUNT_NAME"
+        );
+    }
+    Ok(builder.with_container_name(container))
 }
 
 /// Was this a 401/403 — the credential itself rejected? Used by the managed
@@ -720,50 +1095,6 @@ pub fn is_unauthorized(error: &anyhow::Error) -> bool {
         let text = cause.to_string();
         text.contains("status 403") || text.contains("status 401")
     })
-}
-
-#[cfg(test)]
-mod live_cas {
-    use super::{Bucket, StaticCredentials};
-
-    // Live CAS contract against a real bucket (R2 or GCS). Gated on
-    // CELLD_CAS_LIVE=1 so it never runs in CI; a mock cannot answer whether
-    // object_store maps the provider's precondition failures to Ok(None)
-    // (the fencing contract) rather than Err. Run:
-    //   CELLD_CAS_LIVE=1 CELLD_CAS_BUCKET=<b> CELLD_CAS_ENDPOINT=<ep> AWS_*=... \
-    //     cargo test -p celld put_cas_contract -- --nocapture
-    // or against GCS (Application Default Credentials, no endpoint):
-    //   CELLD_CAS_LIVE=1 CELLD_CAS_BUCKET=gs://<b> \
-    //     cargo test -p celld put_cas_contract -- --nocapture
-    #[tokio::test]
-    async fn put_cas_contract_against_real_bucket() {
-        if std::env::var("CELLD_CAS_LIVE").as_deref() != Ok("1") {
-            return;
-        }
-        let name = std::env::var("CELLD_CAS_BUCKET").expect("CELLD_CAS_BUCKET");
-        let endpoint = std::env::var("CELLD_CAS_ENDPOINT").ok();
-        let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "auto".into());
-        let creds = std::env::var("AWS_ACCESS_KEY_ID")
-            .ok()
-            .map(|access_key_id| StaticCredentials {
-                access_key_id,
-                secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY")
-                    .expect("AWS_SECRET_ACCESS_KEY"),
-                session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
-            });
-        let bucket = Bucket::open(&name, endpoint.as_deref(), &region, creds, Some("cas-test"))
-            .expect("open bucket");
-
-        // The four steps live in `Bucket::probe_cas`, which `celld
-        // diagnose` and node startup run against an operator's bucket.
-        // This test points the same code at a real provider, which is the
-        // one question a mock cannot answer.
-        bucket
-            .probe_cas()
-            .await
-            .expect("the store must keep the conditional-write contract");
-        eprintln!("CAS verified on {name}: create / reject-create / update / reject-stale");
-    }
 }
 
 #[cfg(all(test, celld_internal_tests))]

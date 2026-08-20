@@ -165,6 +165,97 @@ impl OutboundWebSocketSink {
     }
 }
 
+/// Carry frames between a Durable Object's socket and a client end another
+/// isolate in this process kept, after a `stub.fetch` upgrade.
+///
+/// A same-isolate pair links its two ends directly and never involves the
+/// host. This pair cannot: the cell end lives in the cell's isolate and the
+/// client end in the caller's, and neither can reach the other's heap. So
+/// each direction takes the route an external client's frames take —
+/// `dispatch_ws_message` into the cell, a pull queue out to the caller —
+/// which is also why a hibernatable server end needs nothing special here.
+///
+/// The task ends when either side closes, and it unregisters both.
+async fn local_websocket_pipe(
+    app: AppHandle,
+    id: u64,
+    target: celld::js::WsTarget,
+    pull: Option<celld::js::WsPullSender>,
+    reply: tokio::sync::oneshot::Sender<anyhow::Result<celld::js::OutboundWsOpen>>,
+) -> anyhow::Result<()> {
+    let Some(pull) = pull else {
+        let _ = reply.send(Err(anyhow::anyhow!(
+            "a bound WebSocket target needs an isolate queue"
+        )));
+        return Ok(());
+    };
+    // Both registrations flush whatever each end queued before it had
+    // anywhere to send: the cell's greeting frame is queued while its own
+    // fetch handler still runs, and the caller can send the moment it
+    // accepts.
+    let (caller_tx, mut from_caller) = mpsc::unbounded_channel();
+    let (cell_tx, mut from_cell) = mpsc::unbounded_channel();
+    celld::js::ws_register(id, caller_tx);
+    celld::js::ws_register(target.id, cell_tx);
+    let _ = reply.send(Ok(celld::js::OutboundWsOpen {
+        protocol: None,
+        declined: None,
+    }));
+    // Set only by a close the caller sent. A close from the cell needs no
+    // entry here: the isolate that sent it has already told the cell's own
+    // handler, and telling it again would be a second `webSocketClose`.
+    let mut caller_close: Option<(u16, String)> = None;
+    loop {
+        tokio::select! {
+            frame = from_caller.recv() => match frame {
+                Some(celld::js::WsOut::Text(text)) => {
+                    if let Err(error) = dispatch_ws_message(
+                        &app, &target.scope, target.id, celld::js::WsIn::Text(text),
+                    ).await {
+                        tracing::warn!(%error, scope = %target.scope, "kept WebSocket message failed");
+                        break;
+                    }
+                }
+                Some(celld::js::WsOut::Binary(bytes)) => {
+                    if let Err(error) = dispatch_ws_message(
+                        &app, &target.scope, target.id, celld::js::WsIn::Binary(bytes),
+                    ).await {
+                        tracing::warn!(%error, scope = %target.scope, "kept WebSocket message failed");
+                        break;
+                    }
+                }
+                Some(celld::js::WsOut::Close(code, reason)) => {
+                    caller_close = Some((code, reason));
+                    break;
+                }
+                // The caller's region ended and took its socket with it.
+                None => break,
+            },
+            frame = from_cell.recv() => match frame {
+                Some(celld::js::WsOut::Text(text)) => {
+                    if pull.send(celld::js::WsPull::Text(text)).is_err() { break; }
+                }
+                Some(celld::js::WsOut::Binary(bytes)) => {
+                    if pull.send(celld::js::WsPull::Binary(bytes)).is_err() { break; }
+                }
+                Some(celld::js::WsOut::Close(code, reason)) => {
+                    let _ = pull.send(celld::js::WsPull::Close(code, reason, true));
+                    break;
+                }
+                None => break,
+            },
+        }
+    }
+    if let Some((code, reason)) = caller_close {
+        let _ = dispatch_ws_closed(&app, &target.scope, target.id, code, reason, true).await;
+    }
+    app.websocket_closed(target.scope.clone(), target.id);
+    celld::js::ws_unregister(target.id);
+    celld::js::ws_unregister(id);
+    celld::js::ws_pull_unregister(id);
+    Ok(())
+}
+
 pub(crate) async fn outbound_websocket_task(
     app: AppHandle,
     request: celld::js::OutboundWsReq,
@@ -179,8 +270,12 @@ pub(crate) async fn outbound_websocket_task(
         pull,
         headers,
         want_response,
+        target,
         reply,
     } = request;
+    if let Some(target) = target {
+        return local_websocket_pipe(app, id, target, pull, reply).await;
+    }
     let sink = match pull {
         Some(pull) => OutboundWebSocketSink::Isolate(pull),
         None => OutboundWebSocketSink::Cell {
@@ -359,8 +454,8 @@ where
 /// loses the header. The next read then treats a payload byte as a frame header
 /// and the stream never realigns. Earlier versions of both callers read the
 /// socket in the same `tokio::select!` as the cell's outbound queue, which drops
-/// the losing future on every iteration; `tests/p0/runtime/socket_cancel.rs`
-/// fails against that shape.
+/// the losing future on every iteration; a test that cancels a read
+/// mid-payload fails against that shape.
 ///
 /// One async block therefore owns each direction. The halves are split so that
 /// the writer can write while the reader reads, and the writer stops on a signal
@@ -521,6 +616,38 @@ async fn websocket_task<S>(
     // The close handler is allowed to choose the response code and reason.
     // Its output is queued while dispatch_ws_closed drives V8, so flush it
     // before unregistering the socket or considering a protocol-level echo.
+    //
+    // Its output can also still be behind the output gate: the handler may
+    // read, and what it reads can belong to a write another request has not
+    // proved durable yet. The drain below does not block, so a frame still in
+    // flight leaves `handler_sent_close` false and the peer is answered with
+    // the echo of its own close -- a clean close carrying the wrong reason,
+    // which is indistinguishable from the handler choosing it.
+    //
+    // Bounded, and skipped outright on a draining node. The drain loop polls
+    // the gate calls it already dispatched but never receives a new one: it
+    // has no `gate_rx` arm. A ticket taken after the main loop broke is sent
+    // to a live but unread channel and parks for good, so waiting on it here
+    // would hold the socket task open until the drain hits its deadline. The
+    // bound covers the same park reached the other way: `is_draining` is read
+    // once, and shutdown can begin between that read and the wait. Giving up
+    // costs the reason the handler chose, never a frame the gate has not
+    // cleared -- the drain below still finds nothing, the echo still answers
+    // the peer, and a frame released later lands on a socket that is gone.
+    if !app.is_draining() {
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            celld::js::ws_await_flushes(target.id),
+        )
+        .await;
+        if waited.is_err() {
+            tracing::warn!(
+                scope = %target.scope,
+                websocket = target.id,
+                "gave up waiting for the close handler's frames"
+            );
+        }
+    }
     let mut handler_sent_close = false;
     while let Ok(output) = outputs.try_recv() {
         handler_sent_close |= matches!(output, celld::js::WsOut::Close(_, _));
@@ -624,8 +751,8 @@ where
 /// advanced and loses the header. The next read then treats a payload byte as
 /// a frame header and the stream never realigns. An earlier version of this
 /// function ran both reads in one `tokio::select!`, which drops the losing
-/// future on every iteration; `tests/p0/runtime/tunnel_cancel.rs` fails against
-/// that shape.
+/// future on every iteration; a test that cancels a read mid-payload fails
+/// against that shape.
 ///
 /// One task therefore owns each direction. The halves are split so that a task
 /// can write to a socket while the other task reads it, and neither read is
@@ -863,7 +990,7 @@ pub(crate) async fn handle_websocket(mut request: Request<Incoming>, app: AppHan
     let body_read_us = body_started.elapsed().as_micros() as u64;
     let worker_started = Instant::now();
     let worker_response = match runtime
-        .fetch_worker_pool(url, method, body, headers, request_id)
+        .fetch_worker_pool(url, method, body.into(), headers, request_id)
         .await
     {
         Ok(response) => response,

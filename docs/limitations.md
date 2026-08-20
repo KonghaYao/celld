@@ -4,10 +4,11 @@ The boundaries of the current alpha:
 
 - A fleet runs one application deployment. There is no multi-tenant
   scheduler, no account service, or managed ingress.
-- celld requires an S3-compatible bucket or a Google Cloud Storage
-  bucket, also on a laptop. There is no local filesystem mode, so local
-  development needs a real bucket or a local store that provides
-  conditional writes (see [ownership and fencing](fencing.md)).
+- celld requires an S3-compatible bucket, a Google Cloud Storage bucket,
+  or an Azure Blob Storage container, also on a laptop. There is no local
+  filesystem mode, so local development needs a real bucket or a local
+  store that provides conditional writes (see [ownership and
+  fencing](fencing.md)).
 - The peer HTTP protocol does not terminate TLS. Run the fleet on a
   private network or an encrypted overlay, and terminate public TLS in an
   ingress proxy.
@@ -19,7 +20,17 @@ The boundaries of the current alpha:
   identity tokens. celld does not read `~/.aws` profiles or SSO logins.
   A `gs://` bucket authenticates with Google Application Default
   Credentials or with a service account key from the `GOOGLE_*`
-  environment; S3 static credentials do not apply to it.
+  environment; S3 static credentials do not apply to it. An `az://`
+  bucket authenticates with a storage account key, a managed identity, or
+  a workload identity on the public Azure cloud. celld requires exactly one
+  credential family, and it refuses every recognized Azure configuration
+  variable outside those families. It ignores an `AZURE_*` name that
+  `object_store` 0.11.2 does not recognize.
+- An `az://` bucket reads a managed identity from the Azure instance
+  metadata service, which an Azure VM and an AKS node supply. celld does
+  not read the `IDENTITY_ENDPOINT` variable, so a managed identity on
+  Azure App Service or Azure Container Apps does not work. Use a workload
+  identity or a storage account key on those two platforms.
 - The [Cloudflare compatibility](cloudflare-compat.md) page shows what
   celld runs of the Workers platform: the available APIs, the deploy
   contract, and what is out of scope (KV, R2, `wrangler.toml`, routes).

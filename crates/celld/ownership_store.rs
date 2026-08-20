@@ -1,5 +1,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
+#![warn(clippy::disallowed_macros)]
+
 //! Bucket ownership effect adapter, over either conditional-write dialect.
 //!
 //! This module deliberately contains serialization, wall-clock sampling, SDK
@@ -15,7 +17,6 @@ use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize)]
 struct OwnerWire<'a> {
@@ -29,7 +30,7 @@ struct OwnerWireOwned {
     epoch: u64,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct NodeLeaseWire {
     pub(crate) node: String,
     pub(crate) expires_ms: u64,
@@ -40,9 +41,37 @@ pub(crate) struct NodeLeaseWire {
     #[serde(default)]
     pub(crate) peer_protocol: u16,
     #[serde(default, rename = "ownership_index_generation")]
-    generation: String,
+    pub(crate) generation: String,
+    /// The folded node log: absent until the
+    /// session's first fleet open. Every writer of this record carries it
+    /// through unchanged except the log tier itself and recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) log: Option<NodeLogWire>,
     #[serde(default)]
     pub(crate) load: NodeLoadWire,
+}
+
+/// The folded log fields, exactly the old log/<session>.json body: the
+/// record moved into the lease, the shape did not change.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct NodeLogWire {
+    pub(crate) state: String,
+    pub(crate) epoch: u64,
+    pub(crate) ensemble: Vec<String>,
+    pub(crate) tiered: u64,
+    #[serde(default)]
+    pub(crate) active: bool,
+}
+
+pub(crate) fn log_state_from_wire(
+    log: &Option<NodeLogWire>,
+) -> Option<celld_logic::log_tier::LogState> {
+    match log.as_ref().map(|log| log.state.as_str()) {
+        Some("open") => Some(celld_logic::log_tier::LogState::Open),
+        Some("recovering") => Some(celld_logic::log_tier::LogState::Recovering),
+        Some("sealed") => Some(celld_logic::log_tier::LogState::Sealed),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -85,10 +114,7 @@ fn capacity_record_is_recent(last_modified_secs: i64, now_ms: u64, lease_ttl_ms:
 }
 
 pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    crate::asyncrt::wall_ms().max(0) as u64
 }
 
 /// The production-compatible conditional object store used by ownership
@@ -101,29 +127,35 @@ pub struct BucketOwnership {
     probe_public_key: String,
     live: Arc<LiveLoad>,
     lease_ttl_ms: u64,
+    /// The full folded log object this node's OWN lease record carries,
+    /// tagged with a publish sequence.
+    /// Renewals snapshot (seq, object) ONCE when they serialize the wire
+    /// body, and the applied notification reports the seq of the body
+    /// that actually landed — never a re-read of this slot, which is what
+    /// made the first protocol unsound (cold review, B1): a confirmation
+    /// must carry the identity of the write it confirms.
+    own_log: std::sync::Mutex<(u64, Option<NodeLogWire>)>,
+    /// Every APPLIED write of our own lease record, as (etag, the publish
+    /// seq its body carried). A waiter that published seq S is satisfied
+    /// only by applied seq >= S; combined with the OwnLog write lock
+    /// (one publish outstanding at a time), >= S implies the applied body
+    /// IS the waiter's object.
+    applied: tokio::sync::watch::Sender<(String, u64)>,
 }
 
 /// What this node currently looks like, for peers deciding where to place a
 /// cell. The executor owns these numbers and publishes them on every lease
 /// renewal; nothing here decides anything locally.
-/// The shedding latch, readable without the core loop.
-///
-/// Admission on the stateless path is a relaxed atomic load, not a message:
-/// that path is the hello-world path, and asking the core would reinstate the
-/// round trip removed to reach its throughput. Set once at startup, alongside
-/// the counters peers rank this node by.
-static NODE_LOAD: std::sync::OnceLock<std::sync::Arc<LiveLoad>> = std::sync::OnceLock::new();
-
 pub fn set_node_load(load: std::sync::Arc<LiveLoad>) {
-    let _ = NODE_LOAD.set(load);
+    crate::asyncrt::services().set_node_load(load);
 }
 
 /// Is this node over a resource ceiling and recovering? False when nothing
 /// publishes load (no bucket), which is also when there is no pressure
 /// sampler to say otherwise.
 pub fn node_is_shedding() -> bool {
-    NODE_LOAD
-        .get()
+    crate::asyncrt::services()
+        .node_load()
         .is_some_and(|load| load.pressured.load(std::sync::atomic::Ordering::Relaxed))
 }
 
@@ -157,6 +189,8 @@ impl BucketOwnership {
             probe_public_key,
             live: Arc::new(LiveLoad::default()),
             lease_ttl_ms: 0,
+            own_log: std::sync::Mutex::new((0, None)),
+            applied: tokio::sync::watch::channel((String::new(), 0)).0,
         }
     }
 
@@ -165,6 +199,19 @@ impl BucketOwnership {
     pub fn with_lease_ttl_ms(mut self, ttl_ms: u64) -> Self {
         self.lease_ttl_ms = ttl_ms;
         self
+    }
+
+    pub fn lease_ttl_ms(&self) -> u64 {
+        self.lease_ttl_ms
+    }
+
+    /// The store's own transport, shared with the log tier. A fresh client
+    /// costs tens of milliseconds of rustls setup at boot, and boot speed is
+    /// load-bearing: the clean-reload resume window is the predecessor's
+    /// remaining lease TTL, and two extra client constructions can consume
+    /// enough of a short lease to prevent a clean reload.
+    pub fn bucket_client(&self) -> Bucket {
+        self.bucket.clone()
     }
 
     /// The counters this node publishes to its peers.
@@ -188,11 +235,12 @@ impl BucketOwnership {
         let Some((owner, etag)) = load_json::<OwnerWireOwned>(&self.bucket, &key).await? else {
             return Ok(None);
         };
-        Ok(Some(OwnerRecord {
+        let record = OwnerRecord {
             node: (!owner.node.is_empty()).then_some(owner.node),
             epoch: owner.epoch,
             etag,
-        }))
+        };
+        Ok(Some(record))
     }
 
     pub async fn read_node_lease(&self, owner: &str) -> anyhow::Result<Option<NodeLeaseRecord>> {
@@ -317,6 +365,7 @@ impl BucketOwnership {
         &self,
         guard: CasGuard,
         record: &NodeLeaseRecord,
+        stamped: &mut Option<celld_logic::log_tier::LogState>,
     ) -> anyhow::Result<LeaseCasOutcome> {
         if self.probe_public_key.is_empty() {
             return Err(anyhow::anyhow!(
@@ -324,6 +373,15 @@ impl BucketOwnership {
             ));
         }
         let key = format!("nodes/{}.json", self.node);
+        // Snapshot the folded log ONCE, before serialization: the applied
+        // notification below reports THIS seq — the identity of the body
+        // that landed — never a re-read of the slot (cold review, B1).
+        let (log_seq, log) = self.own_log.lock().unwrap().clone();
+        // Report the stamp through the out-parameter, synchronously,
+        // before the first await: a caller that times this future out
+        // still learns what the possibly-landed body carried (second
+        // cold review, finding 3).
+        *stamped = log_state_from_wire(&log);
         let body = serde_json::to_vec(&NodeLeaseWire {
             node: record.node.clone(),
             expires_ms: record.expires_ms,
@@ -332,15 +390,42 @@ impl BucketOwnership {
             peer_protocol: record.peer_protocol,
             generation: record.generation.clone(),
             load: process_load(&self.live),
+            // The CORE's lease writes carry the folded log through
+            // UNCHANGED: the full object lives in own_log, written only by
+            // the log tier's own core-mediated updates.
+            log,
         })?;
         let etag = match &guard {
             CasGuard::Absent => None,
             CasGuard::Match(etag) => Some(etag.as_str()),
         };
         match self.lease_bucket.put_cas(&key, body, etag).await? {
-            Some(etag) => Ok(LeaseCasOutcome::Applied { etag }),
+            Some(etag) => {
+                let _ = self.applied.send((etag.clone(), log_seq));
+                Ok(LeaseCasOutcome::Applied { etag })
+            }
             None => Ok(LeaseCasOutcome::Rejected),
         }
+    }
+}
+
+impl BucketOwnership {
+    /// Replace the folded log object the next lease write carries and
+    /// return its publish seq. The caller nudges a renewal and awaits
+    /// `applied_log` reaching that seq; the store never initiates writes.
+    pub(crate) fn set_own_log(&self, log: Option<NodeLogWire>) -> u64 {
+        let mut slot = self.own_log.lock().unwrap();
+        slot.0 += 1;
+        slot.1 = log;
+        slot.0
+    }
+
+    pub(crate) fn own_log(&self) -> Option<NodeLogWire> {
+        self.own_log.lock().unwrap().1.clone()
+    }
+
+    pub(crate) fn applied_log(&self) -> tokio::sync::watch::Receiver<(String, u64)> {
+        self.applied.subscribe()
     }
 }
 
@@ -352,6 +437,7 @@ pub(crate) async fn load_node_lease(
     Ok(load_json::<NodeLeaseWire>(bucket, &key)
         .await?
         .map(|(lease, etag)| NodeLeaseRecord {
+            log_state: log_state_from_wire(&lease.log),
             node: lease.node,
             addr: lease.addr,
             expires_ms: lease.expires_ms,
@@ -373,6 +459,7 @@ async fn load_json<T: for<'de> Deserialize<'de>>(
     Ok(Some((value, etag)))
 }
 
+#[allow(clippy::disallowed_methods)] // `/proc` is host telemetry, not node storage.
 fn process_load(live: &LiveLoad) -> NodeLoadWire {
     // One sample for both numbers. Reading the resident set size here and the
     // in-use figure from a value the actor wrote on its own timer would publish

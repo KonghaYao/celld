@@ -328,6 +328,7 @@ pub fn validate_peer_id(value: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(all(test, celld_internal_tests))]
+#[allow(clippy::disallowed_methods)]
 mod conformance_startup_tests {
     include!(env!("CELLD_CONFORMANCE_STARTUP_TESTS"));
 }

@@ -34,7 +34,7 @@ use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjPath;
 use object_store::{
     Attribute, AttributeValue, Attributes, ClientOptions, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload,
+    PutOptions, PutPayload, RetryConfig,
 };
 
 use crate::error::{Error, Result};
@@ -48,6 +48,61 @@ use super::ReplicaClient;
 
 /// The standard Litestream S3 metadata key for an LTX header timestamp.
 const METADATA_KEY_TIMESTAMP: &str = "litestream-timestamp";
+
+/// The retry policy every replica store uses.
+///
+/// object_store defaults to 10 retries under a 180-second ceiling. That suits
+/// a client whose caller has nowhere else to go. A replica store always has
+/// somewhere else to go: a failed segment read is retried by the restore that
+/// asked for it, and a failed upload is retried by the next replication turn,
+/// so a long ladder inside one request buys nothing and delays the answer.
+///
+/// The ceiling matters most on a request a person is waiting for. A read-only
+/// cell inspection reaches this store, and a definite failure under the
+/// default policy takes seconds of pure backoff before the caller learns
+/// anything. Three attempts still absorb an ordinary transient error.
+pub fn replica_retry_config() -> RetryConfig {
+    RetryConfig {
+        max_retries: 3,
+        retry_timeout: std::time::Duration::from_secs(30),
+        ..RetryConfig::default()
+    }
+}
+
+/// The same key with an underscore, for Azure Blob Storage. An Azure blob
+/// metadata name must be a C# identifier, so it cannot hold a hyphen, and
+/// the standard key is refused there.
+const METADATA_KEY_TIMESTAMP_UNDERSCORE: &str = "litestream_timestamp";
+
+/// Which object-metadata name carries the LTX header timestamp.
+///
+/// The name is per backend, not per deployment: Azure Blob Storage
+/// refuses a hyphen in a metadata name, and every other supported store
+/// accepts the standard Litestream key. The value and its format do not
+/// change.
+///
+/// The key exists for external Litestream tooling, which reads
+/// `litestream-timestamp` to do a timestamp restore without downloading
+/// every candidate file. A renamed key therefore ends that interop on
+/// Azure. celld itself never reads the key back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TimestampMetadataKey {
+    /// `litestream-timestamp`, the standard Litestream key.
+    #[default]
+    Litestream,
+    /// `litestream_timestamp`, for a store that refuses a hyphen.
+    Underscore,
+}
+
+impl TimestampMetadataKey {
+    /// The metadata name this variant writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Litestream => METADATA_KEY_TIMESTAMP,
+            Self::Underscore => METADATA_KEY_TIMESTAMP_UNDERSCORE,
+        }
+    }
+}
 
 /// Max keys S3 operates on per batch DELETE. `MaxKeys` (s3/replica_client.go:56).
 pub const MAX_KEYS: usize = 1000;
@@ -90,6 +145,11 @@ pub struct ObjectStoreConfig {
     pub skip_verify: bool,
     /// Multipart part size in bytes; 0 = default (5 MiB).
     pub part_size: u64,
+    /// The metadata name for the LTX header timestamp. The default is the
+    /// standard Litestream key; a host that injects an Azure store must
+    /// select [`TimestampMetadataKey::Underscore`], because Azure refuses
+    /// a hyphen in a metadata name.
+    pub timestamp_metadata_key: TimestampMetadataKey,
 }
 
 impl ObjectStoreConfig {
@@ -209,6 +269,7 @@ impl ObjectStoreConfig {
             force_path_style,
             skip_verify,
             part_size,
+            timestamp_metadata_key: TimestampMetadataKey::default(),
         })
     }
 
@@ -230,13 +291,13 @@ impl ObjectStoreConfig {
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&self.bucket)
             .with_region(region)
+            .with_retry(replica_retry_config())
             // Path-style ⇔ NOT virtual-hosted-style (s3/replica_client.go:258-263).
             .with_virtual_hosted_style_request(!self.force_path_style)
-            // object_store ships with conditional puts DISABLED for S3 and
-            // answers PutMode::Create with NotImplemented. The epoch seal is a
-            // conditional create (first restorer wins), and every provider on
-            // the support matrix speaks the If-None-Match/If-Match headers
-            // this enables.
+            // object_store disables S3 conditional puts by default. Keep the
+            // established ETagMatch behavior, so a user of the returned store
+            // can send PutMode::Create or PutMode::Update. Ordinary replica
+            // PUTs remain unconditional.
             .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch);
 
         if !self.endpoint.is_empty() {
@@ -596,12 +657,13 @@ impl ReplicaClient for ObjectStoreClient {
         // Preserve the LTX header timestamp in the standard Litestream object
         // metadata. This costs no extra request and lets Litestream perform an
         // accurate timestamp restore without downloading every candidate file.
+        // The name is per backend, because Azure refuses a hyphen in it.
         let header = ltx::Header::parse(data)?;
         let created_at = std::time::UNIX_EPOCH
             + std::time::Duration::from_millis(header.timestamp.max(0) as u64);
         let mut attributes = Attributes::new();
         attributes.insert(
-            Attribute::Metadata(METADATA_KEY_TIMESTAMP.into()),
+            Attribute::Metadata(self.config.timestamp_metadata_key.as_str().into()),
             AttributeValue::from(format_rfc3339_nano(header.timestamp)?),
         );
         let key = ObjPath::from(self.ltx_key(level, min_txid, max_txid));
@@ -762,13 +824,14 @@ mod tests {
         assert!(format_rfc3339_nano(i64::MAX).is_err());
     }
 
-    #[tokio::test]
-    async fn write_preserves_the_litestream_timestamp_metadata() {
+    /// Write one LTX object under `key` and answer the object's metadata.
+    async fn write_ltx_and_read_metadata(key: TimestampMetadataKey) -> Attributes {
         let store = Arc::new(object_store::memory::InMemory::new());
         let client = ObjectStoreClient::with_store(
             ObjectStoreConfig {
                 bucket: "bucket".into(),
                 path: "replica".into(),
+                timestamp_metadata_key: key,
                 ..Default::default()
             },
             store.clone(),
@@ -805,11 +868,37 @@ mod tests {
             )
             .await
             .expect("read object metadata");
-        let value = result
-            .attributes
+        result.attributes
+    }
+
+    #[tokio::test]
+    async fn write_preserves_the_litestream_timestamp_metadata() {
+        let attributes = write_ltx_and_read_metadata(TimestampMetadataKey::Litestream).await;
+        let value = attributes
             .get(&Attribute::Metadata(METADATA_KEY_TIMESTAMP.into()))
             .expect("litestream timestamp metadata");
         assert_eq!(value.as_ref(), "2021-01-01T00:00:00.123Z");
+    }
+
+    // Azure Blob Storage refuses a hyphen in a metadata name, so an az://
+    // replica writes the same value under an underscored key. The hyphen
+    // key must then be absent — a reader that finds both cannot tell which
+    // write produced the object.
+    #[tokio::test]
+    async fn an_underscored_key_replaces_the_hyphenated_one() {
+        let attributes = write_ltx_and_read_metadata(TimestampMetadataKey::Underscore).await;
+        let value = attributes
+            .get(&Attribute::Metadata(
+                METADATA_KEY_TIMESTAMP_UNDERSCORE.into(),
+            ))
+            .expect("underscored timestamp metadata");
+        assert_eq!(value.as_ref(), "2021-01-01T00:00:00.123Z");
+        assert!(
+            attributes
+                .get(&Attribute::Metadata(METADATA_KEY_TIMESTAMP.into()))
+                .is_none(),
+            "the hyphenated key must not also be written"
+        );
     }
 
     // ── ParseHost (port of TestParseHost, s3/replica_client_test.go:1071) ──────

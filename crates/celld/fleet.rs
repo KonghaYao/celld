@@ -1,5 +1,8 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
+// Fleet CLI and peer-diagnostic work is outside the Actor-backed World.
+#![allow(clippy::disallowed_methods)]
+
 //! Production bucket deployment adapters reused by the clean-sheet host.
 
 use crate::bucket::{Bucket, CasVerdict};
@@ -216,7 +219,7 @@ pub async fn diagnose(
 
     let enumerated = peers.is_empty();
     let peers = if enumerated {
-        let peers = diagnostic_node_ids(bucket).await?;
+        let peers = node_lease_ids(bucket).await?;
         println!("ok fleet {} node lease(s) enumerated", peers.len());
         peers
     } else {
@@ -238,7 +241,7 @@ pub async fn diagnose(
     let mut failures = 0_usize;
     let mut expired = 0_usize;
     for peer in peers {
-        let node = match diagnostic_node(bucket, &peer).await {
+        let node = match live_node_lease(bucket, &peer).await {
             Ok(Some(node)) => node,
             Ok(None) if enumerated => {
                 expired += 1;
@@ -332,7 +335,10 @@ pub async fn diagnose(
     Ok(())
 }
 
-async fn diagnostic_node(bucket: &Bucket, peer: &str) -> anyhow::Result<Option<NodeLeaseWire>> {
+pub(crate) async fn live_node_lease(
+    bucket: &Bucket,
+    peer: &str,
+) -> anyhow::Result<Option<NodeLeaseWire>> {
     let key = format!("nodes/{peer}.json");
     let node: NodeLeaseWire = serde_json::from_str(&get_string(bucket, &key).await?)
         .with_context(|| format!("decode {}://{}/{key}", bucket.scheme(), bucket.name))?;
@@ -351,7 +357,7 @@ async fn diagnostic_node(bucket: &Bucket, peer: &str) -> anyhow::Result<Option<N
     Ok(Some(node))
 }
 
-async fn diagnostic_node_ids(bucket: &Bucket) -> anyhow::Result<Vec<String>> {
+pub(crate) async fn node_lease_ids(bucket: &Bucket) -> anyhow::Result<Vec<String>> {
     let mut nodes = Vec::new();
     for object in bucket
         .list("nodes/")
@@ -393,7 +399,10 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
         options.endpoint = env("S3_ENDPOINT");
     }
     if !options.dry_run && options.bucket.is_none() {
-        bail!("celld deploy requires --bucket s3://NAME or gs://NAME (or CELLD_BUCKET)");
+        bail!(
+            "celld deploy requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
+             (or CELLD_BUCKET)"
+        );
     }
     let built = deploy::build(&options)?;
     built.report();
@@ -522,6 +531,21 @@ async fn load_worker_from_pointer(
     let r2_bindings = bindings(&manifest, "r2_bucket")
         .filter_map(|binding| binding.get("name")?.as_str().map(str::to_string))
         .collect();
+    // (env name, stable database identity). A Cloudflare database_id survives
+    // Worker renames and lets several Workers share the resource. A celld-only
+    // config without one falls back to the database name.
+    let d1_bindings = bindings(&manifest, "d1")
+        .filter_map(|binding| {
+            Some((
+                binding.get("name")?.as_str()?.to_string(),
+                binding
+                    .get("database_id")
+                    .or_else(|| binding.get("database_name"))?
+                    .as_str()?
+                    .to_string(),
+            ))
+        })
+        .collect();
     let ai_binding = configured_ai_binding(
         bindings(&manifest, "ai")
             .find_map(|binding| binding.get("name")?.as_str().map(str::to_string)),
@@ -546,6 +570,7 @@ async fn load_worker_from_pointer(
         .and_then(crate::assets::AssetResolver::binding_name)
         .map(str::to_string);
     let script_name = manifest.script_name.clone();
+    let crons = manifest.crons.clone();
     Ok(LoadedDeployment {
         options: WorkerConfigOptions {
             src,
@@ -553,6 +578,7 @@ async fn load_worker_from_pointer(
             do_classes: manifest.do_classes,
             bindings: do_bindings,
             r2_bindings,
+            d1_bindings,
             ai_binding,
             vars,
             node,
@@ -563,6 +589,7 @@ async fn load_worker_from_pointer(
         asset_binding,
         assets,
         services,
+        crons,
     })
 }
 
@@ -579,6 +606,8 @@ pub struct LoadedDeployment {
     pub asset_binding: Option<String>,
     pub assets: Option<crate::assets::AssetResolver>,
     pub services: Vec<(String, String, Option<String>)>,
+    /// `triggers.crons` from the manifest, driving the reserved cron cell.
+    pub crons: Vec<String>,
 }
 
 fn bindings<'a>(

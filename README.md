@@ -5,12 +5,13 @@ Self-hosted, distributed **Durable Objects**.
 celld is an open-source daemon that runs Cloudflare Workers and Durable
 Objects on your own machines. Each object is its own SQLite database.
 celld addresses an object by name and replicates it to a bucket that you
-own. The bucket can be S3-compatible or Google Cloud Storage. The nodes
-coordinate through that bucket alone, with no control plane and no
-consensus. Because every object is its own small database,
-applications shard by construction — the contention and blast-radius failures
-of one shared database are designed out, not managed. A cell that no node
-holds is inactive, and an inactive cell costs nearly nothing. Learn more at
+own. The bucket can be S3-compatible, Google Cloud Storage, or Azure
+Blob Storage. The nodes coordinate through that bucket alone, with no
+control plane and no consensus. Because every object is its own small
+database, applications shard by construction — the contention and
+blast-radius failures of one shared database are designed out, not
+managed. A cell that no node holds is inactive, and an inactive cell
+costs nearly nothing. Learn more at
 [celld.dev](https://celld.dev) or read the
 [documentation](https://celld.dev/docs).
 
@@ -18,9 +19,10 @@ holds is inactive, and an inactive cell costs nearly nothing. Learn more at
 
 Every `celld` node embeds V8 and executes Wrangler bundles. The fleet shares
 one bucket, which contains deployments, cell state, and small ownership
-records. The bucket can be S3-compatible or Google Cloud Storage. Object-storage compare-and-swap ensures that exactly one node owns a
-cell at a time, without a membership protocol, failure detector, or consensus
-service.
+records. The bucket can be S3-compatible, Google Cloud Storage, or Azure
+Blob Storage. Object-storage compare-and-swap ensures that exactly one
+node owns a cell at a time, without a membership protocol, failure
+detector, or consensus service.
 
 celld continuously replicates each cell's SQLite database to the bucket.
 When a cell moves, or when an inactive cell activates, its new owner restores
@@ -109,6 +111,27 @@ celld --bucket gs://my-cells-bucket --listen 0.0.0.0:8080 \
   --internal-listen 10.0.0.12:8081 --advertise 10.0.0.12:8081
 ```
 
+An `az://` bucket selects Azure Blob Storage, where the NAME is the
+container. The storage account comes from `AZURE_STORAGE_ACCOUNT_NAME`.
+celld requires exactly one storage account key, managed identity, or workload
+identity. An AKS workload identity uses `AZURE_AUTHORITY_HOST`,
+`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_FEDERATED_TOKEN_FILE`.
+The authority host must identify the public Azure cloud. A Microsoft Entra
+identity needs data-plane permission to read, write, list, and delete blobs.
+The `Storage Blob Data Contributor` role supplies these permissions. celld
+rejects an S3 `--endpoint` for an `az://` bucket, and it ignores the storage
+region. celld qualifies an `az://` bucket: the conditional-write contract and
+the multipart upload path were tested against a live Azure account on
+2026-08-18, under each of the three credential families named above. See
+[ownership and fencing](docs/fencing.md):
+
+```sh
+export AZURE_STORAGE_ACCOUNT_NAME=myaccount
+celld deploy . --bucket az://my-cells-container
+celld --bucket az://my-cells-container --listen 0.0.0.0:8080 \
+  --internal-listen 10.0.0.12:8081 --advertise 10.0.0.12:8081
+```
+
 A fleet runs one application, and every node loads its
 latest successfully committed deployment from `deploy/current.json`. Run
 `celld --help` for the complete command line.
@@ -145,6 +168,14 @@ and incompatible protocols. It also prints each node's coarse resident-cell,
 WebSocket, RSS, CPU, file-descriptor, pressure, and shedding sample. Pass one
 or more `--peer NODE_ID` options to restrict the check.
 
+`celld d1` runs SQL and migrations against a deployed D1 database. It finds a
+node through the same node leases, and that node sends the work to the node
+that owns the database:
+
+```sh
+celld d1 migrations apply ledger --bucket s3://my-cells-bucket
+```
+
 Set a hard resident-cell limit on each loaded node:
 
 ```sh
@@ -174,6 +205,25 @@ the cap. The cap is then the effective limit. The node decides on its resident
 set size, and celld reports this at startup. `CELLD_MAX_RSS_MB=0`
 disables the threshold and the cap together. When celld cannot read the size of
 the available memory, it applies a cap of 125% of an explicit threshold.
+
+Each isolate also has a V8 heap limit, and this limit is separate from the
+memory of the node. The default is 128 MB, and it matches the limit of a
+Durable Object on Cloudflare. Set `CELLD_V8_HEAP_LIMIT_MB` to change it. The
+limit decides how much state one isolate can hold, so it decides how many
+hibernatable WebSocket clients a cell can carry. Each client holds state in the
+heap. A cell holds approximately 50,000 clients with the default limit, and it
+needs approximately 512 MB to hold 100,000 clients.
+
+An isolate that uses more than 90% of this limit refuses a new hibernatable
+WebSocket, and the error names the heap. The refusal is not permanent, and the
+isolate accepts a WebSocket again when the use of the heap falls under 90%.
+
+An isolate that reaches the limit stops more than an accept. It also stops the
+materialization of a SQL result set, and that error names the heap too. celld
+measures the heap before each event, and the isolate serves again when the use
+of the heap falls under 75% of the limit. An idle isolate holds a dead heap
+until something allocates again, so celld forces a collection when a
+measurement is above that share. A restart of the process is not necessary.
 
 Under pressure, celld durably replicates and fences the least-recently used idle
 cells. It then publishes the cells as unowned without resetting their epochs.

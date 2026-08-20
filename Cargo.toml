@@ -46,7 +46,7 @@ encoding_rs = "0.8"
 # unstable-split gives the read and write halves as separate objects. The
 # tunnel needs them: a WebSocket read is not cancel-safe, so a live read
 # future must survive while the same socket is written, and that is only
-# possible when the halves are not one borrow. See tests/p0/runtime/tunnel_cancel.rs.
+# possible when the halves are not one borrow.
 #
 # The feature is unstable by name, so a 0.8.x release can rename or drop it
 # without upstream calling that a break, and a caret range would take it. Deno
@@ -64,6 +64,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
 lz4_flex = { version = "0.11", features = ["frame"] }
 md-5 = "0.10"
+nix = { version = "0.31", features = ["feature", "fs"] }
 object_store = { version = "0.11", default-features = false }
 # The native column-writer API only: no `arrow` feature, so the arrow
 # crate stack stays out of the binary. Revisit only if the telemetry

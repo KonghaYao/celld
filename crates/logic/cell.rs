@@ -12,26 +12,39 @@
 //! The gate lives here, and the callers that accept a scope from the network
 //! apply it before the scope reaches storage.
 
-/// Is a cell scope well-formed? Non-empty, at most 512 bytes, and only ASCII
-/// alphanumerics plus `_ - . : $`.
+/// The fleet-wide storage limit for one cell scope. Every data filesystem must
+/// support a path component of this size, so scope validity is the same on
+/// every node that can own the cell.
+pub const MAX_CELL_SCOPE: usize = 255;
+
+/// Is a cell scope well-formed? Non-empty, at most `MAX_CELL_SCOPE` bytes, not
+/// `.` or `..`, and only ASCII alphanumerics plus `_ - . : $`.
 ///
 /// The charset is the fence. `/` and `\` are excluded so the scope can never be
-/// more than one path component, which is what makes `..` inert: `Class:..` is
-/// a literal directory name, while `Class:../..` would traverse. Control bytes
-/// and NUL are excluded with everything else outside the set.
+/// more than one path component, which is what makes an embedded `..` inert:
+/// `Class:..` is a literal directory name, while `Class:../..` would traverse.
+/// Control bytes and NUL are excluded with everything else outside the set.
+///
+/// One path component is not sufficient on its own, because `.` and `..` are
+/// themselves single components that the filesystem resolves. A bare `..`
+/// clears the charset, and the callers that take a scope without a class prefix
+/// — `/cell/`, `/evict/`, the peer routes, and the wake index — hand it to
+/// `db_path` unchanged, so `data_dir.join("..")` lands above the data
+/// directory. Both names are therefore rejected.
 ///
 /// `:` is admitted because it is the class/instance separator and an instance
 /// may itself contain one. `$` is admitted because it is a legal JavaScript
 /// identifier character, so it is a legal exported class name. Both are inert
 /// in a path component.
 ///
-/// The 512-byte bound is generous next to the two shapes that actually occur —
-/// a class name and a 64-character hex id, or a class name and a
-/// developer-chosen instance name — and it bounds what a single request can
-/// make the storage layer allocate.
+/// The bound is also the minimum `NAME_MAX` that celld accepts for a data
+/// filesystem. The runtime checks that capability at startup. Therefore, a
+/// scope that passes this gate fits every node in the fleet.
 pub fn valid_cell_scope(scope: &str) -> bool {
     !scope.is_empty()
-        && scope.len() <= 512
+        && scope.len() <= MAX_CELL_SCOPE
+        && scope != "."
+        && scope != ".."
         && scope
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':' | b'$'))

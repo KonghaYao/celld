@@ -2,20 +2,40 @@
 // Extracted module from the bootstrap.js IIFE.
 //
 // TextEncoder always emits UTF-8 (per spec). TextDecoder
-// decodes utf-8 / utf-16le / utf-16be in pure JS — the
-// hot path, no host ops. Every other WHATWG label
-// (windows-1252, big5, gbk/gb18030, iso-2022-jp,
-// x-user-defined, …) is the slow path: encoding_rs on
-// the host via the $$textDecoder* ops, one call per
-// decode() with native streaming state per decoder.
+// decodes nothing itself: every label, utf-8 and utf-16
+// included, goes to encoding_rs on the host via the
+// $$textDecoder* ops, one call per decode() with native
+// streaming state per decoder. This file resolves the
+// label and owns the decoder's lifetime.
+//
+// Previous utf-8 and utf-16 hand-written JS decoders kept a
+// host call off a small `request.text()`, but measurement did
+// not support that design: the host was faster at every size
+// down to 16 bytes,
+// and what a JS decode cost depended on the decodes that
+// ran before it. A cell that decoded a few hundred small
+// or malformed bodies first spent 48ms per MiB on a bulk
+// decode, against 5ms for the same binary that decoded
+// one large body first. The order was the only
+// difference, the effect was sticky, and the ratio was
+// the ratio between V8's interpreter and its optimizing
+// tier. The mechanism was not traced further, so no claim
+// is made about which feedback caused it — but the
+// traffic that provoked it was ordinary, and no shape of
+// the JS decoder resisted it. Two decoders for one
+// encoding also owe a byte-for-byte equivalence proof,
+// and that debt had already shipped one bug: a utf-16
+// buffer ending in an unpaired lead surrogate and an odd
+// byte yielded two U+FFFD in JS and one on the host.
 (function () {
     const _tdLabel = $$textDecoderLabel;
     const _tdNew = $$textDecoderNew;
     const _tdDecode = $$textDecoderDecode;
+    const _tdDecodeOnce = $$textDecoderDecodeOnce;
     const _tdFree = $$textDecoderFree;
     // Frees native decoders abandoned mid-stream. Ids
     // are never reused, so a late free is a no-op.
-    // Created on first legacy stream, not at boot.
+    // Created on the first stream, not at boot.
     let _tdRegistry;
     const _tdTrack = (target, id) => {
         if (_tdRegistry === undefined) {
@@ -133,21 +153,22 @@
         #encoding;
         #fatal;
         #ignoreBOM;
-        #pending = [];
-        #bomSeen = false;
-        // Live native decoder id while a legacy-encoding
-        // stream is in flight; undefined otherwise.
-        #legacyId;
+        // Live native decoder id while a stream is in
+        // flight; undefined otherwise.
+        #nativeId;
         constructor(label = 'utf-8', options = {}) {
             // Per WHATWG encoding: strip ASCII whitespace
             // only (not Unicode — \v, NBSP, etc. stay).
             label = String(label)
                 .replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '')
                 .toLowerCase();
-            // The full WHATWG label set for the pure-JS encodings. A miss
-            // here (e.g. 'ansi_x3.4-1968', which the standard maps to
-            // windows-1252 rather than utf-8) resolves through the host's
-            // encoding_rs label table instead.
+            // The WHATWG label set for utf-8 and utf-16, resolved here to
+            // keep a host call out of `new TextDecoder()` — which every
+            // `request.text()` makes. A miss (e.g. 'ansi_x3.4-1968',
+            // which the standard maps to windows-1252 rather than utf-8)
+            // resolves through the host's encoding_rs label table
+            // instead. Both answers are encoding_rs labels, so the
+            // decode itself does not care which way the name arrived.
             const aliases = {
                 'utf-8': 'utf-8', 'utf8': 'utf-8',
                 'unicode-1-1-utf-8': 'utf-8',
@@ -168,8 +189,8 @@
             if (!enc) {
                 // undefined covers unknown labels and the replacement
                 // encoding — both RangeError per spec. A resolved name
-                // is canonical lowercase; route utf names (all already
-                // aliases keys) back to the pure-JS path.
+                // is canonical lowercase, and the alias lookup then
+                // normalizes the utf names to the spelling above.
                 const name = _tdLabel(label);
                 if (name === undefined) throw new RangeError(
                     `The encoding label` +
@@ -217,226 +238,36 @@
                     + " a BufferSource",
                 );
             }
-            // Prepend any pending bytes.
-            if (this.#pending.length > 0) {
-                const merged = new Uint8Array(
-                    this.#pending.length + b.length);
-                merged.set(this.#pending);
-                merged.set(b, this.#pending.length);
-                b = merged;
-                this.#pending = [];
-            }
-            if (this.#encoding === 'utf-8') {
-                return this._decode8(b, stream);
-            }
-            if (this.#encoding === 'utf-16le' ||
-                this.#encoding === 'utf-16be') {
-                return this._decode16(b, stream);
-            }
-            return this._decodeLegacy(b, stream);
+            return this._decodeNative(b, stream);
         }
-        // Legacy WHATWG encodings: one host op per decode(). Streaming
-        // state (multibyte carry-over, ISO-2022-JP mode) lives in the
-        // native decoder; a fatal error frees it, matching Workerd —
-        // the next decode starts clean.
-        _decodeLegacy(b, stream) {
-            let id = this.#legacyId;
+        // One op per decode(), for every label. Streaming state (a split
+        // multibyte sequence, a BOM, ISO-2022-JP mode) lives in the
+        // native decoder; a fatal error frees it, matching Workerd — the
+        // next decode starts clean.
+        _decodeNative(b, stream) {
+            let id = this.#nativeId;
+            // A complete buffer with no stream around it
+            // needs no decoder that outlives the call, so
+            // it takes the one-shot op and never reaches
+            // the host's decoder table.
+            if (id === undefined && !stream) {
+                return _tdDecodeOnce(
+                    this.#encoding, b, this.#fatal,
+                    this.#ignoreBOM);
+            }
             if (id === undefined) {
                 id = _tdNew(this.#encoding, this.#ignoreBOM);
-                if (stream) {
-                    this.#legacyId = id;
-                    _tdTrack(this, id);
-                }
+                this.#nativeId = id;
+                _tdTrack(this, id);
             } else if (!stream) {
-                this.#legacyId = undefined;
+                this.#nativeId = undefined;
             }
             try {
                 return _tdDecode(id, b, this.#fatal, !stream);
             } catch (e) {
-                this.#legacyId = undefined;
+                this.#nativeId = undefined;
                 throw e;
             }
-        }
-        _decode8(b, stream) {
-            const fatal = this.#fatal;
-            const fail = () => {
-                if (fatal) throw new TypeError(
-                    'The encoded data is not valid.');
-                return '�';
-            };
-            const isCont = (x) =>
-                x !== undefined && (x & 0xC0) === 0x80;
-            // Expected byte count for lead byte.
-            const seqLen = (c) => {
-                if (c < 0x80) return 1;
-                if ((c & 0xE0) === 0xC0) return 2;
-                if ((c & 0xF0) === 0xE0) return 3;
-                if ((c & 0xF8) === 0xF0) return 4;
-                return 0; // invalid
-            };
-            let s = '', i = 0;
-            if (!this.#bomSeen && !this.#ignoreBOM &&
-                b.length >= 3 && b[0]===0xEF &&
-                b[1]===0xBB && b[2]===0xBF) {
-                i = 3;
-                this.#bomSeen = true;
-            }
-            while (i < b.length) {
-                const c0 = b[i];
-                const need = seqLen(c0);
-                if (need === 0) {
-                    s += fail(); i++; continue;
-                }
-                if (need === 1) {
-                    s += String.fromCharCode(c0);
-                    i++; continue;
-                }
-                // Early reject invalid lead bytes.
-                if (need === 2 && c0 < 0xC2)
-                    { s += fail(); i++; continue; }
-                if (need === 4 && c0 > 0xF4)
-                    { s += fail(); i++; continue; }
-                // Find how many valid cont bytes follow.
-                let valid = 0;
-                for (let j = 1; j < need &&
-                     i + j < b.length; j++) {
-                    if (!isCont(b[i+j])) break;
-                    valid++;
-                }
-                const have = 1 + valid;
-                // Range checks on partial data.
-                let rangeOk = true;
-                if (valid >= 1 && need >= 3) {
-                    const b1 = b[i+1];
-                    if (need===3 && c0===0xE0 && b1<0xA0)
-                        rangeOk = false;
-                    if (need===3 && c0===0xED && b1>=0xA0)
-                        rangeOk = false;
-                    if (need===4 && c0===0xF0 && b1<0x90)
-                        rangeOk = false;
-                    if (need===4 && c0===0xF4 && b1>=0x90)
-                        rangeOk = false;
-                }
-                if (!rangeOk) {
-                    s += fail(); i++; continue;
-                }
-                if (have < need) {
-                    // Buffer only if we're at end of
-                    // input and all bytes so far are
-                    // valid continuations.
-                    if (stream &&
-                        i + have === b.length) {
-                        this.#pending =
-                            Array.from(b.slice(i));
-                        break;
-                    }
-                    // Emit one FFFD, skip past valid
-                    // continuation bytes.
-                    s += fail();
-                    i += have;
-                    continue;
-                }
-                if (need === 2) {
-                    s += String.fromCharCode(
-                        ((c0&0x1F)<<6)
-                        |(b[i+1]&0x3F));
-                    i += 2;
-                } else if (need === 3) {
-                    const cp = ((c0&0x0F)<<12)
-                        |((b[i+1]&0x3F)<<6)
-                        |(b[i+2]&0x3F);
-                    if (cp < 0x800 ||
-                        (cp>=0xD800 && cp<=0xDFFF))
-                        { s += fail(); i++; continue; }
-                    s += String.fromCharCode(cp);
-                    i += 3;
-                } else {
-                    const cp = ((c0&0x07)<<18)
-                        |((b[i+1]&0x3F)<<12)
-                        |((b[i+2]&0x3F)<<6)
-                        |(b[i+3]&0x3F);
-                    if (cp < 0x10000 || cp > 0x10FFFF)
-                        { s += fail(); i++; continue; }
-                    s += String.fromCodePoint(cp);
-                    i += 4;
-                }
-            }
-            // A non-stream decode ends the sequence: the
-            // next call starts a fresh decoder, so BOM
-            // stripping applies again (spec step 1).
-            if (!stream) {
-                this.#pending = [];
-                this.#bomSeen = false;
-            }
-            return s;
-        }
-        _decode16(b, stream) {
-            const be = this.#encoding === 'utf-16be';
-            const fatal = this.#fatal;
-            const fail = () => {
-                if (fatal) throw new TypeError(
-                    'The encoded data is not valid.');
-                return '�';
-            };
-            let s = '', i = 0;
-            if (!this.#bomSeen && !this.#ignoreBOM &&
-                b.length >= 2) {
-                if (b[0]===0xFF && b[1]===0xFE && !be) {
-                    i = 2; this.#bomSeen = true;
-                } else if (b[0]===0xFE &&
-                           b[1]===0xFF && be) {
-                    i = 2; this.#bomSeen = true;
-                }
-            }
-            while (i + 1 < b.length) {
-                const unitStart = i;
-                const lo = be ? b[i+1] : b[i];
-                const hi = be ? b[i] : b[i+1];
-                const code = lo | (hi << 8);
-                i += 2;
-                if (code >= 0xD800 && code <= 0xDBFF) {
-                    // Lead surrogate — look for trail.
-                    if (i + 1 < b.length) {
-                        const lo2 = be ? b[i+1] : b[i];
-                        const hi2 = be ? b[i] : b[i+1];
-                        const trail = lo2 | (hi2 << 8);
-                        if (trail >= 0xDC00
-                            && trail <= 0xDFFF) {
-                            const cp =
-                                ((code - 0xD800) << 10)
-                                + (trail - 0xDC00)
-                                + 0x10000;
-                            i += 2;
-                            s += String.fromCodePoint(cp);
-                            continue;
-                        }
-                        s += fail();
-                        continue;
-                    }
-                    if (stream) {
-                        i = unitStart;
-                        break;
-                    }
-                    s += fail();
-                } else if (code >= 0xDC00
-                           && code <= 0xDFFF) {
-                    s += fail();
-                } else {
-                    s += String.fromCharCode(code);
-                }
-            }
-            if (i < b.length) {
-                if (stream) {
-                    this.#pending =
-                        Array.from(b.slice(i));
-                } else if (this.#fatal) {
-                    throw new TypeError(
-                        'The encoded data is not valid.'
-                    );
-                }
-            }
-            if (!stream) this.#bomSeen = false;
-            return s;
         }
     };
     // Web IDL toStringTag.

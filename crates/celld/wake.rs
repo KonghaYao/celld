@@ -1,5 +1,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
+#![warn(clippy::disallowed_macros)]
+
 //! Alarm wake for inactive cells (on by default).
 //!
 //! Committed alarm state is mirrored into the bucket as
@@ -37,10 +39,16 @@ pub fn resident_ms() -> i64 {
 /// Scan the due wake buckets: used by the boot-time orphan scan and the
 /// Phase 3 waker tick. The whole `wake/` prefix is listed and filtered
 /// locally; entries are deleted as their alarms are consumed, so the listing
-/// stays O(armed entries).
+/// stays O(armed entries) plus any entry that `parse_entry_key` rejects with
+/// the fleet-wide scope fence.
 /// Due entries as (cell, minute_ms). The minute is carried out so a reviving
 /// node can adopt the entry it acted on: without it, a cell whose restored
 /// truth has no alarm leaves the entry that woke it in the bucket forever.
+///
+/// A rejected entry is skipped and never adopted, so nothing deletes it and
+/// every listing carries it. That is the intended trade: such an entry can only
+/// come from a bucket writer that bypassed every route, and deleting on a parse
+/// failure would let one bad listing reap live entries.
 pub async fn due_scan(bucket: &Bucket, now_ms: i64) -> Vec<(String, i64)> {
     let mut due = Vec::new();
     let objects = match bucket.list("wake/").await {
@@ -104,8 +112,10 @@ pub async fn try_hold_waker(bucket: &Bucket, node: &str, now_ms: i64, ttl_ms: i6
 /// executor, and the shadow-pin log.
 pub struct WakeFlusher {
     core: Mutex<WakeCore>,
-    /// Signals each settled delete, so `await_no_inflight_delete` waiters
-    /// can re-check.
+    #[cfg(all(test, celld_internal_tests))]
+    tracked_due: Mutex<std::collections::BTreeMap<String, i64>>,
+    /// Signals each settled delete, so the `await_quiesce` waiters -- an arm
+    /// on its own key, a reconcile on the whole cell -- can re-check.
     quiesce: tokio::sync::Notify,
 }
 
@@ -119,6 +129,8 @@ impl WakeFlusher {
     pub fn new() -> Self {
         WakeFlusher {
             core: Mutex::new(WakeCore::new()),
+            #[cfg(all(test, celld_internal_tests))]
+            tracked_due: Mutex::new(std::collections::BTreeMap::new()),
             quiesce: tokio::sync::Notify::new(),
         }
     }
@@ -135,6 +147,12 @@ impl WakeFlusher {
         let mut core = self.core.lock().unwrap();
         if celld_logic::wake::should_adopt_hint(core.tracks(cell), due_ms) {
             core.adopt(cell, due_ms);
+            #[cfg(all(test, celld_internal_tests))]
+            self.tracked_due
+                .lock()
+                .unwrap()
+                .entry(cell.to_string())
+                .or_insert(due_ms);
         }
     }
 
@@ -181,7 +199,14 @@ impl WakeFlusher {
             match step {
                 Step::Put { key, due_ms, body } => {
                     match bucket.put(&key, body.into_bytes()).await {
-                        Ok(()) => plan.put_done(&mut self.core.lock().unwrap(), key, due_ms),
+                        Ok(()) => {
+                            plan.put_done(&mut self.core.lock().unwrap(), key, due_ms);
+                            #[cfg(all(test, celld_internal_tests))]
+                            self.tracked_due
+                                .lock()
+                                .unwrap()
+                                .insert(cell.to_string(), due_ms);
+                        }
                         Err(e) => {
                             warn!(%cell, %key, error = %e, "wake entry put failed");
                             plan.put_failed();
@@ -202,30 +227,72 @@ impl WakeFlusher {
                                 warn!(%cell, %key, error = %e, "wake entry delete failed");
                             }
                             Err(_) => {
-                                tokio::time::sleep(Duration::from_millis(100 << attempt)).await;
+                                crate::asyncrt::sleep(Duration::from_millis(100 << attempt)).await;
                             }
                         }
                     }
-                    plan.delete_done(&mut self.core.lock().unwrap(), &key);
-                    self.quiesce.notify_waiters();
+                    self.settle_delete(&mut plan, &key);
                 }
             }
         }
     }
 
-    /// Wait until no consume-delete for `cell` is on the wire. An arm-time
-    /// PUT — and any new reconcile — sequences behind it; see `reconcile`.
+    /// A delete left the wire -- it landed, or it failed past its retries.
+    /// Report it to the core and release the waits it held.
+    ///
+    /// One method rather than two calls at each site: a `delete_done` that
+    /// forgot the wakeup would park every later arm for the cell behind a
+    /// delete that is no longer on the wire, until some unrelated delete
+    /// happened to settle and released it.
+    fn settle_delete(&self, plan: &mut celld_logic::wake::Reconcile, key: &str) {
+        plan.delete_done(&mut self.core.lock().unwrap(), key);
+        #[cfg(all(test, celld_internal_tests))]
+        if let Some((_, cell)) = celld_logic::wake::parse_entry_key(key) {
+            if !self.core.lock().unwrap().tracks(&cell) {
+                self.tracked_due.lock().unwrap().remove(&cell);
+            }
+        }
+        self.quiesce.notify_waiters();
+    }
+
+    /// Wait until no delete for `cell` is on the wire. A reconcile could name
+    /// its key -- every PUT `decide` plans is at `entry_key(next_alarm_ms,
+    /// cell)`, and a consume plans no PUT at all -- so this wait is wider than
+    /// the same-key race needs. That is deliberate. A reconcile runs on the
+    /// sweep tick with no response waiting on it, so the wider wait costs
+    /// nothing here; the arm gate holds a reply, which is why that one is
+    /// scoped to its key. And it hands `decide` a settled `deleting`, so the
+    /// reconcile path never leans on `decide`'s in-flight guards to answer
+    /// about a delete that is landing as it reads. See `reconcile`.
     pub async fn await_no_inflight_delete(&self, cell: &str) {
+        self.await_quiesce(|core| core.delete_in_flight(cell)).await;
+    }
+
+    /// Wait until no delete of this exact key is on the wire. The arm gate
+    /// knows its key, and only a delete of THAT key can race its PUT, so it
+    /// waits on this and not on `await_no_inflight_delete`. Gating an arm on
+    /// the whole cell would park a response behind the routine move-delete
+    /// that every alarm-minute change performs, for a key it does not touch.
+    pub async fn await_key_deletable(&self, cell: &str, key: &str) {
+        self.await_quiesce(|core| core.key_delete_in_flight(cell, key))
+            .await;
+    }
+
+    /// Wait until `blocked` reads false, re-checking on each settled delete.
+    ///
+    /// The `Notified` is created BEFORE the check, because `notify_waiters`
+    /// reaches only the waiters that exist when it runs. A future created
+    /// after the check would miss a delete that settled during it, and the
+    /// wait would then hang until some unrelated delete settled — with the
+    /// arm gate holding the response behind it. Creation is enough: a
+    /// `Notified` records the `notify_waiters` count at that moment and
+    /// compares it on its first poll, so it needs no poll to observe one.
+    /// That caveat belongs to `notify_one`, which this type does not use, so
+    /// a switch of notifier would reintroduce it.
+    async fn await_quiesce(&self, blocked: impl Fn(&WakeCore) -> bool) {
         loop {
             let notified = self.quiesce.notified();
-            tokio::pin!(notified);
-            // Register the waiter BEFORE the check. `notified()` only enrolls
-            // when the future is first polled, so a delete settling between
-            // the check and the first poll would notify no one and this wait
-            // would hang until some unrelated delete settled — with the arm
-            // gate holding the response that waits on it.
-            notified.as_mut().enable();
-            if !self.core.lock().unwrap().delete_in_flight(cell) {
+            if !blocked(&self.core.lock().unwrap()) {
                 return;
             }
             notified.await;
@@ -242,6 +309,11 @@ impl WakeFlusher {
     /// An arm-time PUT landed: record the proven entry.
     pub fn confirm_arm(&self, cell: &str, due_ms: i64, key: String) {
         self.core.lock().unwrap().confirm_put(cell, due_ms, key);
+        #[cfg(all(test, celld_internal_tests))]
+        self.tracked_due
+            .lock()
+            .unwrap()
+            .insert(cell.to_string(), due_ms);
     }
 
     /// Is this exact committed alarm durably covered by a proven entry? The
@@ -260,5 +332,21 @@ impl WakeFlusher {
     /// this node's to track.
     pub fn forget(&self, cell: &str) {
         self.core.lock().unwrap().forget(cell);
+        #[cfg(all(test, celld_internal_tests))]
+        self.tracked_due.lock().unwrap().remove(cell);
     }
+}
+
+#[cfg(all(test, celld_internal_tests))]
+include!(env!("CELLD_INTERNAL_WAKE_OBSERVERS"));
+
+// The arm gate's executor half: which wait a caller gets, and what releases
+// it. The core's predicates are pinned separately; these cover the wiring
+// on top of them, where an arm that asks the wrong question still answers
+// correctly and only answers late.
+#[cfg(all(test, celld_internal_tests))]
+#[allow(clippy::disallowed_methods)]
+mod wake_gate_private {
+    use super::*;
+    include!(env!("CELLD_CONFORMANCE_WAKE_GATE_TESTS"));
 }

@@ -1,10 +1,12 @@
-//! differential_xtool — **GATE G3 ("M1 correct"), PLAN.md §6.3**: cross-tool
-//! differential tests against the REAL `litestream` binary (pinned v0.5.16).
+// This external-oracle test inspects files produced by two independent tools.
+#![allow(clippy::disallowed_methods)]
+
+//! differential_xtool — cross-tool differential tests against the real
+//! `litestream` binary, pinned by
+//! [`PINNED_LITESTREAM_VERSION`].
 //!
-//! This is the strongest correctness oracle in the project. It does not compare
-//! against rustyriver's own output (forbidden by AGENTS.md rule 3): the expected
-//! value is whatever the real Litestream binary produces. Three directions, each
-//! exactly as specified in §6.3:
+//! This is the strongest correctness oracle in the project. The expected value
+//! comes from the real Litestream binary, not from the implementation under test.
 //!
 //! * **D1 (write path):** rustyriver replicates a DB into a file replica, then the
 //!   **real `litestream restore`** reproduces it → **Oracle A** vs the source.
@@ -18,13 +20,21 @@
 //!   checkpoint). Isolates format fidelity from SQLite-version noise because both
 //!   replay identical page images. Run in both directions (over a
 //!   rustyriver-written replica AND a real-Litestream-written replica).
+//! * **D4 (compaction write path):** celld compacts L0 into an L1 object, then the
+//!   **real `litestream restore`** reads that object → **Oracle A** vs the source.
+//!   D1 only covers the L0 writer, which still emits the pre-v0.5.2 frame
+//!   representation; the compactor emits the v0.5.2 block representation, and D4
+//!   is the only case where a real reader sees one.
 //!
 //! ## Skip policy
 //! Every test self-skips (logs + `return`, never a silent pass and never a
-//! failure) when the `litestream` binary or `sqlite3` is absent from PATH — but
-//! in the pinned CI/dev environment (PLAN.md D-3) both ARE present, so the gate
-//! actually runs. The skip is a runtime guard, not a compile-time ignore
-//! attribute, and no assertion is weakened (AGENTS.md rules 1-2).
+//! failure) when the `litestream` binary or `sqlite3` is absent from PATH. The
+//! skip is a runtime guard, not a compile-time ignore attribute, and it does not
+//! weaken an assertion.
+//!
+//! A skip is also how this gate goes vacuous, so `CELLD_LTX_LITESTREAM_REQUIRED=1`
+//! turns every skip into a failure. CI installs the pinned binary and sets that
+//! variable, so a broken install reds the run instead of passing an empty gate.
 //!
 //! ## Why a file replica (not S3)
 //! D1–D3 exercise the *format* and the *restore algorithm*, which are transport
@@ -36,13 +46,15 @@
 
 use celld_ltx::client::file::FileReplicaClient;
 use celld_ltx::db::Db;
+use celld_ltx::ltx::{HEADER_SIZE, PAGE_HEADER_FLAG_SIZE};
 use celld_ltx::replica::{self, Replica};
-use celld_ltx::TXID;
+use celld_ltx::replica_compactor::ReplicaCompactor;
+use celld_ltx::{ltx_file_path, TXID};
 use rusqlite::Connection;
 use std::path::Path;
 use std::process::Command;
 
-/// Absolute path to the `db_equal.sh` oracle (PLAN.md §6.1).
+/// Absolute path to the `db_equal.sh` oracle.
 fn db_equal_script() -> String {
     format!("{}/scripts/db_equal.sh", env!("CARGO_MANIFEST_DIR"))
 }
@@ -70,12 +82,36 @@ fn db_equal(mode: &str, a: &Path, b: &Path) -> Result<(), String> {
     }
 }
 
+/// The pinned oracle version, and the single place this repository records it.
+/// The CI workflow derives the release it downloads from this constant, so the
+/// pin cannot drift between the test and the job that feeds it.
+///
+/// Litestream v0.5.16 uses superfly/ltx v0.5.2. An older v0.5 binary cannot read
+/// the size-prefixed block representation that the compactor publishes, so the
+/// test must not accept any v0.5 binary as an equivalent oracle.
+pub const PINNED_LITESTREAM_VERSION: &str = "0.5.16";
+
 /// The real binary under test: `$LITESTREAM_BIN`, or `litestream` on PATH.
-/// The oracle is pinned to Litestream v0.5.16, which uses superfly/ltx v0.5.2.
-/// Older v0.5 binaries cannot read the size-prefixed block representation, so
-/// the test must not accept any v0.5 binary as an equivalent oracle.
 fn litestream_bin() -> String {
     std::env::var("LITESTREAM_BIN").unwrap_or_else(|_| "litestream".into())
+}
+
+/// `CELLD_LTX_LITESTREAM_REQUIRED=1` forbids every skip in this file. A job that
+/// installs the oracle and then skips the whole gate is green for the wrong
+/// reason, so CI sets this and a failed install reds the run. This mirrors
+/// `CELLD_LTX_S3_REQUIRED` in `integration_s3.rs`.
+fn required() -> bool {
+    std::env::var("CELLD_LTX_LITESTREAM_REQUIRED").as_deref() == Ok("1")
+}
+
+/// Records a missing prerequisite: a panic in required mode, a logged skip
+/// otherwise.
+fn unavailable(test: &str, reason: &str) {
+    assert!(
+        !required(),
+        "{test}: {reason} (CELLD_LTX_LITESTREAM_REQUIRED=1 forbids the skip)"
+    );
+    eprintln!("skipping {test}: {reason}");
 }
 
 /// True when the resolved binary exists AND speaks the pinned replica era.
@@ -83,21 +119,29 @@ fn litestream_usable(test: &str) -> bool {
     let out = Command::new(litestream_bin()).arg("version").output();
     match out {
         Err(_) => {
-            eprintln!(
-                "skipping {test}: `{}` not runnable; set LITESTREAM_BIN or \
-                 put litestream on PATH",
-                litestream_bin()
+            unavailable(
+                test,
+                &format!(
+                    "`{}` is not runnable; set LITESTREAM_BIN or put litestream on PATH",
+                    litestream_bin()
+                ),
             );
             false
         }
         Ok(o) => {
             let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if v == "v0.5.16" || v == "0.5.16" {
+            // The release prints the bare version; a source build can prefix a
+            // `v`. Both name the same pin, so both are accepted.
+            let pinned = PINNED_LITESTREAM_VERSION;
+            if v == pinned || v.strip_prefix('v') == Some(pinned) {
                 true
             } else {
-                eprintln!(
-                    "skipping {test}: litestream {v:?} is not the pinned v0.5.16 \
-                     oracle; point LITESTREAM_BIN at v0.5.16"
+                unavailable(
+                    test,
+                    &format!(
+                        "litestream {v:?} is not the pinned v{pinned} oracle; \
+                         point LITESTREAM_BIN at v{pinned}"
+                    ),
                 );
                 false
             }
@@ -123,7 +167,10 @@ fn skip_if_tools_missing(test: &str) -> bool {
         return true;
     }
     if !has_bin("sqlite3") {
-        eprintln!("skipping {test}: `sqlite3` not on PATH (required for the db_equal oracle)");
+        unavailable(
+            test,
+            "`sqlite3` is not on PATH (the db_equal oracle needs it)",
+        );
         return true;
     }
     false
@@ -258,7 +305,7 @@ fn litestream_restore(replica_root: &Path, out: &Path) {
 /// restores that tree; the restored DB must be logically identical to the source.
 /// This is the load-bearing proof that rustyriver's LTX serializer is byte-format
 /// compatible with upstream Litestream — if the real tool can read what we wrote,
-/// our format is correct (AGENTS.md rule 3: the binary, not us, is the oracle).
+/// our format is correct because the independent binary is the oracle.
 #[tokio::test(flavor = "multi_thread")]
 async fn d1_our_write_real_restore_oracle_a() {
     if skip_if_tools_missing("d1_our_write_real_restore_oracle_a") {
@@ -450,5 +497,89 @@ async fn d2_real_write_our_restore_at_target_txid() {
     // Oracle A: our point-in-time restore == the real tool's at the same TXID.
     db_equal("A", &theirs, &ours).expect(
         "D2(txid): our restore@target must equal real `litestream restore -txid` at the same TXID (Oracle A)",
+    );
+}
+
+// ─────────────────────── D4 (compaction write path) ───────────────────────
+
+/// Reads the raw bytes of one published LTX object from a file replica tree.
+fn read_replica_object(replica_root: &Path, info: &celld_ltx::FileInfo) -> Vec<u8> {
+    let path = ltx_file_path(
+        &replica_root.to_string_lossy(),
+        info.level as u32,
+        info.min_txid,
+        info.max_txid,
+    );
+    std::fs::read(path).expect("read the published LTX object")
+}
+
+/// **D4 — our L1 compaction → real `litestream restore` → Oracle A vs source.**
+///
+/// D1 covers the L0 writer, and that writer still emits the pre-v0.5.2 frame
+/// representation. The compactor emits the v0.5.2 block representation instead,
+/// and until this case nothing made a real reader look at one: the crate
+/// compared its encoder output with bytes from Go, then decoded its own
+/// compaction output with its own decoder. "Litestream v0.5.16 reads our block
+/// files" was therefore a claim and not a test, and the compaction scheduler is
+/// on by default, so the claim is load-bearing.
+///
+/// The replica deliberately keeps both representations. One L1 object covers a
+/// prefix of the L0 objects and the remaining L0 objects cover the tail, so the
+/// real binary must interleave a block file with frame files. `CalcRestorePlan`
+/// takes the file that extends the longest contiguous TXID range, so the plan
+/// prefers the L1 object over the L0 objects it covers.
+#[tokio::test(flavor = "multi_thread")]
+async fn d4_our_compaction_real_restore_oracle_a() {
+    if skip_if_tools_missing("d4_our_compaction_real_restore_oracle_a") {
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("source.db");
+    let replica_root = dir.path().join("replica");
+    let restored = dir.path().join("restored-by-litestream.db");
+
+    // 1. rustyriver writes the L0 tree.
+    let max_txid = rustyriver_replicate(&src, &replica_root).await;
+
+    // 2. rustyriver compacts a PREFIX of that tree into one L1 object. The
+    //    limit leaves a tail at L0 on purpose, so the restore plan has to mix
+    //    the two page representations rather than read the L1 object alone.
+    const PREFIX_FILES: usize = 4;
+    let client = FileReplicaClient::new(replica_root.to_string_lossy().into_owned());
+    let output = ReplicaCompactor::new(&client)
+        .with_limits(PREFIX_FILES, u64::MAX)
+        .compact(1)
+        .await
+        .expect("compact L0 into L1")
+        .expect("the L0 level must hold objects to compact");
+    assert_eq!(output.info.level, 1, "the destination level must be L1");
+    assert!(
+        output.info.max_txid < max_txid,
+        "the L0 tail must survive the compaction so the plan mixes representations: \
+         L1 covers up to {}, the L0 tree reaches {max_txid}",
+        output.info.max_txid
+    );
+
+    // 3. The published object must really carry the v0.5.2 block layout.
+    //    Without this the case passes even if the compactor silently falls back
+    //    to the frame representation, which is the very thing D4 exists to
+    //    prove a real reader accepts. The first page header follows the file
+    //    header; its flags carry the compressed-size prefix bit.
+    let published = read_replica_object(&replica_root, &output.info);
+    let first_page_flags =
+        u16::from_be_bytes([published[HEADER_SIZE + 4], published[HEADER_SIZE + 5]]);
+    assert_eq!(
+        first_page_flags & PAGE_HEADER_FLAG_SIZE,
+        PAGE_HEADER_FLAG_SIZE,
+        "the compactor must publish the v0.5.2 block representation, not frames"
+    );
+
+    // 4. The REAL binary restores the mixed tree.
+    litestream_restore(&replica_root, &restored);
+
+    // 5. Oracle A: real-restored == source.
+    db_equal("A", &src, &restored).expect(
+        "D4: real `litestream restore` over our compacted L1 object must equal the source (Oracle A)",
     );
 }

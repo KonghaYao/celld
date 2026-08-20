@@ -1,5 +1,8 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
+// Deployment is an operator control-plane path outside the engine World.
+#![allow(clippy::disallowed_methods)]
+
 //! `celld deploy` — build a Wrangler project and write it to the fleet bucket.
 //!
 //! Bundling is esbuild's job; this module does config, identity, and durable
@@ -9,8 +12,8 @@
 use crate::bucket::Bucket;
 use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
-    ModuleKind, ModuleRef, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_SQLITE_VEC_V1,
-    FEATURE_WASM_V1,
+    ModuleKind, ModuleRef, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CRON_V1,
+    FEATURE_D1_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -37,9 +40,28 @@ const SUPPORTED_KEYS: &[&str] = &[
     "migrations",
     "assets",
     "services",
+    "triggers",
     "vars",
+    "d1_databases",
     "no_bundle",
 ];
+
+/// The Durable Object class every D1 database runs as. It is supplied by the
+/// runtime, not by the worker, so a config naming it in `durable_objects` or
+/// `migrations` is refused: the harness registers this class in every isolate,
+/// and a user binding onto it would silently reach a D1 database cell instead
+/// of the user's class. A bare module export of this name is not refused —
+/// the loader skips it rather than let it shadow the built-in.
+pub const D1_CLASS: &str = "__D1Database";
+
+/// Whether a cell scope names a D1 database. The unauthenticated operator
+/// route uses this to refuse one: a D1 cell answers arbitrary SQL, and its
+/// scope is derivable from the project's config rather than secret.
+pub fn is_d1_scope(scope: &str) -> bool {
+    scope
+        .strip_prefix(D1_CLASS)
+        .is_some_and(|rest| rest.starts_with(':'))
+}
 
 const MAX_ASSET_FILES: usize = 20_000;
 const MAX_ASSET_BYTES: u64 = 1024 * 1024 * 1024;
@@ -58,12 +80,13 @@ pub struct Options {
 pub fn print_help() {
     println!(
         "celld deploy — build a Worker with esbuild and write it to the fleet bucket\n\n\
-USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://]NAME[/PREFIX] [OPTIONS]\n\n\
+USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket; celld\n                         then rejects --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  -h, --help             Show this help\n\n\
-Credentials come from the standard AWS credential chain, or from Google\n\
-Application Default Credentials for a gs:// bucket.\n\n\
+OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  -h, --help             Show this help\n\n\
+Credentials come from the standard AWS credential chain, from Google\n\
+Application Default Credentials for a gs:// bucket, or from an Azure storage\n\
+account key, managed identity, or workload identity for an az:// bucket.\n\n\
 Worker projects require `esbuild` on PATH; asset-only projects do not. Static\n\
 assets, service bindings, and string vars are supported. Routes are not; use\n\
 Wrangler for route configuration.\n\
@@ -127,6 +150,7 @@ struct Project {
     metadata: Value,
     do_classes: Vec<String>,
     sqlite_classes: Vec<String>,
+    crons: Vec<String>,
 }
 
 struct ProjectAssets {
@@ -239,6 +263,10 @@ impl Built {
                             );
                         Some((format!("env.{name} (Service)"), target))
                     }
+                    Some("d1") => {
+                        let database = binding.get("database_name").and_then(Value::as_str)?;
+                        Some((format!("env.{name} (D1)"), database.to_string()))
+                    }
                     Some("plain_text") => Some((
                         format!("env.{name} (Text)"),
                         "Environment Variable".to_string(),
@@ -328,6 +356,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .get("compatibility_flags")
         .and_then(Value::as_array)
         .is_some_and(|flags| flags.iter().any(|flag| flag.as_str() == Some("sqlite_vec")));
+    let uses_d1 = project.do_classes.iter().any(|class| class == D1_CLASS);
     let manifest = Manifest {
         schema_version: if asset_reference.is_some() { 2 } else { 1 },
         version: version.clone(),
@@ -345,6 +374,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             })
             .collect(),
         assets: asset_reference,
+        crons: project.crons.clone(),
         // Each capability the manifest depends on is named here, so a node
         // that predates it rejects the deployment up front instead of
         // partially deserializing the manifest and failing at worker load.
@@ -352,6 +382,12 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             let mut features = Vec::new();
             if built_assets.is_some() {
                 features.push(FEATURE_ASSETS_V1.to_string());
+            }
+            if !project.crons.is_empty() {
+                features.push(FEATURE_CRON_V1.to_string());
+            }
+            if uses_d1 {
+                features.push(FEATURE_D1_V1.to_string());
             }
             if sqlite_vec {
                 features.push(FEATURE_SQLITE_VEC_V1.to_string());
@@ -454,6 +490,136 @@ async fn put_pointer(bucket: &Bucket, key: &str, body: Vec<u8>) -> anyhow::Resul
     }
 }
 
+/// What `celld d1` needs out of a project: the declared databases, so a name
+/// the project never declared fails here instead of creating an empty one.
+pub struct D1Project {
+    /// One entry per declaration, in config order.
+    pub databases: Vec<D1Declaration>,
+}
+
+pub struct D1Declaration {
+    pub database_name: String,
+    /// Cloudflare's stable resource ID when present, otherwise the database
+    /// name for a celld-only project.
+    pub database_identity: String,
+    /// Wrangler scopes `migrations_dir` to the binding, so this is per
+    /// database and never shared. A single shared directory would apply one
+    /// database's migrations to another.
+    pub migrations_dir: PathBuf,
+    /// The bookkeeping table, per binding as on wrangler
+    /// (`migrations_table`). Hard-coding `d1_migrations` here made celld
+    /// read an empty table on a project that had renamed it, and every
+    /// already-applied migration re-ran.
+    pub migrations_table: String,
+}
+
+/// Read a project's D1 declarations. This reads the same config `build` reads,
+/// but it does not bundle: `celld d1` acts on a database that is already
+/// deployed, and a project that fails to build must still be migratable.
+pub fn read_d1_project(given: Option<PathBuf>) -> anyhow::Result<D1Project> {
+    let path = resolve_config(given)?;
+    let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let source =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let config: Value = serde_json::from_str(&strip_jsonc(&source))
+        .with_context(|| format!("parse {}", path.display()))?;
+    let object = config
+        .as_object()
+        .ok_or_else(|| anyhow!("{} is not a JSON object", path.display()))?;
+    object
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("{} has no `name`", path.display()))?;
+    let mut databases = Vec::new();
+    if let Some(Value::Array(entries)) = object.get("d1_databases") {
+        for entry in entries {
+            let Some(name) = entry.get("database_name").and_then(Value::as_str) else {
+                continue;
+            };
+            // Wrangler discovers migrations through more knobs than the two
+            // celld reads. An unread knob must be a refusal, not a silent
+            // default: honoring half of a project's migration config applies
+            // the wrong files in the wrong order.
+            if entry.get("migrations_pattern").is_some() {
+                bail!(
+                    "d1 database {name:?} sets `migrations_pattern`, which celld \
+                     does not support; celld reads `*.sql` from `migrations_dir`"
+                );
+            }
+            let migrations_table = match entry.get("migrations_table") {
+                None => "d1_migrations".to_string(),
+                Some(Value::String(table)) => table.clone(),
+                Some(_) => bail!("d1 database {name:?} has a non-string `migrations_table`"),
+            };
+            // The table name is joined into SQL as an identifier, both here
+            // and in the cell, so anything but a plain identifier is refused
+            // before it can reach either.
+            let mut characters = migrations_table.chars();
+            let plain = characters
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                && characters.all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !plain {
+                bail!(
+                    "d1 database {name:?} has a `migrations_table` that is not a \
+                     plain identifier: {migrations_table:?}"
+                );
+            }
+            let database_identity = match entry.get("database_id") {
+                None => name.to_string(),
+                Some(Value::String(identity)) if !identity.is_empty() => identity.clone(),
+                Some(_) => bail!("d1 database {name:?} has an invalid `database_id`"),
+            };
+            databases.push(D1Declaration {
+                database_name: name.to_string(),
+                database_identity,
+                migrations_dir: entry
+                    .get("migrations_dir")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| root.join("migrations"), |dir| root.join(dir)),
+                migrations_table,
+            });
+        }
+    }
+    let mut unique = Vec::<D1Declaration>::new();
+    for declaration in databases {
+        if let Some(previous) = unique
+            .iter()
+            .find(|candidate| candidate.database_name == declaration.database_name)
+        {
+            if previous.database_identity != declaration.database_identity
+                || previous.migrations_dir != declaration.migrations_dir
+                || previous.migrations_table != declaration.migrations_table
+            {
+                bail!(
+                    "d1 database {:?} has ambiguous aliases with different database_id, \
+                     migrations_dir, or migrations_table values",
+                    declaration.database_name
+                );
+            }
+            continue;
+        }
+        if let Some(previous) = unique
+            .iter()
+            .find(|candidate| candidate.database_identity == declaration.database_identity)
+        {
+            if previous.migrations_dir != declaration.migrations_dir
+                || previous.migrations_table != declaration.migrations_table
+            {
+                bail!(
+                    "d1 database identity {:?} has ambiguous aliases {:?} and {:?} with \
+                     different migrations_dir or migrations_table values",
+                    declaration.database_identity,
+                    previous.database_name,
+                    declaration.database_name
+                );
+            }
+        }
+        unique.push(declaration);
+    }
+    Ok(D1Project { databases: unique })
+}
+
 /// A path may name the config itself or the directory holding it; with no
 /// path at all, the working directory.
 fn resolve_config(given: Option<PathBuf>) -> anyhow::Result<PathBuf> {
@@ -551,7 +717,14 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         bail!("an asset-only project cannot set `assets.run_worker_first`");
     }
 
-    let sqlite_classes = read_sqlite_classes(object)?;
+    let mut sqlite_classes = read_sqlite_classes(object)?;
+    if sqlite_classes.iter().any(|class| class == D1_CLASS) {
+        bail!("`{D1_CLASS}` is reserved for D1; remove it from `migrations`");
+    }
+    let crons = read_crons(object)?;
+    if !crons.is_empty() && main.is_none() {
+        bail!("config sets `triggers.crons` without `main`; a cron trigger needs a `scheduled` handler to call");
+    }
 
     // Wrangler-shaped upload metadata, so a manifest written here and one
     // written by the control plane describe a deployment the same way.
@@ -616,6 +789,60 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         bindings.push(encoded);
         service_count += 1;
     }
+    let d1_databases = match object.get("d1_databases") {
+        None => &[][..],
+        Some(Value::Array(databases)) => databases.as_slice(),
+        Some(_) => bail!("config `d1_databases` must be an array"),
+    };
+    // The reserved class must be refused whether or not the project declares
+    // any `d1_databases`: the harness registers its own `__D1Database` class
+    // in every isolate, so a durable_objects binding naming it would silently
+    // resolve to the D1 database cell instead of the user's class.
+    if do_classes.iter().any(|class| class == D1_CLASS) {
+        bail!("`{D1_CLASS}` is reserved for D1; rename the Durable Object class");
+    }
+    let mut d1_binding_names = BTreeSet::new();
+    for database in d1_databases {
+        let binding = database
+            .get("binding")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("d1 database has no `binding`"))?;
+        if !valid_binding(binding) {
+            bail!("invalid d1 binding name: {binding:?}");
+        }
+        if !d1_binding_names.insert(binding.to_string()) {
+            bail!("duplicate d1 binding name: {binding:?}");
+        }
+        let database_name = database
+            .get("database_name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                anyhow!("d1 binding {binding} has no `database_name`; celld uses the name to select the database from the CLI")
+            })?;
+        if database_name.is_empty() {
+            bail!("d1 binding {binding} has an empty `database_name`");
+        }
+        let mut encoded = json!({
+            "type": "d1",
+            "name": binding,
+            "database_name": database_name,
+        });
+        if let Some(database_id) = database.get("database_id") {
+            let database_id = database_id
+                .as_str()
+                .filter(|database_id| !database_id.is_empty())
+                .ok_or_else(|| anyhow!("d1 binding {binding} has an invalid `database_id`"))?;
+            encoded["database_id"] = json!(database_id);
+        }
+        bindings.push(encoded);
+    }
+    if !d1_databases.is_empty() {
+        // A D1 database is a cell of a runtime-supplied class. Declaring it
+        // here is what registers its namespace key and marks it SQLite-backed;
+        // it is never a worker export, so it stays out of `ctx.exports`.
+        do_classes.push(D1_CLASS.to_string());
+        sqlite_classes.push(D1_CLASS.to_string());
+    }
     let vars = match object.get("vars") {
         None => None,
         Some(Value::Object(vars)) => Some(vars),
@@ -653,6 +880,21 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
             "name": binding,
         }));
     }
+    // A name declared as a D1 binding and as anything else would deploy
+    // cleanly and then resolve to whichever `env` assignment ran last, so a
+    // Worker reading `env.DB` could get a service stub where it expected a
+    // database. Collisions between the other binding types are still not
+    // refused here — a known gap, left for a check over every binding type.
+    for binding in &bindings {
+        let name = binding.get("name").and_then(Value::as_str).unwrap_or("");
+        let kind = binding.get("type").and_then(Value::as_str).unwrap_or("");
+        if kind != "d1" && d1_binding_names.contains(name) {
+            bail!(
+                "binding name {name:?} is declared both in `d1_databases` and as a \
+                 {kind} binding; every binding needs its own name"
+            );
+        }
+    }
     let mut metadata = Map::new();
     if main.is_some() {
         metadata.insert("main_module".into(), json!("index.js"));
@@ -682,7 +924,35 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         metadata: Value::Object(metadata),
         do_classes,
         sqlite_classes,
+        crons,
     })
+}
+
+/// `triggers.crons`, validated here so a malformed expression stops the deploy
+/// the developer is watching instead of an activation an hour later. Wrangler
+/// accepts `triggers` with other keys we do not model; only `crons` is read.
+fn read_crons(project: &Map<String, Value>) -> anyhow::Result<Vec<String>> {
+    let Some(value) = project.get("triggers") else {
+        return Ok(Vec::new());
+    };
+    let triggers = value
+        .as_object()
+        .ok_or_else(|| anyhow!("config `triggers` must be an object"))?;
+    let Some(value) = triggers.get("crons") else {
+        return Ok(Vec::new());
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| anyhow!("config `triggers.crons` must be an array of strings"))?;
+    let mut crons = Vec::new();
+    for entry in entries {
+        let expression = entry
+            .as_str()
+            .ok_or_else(|| anyhow!("config `triggers.crons` must be an array of strings"))?;
+        celld_logic::cron::parse(expression).map_err(|error| anyhow!("{error}"))?;
+        crons.push(expression.trim().to_string());
+    }
+    Ok(crons)
 }
 
 fn read_sqlite_classes(project: &Map<String, Value>) -> anyhow::Result<Vec<String>> {
@@ -1149,6 +1419,11 @@ fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
         .arg("--conditions=workerd,worker,browser")
         .arg("--external:node:*")
         .arg("--external:cloudflare:*")
+        .args(
+            crate::js::BARE_NODE_BUILTINS
+                .iter()
+                .map(|specifier| format!("--external:{specifier}")),
+        )
         // Wasm becomes a sibling module (Wrangler's CompiledWasm rule). The
         // `copy` loader makes esbuild resolve each wasm import like any other
         // import (importer-relative, node_modules, deduplicated) and rewrite

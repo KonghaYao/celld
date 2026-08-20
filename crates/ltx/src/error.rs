@@ -12,7 +12,7 @@ use thiserror::Error;
 /// Crate-wide `Result` alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Top-level error enum for `rustyriver`.
+/// Top-level error enum for `celld-ltx`.
 ///
 /// Variants map 1-to-1 to the sentinel errors and error categories in
 /// `litestream.go`; additional variants cover I/O and other infrastructure.

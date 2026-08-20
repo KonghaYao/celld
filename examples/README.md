@@ -7,12 +7,14 @@ Durable Object surface supported by `celld`:
 - `webapi/` — common Web Platform APIs
 - `counter/` — a SQLite-backed Durable Object
 - `vectordb/` — nearest-color search with a per-object `vec0` index
+- `d1/` — a guestbook on a D1 database
 - `async/` — a timer, an outbound fetch, and asynchronous storage
 - `body/` — request and response bodies
 - `router/` — Worker-to-Durable-Object routing
 - `wsecho/` — WebSocket echo with hibernation
 - `wsclient/` — outbound WebSocket client from a Durable Object
 - `alarm/` — a Durable Object alarm handler
+- `cron/` — a cron trigger that writes each tick into a Durable Object
 - `rpc/` — JS RPC: Durable Object methods, a named entrypoint, callbacks,
   `RpcTarget`, and promise pipelining
 - `wasm/` — a Durable Object counter in Rust, compiled to Wasm with

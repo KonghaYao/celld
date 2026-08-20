@@ -46,7 +46,6 @@ pub struct PresenceSnapshot {
     pub serving: bool,
     pub cells: Vec<PresenceCell>,
     pub activity: ActivitySnapshot,
-    pub lazy_lease_shadow: LeaseLifecycleShadowBatch,
 }
 
 impl PresenceSnapshot {
@@ -153,6 +152,10 @@ pub struct NodeLeaseRecord {
     /// Per-process generation; production stores this in
     /// `ownership_index_generation`.
     pub generation: String,
+    /// The folded node-log state: `None` means this session never opened
+    /// a fleet log — it never acked past the bucket. Anything not sealed
+    /// gates a takeover of this node's cells behind node-log recovery.
+    pub log_state: Option<crate::log_tier::LogState>,
     /// Object version observed by the read. Empty only in synthetic events.
     pub etag: String,
 }
@@ -188,56 +191,6 @@ pub struct NodeLeaseSpec {
     /// still-live generation.
     pub resume_generation: Option<String>,
     pub ttl_ms: u64,
-    pub mode: NodeLeaseMode,
-    pub linger_ms: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum NodeLeaseMode {
-    #[default]
-    Continuous,
-    Shadow,
-    Lazy,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NodeLeaseAuthorityAction {
-    Hold,
-    Renew,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LeaseLifecycleShadowSnapshot {
-    pub mode: NodeLeaseMode,
-    pub active_cells: usize,
-    pub serving_cells: usize,
-    pub idle_ms: u64,
-    pub linger_ms: u64,
-    pub lease_active: bool,
-    pub elapsed_since_ok_ms: u64,
-    pub elapsed_since_renew_ms: u64,
-    pub ttl_ms: u64,
-    pub shadow_release_reported: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LeaseLifecycleShadowExpected {
-    pub shadow_release: bool,
-    pub authority_action: NodeLeaseAuthorityAction,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LeaseLifecycleShadowDecision {
-    pub sequence: u64,
-    pub observed_at_ms: u64,
-    pub snapshot: LeaseLifecycleShadowSnapshot,
-    pub expected: LeaseLifecycleShadowExpected,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LeaseLifecycleShadowBatch {
-    pub dropped: u64,
-    pub decisions: Vec<LeaseLifecycleShadowDecision>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -326,6 +279,24 @@ pub enum Timer {
     OperationDeadline {
         op: OpId,
     },
+    /// Fires if `cell` is still parked behind the admission gate. Keyed by
+    /// cell because a parked cell has no operation: `OperationDeadline` is
+    /// armed per emitted effect, and parking is the state of having emitted
+    /// none. Without this the queue is the one stall with no bound.
+    QueuedActivation {
+        cell: CellId,
+        generation: u64,
+    },
+}
+
+/// Which mechanism proved a gated write durable. The fences differ: the
+/// fleet's follower ensemble arbitrates (a takeover seals a member first),
+/// the bucket only stores — so bucket proofs verify ownership before any
+/// reveal and fleet proofs need not; a TLA+ spec checks the pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProofSource {
+    Fleet,
+    Bucket,
 }
 
 /// Whether a failed operation definitely did not commit or may have committed
@@ -352,6 +323,11 @@ pub enum WebSocketKind {
 pub enum Event {
     StartNodeLease {
         now_ms: u64,
+        /// The monotonic instant `now_ms` was sampled. The initial lease's
+        /// TTL is anchored here; without it the anchor is 0 and every
+        /// millisecond of pre-actor startup counts against the first
+        /// acquisition (a slow boot then discards a perfectly good lease).
+        now_mono_ms: u64,
         spec: NodeLeaseSpec,
     },
     SelfNodeLeaseRead {
@@ -364,6 +340,13 @@ pub enum Event {
         op: OpId,
         now_mono_ms: u64,
         result: Result<LeaseCasOutcome, Failure>,
+        /// The folded log state the shell serialized into THIS attempt's
+        /// body. The shell stamps the body from its own slot at
+        /// serialization time — after the core chose `desired` — so the
+        /// core's readback comparisons must use this value, never its
+        /// pre-attempt belief. `None` means the body carried no log
+        /// object (bucket posture, or a backend that does not fold).
+        stamped_log_state: Option<crate::log_tier::LogState>,
     },
     /// The executor scanned the local paths after an exact node-generation
     /// handoff. These cells retain their existing ownership epochs, so the
@@ -380,13 +363,12 @@ pub enum Event {
         request: RequestId,
         cell: CellId,
     },
-    /// Production form of [`Event::Request`] with the sampled clocks needed
-    /// to acquire an idle lazy node lease. Untimed model slices retain the
-    /// compact variant above and use the state's last observed clocks.
+    /// Production form of [`Event::Request`] with the sampled clocks. Untimed
+    /// model slices retain the compact variant above and use the state's last
+    /// observed clocks.
     RequestAt {
         request: RequestId,
         cell: CellId,
-        now_ms: u64,
         now_mono_ms: u64,
     },
     /// A peer selected this node as a possible landing place for an unowned
@@ -396,7 +378,6 @@ pub enum Event {
     CapacityRequestAt {
         request: RequestId,
         cell: CellId,
-        now_ms: u64,
         now_mono_ms: u64,
     },
     /// Reserve an idle resident isolate for a top-level Worker request. The
@@ -428,14 +409,32 @@ pub enum Event {
         request: RequestId,
         position: u64,
     },
+    /// A read-only local response is ready. It can escape immediately only
+    /// when its cell has no outstanding write durability proof.
+    ReadOutput {
+        request: RequestId,
+    },
     /// The shell finished proving a gated write durable. `Ok(position)` reports
     /// the committed-write position the replica has *actually* proved durable;
     /// the core acknowledges only when it covers the gated write's position, so
     /// a replicator that proves less than it was asked to cannot force an early
     /// ack. `Err` failed the proof outright.
+    ///
+    /// `source` says which mechanism proved it, because the two carry
+    /// different ack fences (`CelldAckFence.tla`): a fleet proof is already
+    /// arbitrated — a takeover seals a follower before restoring, so a stale
+    /// owner's next ack-all fails closed — while a bucket proof needs C1's
+    /// ownership verification before anything is revealed.
     DurableReached {
         op: OpId,
         result: Result<u64, Failure>,
+        source: ProofSource,
+    },
+    /// C1's answer: the ownership record still names this node at this epoch
+    /// (`Ok`), or does not, or could not be read.
+    OwnershipVerified {
+        op: OpId,
+        result: Result<(), Failure>,
     },
     WebSocketOpened {
         cell: CellId,
@@ -455,16 +454,26 @@ pub enum Event {
     },
     AlarmFinished {
         op: OpId,
+        /// The cell and epoch the firing was dispatched against. The gate the
+        /// core opens for the consuming commit is keyed by these, and not by
+        /// the alarm's own op: an activity fold can supersede the firing state
+        /// while the handler's write is still unproven, and that write exists
+        /// — and must hold every reader of the cell — regardless.
+        cell: CellId,
+        epoch: Epoch,
         now_ms: u64,
         now_mono_ms: u64,
-        result: Result<(Option<i64>, bool), Failure>,
+        /// The deadline standing after the handler ran, whether a wake entry
+        /// covers it, and the position of the consuming commit if the firing
+        /// wrote. The position is sampled last, so it covers the consume
+        /// itself, and the core proves it durable before the alarm settles.
+        result: Result<(Option<i64>, bool, Option<u64>), Failure>,
     },
     WakeHint {
         cell: CellId,
     },
     WakeHintAt {
         cell: CellId,
-        now_ms: u64,
         now_mono_ms: u64,
     },
     OwnerRead {
@@ -474,6 +483,17 @@ pub enum Event {
         /// read a clock itself.
         now_ms: u64,
         result: Result<Option<OwnerRecord>, Failure>,
+    },
+    NodeLogRecovered {
+        op: OpId,
+        result: Result<(), Failure>,
+    },
+    /// The log tier changed the folded log object the next lease write
+    /// must carry (lease-fold): renew NOW so the change is durable before
+    /// the caller proceeds. A no-op unless the lease is held.
+    NudgeNodeLease {
+        now_ms: u64,
+        now_mono_ms: u64,
     },
     NodeLeaseRead {
         op: OpId,
@@ -499,6 +519,11 @@ pub enum Event {
     },
     RuntimeStarted {
         op: OpId,
+        /// The isolate now holding this cell's realm. Placement happens in the
+        /// shell, so the core has to be told; the walk down groups on it to
+        /// empty a heap rather than scatter its cuts across every one. `None`
+        /// when no runtime placed the cell.
+        isolate: Option<crate::isolate::IsolateId>,
         result: Result<(), Failure>,
     },
     Published {
@@ -607,19 +632,21 @@ pub enum Effect {
     /// Read the local cell inventory. This is emitted only after the initial
     /// node lease CAS replaced the exact certified predecessor generation.
     ReadLocalCells,
-    /// Shadow mode proposed the lazy release but deliberately retained
-    /// authority. The shell only records this decision; it performs no I/O.
-    ObserveNodeLeaseShadowRelease {
-        sequence: u64,
-    },
-    /// Lazy mode stopped renewing its idle node lease. The bucket object is
-    /// intentionally left to expire; this effect is observability only.
-    ObserveNodeLeaseReleased,
     ReadOwner {
         op: OpId,
         cell: CellId,
     },
     ReadNodeLease {
+        op: OpId,
+        cell: CellId,
+        owner: NodeId,
+    },
+    /// The takeover interlock, as a core decision (lease-fold): the dead
+    /// owner's folded log state was not sealed, so its acked tail may
+    /// exist only on its followers. The executor recovers every
+    /// non-sealed session of `owner` into the bucket and reports
+    /// `NodeLogRecovered`; only then does the claim proceed.
+    RecoverNodeLog {
         op: OpId,
         cell: CellId,
         owner: NodeId,
@@ -688,6 +715,15 @@ pub enum Effect {
         epoch: Epoch,
         position: u64,
     },
+    /// C1 for bucket-proof acks: read `own.json` and answer whether it
+    /// still names this node at this epoch. The core holds the gated write
+    /// until `Event::OwnershipVerified` returns. Fleet-proof acks never
+    /// emit this — the ensemble seal is their fence.
+    VerifyOwnership {
+        op: OpId,
+        cell: CellId,
+        epoch: Epoch,
+    },
     StopRuntime {
         op: OpId,
         cell: CellId,
@@ -706,7 +742,8 @@ pub enum Effect {
     },
     /// Release a withheld local write response now that its durability is
     /// decided: `Ok` acknowledges the write, `Err` fails it. Emitted only for a
-    /// request the shell held open via [`Event::Wrote`].
+    /// request the shell held open via [`Event::Wrote`] or
+    /// [`Event::ReadOutput`].
     ReleaseResponse {
         request: RequestId,
         result: Result<(), RequestError>,

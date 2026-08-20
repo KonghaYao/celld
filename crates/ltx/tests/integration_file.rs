@@ -1,12 +1,14 @@
-//! integration_file — the **G2 round-trip gate** (PLAN.md §6.4) against the
-//! file `ReplicaClient`.
+// This file-backend integration test inspects its external filesystem result.
+#![allow(clippy::disallowed_methods)]
+
+//! integration_file — the round-trip gate against the file `ReplicaClient`.
 //!
 //! Proves T10: open a fresh SQLite DB, apply several transactions, capture them
 //! into L0 LTX files (the `Db` capture loop), replicate them to a file replica
 //! (`Replica::sync` → `FileReplicaClient`), restore to a NEW path
 //! (`celld_ltx::replica::restore`), and assert the restored DB equals the
-//! source via **Oracle A** (`scripts/db_equal.sh A` — identical
-//! `PRAGMA integrity_check` + schema + per-table content hash, PLAN.md §6.1).
+//! source via the logical equality oracle (`scripts/db_equal.sh A` — identical
+//! `PRAGMA integrity_check`, schema, and per-table content hash).
 //!
 //! The source DB is written through an ordinary `rusqlite` connection (the
 //! "application"); the managed `Db` holds the read lock and captures the WAL,
@@ -59,15 +61,35 @@ fn litestream_bin() -> String {
     std::env::var("LITESTREAM_BIN").unwrap_or_else(|_| "litestream".into())
 }
 
+/// `CELLD_LTX_LITESTREAM_REQUIRED=1` forbids the skip below. CI installs the
+/// pinned binary and sets the variable, so a failed install reds the run
+/// instead of passing a gate that ran nothing. This mirrors
+/// `CELLD_LTX_S3_REQUIRED` in `integration_s3.rs`.
+fn required() -> bool {
+    std::env::var("CELLD_LTX_LITESTREAM_REQUIRED").as_deref() == Ok("1")
+}
+
+/// Records a missing prerequisite: a panic in required mode, a logged skip
+/// otherwise.
+fn unavailable(test: &str, reason: &str) {
+    assert!(
+        !required(),
+        "{test}: {reason} (CELLD_LTX_LITESTREAM_REQUIRED=1 forbids the skip)"
+    );
+    eprintln!("skipping {test}: {reason}");
+}
+
 /// True when the resolved binary exists AND speaks the pinned replica era.
 fn litestream_usable(test: &str) -> bool {
     let out = Command::new(litestream_bin()).arg("version").output();
     match out {
         Err(_) => {
-            eprintln!(
-                "skipping {test}: `{}` not runnable; set LITESTREAM_BIN or \
-                 put litestream on PATH",
-                litestream_bin()
+            unavailable(
+                test,
+                &format!(
+                    "`{}` is not runnable; set LITESTREAM_BIN or put litestream on PATH",
+                    litestream_bin()
+                ),
             );
             false
         }
@@ -76,9 +98,12 @@ fn litestream_usable(test: &str) -> bool {
             if v.starts_with("v0.5") || v.starts_with("0.5") {
                 true
             } else {
-                eprintln!(
-                    "skipping {test}: litestream {v:?} is the wrong era \
-                     (pinned v0.5.11); point LITESTREAM_BIN at a v0.5 binary"
+                unavailable(
+                    test,
+                    &format!(
+                        "litestream {v:?} is the wrong era (the replica format is \
+                         v0.5); point LITESTREAM_BIN at a v0.5 binary"
+                    ),
                 );
                 false
             }
@@ -111,7 +136,10 @@ fn open_writer(path: &Path) -> Connection {
 #[tokio::test(flavor = "multi_thread")]
 async fn round_trip_file_client_reproduces_source() {
     if !has_bin("sqlite3") {
-        eprintln!("skipping: sqlite3 not on PATH (required for the db_equal Oracle A)");
+        unavailable(
+            "round_trip_file_client_reproduces_source",
+            "`sqlite3` is not on PATH (the db_equal Oracle A needs it)",
+        );
         return;
     }
 
@@ -183,7 +211,10 @@ async fn round_trip_file_client_reproduces_source() {
 #[tokio::test(flavor = "multi_thread")]
 async fn restore_to_target_txid_reproduces_point_in_time() {
     if !has_bin("sqlite3") {
-        eprintln!("skipping: sqlite3 not on PATH");
+        unavailable(
+            "restore_golden_replica_matches_real_litestream",
+            "`sqlite3` is not on PATH (the db_equal oracle needs it)",
+        );
         return;
     }
 
@@ -244,7 +275,10 @@ async fn restore_to_target_txid_reproduces_point_in_time() {
 #[tokio::test(flavor = "multi_thread")]
 async fn restore_golden_replica_matches_real_litestream() {
     if !has_bin("sqlite3") {
-        eprintln!("skipping: sqlite3 not on PATH");
+        unavailable(
+            "restore_golden_replica_matches_real_litestream",
+            "`sqlite3` is not on PATH (the db_equal oracle needs it)",
+        );
         return;
     }
     if !litestream_usable("restore_golden_replica_matches_real_litestream") {

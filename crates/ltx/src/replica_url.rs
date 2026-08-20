@@ -5,8 +5,8 @@
 //! the pure URL-parsing and endpoint-detection functions for the **s3** and
 //! **file** schemes. The `RegisterReplicaClientFactory` registry and the
 //! `NewReplicaClientFromURL` *client construction* path are deferred to the
-//! client tasks (T5/T6/T7) — they cannot exist before the clients do — as are
-//! the dropped schemes (gs/abs/oss/sftp/webdav, PLAN.md §2).
+//! client implementations. The crate does not include the gs, abs, oss, sftp,
+//! or webdav schemes.
 
 use crate::error::{Error, Result};
 

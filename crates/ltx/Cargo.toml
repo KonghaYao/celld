@@ -15,6 +15,10 @@ description = "In-process SQLite WAL replication to object storage (LTX format) 
 readme = "README.md"
 publish = false
 
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(celld_internal_tests)"]
+
 [features]
 default = ["s3"]
 s3 = ["object_store/aws"]

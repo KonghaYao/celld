@@ -9,8 +9,10 @@ celld makes three important promises:
 
 We try to break each promise at the layer where a failure shows most
 clearly. We test the API contract with differential execution against the
-Cloudflare runtime. We test the coordination protocol with deterministic
-simulation. We test the full system with fault injection on live fleets.
+Cloudflare runtime. We check the coordination protocol against an
+exhaustively model-checked specification, and we test it with
+deterministic simulation. We test the full system with fault injection
+on live fleets.
 
 ## Conformance: two runtimes, one output
 
@@ -29,6 +31,52 @@ Objects contract, the web-platform globals, and the upstream Web Platform
 Tests. Before a release, we also replay scenarios through the full
 `celld` binary in each deployment mode: storage, SQL, alarms, streams,
 WebSockets, and lifecycle.
+
+## Specification: exhaustive at small size
+
+The coordination protocol is also specified in TLA+. Heyang Zhou wrote
+the specifications against celld v0.1.0, and his model checking found
+four bugs and a split-brain that lost an acknowledged write. All are
+fixed. None had surfaced in our own review or testing.
+
+Where simulation samples schedules, the checker enumerates them: at a
+small configuration it visits every reachable state. The model grants
+the implementation a linearizable object store and perfect shared
+clocks, so a violation it finds needs no clock skew and no storage
+anomaly to occur. The invariants are the first two promises at the top
+of this page: one writer for each epoch, and no acknowledged write
+lost. The fencing argument itself — that a stale owner's late writes
+cannot cost an acknowledged write, because the epoch in the key keeps
+its lineage apart — is checked, not asserted.
+
+Every configuration carries a pinned expected verdict, and most of the
+verdicts are failures: each failing configuration models a bug the
+protocol once had, or a deliberately broken checker, and the model
+must produce the counterexample. A configuration that stops failing
+has lost its tooth. One tooth had already fallen out when the
+specifications arrived; we repaired it.
+
+Some specifications model a proposed protocol before it is built. When
+the fence on write acknowledgments was redesigned, the design-stage
+check produced an eight-state counterexample against the version it
+replaced: a dormant cell resumes at its old epoch while its release is
+in flight, acknowledges a write, and the takeover that follows
+restores without it. The fix shipped; the counterexample stays as a
+pinned failure.
+
+The checker has also removed code: celld once sealed a cell's durable
+history at restore, and the verdicts showed the seal defended only the
+return of a write that was never acknowledged — an outcome celld does
+not promise to prevent — while its permanent cut could turn a
+recoverable ordering slip into a permanent loss. The seal is gone.
+
+The specifications are a hand-synced snapshot, deliberately not in
+continuous integration: a silently stale gate is worse than none. In
+practice their updates have landed in the same changes that moved the
+protocol, and a delta ledger records what the model does not yet
+describe, including places where the model is weaker than the code
+rather than wrong. Simulation remains the per-commit ratchet; the
+model is its exhaustive small-configuration complement.
 
 ## Simulation: the protocol under adversarial schedules
 

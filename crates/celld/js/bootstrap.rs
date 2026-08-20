@@ -200,7 +200,7 @@ pub(super) fn inject_namespace_keys(
     cell.set(scope, script_key.into(), script_value.into());
     for class_name in do_classes {
         let class_key = v8::String::new(scope, class_name).unwrap();
-        let namespace_key = format!("cells:v1:{}:{script_name}:{class_name}", script_name.len(),);
+        let namespace_key = super::namespace_key(script_name, class_name);
         let namespace_key = v8::String::new(scope, &namespace_key).unwrap();
         if !keys
             .set(scope, class_key.into(), namespace_key.into())
@@ -209,6 +209,28 @@ pub(super) fn inject_namespace_keys(
             anyhow::bail!("could not register namespace key for {class_name}");
         }
     }
+    Ok(())
+}
+
+/// `__cell.crons`: the deployment's cron trigger expressions, verbatim as the
+/// developer wrote them. The reserved cron cell reads them at each activation,
+/// so a schedule change arrives with the deployment and needs no migration of
+/// an alarm the previous deployment armed. Absent `triggers.crons`, the list
+/// is empty and the cron cell retires itself.
+pub(super) fn inject_crons(scope: &mut v8::PinScope, crons: &[String]) -> Result<()> {
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let cell = global
+        .get(scope, v8::String::new(scope, "__cell").unwrap().into())
+        .and_then(|value| value.to_object(scope))
+        .ok_or_else(|| anyhow!("missing __cell runtime state"))?;
+    let list = v8::Array::new(scope, crons.len() as i32);
+    for (index, cron) in crons.iter().enumerate() {
+        let value = v8::String::new(scope, cron).ok_or_else(|| anyhow!("cron expression"))?;
+        list.set_index(scope, index as u32, value.into());
+    }
+    let key = v8::String::new(scope, "crons").unwrap();
+    cell.set(scope, key.into(), list.into());
     Ok(())
 }
 
@@ -257,6 +279,7 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
     let script_name = config.script_name.as_str();
     let bindings = config.bindings.as_slice();
     let r2_bindings = config.r2_bindings.as_slice();
+    let d1_bindings = config.d1_bindings.as_slice();
     let ai_binding = config.ai_binding.as_deref();
     let vars = config.vars.as_slice();
     let services = config.services.as_slice();
@@ -272,6 +295,12 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         }
         for name in r2_bindings {
             lines.push_str(&format!("e[{:?}] = __makeR2Bucket({:?});\n", name, name));
+        }
+        for (name, database) in d1_bindings {
+            lines.push_str(&format!(
+                "e[{:?}] = __makeD1Database({:?});\n",
+                name, database
+            ));
         }
         if let (Some(name), Ok(url)) = (ai_binding, std::env::var("CELLD_AI_URL")) {
             lines.push_str(&format!("e[{:?}] = __makeAiBinding({:?});\n", name, url));
@@ -436,7 +465,8 @@ pub(super) fn inject_routing(scope: &mut v8::PinScope, owned: &[String], node: &
     Ok(())
 }
 
-/// Amend `inject_routing` for one cell, and restore its id name.
+/// Amend `inject_routing` for one cell, release its instance, and restore its
+/// id name.
 ///
 /// The isolate-side half of taking a cell in or giving it back. Kept beside
 /// `inject_routing` because it edits the table that function builds.
@@ -466,7 +496,23 @@ pub(super) fn adopt_cell(
     // before they shared isolates. Re-enabling the fast path needs the
     // target checked against what is already on the stack; correctness
     // first.
-    let source = format!("(() => {{ delete __cell.owned[{cell:?}]; }})();");
+    //
+    // The script also releases everything the isolate holds for this cell's
+    // residency, on both edges: the give-back frees what the application left
+    // behind — memory the node cannot shed, because the cell has left
+    // residency — and the take-in stops state spanning two epochs, which
+    // corrupts rather than leaks. `__cell.release` lives in the harness
+    // because what a residency owns is decided by the maps that hold it; this
+    // side only says when.
+    //
+    // The release loses nothing the cell needs back: `register_actor_name`
+    // persists the id name before writing it here, so the take-in below reads
+    // it back.
+    let source = format!(
+        "(() => {{ const s = {cell:?}; \
+         delete __cell.owned[s]; \
+         __cell.release(s); }})();"
+    );
     let code = v8::String::new(tc, &source).unwrap();
     let script = v8::Script::compile(tc, code, None).ok_or_else(|| anyhow!("adopt compile"))?;
     script.run(tc).ok_or_else(|| anyhow!("adopt run"))?;

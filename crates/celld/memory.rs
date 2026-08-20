@@ -27,6 +27,7 @@ pub fn sample() -> Sample {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // `/proc` is host telemetry, not node storage.
 pub fn resident_bytes() -> u64 {
     std::fs::read_to_string("/proc/self/statm")
         .ok()
@@ -47,7 +48,7 @@ pub fn resident_bytes() -> u64 {
     let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
     let got = unsafe {
         libc::proc_pidinfo(
-            std::process::id() as libc::c_int,
+            libc::getpid(),
             libc::PROC_PIDTASKINFO,
             0,
             (&raw mut info).cast(),

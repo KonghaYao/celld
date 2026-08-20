@@ -1,3 +1,6 @@
+// This fuzz target reads the file-format fixture corpus directly.
+#![allow(clippy::disallowed_methods)]
+
 //! fuzz_parsers — T16 / Gate G4: robustness (fuzz) targets for the LTX and WAL
 //! parsers.
 //!

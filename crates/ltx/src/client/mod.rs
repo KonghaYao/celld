@@ -14,6 +14,7 @@ use crate::ltx::{self, FileInfo, Header, HEADER_FLAG_NO_CHECKSUM, VERSION};
 use crate::TXID;
 use async_trait::async_trait;
 
+pub mod bundle;
 pub mod file;
 pub mod object_store;
 

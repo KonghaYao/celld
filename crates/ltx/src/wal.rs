@@ -567,6 +567,8 @@ fn be_u32(b: &[u8]) -> u32 {
 }
 
 #[cfg(test)]
+// Unit tests inspect materialized file-format fixtures outside production.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -859,7 +861,7 @@ mod tests {
     //
     // sample.wal: 16,512 bytes, page size 4096, magic 0x377f0682 (little-endian
     // checksums), per tests/fixtures/golden/MANIFEST.md. A checksum failure here
-    // means the port is wrong, NOT the fixture (AGENTS.md rule 3).
+    // means the port is wrong, not the fixture.
     #[test]
     fn test_golden_sample_wal() {
         let b = read_golden_wal();

@@ -15,6 +15,8 @@
 //!   * `AWS_REGION` (default `us-east-1`)
 
 #![cfg(feature = "s3")]
+// Live S3 integration setup is outside celld's injected LTX host boundary.
+#![allow(clippy::disallowed_methods)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

@@ -146,6 +146,51 @@ fn jwk_bytes(value: &serde_json::Value, kty: &str, name: &str) -> Result<Vec<u8>
         .map_err(|_| anyhow!("invalid JWK {name}"))
 }
 
+/// Salt length OpenSSL uses for a PBES2 export, which is what Node inherits.
+const PBES2_SALT_LEN: usize = 8;
+/// PBKDF2 iteration count OpenSSL uses for a PBES2 export. Node inherits it,
+/// so an encrypted key celld writes costs a reader the same as a Node one.
+///
+/// This is far weaker than the scrypt cost `pkcs5` reaches for on its own, and
+/// deliberately so: an encrypted key is only as strong as the reader that has
+/// to open it, and every Node and OpenSSL reader expects these parameters. Do
+/// not raise it to harden the KDF -- that hardens celld's keys against celld
+/// alone and desyncs the format from the one the ecosystem writes.
+const PBES2_ITERATIONS: u32 = 2048;
+
+/// PBES2 parameters for an encrypted PKCS#8 export.
+///
+/// `pkcs8::PrivateKeyInfo::encrypt` picks scrypt at its recommended cost
+/// (2^15 rounds over 32 MiB) and AES-256-CBC, and it ignores the cipher the
+/// caller asked for. Node derives with PBKDF2-HMAC-SHA256 over 2048
+/// iterations and honours the cipher, so celld builds the parameters itself.
+/// The scrypt default also made an export cost seconds, which is why the two
+/// crypto suites were slow.
+///
+/// The cipher name arrives lower-cased from `node_crypto.js`, which is also
+/// where an unwritable cipher is refused. A name that reaches the fallback
+/// arm here is a bug on that side, not caller input.
+fn pbes2_parameters<'a>(
+    cipher: &str,
+    salt: &'a [u8],
+    iv: &'a [u8; 16],
+) -> Result<pkcs8::pkcs5::pbes2::Parameters<'a>> {
+    use pkcs8::pkcs5::pbes2::{EncryptionScheme, Parameters, Pbkdf2Params};
+
+    let encryption = match cipher {
+        "aes-128-cbc" => EncryptionScheme::Aes128Cbc { iv },
+        "aes-192-cbc" => EncryptionScheme::Aes192Cbc { iv },
+        "aes-256-cbc" => EncryptionScheme::Aes256Cbc { iv },
+        other => return Err(anyhow!("unsupported cipher {other}")),
+    };
+    let kdf = Pbkdf2Params::hmac_with_sha256(PBES2_ITERATIONS, salt)
+        .map_err(|_| anyhow!("invalid PBKDF2 parameters"))?;
+    Ok(Parameters {
+        kdf: kdf.into(),
+        encryption,
+    })
+}
+
 /// Identify an already-normalized PKCS#8 or SPKI blob and describe it. Node
 /// reports `asymmetricKeyType` and `asymmetricKeyDetails` from exactly this.
 fn describe_key(der: &[u8], private: bool) -> Result<ParsedKey> {
@@ -792,14 +837,14 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             } else {
                 let key = crypto_bytes(args, "key")?;
                 let stated = args.get("type").and_then(serde_json::Value::as_str);
+                let passphrase = args
+                    .get("passphrase")
+                    .filter(|value| !value.is_null())
+                    .map(|_| crypto_bytes(args, "passphrase"))
+                    .transpose()?;
                 if format == "pem" {
                     let text = std::str::from_utf8(&key)
                         .map_err(|_| anyhow!("PEM key is not valid UTF-8"))?;
-                    let passphrase = args
-                        .get("passphrase")
-                        .filter(|value| !value.is_null())
-                        .map(|_| crypto_bytes(args, "passphrase"))
-                        .transpose()?;
                     if text.contains("ENCRYPTED PRIVATE KEY") {
                         let passphrase = passphrase
                             .ok_or_else(|| anyhow!("Passphrase required for encrypted key"))?;
@@ -813,6 +858,18 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                             .map_err(|_| anyhow!("invalid PEM key"))?;
                         normalize_key(document.as_bytes(), pem_structure(label)?)?
                     }
+                } else if let Ok(sealed) = pkcs8::EncryptedPrivateKeyInfo::try_from(key.as_slice())
+                {
+                    // An encrypted PKCS#8 blob is its own structure, so it is
+                    // recognized before the sniffer runs: the sniffer would
+                    // read it as an unknown key and report a parse failure
+                    // rather than a missing or wrong passphrase.
+                    let passphrase = passphrase
+                        .ok_or_else(|| anyhow!("Passphrase required for encrypted key"))?;
+                    let document = sealed
+                        .decrypt(&passphrase)
+                        .map_err(|_| anyhow!("Failed to decrypt private key"))?;
+                    (document.as_bytes().to_vec(), true)
                 } else {
                     (
                         normalize_key_sniffing(&key, stated, want_private)?,
@@ -989,9 +1046,18 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 }
                 let info = pkcs8::PrivateKeyInfo::try_from(der.as_slice())
                     .map_err(|_| anyhow!("invalid PKCS#8 private key"))?;
-                let mut rng = rand::rngs::OsRng;
+                let cipher = args
+                    .get("cipher")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow!("an encrypted export needs a cipher"))?;
+                use rand::RngCore as _;
+                let mut salt = [0u8; PBES2_SALT_LEN];
+                let mut iv = [0u8; 16];
+                rand::rngs::OsRng.fill_bytes(&mut salt);
+                rand::rngs::OsRng.fill_bytes(&mut iv);
+                let params = pbes2_parameters(cipher, &salt, &iv)?;
                 let document = info
-                    .encrypt(&mut rng, &passphrase)
+                    .encrypt_with_params(params, &passphrase)
                     .map_err(|_| anyhow!("could not encrypt the private key"))?;
                 let pem = args
                     .get("format")

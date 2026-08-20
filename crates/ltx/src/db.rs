@@ -16,8 +16,7 @@
 //! T10's `Replica` drives `sync()`/`checkpoint()` from a blocking context
 //! (`spawn_blocking` or a dedicated DB thread). This sidesteps the !Sync/borrow
 //! problem entirely and makes the idempotent-release behavior (issue #934) a
-//! trivial flag check. The task brief sanctions this ("keep the capture API
-//! synchronous and let T10 drive it"). Logged in OPEN_QUESTIONS.md.
+//! trivial flag check.
 //!
 //! ## What this implements (the functional capture path)
 //! - `open`/`init`: WAL-mode DSN, `wal_autocheckpoint(0)`, control tables, read
@@ -35,17 +34,19 @@
 //! - `checkpoint_if_needed`: the 3-tier policy + the three anti-feedback flags
 //!   (`synced_since_checkpoint`/`synced_to_wal_end`/`last_synced_wal_offset`,
 //!   issues #896/#927/#997, footgun F-5).
+//! - Litestream #1292 / celld #150: seal passive checkpoints with a writer
+//!   barrier, retain database-growth pages, and snapshot truncate boundaries.
 //! - `crc64`, `pos` (cached + `LTXError` mapping), `reset_local_state`,
 //!   `snapshot_to_writer`.
 //!
-//! ## Deferred (logged in OPEN_QUESTIONS.md — not on the functional path)
+//! ## Deferred work outside the functional path
 //! - `setPersistWAL` (the `unsafe` `sqlite3_file_control(SQLITE_FCNTL_PERSIST_WAL)`
 //!   FFI, footgun F-10): only matters when *all* connections close and SQLite
 //!   would delete the WAL; the capture path keeps its own connection open.
 //! - The background monitor loop + backoff (footgun F-13), `Replica` integration
 //!   (`ensure_exists`/`sync_status`/`sync_and_wait`/retention/`syncReplicaWithRetry`):
 //!   these need T10's `Replica` handle and land with it.
-//! - `loom` model of the lock protocol (PLAN.md §6.4).
+//! - A `loom` model of the lock protocol.
 
 use crate::error::{new_ltx_error, Error, Result};
 use crate::ltx::{self, lock_pgno, Crc64};
@@ -54,9 +55,8 @@ use crate::{
     ltx_file_path, ltx_level_dir, Pos, CHECKPOINT_MODE_PASSIVE, CHECKPOINT_MODE_RESTART,
     CHECKPOINT_MODE_TRUNCATE, META_DIR_SUFFIX, TXID, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -103,6 +103,8 @@ struct SyncInfo {
     offset: i64,
     salt1: u32,
     salt2: u32,
+    /// Database page count recorded by the previous LTX file.
+    prev_commit: u32,
     /// If true, a full snapshot is required.
     snapshotting: bool,
     /// Reason for the snapshot (for logging / test assertions).
@@ -118,6 +120,7 @@ struct SyncInfo {
 /// Ported from `DB` (db.go:64-198). Synchronous by DECISION (see module docs):
 /// the `!Sync` connection stays on whatever thread T10 drives it from.
 pub struct Db {
+    host: crate::LtxHost,
     path: PathBuf,
     meta_path: PathBuf,
     /// Main connection: writes, PRAGMAs, checkpoints, page-size reads.
@@ -162,6 +165,11 @@ pub struct Db {
     pos_cache: Option<Pos>,
     /// Last L0 `FileInfo` (db.go:99-102; only L0 is tracked in the one-shot).
     max_l0_file_info: Option<ltx::FileInfo>,
+
+    /// Unit-test hook that runs while the passive checkpoint writer barrier is
+    /// held and immediately before the checkpoint PRAGMA.
+    #[cfg(test)]
+    passive_checkpoint_barrier_hook: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Db {
@@ -181,10 +189,37 @@ impl Db {
     /// Ported from `DB.init` (db.go:795-911) — the connection-setup half plus the
     /// read-lock acquire and `ensureWALExists`. (Replica wiring lands in T10.)
     pub fn open(path: impl AsRef<Path>) -> Result<Db> {
+        Self::open_with_host(path, crate::LtxHost::default())
+    }
+
+    /// Opens the database with an injected clock and executor host.
+    pub fn open_with_host(path: impl AsRef<Path>, host: crate::LtxHost) -> Result<Db> {
+        Self::open_with_host_and_optional_vfs(path, host, None)
+    }
+
+    /// Opens both managed connections through an internal test VFS.
+    #[cfg(celld_internal_tests)]
+    pub fn open_with_host_and_vfs(
+        path: impl AsRef<Path>,
+        host: crate::LtxHost,
+        vfs: &str,
+    ) -> Result<Db> {
+        Self::open_with_host_and_optional_vfs(path, host, Some(vfs))
+    }
+
+    fn open_with_host_and_optional_vfs(
+        path: impl AsRef<Path>,
+        host: crate::LtxHost,
+        vfs: Option<&str>,
+    ) -> Result<Db> {
         let path = path.as_ref().to_path_buf();
         let meta_path = Self::meta_path_for(&path);
 
-        let conn = Connection::open(&path).map_err(sql_err)?;
+        let open = |path: &Path| match vfs {
+            Some(vfs) => Connection::open_with_flags_and_vfs(path, OpenFlags::default(), vfs),
+            None => Connection::open(path),
+        };
+        let conn = open(&path).map_err(sql_err)?;
 
         // DSN pragmas: busy_timeout + wal_autocheckpoint(0) (db.go:818).
         // autocheckpoint MUST be 0 — litestream owns checkpointing (footgun
@@ -217,12 +252,13 @@ impl Db {
         .map_err(sql_err)?;
 
         // Dedicated read-lock connection (mirrors a second pooled connection).
-        let rtx_conn = Connection::open(&path).map_err(sql_err)?;
+        let rtx_conn = open(&path).map_err(sql_err)?;
         rtx_conn
             .busy_timeout(Self::DEFAULT_BUSY_TIMEOUT)
             .map_err(sql_err)?;
 
         let mut db = Db {
+            host,
             path,
             meta_path,
             conn,
@@ -238,6 +274,8 @@ impl Db {
             last_synced_wal_offset: 0,
             pos_cache: None,
             max_l0_file_info: None,
+            #[cfg(test)]
+            passive_checkpoint_barrier_hook: None,
         };
 
         // Start the long-running read transaction (db.go:867-871).
@@ -257,10 +295,10 @@ impl Db {
         db.page_size = page_size as u32;
 
         // Ensure the meta directory exists (db.go:880-883).
-        std::fs::create_dir_all(&db.meta_path)?;
+        db.host.create_dir_all(&db.meta_path)?;
 
         // Clear crash-leftover temp files (db.go:576).
-        remove_tmp_files(&db.meta_path)?;
+        remove_tmp_files(&db.host, &db.meta_path)?;
 
         // Ensure the WAL has at least one frame (db.go:886-888).
         db.ensure_wal_exists()?;
@@ -330,6 +368,12 @@ impl Db {
         ltx_file_path(&self.meta_path.to_string_lossy(), level, min_txid, max_txid)
     }
 
+    /// Reads one local LTX file through the host filesystem.
+    pub fn read_ltx_file(&self, level: u32, min_txid: TXID, max_txid: TXID) -> Result<Vec<u8>> {
+        let path = self.ltx_path(level, min_txid, max_txid);
+        Ok(self.host.read(Path::new(&path))?)
+    }
+
     /// The SQLite page size, in bytes. Ported from `DB.PageSize` (db.go:445).
     pub fn page_size(&self) -> u32 {
         self.page_size
@@ -383,8 +427,8 @@ impl Db {
     /// Ported from `ensureWALExists` (db.go:1199-1209): exit early if the WAL
     /// header is present; otherwise force a write to `_litestream_seq`.
     fn ensure_wal_exists(&self) -> Result<()> {
-        if let Ok(md) = std::fs::metadata(self.wal_path()) {
-            if md.len() >= WAL_HEADER_SIZE as u64 {
+        if let Ok(md) = self.host.metadata(&self.wal_path()) {
+            if md.len >= WAL_HEADER_SIZE as u64 {
                 return Ok(());
             }
         }
@@ -400,8 +444,8 @@ impl Db {
     /// Size of the WAL file in bytes, 0 if absent. Ported from `walFileSize`
     /// (db.go:1183-1191).
     fn wal_file_size(&self) -> Result<i64> {
-        match std::fs::metadata(self.wal_path()) {
-            Ok(md) => Ok(md.len() as i64),
+        match self.host.metadata(&self.wal_path()) {
+            Ok(md) => Ok(md.len as i64),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
             Err(e) => Err(e.into()),
         }
@@ -409,8 +453,8 @@ impl Db {
 
     /// The size of the main database file in bytes, 0 if absent.
     fn db_file_size(&self) -> Result<i64> {
-        match std::fs::metadata(&self.path) {
-            Ok(md) => Ok(md.len() as i64),
+        match self.host.metadata(&self.path) {
+            Ok(md) => Ok(md.len as i64),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
             Err(e) => Err(e.into()),
         }
@@ -422,7 +466,7 @@ impl Db {
     /// Ported from `DB.MaxLTX` (db.go:363-380).
     fn max_ltx(&self) -> Result<(TXID, TXID)> {
         let dir = self.ltx_level_dir(0);
-        let entries = match std::fs::read_dir(&dir) {
+        let entries = match self.host.read_dir(Path::new(&dir)) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((TXID(0), TXID(0))),
             Err(e) => return Err(e.into()),
@@ -430,8 +474,7 @@ impl Db {
         let mut min_txid = TXID(0);
         let mut max_txid = TXID(0);
         for ent in entries {
-            let ent = ent?;
-            let name = ent.file_name();
+            let name = ent.file_name;
             let name = name.to_string_lossy();
             if let Ok((mn, mx)) = ltx::parse_filename(&name) {
                 if mx > max_txid {
@@ -458,7 +501,7 @@ impl Db {
         }
 
         let ltx_path = self.ltx_path(0, min_txid, max_txid);
-        let bytes = match std::fs::read(&ltx_path) {
+        let bytes = match self.host.read(Path::new(&ltx_path)) {
             Ok(b) => b,
             Err(e) => {
                 return Err(Error::Ltx(Box::new(new_ltx_error(
@@ -501,7 +544,7 @@ impl Db {
     /// Removes local LTX files, forcing a fresh snapshot on the next sync.
     /// Ported from `DB.ResetLocalState` (db.go:309-328).
     pub fn reset_local_state(&mut self) -> Result<()> {
-        match std::fs::remove_dir_all(self.ltx_dir()) {
+        match self.host.remove_dir_all(Path::new(&self.ltx_dir())) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
@@ -527,19 +570,19 @@ impl Db {
     pub fn seed_l0_baseline(&mut self, min_txid: TXID, max_txid: TXID, data: &[u8]) -> Result<()> {
         // Clear local L0 files (db.go:1241-1249).
         let l0_dir = self.ltx_level_dir(0);
-        match std::fs::remove_dir_all(&l0_dir) {
+        match self.host.remove_dir_all(Path::new(&l0_dir)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
         self.max_l0_file_info = None;
         self.invalidate_pos_cache();
-        std::fs::create_dir_all(&l0_dir)?;
+        self.host.create_dir_all(Path::new(&l0_dir))?;
 
         // Write the baseline file atomically (db.go:1260-1286).
         let local_path = self.ltx_path(0, min_txid, max_txid);
         let tmp_path = format!("{local_path}.tmp");
-        write_file_atomic(&tmp_path, &local_path, data)?;
+        write_file_atomic(&self.host, &tmp_path, &local_path, data)?;
         self.invalidate_pos_cache();
         Ok(())
     }
@@ -611,7 +654,7 @@ impl Db {
         // Determine the last WAL offset we saved from, by decoding the last LTX
         // file's header (db.go:1311-1326).
         let ltx_path = self.ltx_path(0, pos.txid, pos.txid);
-        let ltx_bytes = match std::fs::read(&ltx_path) {
+        let ltx_bytes = match self.host.read(Path::new(&ltx_path)) {
             Ok(b) => b,
             Err(e) => {
                 return Err(Error::Ltx(Box::new(new_ltx_error(
@@ -640,6 +683,7 @@ impl Db {
         info.offset = hdr.wal_offset + hdr.wal_size;
         info.salt1 = hdr.wal_salt1;
         info.salt2 = hdr.wal_salt2;
+        info.prev_commit = hdr.commit;
 
         // If the LTX WAL offset exceeds the real WAL size, the WAL was truncated.
         let wal_size = self.wal_file_size()?;
@@ -650,7 +694,7 @@ impl Db {
             if self.synced_to_wal_end {
                 self.synced_to_wal_end = false;
 
-                let wal_hdr = read_wal_header(&self.wal_path())?;
+                let wal_hdr = read_wal_header(&self.host, &self.wal_path())?;
                 info.offset = WAL_HEADER_SIZE as i64;
                 info.salt1 = be_u32(&wal_hdr[16..]);
                 info.salt2 = be_u32(&wal_hdr[20..]);
@@ -664,7 +708,7 @@ impl Db {
         }
 
         // Compare WAL headers; restart from the beginning of the WAL if different.
-        let wal_hdr = read_wal_header(&self.wal_path())?;
+        let wal_hdr = read_wal_header(&self.host, &self.wal_path())?;
         let salt1 = be_u32(&wal_hdr[16..]);
         let salt2 = be_u32(&wal_hdr[20..]);
         let salt_match = salt1 == hdr.wal_salt1 && salt2 == hdr.wal_salt2;
@@ -744,7 +788,7 @@ impl Db {
             return Ok(false);
         }
 
-        let frame = read_wal_file_at(&self.wal_path(), prev_wal_offset, frame_size)?;
+        let frame = read_wal_file_at(&self.host, &self.wal_path(), prev_wal_offset, frame_size)?;
         let pgno = be_u32(&frame[0..]);
         let fsalt1 = be_u32(&frame[8..]);
         let fsalt2 = be_u32(&frame[12..]);
@@ -768,7 +812,7 @@ impl Db {
     /// Detects whether a FULL or RESTART checkpoint occurred (we may have missed
     /// frames). Ported from `DB.detectFullCheckpoint` (db.go:1477-1507).
     fn detect_full_checkpoint(&self, known_salts: &[(u32, u32)]) -> Result<bool> {
-        let wal_bytes = std::fs::read(self.wal_path())?;
+        let wal_bytes = self.host.read(&self.wal_path())?;
         let rd = WalReader::new(&wal_bytes).map_err(Error::from)?;
         let last_known = known_salts.last().copied().unwrap_or((0, 0));
         let mut m = rd.frame_salts_until(last_known);
@@ -791,7 +835,7 @@ impl Db {
         let db_size = self.db_file_size()?;
         let mut commit = (db_size / self.page_size as i64) as u32;
 
-        let wal_bytes = std::fs::read(self.wal_path())?;
+        let wal_bytes = self.host.read(&self.wal_path())?;
 
         // Choose the WAL reader start: from the header, or seek to info.offset.
         // A previous-frame mismatch falls back to a full read (snapshot),
@@ -842,7 +886,7 @@ impl Db {
         let pages: Vec<(u32, Vec<u8>)> = if info.snapshotting {
             self.collect_snapshot_pages(&wal_bytes, &page_map, commit)?
         } else {
-            self.collect_wal_pages(&wal_bytes, &page_map)?
+            self.collect_wal_pages(&wal_bytes, &page_map, info.prev_commit, commit)?
         };
 
         let header = ltx::Header {
@@ -852,7 +896,7 @@ impl Db {
             commit,
             min_txid: tx_id,
             max_txid: tx_id,
-            timestamp: now_unix_millis(),
+            timestamp: self.host.now_unix_millis(),
             pre_apply_checksum: 0,
             wal_offset: info.offset,
             wal_size: sz,
@@ -867,9 +911,9 @@ impl Db {
         // Atomic tmp → fsync → rename (db.go:1609-1685, footgun F-8).
         let tmp_filename = format!("{filename}.tmp");
         if let Some(parent) = Path::new(&tmp_filename).parent() {
-            std::fs::create_dir_all(parent)?;
+            self.host.create_dir_all(parent)?;
         }
-        write_file_atomic(&tmp_filename, &filename, &encoded).inspect_err(|_| {
+        write_file_atomic(&self.host, &tmp_filename, &filename, &encoded).inspect_err(|_| {
             // On rename failure, clear the L0 cache + invalidate pos
             // (db.go:1680-1684). We do this in the error path below too.
         })?;
@@ -882,7 +926,7 @@ impl Db {
             pre_apply_checksum: 0,
             post_apply_checksum: 0,
             size: encoded.len() as i64,
-            created_at: Some(SystemTime::now()),
+            created_at: Some(system_time_from_unix_millis(self.host.now_unix_millis())),
         });
         // The encoder's post-apply pos: for a NoChecksum file the post-apply
         // checksum is 0; the position is (tx_id, 0).
@@ -900,20 +944,43 @@ impl Db {
         Ok(true)
     }
 
-    /// Collects the page set for an incremental (WAL-only) sync, in ascending
-    /// page-number order. Ported from `DB.writeLTXFromWAL` (db.go:1772-1799).
+    /// Collects the page set for an incremental sync, in ascending page-number
+    /// order. Pages absent from the WAL growth range come from the database file
+    /// (Litestream #1292 / celld #150).
     fn collect_wal_pages(
         &self,
         wal_bytes: &[u8],
         page_map: &HashMap<u32, i64>,
+        prev_commit: u32,
+        commit: u32,
     ) -> Result<Vec<(u32, Vec<u8>)>> {
         let mut pgnos: Vec<u32> = page_map.keys().copied().collect();
+        let lock = lock_pgno(self.page_size);
+        if commit > prev_commit {
+            for pgno in (prev_commit + 1)..=commit {
+                if pgno != lock && !page_map.contains_key(&pgno) {
+                    pgnos.push(pgno);
+                }
+            }
+        }
         pgnos.sort_unstable();
 
         let mut out = Vec::with_capacity(pgnos.len());
+        let mut db_file: Option<crate::HostFile> = None;
         for pgno in pgnos {
-            let offset = page_map[&pgno];
-            let data = read_wal_page(wal_bytes, offset, self.page_size)?;
+            let data = if let Some(&offset) = page_map.get(&pgno) {
+                read_wal_page(wal_bytes, offset, self.page_size)?
+            } else {
+                let f = match &mut db_file {
+                    Some(f) => f,
+                    None => {
+                        db_file = Some(self.host.open(&self.path)?);
+                        db_file.as_mut().unwrap()
+                    }
+                };
+                let offset = (pgno as i64 - 1) * self.page_size as i64;
+                f.read_exact_at(offset as u64, self.page_size as usize)?
+            };
             out.push((pgno, data));
         }
         Ok(out)
@@ -929,7 +996,7 @@ impl Db {
         commit: u32,
     ) -> Result<Vec<(u32, Vec<u8>)>> {
         let lock = lock_pgno(self.page_size);
-        let mut db_file: Option<std::fs::File> = None;
+        let mut db_file: Option<crate::HostFile> = None;
         let mut out = Vec::with_capacity(commit as usize);
 
         for pgno in 1..=commit {
@@ -945,12 +1012,12 @@ impl Db {
             let f = match &mut db_file {
                 Some(f) => f,
                 None => {
-                    db_file = Some(std::fs::File::open(&self.path)?);
+                    db_file = Some(self.host.open(&self.path)?);
                     db_file.as_mut().unwrap()
                 }
             };
             let offset = (pgno as i64 - 1) * self.page_size as i64;
-            let data = read_file_at(f, offset, self.page_size as usize)?;
+            let data = f.read_exact_at(offset as u64, self.page_size as usize)?;
             out.push((pgno, data));
         }
         Ok(out)
@@ -984,10 +1051,7 @@ impl Db {
         // checkpoint (#896). Uses the DB-file mtime and a logical-size guard so an
         // idle DB does not spin LTX files (db.go:1133-1153).
         if self.checkpoint_interval > Duration::ZERO && self.synced_since_checkpoint {
-            let modified = std::fs::metadata(&self.path)?.modified()?;
-            let elapsed = SystemTime::now()
-                .duration_since(modified)
-                .unwrap_or(Duration::ZERO);
+            let elapsed = self.host.file_age(&self.path)?;
             if elapsed > self.checkpoint_interval && new_wal_size > calc_wal_size(self.page_size, 1)
             {
                 return self.checkpoint_passive_swallowing_busy();
@@ -1010,9 +1074,9 @@ impl Db {
     /// Performs a checkpoint on the WAL.
     ///
     /// Ported from `DB.Checkpoint`/`DB.checkpoint` (db.go:1801-1873, footgun F-9).
-    /// Two-phase: copy the WAL tail, `exec_checkpoint`, force a fresh WAL page,
-    /// and — if the WAL restarted — grab a write lock and copy the post-checkpoint
-    /// tail before rolling back.
+    /// A passive checkpoint seals the WAL under a short writer barrier before
+    /// it runs. If any checkpoint restarts the WAL, a post-checkpoint write lock
+    /// protects either an incremental sync or a full boundary snapshot.
     ///
     /// NOTE: the upstream `chkMu.TryLock` snapshot-vs-checkpoint gate (footgun F-3)
     /// is unnecessary in the synchronous `Db` — `&mut self` already serializes
@@ -1020,14 +1084,31 @@ impl Db {
     /// the `Db` (single owner / one blocking thread).
     pub fn checkpoint(&mut self, mode: CheckpointMode) -> Result<()> {
         // Read the WAL header before the checkpoint to detect a restart.
-        let hdr = read_wal_header(&self.wal_path())?;
+        let hdr = read_wal_header(&self.host, &self.wal_path())?;
 
         // Copy the end of the WAL before the checkpoint to capture as much as
         // possible (db.go:1823-1826).
         self.verify_and_sync()?;
 
-        // Execute the checkpoint, then force a write so a new WAL page exists.
-        self.exec_checkpoint(mode)?;
+        let frame_size = self.page_size as i64 + WAL_FRAME_HEADER_SIZE as i64;
+        let pre_checkpoint_frame_n = if self.last_synced_wal_offset > WAL_HEADER_SIZE as i64 {
+            (self.last_synced_wal_offset - WAL_HEADER_SIZE as i64) / frame_size
+        } else {
+            0
+        };
+
+        // A passive checkpoint does not acquire SQLite's writer lock. Hold a
+        // short write transaction on the dedicated read-lock connection, then
+        // sync again to seal every commit before running the checkpoint on the
+        // main connection. Keep the barrier until the checkpoint completes.
+        let wal_frame_n = if mode == CheckpointMode::Passive {
+            self.exec_passive_checkpoint_with_barrier()?
+        } else {
+            self.exec_checkpoint(mode)?
+        };
+
+        // Force a write so a restarted WAL has a new header and at least one
+        // frame that verify can read.
         self.conn
             .execute_batch(
                 "INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) \
@@ -1036,21 +1117,37 @@ impl Db {
             .map_err(sql_err)?;
 
         // If the WAL header is unchanged, the WAL did not restart — done.
-        let other = read_wal_header(&self.wal_path())?;
+        let other = read_wal_header(&self.host, &self.wal_path())?;
         if hdr == other {
             self.synced_since_checkpoint = false;
             return Ok(());
         }
 
-        // The WAL restarted. Grab the write lock (via an INSERT into the lock
-        // table inside a transaction that always rolls back, db.go:1844-1857), copy
-        // anything written after the checkpoint, then release.
+        // The WAL restarted. Grab the write lock, then either copy the new WAL
+        // tail or take a complete boundary image. TRUNCATE always needs the
+        // boundary image because SQLite reports zero frames after resetting the
+        // WAL. A forced checkpoint also needs one if it covered more frames than
+        // the sealed pre-checkpoint sync observed.
         self.conn.execute_batch("BEGIN").map_err(sql_err)?;
         let post = (|| -> Result<()> {
             self.conn
                 .execute_batch("INSERT INTO _litestream_lock (id) VALUES (1)")
                 .map_err(sql_err)?;
-            self.verify_and_sync()?;
+            if mode == CheckpointMode::Truncate
+                || (mode != CheckpointMode::Passive && wal_frame_n > pre_checkpoint_frame_n)
+            {
+                let info = SyncInfo {
+                    offset: WAL_HEADER_SIZE as i64,
+                    salt1: be_u32(&other[16..]),
+                    salt2: be_u32(&other[20..]),
+                    snapshotting: true,
+                    reason: "checkpoint boundary snapshot".to_string(),
+                    ..Default::default()
+                };
+                self.sync_inner(info)?;
+            } else {
+                self.verify_and_sync()?;
+            }
             Ok(())
         })();
         // Always roll back the write transaction (db.go:1849,1867).
@@ -1062,12 +1159,51 @@ impl Db {
         Ok(())
     }
 
+    /// Seals and runs a passive checkpoint while holding SQLite's writer lock.
+    ///
+    /// The long-lived read transaction uses `rtx_conn`, so this method releases
+    /// that read lock and temporarily reuses the same connection for the writer
+    /// barrier. The checkpoint itself runs through `conn`, as SQLite does not
+    /// permit a checkpoint on the connection that owns the write transaction.
+    fn exec_passive_checkpoint_with_barrier(&mut self) -> Result<i64> {
+        self.release_read_lock()?;
+
+        let result = (|| -> Result<i64> {
+            self.rtx_conn.execute_batch("BEGIN").map_err(sql_err)?;
+            self.rtx_conn
+                .execute_batch("INSERT INTO _litestream_lock (id) VALUES (1)")
+                .map_err(sql_err)?;
+
+            // Commits can land between the earlier sync and acquisition of the
+            // barrier. This second sync seals them before the checkpoint.
+            self.verify_and_sync()?;
+            #[cfg(test)]
+            if let Some(hook) = self.passive_checkpoint_barrier_hook.take() {
+                hook();
+            }
+            self.run_checkpoint_pragma(CheckpointMode::Passive)
+        })();
+
+        // Release the writer barrier before restoring the long-lived read lock.
+        // Preserve the operation error if both the operation and cleanup fail.
+        let rollback_result = rollback(&self.rtx_conn);
+        let reacquire_result = self.acquire_read_lock();
+        match result {
+            Err(error) => Err(error),
+            Ok(wal_frame_n) => {
+                rollback_result?;
+                reacquire_result?;
+                Ok(wal_frame_n)
+            }
+        }
+    }
+
     /// Releases the read lock, runs `PRAGMA wal_checkpoint(<mode>)`, and
     /// re-acquires the read lock — re-acquiring even on error.
     ///
     /// Ported from `DB.execCheckpoint` (db.go:1875-1919, footgun F-1). The exact
     /// release→checkpoint→re-acquire sequence is load-bearing.
-    fn exec_checkpoint(&mut self, mode: CheckpointMode) -> Result<()> {
+    fn exec_checkpoint(&mut self, mode: CheckpointMode) -> Result<i64> {
         // Ensure the read lock is removed before the checkpoint; defer the
         // re-acquire so it runs even on early return.
         self.release_read_lock()?;
@@ -1079,16 +1215,17 @@ impl Db {
         // error; otherwise surface the original pragma error.
         let reacquire = self.acquire_read_lock();
         match (result, reacquire) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Ok(()), Err(e)) => Err(e),
+            (Ok(wal_frame_n), Ok(())) => Ok(wal_frame_n),
+            (Ok(_), Err(e)) => Err(e),
             (Err(e), _) => Err(e),
         }
     }
 
     /// Runs the raw `PRAGMA wal_checkpoint(<mode>)` and reads its 3-int result.
-    fn run_checkpoint_pragma(&self, mode: CheckpointMode) -> Result<()> {
+    fn run_checkpoint_pragma(&self, mode: CheckpointMode) -> Result<i64> {
         let sql = format!("PRAGMA wal_checkpoint({mode})");
-        self.conn
+        let (_, wal_frame_n, _): (i64, i64, i64) = self
+            .conn
             .query_row(&sql, [], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -1097,7 +1234,7 @@ impl Db {
                 ))
             })
             .map_err(sql_err)?;
-        Ok(())
+        Ok(wal_frame_n)
     }
 
     // ── CRC64 ──────────────────────────────────────────────────────────────
@@ -1112,7 +1249,7 @@ impl Db {
         let pos = self.pos()?;
 
         // Checksum the whole database file (CRC64-ISO).
-        let bytes = std::fs::read(&self.path)?;
+        let bytes = self.host.read(&self.path)?;
         let mut h = Crc64::new();
         h.update(&bytes);
         Ok((h.sum64(), pos))
@@ -1139,7 +1276,7 @@ impl Db {
         let db_size = self.db_file_size()?;
         let mut commit = (db_size / self.page_size as i64) as u32;
 
-        let wal_bytes = std::fs::read(self.wal_path())?;
+        let wal_bytes = self.host.read(&self.wal_path())?;
         let mut rd = WalReader::new(&wal_bytes).map_err(Error::from)?;
         let (page_map, max_offset, wal_commit) = rd.page_map().map_err(Error::from)?;
         if wal_commit > 0 {
@@ -1172,7 +1309,7 @@ impl Db {
             commit,
             min_txid: TXID(1),
             max_txid: pos.txid,
-            timestamp: now_unix_millis(),
+            timestamp: self.host.now_unix_millis(),
             pre_apply_checksum: 0,
             wal_offset,
             wal_size: sz,
@@ -1267,28 +1404,19 @@ fn rollback(conn: &Connection) -> Result<()> {
 /// Reads the 32-byte WAL header. Ported from `readWALHeader`
 /// (litestream.go:138-148): returns the header bytes; errors if the file is
 /// missing or shorter than 32 bytes.
-fn read_wal_header(path: &Path) -> Result<[u8; WAL_HEADER_SIZE]> {
-    let mut f = std::fs::File::open(path)?;
-    let mut buf = [0u8; WAL_HEADER_SIZE];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
+fn read_wal_header(host: &crate::LtxHost, path: &Path) -> Result<[u8; WAL_HEADER_SIZE]> {
+    let mut file = host.open(path)?;
+    let bytes = file.read_exact_at(0, WAL_HEADER_SIZE)?;
+    Ok(bytes
+        .try_into()
+        .expect("the exact read has the header size"))
 }
 
 /// Reads `n` bytes at `offset` from a WAL file. Ported from `readWALFileAt`
 /// (litestream.go:152-166): a short read is an "unexpected EOF" error.
-fn read_wal_file_at(path: &Path, offset: i64, n: i64) -> Result<Vec<u8>> {
-    let bytes = std::fs::read(path)?;
-    let start = offset as usize;
-    let end = start
-        .checked_add(n as usize)
-        .ok_or_else(|| Error::Other("wal read overflow".into()))?;
-    if end > bytes.len() {
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "short wal read",
-        )));
-    }
-    Ok(bytes[start..end].to_vec())
+fn read_wal_file_at(host: &crate::LtxHost, path: &Path, offset: i64, n: i64) -> Result<Vec<u8>> {
+    let mut file = host.open(path)?;
+    Ok(file.read_exact_at(offset as u64, n as usize)?)
 }
 
 /// Reads one page's worth of bytes from an in-memory WAL buffer at the frame
@@ -1309,61 +1437,56 @@ fn read_wal_page(wal_bytes: &[u8], offset: i64, page_size: u32) -> Result<Vec<u8
     Ok(wal_bytes[start..end].to_vec())
 }
 
-/// Reads `n` bytes at `offset` from an open file (the DB-file `ReadAt`).
-fn read_file_at(f: &mut std::fs::File, offset: i64, n: usize) -> Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-    f.seek(SeekFrom::Start(offset as u64))?;
-    let mut buf = vec![0u8; n];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
-}
-
 /// Writes `data` to `tmp_path`, fsyncs, then renames to `final_path` — the
 /// crash-consistent atomic-write idiom (footgun F-8). On any failure the temp
 /// file is removed.
-fn write_file_atomic(tmp_path: &str, final_path: &str, data: &[u8]) -> Result<()> {
-    use std::io::Write;
+fn write_file_atomic(
+    host: &crate::LtxHost,
+    tmp_path: &str,
+    final_path: &str,
+    data: &[u8],
+) -> Result<()> {
     let result = (|| -> Result<()> {
-        let mut f = std::fs::File::create(tmp_path)?;
-        f.write_all(data)?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(tmp_path, final_path)?;
+        let mut file = host.create(Path::new(tmp_path))?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        host.rename(Path::new(tmp_path), Path::new(final_path))?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(tmp_path);
+        let _ = host.remove_file(Path::new(tmp_path));
     }
     result
 }
 
 /// Recursively removes `.tmp` files under `root`. Ported from `removeTmpFiles`
 /// (litestream.go:169-182): missing root / errored entries are skipped.
-fn remove_tmp_files(root: &Path) -> Result<()> {
-    fn walk(dir: &Path) {
-        let entries = match std::fs::read_dir(dir) {
+fn remove_tmp_files(host: &crate::LtxHost, root: &Path) -> Result<()> {
+    fn walk(host: &crate::LtxHost, dir: &Path) {
+        let entries = match host.read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
         };
-        for ent in entries.flatten() {
-            let path = ent.path();
-            if path.is_dir() {
-                walk(&path);
+        for ent in entries {
+            let path = ent.path;
+            if ent.is_dir {
+                walk(host, &path);
             } else if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
-                let _ = std::fs::remove_file(&path);
+                let _ = host.remove_file(&path);
             }
         }
     }
-    walk(root);
+    walk(host, root);
     Ok(())
 }
 
-/// Current time as Unix milliseconds (the LTX header timestamp).
-fn now_unix_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+fn system_time_from_unix_millis(milliseconds: i64) -> SystemTime {
+    if milliseconds >= 0 {
+        UNIX_EPOCH + Duration::from_millis(milliseconds as u64)
+    } else {
+        UNIX_EPOCH - Duration::from_millis(milliseconds.unsigned_abs())
+    }
 }
 
 /// Big-endian `u32` from the first four bytes of `b`.
@@ -1373,6 +1496,8 @@ fn be_u32(b: &[u8]) -> u32 {
 }
 
 #[cfg(test)]
+// Unit tests inspect materialized file-format fixtures outside production.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -1396,6 +1521,21 @@ mod tests {
             .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
             .unwrap();
         w
+    }
+
+    fn assert_ltx_covers_commit(db: &Db, txid: TXID) {
+        let bytes = std::fs::read(db.ltx_path(0, txid, txid)).unwrap();
+        let decoded = ltx::decode_file(&bytes).expect("LTX decodes and verifies");
+        let present: std::collections::BTreeSet<u32> = decoded.pgnos.iter().copied().collect();
+        let lock = lock_pgno(db.page_size);
+        let missing: Vec<u32> = (1..=decoded.header.commit)
+            .filter(|pgno| *pgno != lock && !present.contains(pgno))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "LTX {txid} does not cover commit {}: missing {missing:?}",
+            decoded.header.commit
+        );
     }
 
     /// Counts whole WAL frames currently in the WAL file (the Go
@@ -1622,7 +1762,7 @@ mod tests {
         let bytes = std::fs::read(db.ltx_path(0, pos2.txid, pos2.txid)).unwrap();
         let new_commit = ltx::Header::parse(&bytes).unwrap().commit;
         let decoded = ltx::decode_file(&bytes).expect("decodes + verifies");
-        let present: std::collections::HashSet<u32> = decoded.pgnos.iter().copied().collect();
+        let present: std::collections::BTreeSet<u32> = decoded.pgnos.iter().copied().collect();
 
         let lock = lock_pgno(db.page_size);
         let mut missing = Vec::new();
@@ -1640,6 +1780,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn incremental_ltx_fills_checkpointed_growth_pages_from_database() {
+        let (_dir, mut db, w) = open_dbs();
+        w.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)")
+            .unwrap();
+        for i in 0..10 {
+            w.execute(
+                "INSERT INTO t VALUES (?, ?)",
+                rusqlite::params![i, vec![0u8; 100]],
+            )
+            .unwrap();
+        }
+        db.sync().unwrap();
+        let previous = db.pos().unwrap();
+        let previous_header = ltx::Header::parse(
+            &std::fs::read(db.ltx_path(0, previous.txid, previous.txid)).unwrap(),
+        )
+        .unwrap();
+
+        // Move database growth out of the old WAL, then create a small restarted
+        // WAL. verify() treats this as an expected checkpoint and performs an
+        // incremental capture, so pages absent from the new WAL must come from
+        // the database file.
+        db.release_read_lock().unwrap();
+        for i in 10..310 {
+            w.execute(
+                "INSERT INTO t VALUES (?, ?)",
+                rusqlite::params![i, vec![i as u8; 4000]],
+            )
+            .unwrap();
+        }
+        let (busy, wal_frames, checkpointed): (i64, i64, i64) = w
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 0);
+        assert_eq!(wal_frames, checkpointed);
+        w.execute(
+            "INSERT INTO t VALUES (?, ?)",
+            rusqlite::params![310, vec![1u8; 32]],
+        )
+        .unwrap();
+        db.acquire_read_lock().unwrap();
+
+        let info = db.verify().unwrap();
+        assert!(
+            !info.snapshotting,
+            "expected incremental checkpoint recovery"
+        );
+        assert_eq!(info.prev_commit, previous_header.commit);
+        assert!(db.sync_inner(info).unwrap());
+
+        let current = db.pos().unwrap();
+        let bytes = std::fs::read(db.ltx_path(0, current.txid, current.txid)).unwrap();
+        let decoded = ltx::decode_file(&bytes).unwrap();
+        let present: std::collections::HashSet<u32> = decoded.pgnos.iter().copied().collect();
+        let lock = lock_pgno(db.page_size);
+        let missing: Vec<u32> = ((previous_header.commit + 1)..=decoded.header.commit)
+            .filter(|pgno| *pgno != lock && !present.contains(pgno))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "incremental LTX omitted checkpointed growth pages: {missing:?}"
+        );
+    }
+
     // TestDB_Verify_WALOffsetAtHeader (db_internal_test.go:565-681): an L0 file
     // with WALOffset=32, WALSize=0 and matching salt → snapshotting=false,
     // offset=32, no underflow (issue #900).
@@ -1649,7 +1856,7 @@ mod tests {
         w.execute_batch("CREATE TABLE t (id INT)").unwrap();
         db.sync().unwrap();
 
-        let wal_hdr = read_wal_header(&db.wal_path()).unwrap();
+        let wal_hdr = read_wal_header(&db.host, &db.wal_path()).unwrap();
         let salt1 = be_u32(&wal_hdr[16..]);
         let salt2 = be_u32(&wal_hdr[20..]);
 
@@ -1693,7 +1900,7 @@ mod tests {
         w.execute_batch("CREATE TABLE t (id INT)").unwrap();
         db.sync().unwrap();
 
-        let wal_hdr = read_wal_header(&db.wal_path()).unwrap();
+        let wal_hdr = read_wal_header(&db.host, &db.wal_path()).unwrap();
         let salt1 = be_u32(&wal_hdr[16..]);
         let salt2 = be_u32(&wal_hdr[20..]);
 
@@ -1770,6 +1977,61 @@ mod tests {
     #[test]
     fn checkpoint_does_not_trigger_snapshot_passive() {
         checkpoint_does_not_trigger_snapshot(CheckpointMode::Passive);
+    }
+
+    #[test]
+    fn passive_checkpoint_holds_writer_barrier_through_pragma() {
+        let (_dir, mut db, w) = open_dbs();
+        w.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)")
+            .unwrap();
+        w.execute("INSERT INTO t VALUES (1, zeroblob(4096))", [])
+            .unwrap();
+        db.sync().unwrap();
+        drop(w);
+
+        let path = db.path.clone();
+        db.passive_checkpoint_barrier_hook = Some(Box::new(move || {
+            let w = open_writer(&path);
+            w.busy_timeout(Duration::ZERO).unwrap();
+            let blocked = match w.execute("INSERT INTO t VALUES (2, zeroblob(4096))", []) {
+                Ok(_) => false,
+                Err(error) => matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy)
+                        | Some(rusqlite::ErrorCode::DatabaseLocked)
+                ),
+            };
+            assert!(
+                blocked,
+                "a writer was not blocked while the passive checkpoint barrier was held"
+            );
+        }));
+        db.checkpoint(CheckpointMode::Passive).unwrap();
+
+        // The barrier transaction rolls back after the checkpoint.
+        let w = open_writer(db.path());
+        w.execute("INSERT INTO t VALUES (3, zeroblob(4096))", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn truncate_checkpoint_writes_complete_boundary_ltx() {
+        let (_dir, mut db, w) = open_dbs();
+        w.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)")
+            .unwrap();
+        db.sync().unwrap();
+        for i in 0..200 {
+            w.execute(
+                "INSERT INTO t VALUES (?, ?)",
+                rusqlite::params![i, vec![i as u8; 4000]],
+            )
+            .unwrap();
+        }
+
+        db.checkpoint(CheckpointMode::Truncate).unwrap();
+
+        let pos = db.pos().unwrap();
+        assert_ltx_covers_commit(&db, pos.txid);
     }
 
     // TestDB_MultipleCheckpointsWithWrites (db_internal_test.go:989-1061): repeated

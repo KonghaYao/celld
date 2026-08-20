@@ -127,6 +127,58 @@ default scope permits only storage reads. Create the instance with the
 `cloud-platform` scope, so the IAM role of the service account controls
 the access.
 
+For Azure Blob Storage, the bucket NAME is the container, and the
+storage account comes from the environment. Create a container. Then
+set the account and one credential:
+
+```sh
+export AZURE_STORAGE_ACCOUNT_NAME=YOUR-ACCOUNT
+export AZURE_STORAGE_ACCOUNT_KEY=...
+export CELLD_BUCKET=az://YOUR-CONTAINER
+```
+
+celld accepts three Azure credential families: a storage account key, a
+managed identity, and a workload identity. You must configure exactly one
+family. A system-assigned managed identity needs only the account name. A
+user-assigned managed identity can use `AZURE_CLIENT_ID`, `AZURE_OBJECT_ID`,
+or `AZURE_MSI_RESOURCE_ID` as a selector. You must set exactly one of these
+three selectors, because two selectors can name two different identities and
+celld must not choose between them.
+
+celld reads the managed identity from the Azure instance metadata service.
+An Azure VM and an AKS node supply that service. Azure App Service and Azure
+Container Apps supply a different endpoint, so celld does not support a
+managed identity on those two platforms.
+
+The standard AKS workload identity environment contains
+`AZURE_AUTHORITY_HOST`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and
+`AZURE_FEDERATED_TOKEN_FILE`. celld accepts the public authority host,
+`https://login.microsoftonline.com`, with or without a trailing slash, and it
+rejects a sovereign or custom authority host.
+
+celld rejects each recognized Azure configuration variable outside these
+families. This includes another credential source, an endpoint override, and
+the OneLake endpoint. celld ignores an `AZURE_*` name that `object_store`
+0.11.2 does not recognize, because that name cannot change the client.
+
+A managed identity or a workload identity must have Azure Blob data-plane
+permission to read, write, list, and delete blobs. The built-in `Storage Blob
+Data Contributor` role supplies these permissions. See the
+[Azure built-in roles](https://learn.microsoft.com/azure/role-based-access-control/built-in-roles#storage-blob-data-contributor).
+An `az://` bucket takes no `S3_ENDPOINT` and no `AWS_*` credentials, and celld
+ignores the storage region.
+
+celld qualifies an `az://` bucket for a production fleet: the
+conditional-write contract and the multipart upload path were tested against
+a live Azure account on 2026-08-18, under an account key, a VM managed
+identity, and an AKS workload identity. See
+[ownership and fencing](fencing.md).
+
+For local development against Azurite, set
+`AZURE_STORAGE_USE_EMULATOR=true`. celld then accepts the emulator
+endpoint. Azurite is a development store, so celld does not qualify it
+for a fleet either.
+
 The bucket credentials give full control of the fleet. Keep them safe. The
 bucket contains the deployments, the SQLite replicas, the ownership
 records, the node leases, and the peer-authentication secret.
@@ -138,10 +190,10 @@ the bucket, therefore an existing fleet does not move its data.
 
 The store must provide conditional writes and read-after-write
 consistency, because the ownership records depend on them. Amazon S3,
-Cloudflare R2, Google Cloud Storage, Azure Blob Storage, and Tigris
+Cloudflare R2, Google Cloud Storage, Tigris, and Azure Blob Storage
 qualify; MinIO (community edition), Backblaze B2, Hetzner, and
-DigitalOcean Spaces do not. See [ownership and fencing](fencing.md)
-for the exact requirements.
+DigitalOcean Spaces do not.
+See [ownership and fencing](fencing.md) for the exact requirements.
 
 ## Deploy an application
 
@@ -252,6 +304,23 @@ not follow to a v0.2.0 node; and v0.2.0 compacts replicated data into
 block objects that a v0.1.0 reader can not restore. A fleet must not
 mix the two versions.
 
+The upgrade from v0.2.1 to v0.3.0 can use a rolling update. v0.3.0 changes
+the default durability from `bucket` to `fleet`. A single node keeps the
+v0.2.1 behavior, and a fleet of two or more nodes activates fleet replication
+automatically.
+
+Stage the v0.3.0 binary on every node, and restart one node at a time. Wait for
+the replacement to report healthy before you restart the next node. A mixed
+fleet stays safe, but a v0.3.0 node cannot replicate to a v0.2.x peer. The
+v0.3.0 node therefore acknowledges writes through the bucket and retries until
+the peer runs v0.3.0.
+
+Do not start a v0.2.x binary after that node runs v0.3.0 unless the shutdown log
+contains `node-log close: sealed epoch`. A graceful stop attempts this seal.
+A stop under load can leave the record open. A v0.2.x binary cannot read writes
+that wait in the replicated log or bundle objects, so this downgrade can lose
+acknowledged writes.
+
 The internal listener also provides an alpha operator API. `/state` reports the
 node state, and `POST /shutdown` starts the same graceful handoff. The
 `POST /shutdown?handoff=preserve` request prepares a clean same-node reload and
@@ -294,6 +363,10 @@ For the full list, run `celld -h`. This table shows the primary settings:
 | `AWS_REGION`, `AWS_DEFAULT_REGION` | The storage region |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Explicit AWS credentials. The standard AWS credential chain is also available |
 | `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_SERVICE_ACCOUNT_KEY` | Google credentials for a `gs://` bucket. Application Default Credentials are also available |
+| `AZURE_STORAGE_ACCOUNT_NAME` | The storage account for an `az://` bucket. The bucket NAME is the container |
+| `AZURE_STORAGE_ACCOUNT_KEY` | The storage account key. Do not combine it with an identity selector |
+| `AZURE_AUTHORITY_HOST`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE` | The standard AKS workload identity environment for an `az://` bucket. The authority must be the public Azure host |
+| `AZURE_STORAGE_USE_EMULATOR` | Set to `true` to develop against Azurite. celld does not qualify Azurite for a production fleet |
 | `CELLD_ADDR` | The public Worker listener. The same as `--listen` |
 | `CELLD_INTERNAL_ADDR` | The peer and operator listener. The same as `--internal-listen` |
 | `CELLD_ADVERTISE` | The internal address that peers can reach. The same as `--advertise` |

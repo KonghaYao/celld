@@ -1,5 +1,9 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
+// RuntimeManager is the V8 cell-host arm. A later scripted cell host replaces
+// it in the World, so its executor and observability clocks remain ambient.
+#![allow(clippy::disallowed_macros, clippy::disallowed_methods)]
+
 //! V8 runtime materialization behind core-authorized lifecycle effects.
 //!
 //! The manager owns handles and filesystem paths, never lifecycle policy.
@@ -49,8 +53,9 @@ struct OwnedCleanReloadMarker {
 /// can be replaced; this local value grants no authority by itself.
 pub fn take_clean_reload_generation(data_dir: &Path, node: &str) -> Option<String> {
     let path = data_dir.join(CLEAN_RELOAD_MARKER);
-    let bytes = std::fs::read(&path).ok()?;
-    let _ = std::fs::remove_file(path);
+    let filesystem = asyncrt::fs();
+    let bytes = filesystem.read(&path).ok()?;
+    let _ = filesystem.remove_file(&path);
     let marker: OwnedCleanReloadMarker = serde_json::from_slice(&bytes).ok()?;
     (marker.node == node).then_some(marker.generation)
 }
@@ -60,12 +65,38 @@ pub fn write_clean_reload_marker(
     node: &str,
     generation: &str,
 ) -> anyhow::Result<()> {
-    std::fs::create_dir_all(data_dir)?;
+    let filesystem = asyncrt::fs();
+    filesystem.create_dir_all(data_dir)?;
     let marker = data_dir.join(CLEAN_RELOAD_MARKER);
     let temporary = data_dir.join(".clean-reload.tmp");
     let body = serde_json::to_vec(&CleanReloadMarker { node, generation })?;
-    std::fs::write(&temporary, body)?;
-    std::fs::rename(temporary, marker)?;
+    filesystem.write(&temporary, &body)?;
+    filesystem.rename(&temporary, &marker)?;
+    Ok(())
+}
+
+fn require_cell_scope_capacity(data_dir: &Path) -> anyhow::Result<()> {
+    asyncrt::fs()
+        .create_dir_all(data_dir)
+        .with_context(|| format!("create data directory {}", data_dir.display()))?;
+    let reported = asyncrt::filesystem_name_max(data_dir)
+        .with_context(|| format!("read NAME_MAX for {}", data_dir.display()))?
+        .with_context(|| {
+            format!(
+                "the filesystem does not report NAME_MAX for {}",
+                data_dir.display()
+            )
+        })?;
+    let name_max = usize::try_from(reported).context("NAME_MAX does not fit usize")?;
+    require_cell_scope_name_max(name_max)
+}
+
+pub(crate) fn require_cell_scope_name_max(name_max: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        name_max >= celld_logic::cell::MAX_CELL_SCOPE,
+        "the data filesystem supports {name_max}-byte names, but celld requires {}",
+        celld_logic::cell::MAX_CELL_SCOPE
+    );
     Ok(())
 }
 
@@ -203,6 +234,107 @@ pub struct RuntimeManager {
     region: Arc<str>,
 }
 
+/// The Actor's cell-runtime boundary. Ordinary builds contain only the V8
+/// arm; an internal test build adds the deterministic scripted arm.
+#[derive(Clone)]
+pub(crate) enum CellHost {
+    V8(RuntimeManager),
+    #[cfg(all(test, celld_internal_tests))]
+    Scripted(crate::conformance_sim_cell_host::SimCellHost),
+}
+
+impl CellHost {
+    pub(crate) fn local_reload_cells(&self) -> anyhow::Result<Vec<celld_logic::LocalCell>> {
+        match self {
+            Self::V8(runtime) => runtime.local_reload_cells(),
+            #[cfg(all(test, celld_internal_tests))]
+            Self::Scripted(runtime) => runtime.local_reload_cells(),
+        }
+    }
+
+    pub(crate) async fn restore_cell(
+        &self,
+        cell: &str,
+        spec: &celld_logic::RestoreSpec,
+    ) -> anyhow::Result<celld_logic::RestoreOutcome> {
+        match self {
+            Self::V8(runtime) => runtime.restore_cell(cell, spec).await,
+            #[cfg(all(test, celld_internal_tests))]
+            Self::Scripted(runtime) => runtime.restore_cell(cell, spec).await,
+        }
+    }
+
+    pub(crate) async fn start_cell(
+        &self,
+        cell: String,
+        epoch: u64,
+        fresh: bool,
+    ) -> anyhow::Result<celld_logic::isolate::IsolateId> {
+        match self {
+            Self::V8(runtime) => runtime.start_cell(cell, epoch, fresh).await,
+            #[cfg(all(test, celld_internal_tests))]
+            Self::Scripted(runtime) => runtime.start_cell(cell, epoch, fresh).await,
+        }
+    }
+
+    pub(crate) fn publish_cell(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
+        match self {
+            Self::V8(runtime) => runtime.publish_cell(cell, epoch),
+            #[cfg(all(test, celld_internal_tests))]
+            Self::Scripted(runtime) => runtime.publish_cell(cell, epoch),
+        }
+    }
+
+    pub(crate) async fn ensure_durable(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
+        match self {
+            Self::V8(runtime) => runtime.ensure_durable(cell, epoch).await,
+            #[cfg(all(test, celld_internal_tests))]
+            Self::Scripted(runtime) => runtime.ensure_durable(cell, epoch).await,
+        }
+    }
+
+    pub(crate) async fn await_durable(
+        &self,
+        cell: &str,
+        epoch: u64,
+        position: u64,
+    ) -> anyhow::Result<(u64, celld_logic::ProofSource)> {
+        match self {
+            Self::V8(runtime) => runtime.await_durable(cell, epoch, position).await,
+            #[cfg(all(test, celld_internal_tests))]
+            Self::Scripted(runtime) => runtime.await_durable(cell, epoch, position).await,
+        }
+    }
+
+    pub(crate) async fn stop_cell(
+        &self,
+        cell: &str,
+        epoch: u64,
+        evict: bool,
+        preserve_local: bool,
+    ) {
+        match self {
+            Self::V8(runtime) => runtime.stop_cell(cell, epoch, evict, preserve_local).await,
+            #[cfg(all(test, celld_internal_tests))]
+            Self::Scripted(runtime) => {
+                runtime.stop_cell(cell, epoch, evict, preserve_local).await;
+            }
+        }
+    }
+
+    pub(crate) async fn fire_alarm(
+        &self,
+        cell: String,
+        scheduled_ms: i64,
+    ) -> anyhow::Result<(Option<i64>, bool, Option<u64>)> {
+        match self {
+            Self::V8(runtime) => runtime.fire_alarm(cell, scheduled_ms).await,
+            #[cfg(all(test, celld_internal_tests))]
+            Self::Scripted(runtime) => runtime.fire_alarm(cell, scheduled_ms).await,
+        }
+    }
+}
+
 pub struct CohostedWorker {
     pub options: WorkerConfigOptions,
     pub services: Vec<(String, String, Option<String>)>,
@@ -221,6 +353,8 @@ pub struct RuntimeOptions {
     pub alarm_observer: AlarmObserver,
     pub node: String,
     pub region: String,
+    /// `triggers.crons` from the deployment, driving the reserved cron cell.
+    pub crons: Vec<String>,
 }
 
 /// Owned HTTP request crossing from the async shell into a V8 executor.
@@ -265,6 +399,11 @@ impl Replication {
         })
     }
 
+    /// The log tier installs its shipper and takeover interlock here.
+    pub fn ltx(&self) -> Arc<LtxRepl> {
+        self.ltx.clone()
+    }
+
     async fn restore(
         &self,
         cell: &str,
@@ -276,6 +415,7 @@ impl Replication {
             fresh: spec.fresh,
             took_over: spec.took_over,
             resume_local: spec.resume_local,
+            prior: spec.prior.clone(),
         };
         let activated = self.ltx.activate(options).await?;
         Ok((activated.path, activated.restored))
@@ -297,7 +437,7 @@ impl Replication {
     ///
     /// The directory walk is synchronous, so callers must run this on a
     /// blocking executor rather than the runtime's serving thread.
-    pub fn prune_local_cache(&self, max_bytes: u64) -> (usize, usize, u64) {
+    pub fn prune_local_cache(&self, max_bytes: u64) -> std::io::Result<(usize, usize, u64)> {
         self.ltx.prune_local_cache(max_bytes)
     }
 
@@ -355,15 +495,25 @@ impl Replication {
     }
 
     /// The output-gate durability wait: return the committed-write position the
-    /// replica has proved durable, at least covering `position`. The replicator
-    /// batches concurrent writes to one cell behind a background sync and
-    /// reports the real durable position.
-    async fn await_durable(&self, cell: &str, epoch: u64, position: u64) -> anyhow::Result<u64> {
+    /// replica has proved durable, at least covering `position`, and which
+    /// mechanism proved it (the fences differ; see `celld_logic::ProofSource`).
+    /// The replicator batches concurrent writes to one cell behind a
+    /// background sync and reports the real durable position.
+    async fn await_durable(
+        &self,
+        cell: &str,
+        epoch: u64,
+        position: u64,
+    ) -> anyhow::Result<(u64, celld_logic::ProofSource)> {
         self.ltx.await_durable(cell, epoch, position).await
     }
 
     async fn evict(&self, cell: &str, epoch: u64, preserve_local: bool) {
         self.ltx.evict(cell, epoch, preserve_local).await
+    }
+
+    fn release(&self, cell: &str, epoch: u64) {
+        self.ltx.release(cell, epoch)
     }
 }
 
@@ -383,6 +533,17 @@ impl RuntimeManager {
         !self.cell_configs.is_empty()
     }
 
+    /// The reserved cell carrying this deployment's cron schedule, or `None`
+    /// when the deployment declares no `triggers.crons`. Asked at boot so the
+    /// schedule is armed without a request; the answer is derived from the
+    /// registered class rather than plumbed separately, so it cannot disagree
+    /// with what `start_cell` will accept.
+    pub fn cron_cell(&self) -> Option<String> {
+        self.cell_configs
+            .get(celld_logic::cron::RESERVED_CLASS)
+            .map(|config| celld_logic::cron::reserved_cell(&config.script_name))
+    }
+
     pub fn start(options: RuntimeOptions) -> anyhow::Result<Self> {
         let RuntimeOptions {
             worker,
@@ -396,20 +557,35 @@ impl RuntimeManager {
             alarm_observer,
             node,
             region,
+            crons,
         } = options;
+        require_cell_scope_capacity(&data_dir)?;
         init_v8();
 
         let node: Arc<str> = Arc::from(node);
         let region: Arc<str> = Arc::from(region);
         let primary_script = worker.script_name.clone();
         let primary_classes = worker.do_classes.clone();
+        // Only classes the user declared can be a bare-id default. The
+        // runtime-supplied `__D1Database` rides in `do_classes` so that its
+        // namespace key is minted, and counting it here made adding any D1
+        // binding flip a one-class project past the `len == 1` test — every
+        // `/do/<bare-id>` request then failed with "requires exactly one
+        // configured Durable Object class" for a config that still declared
+        // exactly one.
+        let user_classes: Vec<&String> = worker
+            .do_classes
+            .iter()
+            .filter(|class| class.as_str() != crate::deploy::D1_CLASS)
+            .collect();
         let default_do_class =
-            (worker.do_classes.len() == 1).then(|| Arc::from(worker.do_classes[0].as_str()));
+            (user_classes.len() == 1).then(|| Arc::from(user_classes[0].as_str()));
         let config = Arc::new(
             WorkerConfig::new(worker)
                 .with_services(services)
                 .with_asset_binding(asset_binding)
-                .with_loader(loader_binding),
+                .with_loader(loader_binding)
+                .with_crons(crons),
         );
         let stateless = StatelessRuntime::start(config.clone(), node.clone(), region.clone())?;
         let mut service_pools = HashMap::from([(primary_script, stateless.clone())]);
@@ -418,6 +594,16 @@ impl RuntimeManager {
             if cell_configs.insert(class.clone(), config.clone()).is_some() {
                 return Err(anyhow!("duplicate Durable Object class {class}"));
             }
+        }
+        // The reserved cron cell is not a user class, so it is registered here
+        // rather than arriving in the manifest's `do_classes`. It shares the
+        // primary Worker's config because its alarm's only job is to call that
+        // script's `scheduled` handler.
+        if !config.crons.is_empty() {
+            cell_configs.insert(
+                celld_logic::cron::RESERVED_CLASS.to_string(),
+                config.clone(),
+            );
         }
         for target in cohosted {
             let script = target.options.script_name.clone();
@@ -498,6 +684,10 @@ impl RuntimeManager {
     /// path component and as an object-store key, so the charset gate runs
     /// first. Without it a scope carries its own path segments and `db_path`
     /// walks out of the data directory through them.
+    ///
+    /// The fleet-wide storage gate runs a second time on the composed scope. A
+    /// bare id takes a class prefix, so the scope that reaches storage is the
+    /// value that must fit.
     pub fn cell_scope(&self, id: &str) -> anyhow::Result<String> {
         if !celld_logic::cell::valid_cell_scope(id) {
             return Err(anyhow!("cell id is not a well-formed scope"));
@@ -508,7 +698,11 @@ impl RuntimeManager {
         let class = self.default_do_class.as_deref().ok_or_else(|| {
             anyhow!("a bare cell id requires exactly one configured Durable Object class")
         })?;
-        Ok(format!("{class}:{id}"))
+        let scope = format!("{class}:{id}");
+        if !celld_logic::cell::valid_cell_scope(&scope) {
+            return Err(anyhow!("cell id is not a well-formed scope"));
+        }
+        Ok(scope)
     }
 
     pub async fn fetch_worker(
@@ -518,7 +712,9 @@ impl RuntimeManager {
         body: Vec<u8>,
         headers: Vec<(String, String)>,
     ) -> anyhow::Result<HttpResponse> {
-        self.stateless.fetch(url, method, body, headers, None).await
+        self.stateless
+            .fetch(url, method, body.into(), headers, None)
+            .await
     }
 
     /// Dispatch a cancellable top-level Worker request to the stateless pool.
@@ -526,7 +722,7 @@ impl RuntimeManager {
         &self,
         url: String,
         method: String,
-        body: Vec<u8>,
+        body: js::RequestBody,
         headers: Vec<(String, String)>,
         request_id: js::RequestId,
     ) -> anyhow::Result<HttpResponse> {
@@ -564,7 +760,9 @@ impl RuntimeManager {
             .published
             .get(&cell)
             .filter(|handle| handle.epoch == epoch)
-            .map(|handle| handle.residency.slot().clone())
+            // Affiliated under the registry lock for the driver's whole
+            // lifetime, exactly like cell_isolate (denoland/celld#147).
+            .map(|handle| handle.residency.slot().affiliate())
             .ok_or_else(|| anyhow!("cell runtime is not published at epoch {epoch}: {cell}"))?;
         // The Worker entry, run in the isolate that hosts the cell it will
         // route to, so `env.NS.get(ownScope)` resolves in-isolate instead of
@@ -580,7 +778,7 @@ impl RuntimeManager {
             queued_at: Instant::now(),
             url,
             method,
-            body,
+            body: body.into(),
             headers,
             request_id: Some(request_id),
             reply,
@@ -609,7 +807,7 @@ impl RuntimeManager {
             .cloned()
             .ok_or_else(|| anyhow!("no service Worker for script {script}"))?;
         let request_id = js::next_request_id();
-        let response = pool.fetch(url, method, body, headers, Some(request_id));
+        let response = pool.fetch(url, method, body.into(), headers, Some(request_id));
         match cancel {
             Some(mut cancel) => tokio::select! {
                 response = response => response,
@@ -658,9 +856,12 @@ impl RuntimeManager {
             });
         }
         let parent = path.parent().context("cell database has no parent")?;
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("create cell data directory {}", parent.display()))?;
+        let parent = parent.to_path_buf();
+        let parent_display = parent.display().to_string();
+        let filesystem = asyncrt::fs();
+        asyncrt::blocking(move || filesystem.create_dir_all(&parent))
+            .await?
+            .with_context(|| format!("create cell data directory {parent_display}"))?;
         Ok(celld_logic::RestoreOutcome {
             restored: false,
             alarm: self.restored_alarm(cell, &path),
@@ -675,37 +876,7 @@ impl RuntimeManager {
         cell: &str,
         path: &std::path::Path,
     ) -> Option<celld_logic::RestoredAlarm> {
-        let persisted = crate::storage::persisted_alarm(&path.to_string_lossy(), cell);
-        let at_ms = match persisted {
-            Some((at_ms, ..)) => at_ms,
-            None => -1,
-        };
-        if at_ms < 0 {
-            // The durable truth this activation just restored has NO alarm —
-            // but a wake entry may still be tracked (the due scan adopts the
-            // entry that woke the cell). That entry disagrees with durable
-            // truth: an arm whose commit never replicated, or a consume whose
-            // delete was lost. Left alone it is immortal — one spurious
-            // activation per waker tick, forever (the item-6 audit's cost
-            // leak). Reconciling against the empty truth deletes it;
-            // `take_delete` re-checks at execution time, so an arm racing
-            // this activation cancels the delete.
-            if crate::js::wake_entry_tracked(cell) {
-                let cell_ = cell.to_string();
-                crate::asyncrt::op_handle().spawn(async move {
-                    crate::js::reconcile_wake_entry(&cell_, -1, true).await;
-                });
-            }
-            return None;
-        }
-        // The entry this alarm already has in the bucket was written by
-        // whoever armed it, which is not this process once the cell went
-        // inactive. Claim it now, while the alarm is in hand.
-        crate::js::adopt_wake_entry(cell, at_ms);
-        Some(celld_logic::RestoredAlarm {
-            at_ms,
-            covered: self.alarm_covered(cell, Some(at_ms)),
-        })
+        restored_alarm_from_path(cell, path, |at_ms| self.alarm_covered(cell, Some(at_ms)))
     }
 
     pub fn replication(&self) -> Option<Replication> {
@@ -773,22 +944,30 @@ impl RuntimeManager {
     }
 
     /// The output-gate durability wait (see `Replication::await_durable`).
-    /// Returns the proved durable position; with no replicator every position is
-    /// trivially durable.
+    /// Returns the proved durable position and its proof source; with no
+    /// replicator every position is trivially durable, and the fleet source
+    /// keeps the gate read-free exactly like the old immediate release.
     pub async fn await_durable(
         &self,
         cell: &str,
         epoch: u64,
         position: u64,
-    ) -> anyhow::Result<u64> {
+    ) -> anyhow::Result<(u64, celld_logic::ProofSource)> {
         match &self.replication {
             Some(replication) => replication.await_durable(cell, epoch, position).await,
-            None => Ok(position),
+            None => Ok((position, celld_logic::ProofSource::Fleet)),
         }
     }
 
     /// Materialize an isolate and retain it as non-routable until publication.
-    pub async fn start_cell(&self, cell: String, epoch: u64, fresh: bool) -> anyhow::Result<()> {
+    /// Start a cell's runtime and report which isolate took its realm. The
+    /// core groups eviction on that, so it has to come back from here.
+    pub async fn start_cell(
+        &self,
+        cell: String,
+        epoch: u64,
+        fresh: bool,
+    ) -> anyhow::Result<celld_logic::isolate::IsolateId> {
         let db_path = self.db_path(&cell, epoch);
         let class = cell
             .split_once(':')
@@ -830,6 +1009,7 @@ impl RuntimeManager {
             }
         };
         let isolate = residency.slot().clone();
+        let placed_in = isolate.id;
 
         // Everything the cell needs that the isolate must do: open its
         // SQLite — which the isolate owns, not the caller — restore its
@@ -865,7 +1045,7 @@ impl RuntimeManager {
                     next_alarm_ms: AtomicI64::new(alarm.unwrap_or(-1)),
                 },
             );
-            Ok(())
+            Ok(placed_in)
         }
     }
 
@@ -928,7 +1108,6 @@ impl RuntimeManager {
                 }
             }
         }
-        let stopped_runtime = !stopped.is_empty();
         for handle in stopped {
             // Give the cell back rather than shutting the isolate down: it
             // serves other cells. Taking the isolate for this turn is the
@@ -945,9 +1124,23 @@ impl RuntimeManager {
             // the isolate once no cell is left in it.
             drop(handle);
         }
-        if stopped_runtime && evict {
-            if let Some(replication) = &self.replication {
+        if let Some(replication) = &self.replication {
+            // Every stop releases the handle, and this does not test
+            // `stopped_runtime`. The replication entry is created by
+            // `Effect::Restore` and the registry entry by
+            // `Effect::StartRuntime`, so the entry outlives a start that fails
+            // between the two and there is nothing else that would ever remove
+            // it. Its lifetime is the activation's, not the registry's.
+            //
+            // Eviction takes the orderly file path. A reset discards the local
+            // database without another durability attempt, while every other
+            // stop releases the handle and keeps its files for reactivation.
+            if evict {
                 replication.evict(cell, epoch, preserve_local).await;
+            } else if preserve_local {
+                replication.release(cell, epoch);
+            } else {
+                replication.ltx.discard(cell, epoch);
             }
         }
     }
@@ -1170,13 +1363,21 @@ impl RuntimeManager {
     }
 
     /// The isolate a published cell's events run in.
-    fn cell_isolate(&self, cell: &str) -> anyhow::Result<Arc<crate::pool::Slot>> {
+    fn cell_isolate(&self, cell: &str) -> anyhow::Result<crate::pool::Affiliation> {
+        // The affiliation is taken UNDER the registry lock, while the
+        // cell's Residency provably pins the slot, and it is held by the
+        // driver for the event's entire async lifetime — including while
+        // the event is suspended awaiting host I/O. Without it, a
+        // suspended event holds only a bare Arc<Slot>: stop_cell() drops
+        // the Residency, the pool reaps the "drained" isolate, and the
+        // resumed event enters a freed worker and aborts the process
+        // (denoland/celld#147).
         self.cells
             .lock()
             .expect("cell registry poisoned")
             .published
             .get(cell)
-            .map(|handle| handle.residency.slot().clone())
+            .map(|handle| handle.residency.slot().affiliate())
             .ok_or_else(|| anyhow!("cell runtime is not published: {cell}"))
     }
 
@@ -1203,12 +1404,78 @@ impl RuntimeManager {
     }
 
     fn db_path(&self, cell: &str, epoch: u64) -> PathBuf {
+        // A runtime without replication has no remote epoch namespace, so it
+        // keeps its only SQLite family at the existing e1 path across logical
+        // ownership epochs. The stable path survives a restart, needs no
+        // multi-file SQLite family move, and remains compatible with older
+        // releases.
+        let epoch = if self.replication.is_some() { epoch } else { 1 };
         self.data_dir
             .join(cell)
             .join("ltx")
             .join(format!("e{epoch}"))
             .join("db.sqlite")
     }
+}
+
+fn restored_alarm_from_path(
+    cell: &str,
+    path: &std::path::Path,
+    covered: impl FnOnce(i64) -> bool,
+) -> Option<celld_logic::RestoredAlarm> {
+    let persisted = crate::storage::persisted_alarm(&path.to_string_lossy(), cell);
+    let at_ms = match persisted {
+        Some((at_ms, ..)) => at_ms,
+        None => -1,
+    };
+    if at_ms < 0 {
+        #[cfg(all(test, celld_internal_tests))]
+        if crate::asyncrt::sabotage_active(
+            crate::host_services::EngineSabotage::IgnoreAlarmConsumeOnRestore,
+        ) {
+            if let Some(stale_at_ms) = crate::js::tracked_wake_due_ms(cell) {
+                crate::js::adopt_wake_entry(cell, stale_at_ms);
+                return Some(celld_logic::RestoredAlarm {
+                    at_ms: stale_at_ms,
+                    covered: covered(stale_at_ms),
+                });
+            }
+        }
+        // The durable truth this activation just restored has NO alarm —
+        // but a wake entry may still be tracked (the due scan adopts the
+        // entry that woke the cell). That entry disagrees with durable
+        // truth: an arm whose commit never replicated, or a consume whose
+        // delete was lost. Left alone it is immortal — one spurious
+        // activation per waker tick, forever (the item-6 audit's cost leak).
+        // Reconciling against the empty truth deletes it; `take_delete`
+        // re-checks at execution time, so an arm racing this activation
+        // cancels the delete.
+        if crate::js::wake_entry_tracked(cell) {
+            let cell_ = cell.to_string();
+            crate::asyncrt::spawn(async move {
+                crate::js::reconcile_wake_entry(&cell_, -1, true).await;
+            })
+            .detach();
+        }
+        return None;
+    }
+    // The entry this alarm already has in the bucket was written by whoever
+    // armed it, which is not this process once the cell went inactive. Claim
+    // it now, while the alarm is in hand.
+    crate::js::adopt_wake_entry(cell, at_ms);
+    Some(celld_logic::RestoredAlarm {
+        at_ms,
+        covered: covered(at_ms),
+    })
+}
+
+#[cfg(all(test, celld_internal_tests))]
+pub(crate) fn restored_alarm_for_test(
+    cell: &str,
+    path: &std::path::Path,
+    covered: bool,
+) -> Option<celld_logic::RestoredAlarm> {
+    restored_alarm_from_path(cell, path, |_| covered)
 }
 
 /// The caller's trace context, when the ingress request carried one.
@@ -1564,7 +1831,7 @@ impl StatelessRuntime {
         &self,
         url: String,
         method: String,
-        body: Vec<u8>,
+        body: js::RequestBody,
         headers: Vec<(String, String)>,
         request_id: Option<js::RequestId>,
     ) -> anyhow::Result<HttpResponse> {
@@ -1703,7 +1970,11 @@ fn load_cell_isolate(config: Arc<WorkerConfig>) -> anyhow::Result<Worker> {
 /// The stateless `drive` loop, with the isolate named rather than admitted:
 /// this request must run *here*, because the cell it will route to lives
 /// here and routing to it in-isolate is the point.
-async fn drive_worker_on_cell(slot: Arc<crate::pool::Slot>, job: crate::WorkerJob) {
+async fn drive_worker_on_cell(affiliation: crate::pool::Affiliation, job: crate::WorkerJob) {
+    // Held to the end of this function: the request's claim on the isolate
+    // outlives every suspension, so the pool cannot free the worker under
+    // a parked event (denoland/celld#147).
+    let slot = affiliation.slot().clone();
     let remote = inbound_parent(&job);
     let trace = crate::telemetry::start_trace_with_parent(remote.as_ref());
     let span_started = trace.map(|_| (Instant::now(), crate::telemetry::now_unix_us()));
@@ -1772,11 +2043,15 @@ fn report_alarm_moves(report: &Option<AlarmReporter>, moves: Vec<(String, i64)>)
 /// a handler awaiting I/O stops neither its own cell's next event nor any
 /// other cell sharing the isolate.
 pub(crate) async fn drive_cell(
-    slot: Arc<crate::pool::Slot>,
+    affiliation: crate::pool::Affiliation,
     mut job: CellJob,
     report: Option<AlarmReporter>,
     parent: Option<crate::telemetry::TraceIds>,
 ) {
+    // Held to the end of this function: the event's claim on the isolate
+    // outlives every suspension, so the pool cannot free the worker under
+    // a parked event (denoland/celld#147).
+    let slot = affiliation.slot().clone();
     // Two calls a caller made back-to-back reach the cell in that order.
     // This is the only place that can hold it: everything upstream is a
     // race, and everything downstream has already been delivered. Held

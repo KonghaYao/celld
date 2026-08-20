@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 /// Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -48,10 +48,20 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 }
 
 /// Inverse of `entry_key`: (due minute floor in ms, cell scope).
+///
+/// The scope is the remainder of a bucket key, so it is the one place a scope
+/// enters celld without passing a route. `due_scan` sends it as a `WakeHint`,
+/// which reaches the ownership CAS and `Effect::Restore` exactly as a request
+/// does, so it carries the same charset fence. An entry that fails the fence is
+/// ignored rather than repaired: it cannot name a cell this node can serve, and
+/// a bad entry left by an older node would otherwise replay on every tick.
 pub fn parse_entry_key(key: &str) -> Option<(i64, String)> {
     let rest = key.strip_prefix("wake/")?;
     let (minute, cell) = rest.split_at(rest.char_indices().nth(16)?.0);
     let cell = cell.strip_prefix('/')?;
+    if !crate::cell::valid_cell_scope(cell) {
+        return None;
+    }
     let y: i64 = minute.get(0..4)?.parse().ok()?;
     let mo: u32 = minute.get(5..7)?.parse().ok()?;
     let d: u32 = minute.get(8..10)?.parse().ok()?;
@@ -261,8 +271,19 @@ impl WakeCore {
     /// cell must be sequenced after it settles: the store gives concurrent
     /// same-key writes no order, so a PUT racing the DELETE can lose and
     /// leave a confirmed belief with no entry.
+    ///
+    /// A caller that already knows its key must ask `key_delete_in_flight`
+    /// instead. This question is the conservative one, and only a caller
+    /// that cannot yet name its key needs it.
     pub fn delete_in_flight(&self, cell: &str) -> bool {
         self.deleting.get(cell).is_some_and(|keys| !keys.is_empty())
+    }
+
+    /// Is a delete of this exact key on the wire for this cell? The precise
+    /// question an arm can ask: only a delete of the key it is about to PUT
+    /// can race that PUT, so an arm gated on this waits for nothing else.
+    pub fn key_delete_in_flight(&self, cell: &str, key: &str) -> bool {
+        self.deleting_key(cell, key)
     }
 
     /// Entries whose cells this node evicted and whose due time has arrived.

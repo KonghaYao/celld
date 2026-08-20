@@ -565,6 +565,8 @@ fn u64_be(b: &[u8]) -> u64 {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+// Unit tests inspect materialized file-format fixtures outside production.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -573,9 +575,9 @@ mod tests {
         "/tests/fixtures/golden/replica/ltx/0"
     );
 
-    // Byte-exact golden vectors: decode every real-litestream L0 file and verify
-    // its CRC64-ISO checksums. A failure means rustyriver is wrong, never the
-    // fixture (AGENTS.md rule 3).
+    // Byte-exact golden vectors: decode every real-Litestream L0 file and verify
+    // its CRC64-ISO checksums. A failure means the implementation is wrong, not
+    // the fixture.
     #[test]
     fn golden_ltx_files_decode_and_verify() {
         for i in 1u64..=6 {

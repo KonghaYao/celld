@@ -1,5 +1,8 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
+// Peer probing is a real-wire diagnostic outside the World.
+#![allow(clippy::disallowed_types)]
+
 //! Challenge-bound proof that a diagnostic reached the node named by a lease.
 
 use anyhow::{anyhow, Context};

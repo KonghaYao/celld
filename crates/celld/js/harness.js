@@ -153,7 +153,9 @@ async function __drainBody(target) {
     offset += chunk.byteLength;
   }
   target._bodyBytes = bytes;
-  target._body = new TextDecoder().decode(bytes);
+  // text() memoizes into _body on demand. Decoding here charges every
+  // binary passthrough the cost of a string it never reads.
+  target._body = undefined;
   return bytes;
 }
 class CelldBodyStream extends ReadableStream {
@@ -205,9 +207,11 @@ class CelldHttpBodyStream extends ReadableStream {
     const id = Number(streamId);
     super({
       async pull(controller) {
-        const chunk = JSON.parse(await __http_stream_read(id));
-        if (chunk.done) controller.close();
-        else controller.enqueue(Uint8Array.from(chunk.bytes || []));
+        // A chunk arrives as a Uint8Array. The host moves it in without
+        // a copy. The end of the stream arrives as a string.
+        const chunk = await __http_stream_read(id);
+        if (typeof chunk === "string") controller.close();
+        else controller.enqueue(chunk);
       },
       cancel() { __http_stream_cancel(id); },
     }, { highWaterMark: 0 });
@@ -584,24 +588,50 @@ globalThis.__makeAiBinding = (url) => ({
     return response.json();
   },
 });
+// A host timer op resolves once, so an interval arms a new one after every
+// round. `__timers` maps the id the caller holds to the op that is armed
+// right now: for a timeout that is the same id, and for an interval it is a
+// fresh id each round. Clearing therefore cancels the armed op, not the id.
 const __timers = new Map();
+const __clearTimer = (id) => {
+  const armed = __timers.get(id);
+  if (armed === undefined) return;
+  __timers.delete(id);
+  __timer_cancel(armed);
+};
 globalThis.setTimeout = (cb, ms, ...a) => {
   const id = __timer_alloc();
-  __timers.set(id, true);
+  __timers.set(id, id);
   __op_timer(id, ms | 0).then(() => {
     if (!__timers.delete(id)) return;
     cb(...a);
   });
   return id;
 };
-globalThis.clearTimeout = (id) => {
-  if (!__timers.delete(id)) return;
-  __timer_cancel(id);
+globalThis.setInterval = (cb, ms, ...a) => {
+  const id = __timer_alloc();
+  const delay = ms | 0;
+  const arm = (armed) => {
+    __timers.set(id, armed);
+    __op_timer(armed, delay).then(() => {
+      // Cancelling drops the entry and cancelling then re-arming replaces
+      // it, so a round whose op is no longer the armed one is dead and
+      // stops here. A cancelled op still resolves, which is why this test
+      // is on identity and not on the op alone.
+      if (__timers.get(id) !== armed) return;
+      // Arm the next round before the callback runs. A `clearInterval`
+      // inside the callback must end the interval, and arming after the
+      // callback would undo it.
+      arm(__timer_alloc());
+      cb(...a);
+    });
+  };
+  arm(id);
+  return id;
 };
-globalThis.setInterval = () => {
-  throw new Error("setInterval is not implemented in celld");
-};
-globalThis.clearInterval = () => {};
+// One id space and one cancel, because a caller can cross the two.
+globalThis.clearTimeout = __clearTimer;
+globalThis.clearInterval = __clearTimer;
 
 const __sqlCursorFinalizer = typeof FinalizationRegistry === "function"
   ? new FinalizationRegistry((cursorId) => __sql_cursor_close(cursorId))
@@ -696,7 +726,9 @@ class SqlCursor {
       if (result.done) return rows;
       rows.push(result.value);
       if (__heap_limit_excessively_exceeded())
-        throw new Error("result set is too large to fit in memory");
+        throw new Error(
+          "the isolate is over its V8 heap limit, so it stopped " +
+          "materializing a result set (see CELLD_V8_HEAP_LIMIT_MB)");
     }
   }
   one() {
@@ -1271,6 +1303,10 @@ class DurableObjectState {
     return JSON.parse(__ws_list(this._scope, tag)).map((row) => __socketFromRow(row));
   }
   acceptWebSocket(ws, tags = []) {
+    if (__heap_over_admission_share())
+      throw new Error(
+        "the isolate is near its V8 heap limit, so it refused a " +
+        "WebSocket (see CELLD_V8_HEAP_LIMIT_MB)");
     ws._target = { id: ws._id, scope: this._scope };
     if (ws._peer) ws._peer._target = ws._target;
     ws._hibernatable = true;
@@ -1451,6 +1487,15 @@ const __STATUS_TEXT = {
   510: "Not Extended", 511: "Network Authentication Required",
 };
 const __wrapServiceResponse = (res, url) => {
+  // A 101 that crossed isolates carries a target rather than a socket: the
+  // pair's other end is in the isolate that answered, and the two cannot be
+  // linked the way the loopback below links them. Give the caller a client
+  // end the host can join to that target, on the same terms as a Durable
+  // Object subrequest -- nothing binds until `accept()`, so a response
+  // passed straight back out keeps the direct route to the real client.
+  const bound = !res.webSocket && res._wsTarget && res.status === 101
+    ? new WebSocket(undefined, [], res._wsTarget)
+    : undefined;
   const wrapped = new Response(
     // Buffered bodies re-stream (an empty buffer still yields a
     // stream, as over real HTTP); a streaming body passes through.
@@ -1460,7 +1505,7 @@ const __wrapServiceResponse = (res, url) => {
       statusText:
         res.statusText || __STATUS_TEXT[res.status] || "",
       headers: res.headers,
-      webSocket: res.webSocket,
+      webSocket: res.webSocket || bound,
       __wsTarget: res._wsTarget,
     },
   );
@@ -1697,7 +1742,9 @@ globalThis.__makeServiceBinding = (script, entrypoint = null) => {
         ? r.body
         : Uint8Array.from(r.bodyBytes || []);
     return __wrapServiceResponse(
-      new Response(body, { status: r.status, headers: r.headers }),
+      new Response(body, {
+        status: r.status, headers: r.headers, __wsTarget: r.wsTarget,
+      }),
       req.url);
   },
   // Workerd's test-visible Fetcher.scheduled(): invoke the target's
@@ -1924,6 +1971,44 @@ const __actorBreak = (scope, reason) => {
     if (entry.scope === scope)
       __ctxAbort(entry.ctx, new __ActorAbort(reason));
 };
+// Everything this isolate holds for one cell scope that belongs to the
+// cell's residency rather than to the isolate, so a fresh instance
+// inherits none of it. `adopt_cell` calls this on both edges: the
+// give-back frees it, the take-in guarantees that no epoch spans.
+// Storage is not here — `stop_cell` closes it host-side — and sockets
+// live in the host registry, so a hibernated cell keeps them.
+const __cellRelease = (scope) => {
+  delete __cell.instances[scope];
+  delete __cell.idNames[scope];
+  __brokenActors.delete(scope);
+  // An abandoned block never runs `__blockLeave`, leaving `shut` above
+  // zero for a scope with no critical section. This is an invariant
+  // rather than a fix: an eviction cannot abandon a block, because the
+  // block holds the cell's gate and a cell with an event in flight is
+  // not given back. Only a stop that waits for nobody -- a fence, a
+  // reset, a clean reload -- reaches it, and by then the only reader
+  // left is a stub minted in the next epoch, which reads `holder` for
+  // one microtask before the next acquire overwrites it. Cheap to hold,
+  // and it keeps the rule whole: the release drops everything this
+  // isolate keys by the scope.
+  __cellBlocks.delete(scope);
+  // An entry holds `target`, which can be an object the released
+  // instance owns. Dropping it ends that reachability; `released` is
+  // what an already-revived handle reads, since it holds its entry
+  // directly and never looks in this map again.
+  for (const entry of __stubEntries.values()) {
+    if (entry.scope !== scope) continue;
+    entry.released = true;
+    __stubEntries.delete(entry.id);
+    // Break in-flight ops as an abort would, but not through
+    // `__actorBreak`: that records the scope broken for the life of the
+    // isolate, which is the state this function drops.
+    __ctxAbort(entry.ctx, new __ActorAbort(__releasedStubError()));
+  }
+};
+const __releasedStubError = () => new Error(
+  "The Durable Object that returned this RPC stub no longer runs on " +
+  "this node.");
 const __disposeStub = (meta) => {
   if (meta.disposed) return;
   meta.disposed = true;
@@ -2449,6 +2534,10 @@ const __rpcWalk = async (root, path, args, entrypointRoot) => {
 const __stubOp = (meta, path, args) => {
   if (meta.disposed) return Promise.reject(__stubDisposedError());
   const entry = meta.entry;
+  // The cell that minted this stub left residency, so `entry.target`
+  // belongs to an instance this node released. The stub fails here
+  // rather than calling into it.
+  if (entry.released) return Promise.reject(__releasedStubError());
   // A stub rooted in an aborted context is broken: reject with the
   // abort reason, before and after the dispatch (the target may
   // abort its own context mid-call). Gated on one field read.
@@ -3055,8 +3144,18 @@ class DurableObjectNamespace {
           : r.body !== undefined
             ? r.body
             : Uint8Array.from(r.bodyBytes || []);
+        // An upgrade the cell answered with. The pair straddles two isolates,
+        // so the client end cannot be the peer object itself -- it is a new
+        // socket the host joins to the cell's on `accept()`. A caller that
+        // returns this response instead of accepting keeps the direct route
+        // `__wsTarget` already describes, and binds nothing.
         return new Response(body, {
-          status: r.status, headers: r.headers, __wsTarget: r.wsTarget,
+          status: r.status,
+          headers: r.headers,
+          __wsTarget: r.wsTarget,
+          webSocket: r.status === 101 && r.wsTarget
+            ? new WebSocket(undefined, [], r.wsTarget)
+            : undefined,
         });
     };
     const stub = new Proxy(target, { get: (_target, prop) => {
@@ -3139,10 +3238,16 @@ const __attachResponseRequestCancellation = (
 // A top-level (non-actor) request whose signal can be aborted by id, so a
 // disconnected HTTP or service-binding caller reaches the target's
 // `request.signal`.
+// A large body, or a body of unknown length, arrives as a stream id and
+// not as bytes. The handler then pulls the body off the socket as it
+// reads, so the whole body is never resident. `request.body` is a stream
+// in both cases.
 globalThis.__makeIncomingRequest = (
-  url, method, body, headersJson,
+  url, method, body, headersJson, streamId,
 ) => __makeRequest(
-  url, method, body, headersJson, undefined, true);
+  url, method,
+  streamId === undefined ? body : new CelldHttpBodyStream(streamId),
+  headersJson, undefined, true);
 globalThis.__dispatchTo = async (
   scope, url, method, body, headersJson, requestId = null, inline = false,
   callerSignal = null,
@@ -3209,7 +3314,8 @@ globalThis.__dispatchTo = async (
     // as zero — a write advances past it, a read leaves it there.
     if (inline) {
       const after = __writePosition(scope);
-      if (after !== null && after > (gateBefore ?? 0)) await __gateWrite(scope, after);
+      const wrote = after !== null && after > (gateBefore ?? 0);
+      await __gateWrite(scope, wrote ? after : null);
     }
     return response;
   } finally {
@@ -3532,11 +3638,123 @@ globalThis.__fireAlarm = async (scope, scheduledTime, retryCount) => {
       __actorEventStack.pop();
   }
 };
+// The reserved cron cell. It is not a user class: celld registers it under
+// `.cron` for every deployment that declares `triggers.crons`, and one cell
+// per script carries that script's whole schedule. Ownership CAS on that one
+// name is what makes a cron trigger fire once per fleet rather than once per
+// node -- the same arbiter an alarm already relies on, with nothing added.
+//
+// The schedule itself is never stored here. `__cell.crons` comes from the
+// deployment the cell is running under, so changing a cron expression takes
+// effect on the next activation and needs no migration of an armed alarm.
+class CelldCronSchedule {
+  constructor(state) {
+    this._state = state;
+    // Failures within one occurrence. Held in memory on purpose: losing the
+    // count to an eviction only makes the next retry sooner, and every retry
+    // is capped at the next occurrence anyway, so it need not be durable.
+    this._retry = 0;
+    // What a pending retry owes: the occurrence, the expressions of it that
+    // failed, and the deadline the retry was armed for. A retry deadline is a
+    // backoff instant and not an occurrence, so nothing about it can be
+    // recovered from the deadline itself -- without this record the wake
+    // matches no expression, runs nothing, and drops the failed tick in
+    // silence. Held in memory beside `_retry` and for the same reason: an
+    // eviction costs the retry, never the next occurrence.
+    this._owed = null;
+  }
+  // celld calls this once per node after a deployment loads, because a cron
+  // cell has no client to wake it. Arming is idempotent -- the same schedule
+  // and the same clock give the same answer -- so it does not matter which
+  // node wins the cell.
+  async fetch() {
+    // A pending retry is a deadline this cell already owes, and re-arming
+    // would move it to the next occurrence and lose the tick it owes with it.
+    if (this._owed !== null) return new Response(null, { status: 204 });
+    const armed = await this._state.storage.getAlarm();
+    // An alarm already due is a tick that is late, not one that is wrong.
+    // Leaving it alone is what makes a fleet that was down fire the missed
+    // occurrence once, instead of skipping it by re-arming into the future.
+    if (armed === null || armed > Date.now()) await this._arm(null, [], false);
+    return new Response(null, { status: 204 });
+  }
+  async alarm(info) {
+    const crons = __cell.crons || [];
+    // A retry wake carries the backoff instant as its deadline, so what to run
+    // and what time to report both come from the record the failure left. Only
+    // a deadline that is not a retry is an occurrence to match against.
+    const owed = this._owed !== null && this._owed.armedFor === info.scheduledTime
+      ? this._owed
+      : null;
+    const occurrence = owed === null ? info.scheduledTime : owed.at;
+    // One deadline can belong to several expressions, and each is its own
+    // invocation with its own controller.cron, as on Cloudflare. A retry
+    // repeats only the expressions that failed, because the ones that
+    // succeeded already ran for this occurrence.
+    const due = owed === null
+      ? __cron_plan(crons, info.scheduledTime, Date.now(), 0, false).matching
+      : owed.indices;
+    const failed = [];
+    for (const index of due) {
+      let noRetry = false;
+      const controller = {
+        // The occurrence, never the instant this attempt started, so a late
+        // run and a retry both report the minute they were scheduled for.
+        scheduledTime: occurrence,
+        cron: crons[index],
+        noRetry() { noRetry = true; },
+      };
+      const ctx = __beginEvent();
+      try {
+        if (typeof __cell.selfScheduled !== "function")
+          throw new Error(
+            "a cron trigger needs the Worker to export a `scheduled` handler");
+        await __cell.selfScheduled(controller, __cell.env, ctx);
+      } catch (error) {
+        // Swallowed on purpose: this handler owns the re-arm below, so
+        // throwing would hand the deadline to the generic alarm retry and
+        // lose the next occurrence with it.
+        console.error(
+          `scheduled handler for cron ${JSON.stringify(crons[index])} failed:`,
+          error);
+        if (!noRetry) failed.push(index);
+      } finally {
+        __endEvent();
+      }
+    }
+    await this._arm(occurrence, failed, owed !== null);
+  }
+  // `occurrence` is the tick just handled, or null when the cell is only
+  // arming, `failed` holds the expressions of it still owed, and `retried`
+  // says the deadline just handled was a backoff rather than an occurrence.
+  async _arm(occurrence, failed, retried) {
+    const crons = __cell.crons || [];
+    // The count is failures within one occurrence, so a fresh occurrence
+    // starts at one however the last one ended. Carrying it across would
+    // spend `alarm_retry`'s ceiling once and leave every later occurrence
+    // with no retry at all, which is a budget for the schedule and not for
+    // the tick.
+    this._retry = failed.length ? (retried ? this._retry + 1 : 1) : 0;
+    // A negative first argument means "arming only, nothing fired".
+    const plan = __cron_plan(crons, -1, Date.now(), this._retry, failed.length > 0);
+    // The next occurrence beats the backoff whenever it is sooner, and it then
+    // cancels the retry rather than queueing behind it, so the record the
+    // retry needed goes when the retry does.
+    this._owed = plan.armIsRetry
+      ? { at: occurrence, indices: failed, armedFor: plan.armAt }
+      : null;
+    // No expression matches again and nothing is owed: the deployment dropped
+    // its crons, so the cell retires rather than waking forever.
+    if (plan.armAt === null) await this._state.storage.deleteAlarm();
+    else await this._state.storage.setAlarm(plan.armAt);
+  }
+}
 globalThis.__cell = {
   entrypoints: {},
   objectEntrypoints: {},
   doExports: {},
-  classes: {},
+  classes: { ".cron": CelldCronSchedule },
+  crons: [],
   instances: {},
   env: {},
   owned: {},
@@ -3546,7 +3764,348 @@ globalThis.__cell = {
   deleteAllDeletesAlarm: false,
   compat: { jsRpc: false, fetcherGetPutDelete: false },
   makeNamespace,
+  release: __cellRelease,
 };
+// ---- D1 -----------------------------------------------------------------
+// A D1 database is a cell of a runtime-supplied Durable Object class, so it
+// inherits ownership, fencing, LTX replication, RPO=0 acknowledgement and
+// pressure shedding from the cell it already is. This half is the server;
+// `__makeD1Database` below is the client the binding hands to a Worker.
+//
+// Everything SQL goes through the one `__d1_run` op. The engine owns the
+// statement walk, the row and byte caps, and the meta snapshot, all inside
+// one execution — the previous shape assembled these from the general
+// SqlStorage ops, and every seam between them was a contract only convention
+// enforced.
+
+// The error families applications match on. A message that already carries
+// one must pass through unwrapped: wrapping again would bury the family the
+// application is matching under a second D1_ERROR prefix.
+const __d1IsFamilyError = (message) =>
+  /^D1_([A-Z]+_)*(ERROR|NOTFOUND): /.test(String(message));
+
+const __d1Error = (message, cause) => {
+  const error = new Error("D1_ERROR: " + String(message));
+  error.cause = cause !== undefined ? cause : new Error(String(message));
+  return error;
+};
+
+// A typed refusal from the engine: `{family, message}` becomes the Error the
+// application sees, with `.cause` carrying the bare message as upstream does.
+const __d1Failure = (failure) => {
+  const error = new Error(failure.family + ": " + failure.message);
+  error.cause = new Error(failure.message);
+  return error;
+};
+
+const __d1Run = (scope, request) => {
+  const response = JSON.parse(__d1_run(scope, JSON.stringify(request)));
+  if (response.error) throw __d1Failure(response.error);
+  return response.ok;
+};
+
+class __D1DatabaseCell {
+  constructor(ctx) {
+    this.ctx = ctx;
+  }
+  // Takes an array so that `batch()` can ride this same method, and the
+  // same turn, when it lands.
+  __d1Query(statements) {
+    const scope = this.ctx.storage.sql._scope;
+    return statements.map((statement) =>
+      __d1Run(scope, {
+        mode: "prepared",
+        sql: String(statement.sql),
+        params: statement.params || [],
+        first: !!statement.first,
+      })
+    );
+  }
+  __d1Batch(statements) {
+    return __d1Run(this.ctx.storage.sql._scope, {
+      mode: "batch",
+      statements: statements.map((statement) => ({
+        sql: String(statement.sql),
+        params: statement.params || [],
+      })),
+    });
+  }
+  // The CLI's way in. `celld d1` signs each request with the fleet secret
+  // and sends it to a live node's `/__d1/<scope>` route, which verifies the
+  // signature and then forwards to the owner over the same dispatch `/do/`
+  // uses — so the CLI needs no ownership logic and the database is reached
+  // the way a Worker reaches it. The unauthenticated `/do/` route refuses a
+  // D1 scope outright: this cell answers arbitrary SQL, and its scope is an
+  // HMAC over names that sit in the project's config, so the scope itself
+  // is no secret.
+  async fetch(request) {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return Response.json({ error: "D1_ERROR: invalid request body" }, { status: 400 });
+    }
+    try {
+      let result;
+      if (body.migrate !== undefined) {
+        result = this.__d1Migrate(
+          String(body.migrate.name),
+          String(body.migrate.sql),
+          String(body.migrate.table || "d1_migrations"),
+        );
+      } else if (body.exec !== undefined) {
+        // The CLI asks for rows; the Worker binding's exec() never does.
+        result = __d1Run(this.ctx.storage.sql._scope, {
+          mode: "exec",
+          sql: String(body.exec.sql),
+          rows: !!body.exec.rows,
+        });
+      } else {
+        result = this.__d1Query(body.statements || []);
+      }
+      return Response.json({ result });
+    } catch (error) {
+      return Response.json({ error: String(error && error.message || error) }, { status: 400 });
+    }
+  }
+  __d1Exec(source) {
+    const result = __d1Run(this.ctx.storage.sql._scope, {
+      mode: "exec",
+      sql: String(source),
+      rows: false,
+    });
+    return { count: result.count, duration: result.duration };
+  }
+  // Apply one migration and record it. The engine runs the file, the
+  // bookkeeping insert (the name is a bound parameter, so a file name never
+  // reaches SQL text) and the BEGIN IMMEDIATE .. COMMIT bracket in one
+  // request, so a migration that fails part-way rolls back whole and the
+  // operator fixes the file and re-runs. Without the transaction the
+  // statements that DID land are exactly the ones a re-run trips over.
+  __d1Migrate(name, source, table) {
+    return __d1Run(this.ctx.storage.sql._scope, {
+      mode: "migrate",
+      name,
+      sql: source,
+      table,
+    });
+  }
+}
+
+__cell.classes.__D1Database = __D1DatabaseCell;
+// RPC on a stub needs `extends DurableObject` or the js_rpc flag. This class
+// is the runtime's own, so grant it here instead of making every D1 user set
+// a compatibility flag to reach their database.
+__cell.doExports.__D1Database = true;
+
+// Validate and encode bind values once, at the public boundary, exactly as
+// upstream does (workerd d1-api.ts). Byte-shaped values become byte arrays —
+// the wire format for a BLOB bind — and anything unsupported throws
+// D1_TYPE_ERROR here, before any SQL runs. The first version deferred this
+// to a JSON round-trip whose fallthrough was SQL NULL, so a Uint8Array bind
+// stored NULL and nothing said so.
+const __d1BindValue = (value) => {
+  const kind = typeof value;
+  if (kind === "number") {
+    // A non-finite number has no JSON form, so it crosses as null and
+    // stores SQL NULL. Upstream does the same (bind(NaN) selects typeof
+    // "null"); making it explicit here turns the conversion from an
+    // accident of JSON.stringify into a pinned decision.
+    return Number.isFinite(value) ? value : null;
+  }
+  if (kind === "string") return value;
+  if (kind === "boolean") return value ? 1 : 0;
+  if (kind === "object") {
+    if (value === null) return value;
+    if (
+      Array.isArray(value) &&
+      value.every((byte) => typeof byte === "number" && byte >= 0 && byte < 256)
+    ) {
+      return value;
+    }
+    if (value instanceof ArrayBuffer) {
+      return Array.from(new Uint8Array(value));
+    }
+    // A typed view binds its ELEMENT values, each truncated to a byte —
+    // Int8Array([-1]) stores 0xff, Float32Array([1.5]) stores 0x01 — not
+    // its underlying byte window, so Uint16Array([65, 66]) stores 2 bytes
+    // and not 4. Upstream behaves this way (verified against workerd's D1;
+    // the differential suite pins it), and the bare Array.from that
+    // preceded this produced elements the engine then refused as bytes.
+    if (ArrayBuffer.isView(value)) return Array.from(Uint8Array.from(value));
+  }
+  const error = new Error(
+    `D1_TYPE_ERROR: Type '${kind}' not supported for value '${value}'`,
+  );
+  error.cause = new Error(`Type '${kind}' not supported for value '${value}'`);
+  throw error;
+};
+
+class D1PreparedStatement {
+  constructor(database, sql, params) {
+    Object.defineProperty(this, "_database", { value: database });
+    Object.defineProperty(this, "_sql", { value: sql });
+    Object.defineProperty(this, "_params", { value: params });
+  }
+  bind(...values) {
+    return new D1PreparedStatement(
+      this._database,
+      this._sql,
+      values.map(__d1BindValue),
+    );
+  }
+  async _run(first) {
+    const results = await this._database._query([
+      { sql: this._sql, params: this._params, first },
+    ]);
+    return results[0];
+  }
+  async all() {
+    const result = await this._run();
+    return {
+      success: true,
+      meta: result.meta,
+      results: result.rows.map((row) => __d1Shape(result.columns, row)),
+    };
+  }
+  async run() {
+    return await this.all();
+  }
+  async first(column) {
+    // `first: true` keeps one row on the cell side, so only that row crosses
+    // the isolate boundary and the row cap cannot fire for a first().
+    const result = await this._run(true);
+    if (result.rows.length === 0) return null;
+    const row = __d1Shape(result.columns, result.rows[0]);
+    if (column === undefined) return row;
+    // The check runs on the shaped object, as upstream's does, so a column
+    // named like an Object.prototype member behaves the same here as there.
+    if (row[column] === undefined) {
+      const error = new Error(
+        `D1_COLUMN_NOTFOUND: Column not found (${column})`,
+      );
+      error.cause = new Error("Column not found");
+      throw error;
+    }
+    return row[column];
+  }
+  async raw(options) {
+    const result = await this._run();
+    return options && options.columnNames
+      ? [result.columns, ...result.rows]
+      : result.rows;
+  }
+}
+
+// Object.fromEntries, not property assignment: assigning to a column named
+// `__proto__` would walk the prototype chain and silently drop the value,
+// while fromEntries defines an own property whatever the name.
+const __d1Shape = (columns, row) =>
+  Object.fromEntries(row.map((value, index) => [columns[index], value]));
+
+const __d1PublicResult = (result) => ({
+  success: true,
+  meta: result.meta,
+  results: result.rows.map((row) => __d1Shape(result.columns, row)),
+});
+
+// celld has one primary and no replicas, so every completed query satisfies
+// every earlier session constraint. One stable opaque token states that fact
+// without pretending an isolate-local counter is a durable database position.
+const __d1PrimaryBookmark = "celld:primary";
+
+class D1DatabaseSession {
+  constructor(database, constraintOrBookmark) {
+    Object.defineProperty(this, "_database", { value: database });
+    const value = constraintOrBookmark == null
+      ? "first-unconstrained"
+      : String(constraintOrBookmark).trim();
+    if (!value) {
+      throw new Error("D1_SESSION_ERROR: invalid bookmark or constraint");
+    }
+    Object.defineProperty(this, "_bookmark", {
+      value: value === "first-primary" || value === "first-unconstrained" ? null : value,
+      writable: true,
+    });
+  }
+  _advanceBookmark() {
+    this._bookmark = __d1PrimaryBookmark;
+  }
+  async _query(statements) {
+    const results = await this._database._query(statements);
+    this._advanceBookmark();
+    return results;
+  }
+  prepare(sql) {
+    return new D1PreparedStatement(this, String(sql), []);
+  }
+  async batch(statements) {
+    const results = await this._database._batch(statements);
+    this._advanceBookmark();
+    return results;
+  }
+  getBookmark() {
+    return this._bookmark;
+  }
+}
+
+// Named so SDKs that sniff a binding by `constructor.name` recognise it.
+class D1Database {
+  constructor(databaseName) {
+    Object.defineProperty(this, "_databaseName", { value: databaseName });
+  }
+  // Resolved per call rather than cached: a cell can move between calls, and
+  // `getByName` is the same cost the Durable Object path already pays.
+  get _stub() {
+    return __cell.makeNamespace("__D1Database").getByName(this._databaseName);
+  }
+  async _query(statements) {
+    try {
+      return await this._stub.__d1Query(statements);
+    } catch (error) {
+      if (__d1IsFamilyError(error && error.message)) throw error;
+      throw __d1Error(String(error && error.message || error), error);
+    }
+  }
+  async _batch(statements) {
+    try {
+      const encoded = statements.map((statement) => ({
+        sql: statement._sql,
+        params: statement._params,
+      }));
+      const results = await this._stub.__d1Batch(encoded);
+      return results.map(__d1PublicResult);
+    } catch (error) {
+      if (__d1IsFamilyError(error && error.message)) throw error;
+      throw __d1Error(String(error && error.message || error), error);
+    }
+  }
+  prepare(sql) {
+    return new D1PreparedStatement(this, String(sql), []);
+  }
+  async exec(sql) {
+    try {
+      return await this._stub.__d1Exec(String(sql));
+    } catch (error) {
+      if (__d1IsFamilyError(error && error.message)) throw error;
+      throw __d1Error(String(error && error.message || error), error);
+    }
+  }
+  async batch(statements) {
+    return await this._batch(statements);
+  }
+  withSession(constraintOrBookmark) {
+    return new D1DatabaseSession(this, constraintOrBookmark);
+  }
+  async dump() {
+    throw __d1Error(
+      "dump() is not implemented in celld; the database is a SQLite file in " +
+        "your own bucket",
+    );
+  }
+}
+
+globalThis.__makeD1Database = (databaseName) => new D1Database(databaseName);
 // `cloudflare:workers` module surface. The DO base class sets ctx/env the
 // way `class X extends DurableObject` expects; env aliases the cell env.
 globalThis.__cf = {
@@ -4251,10 +4810,17 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
   static READY_STATE_OPEN = 1;
   static READY_STATE_CLOSING = 2;
   static READY_STATE_CLOSED = 3;
-  constructor(id, protocols = []) {
+  constructor(id, protocols = [], boundTarget = null) {
     super();
-    const outbound = typeof id === "string";
+    const dialed = typeof id === "string";
+    // A socket bound to a Durable Object's socket behaves like a dialed one
+    // in every way that matters here: the host carries its frames, so every
+    // operation goes out through `__ws_*` on this id rather than to a peer
+    // in this heap.
+    const outbound = dialed || boundTarget !== null;
     this._outbound = outbound;
+    this._boundTarget = boundTarget;
+    this._bound = false;
     this._pendingClose = null;
     this._id = outbound ? __ws_alloc() : Number(id);
     this._attachment = undefined;
@@ -4271,11 +4837,19 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
       ? "blob"
       : "arraybuffer";
     // A server-side socket has no URL, and reports null rather than an empty
-    // string -- workerd's inspect output pins this.
-    this.url = outbound ? id : null;
+    // string -- workerd's inspect output pins this. A socket that came back
+    // from an upgrade has none either: nothing in this isolate dialed it.
+    this.url = dialed ? id : null;
     this.protocol = "";
     this.extensions = "";
-    if (outbound) {
+    if (boundTarget !== null) {
+      // The caller drives this socket itself, exactly as a Worker drives one
+      // it opened. The host pipe is not built until `accept()`, so a
+      // response passed straight back out is left alone.
+      this._polled = true;
+      this._target = boundTarget;
+    }
+    if (dialed) {
       // workerd validates the URL in the constructor and throws
       // synchronously; letting the connector reject later would surface a
       // scheme mistake as a network failure instead of a TypeError.
@@ -4413,6 +4987,16 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     // A socket obtained from a `fetch()` upgrade is already connected and
     // delivers nothing until it is accepted; this is where it starts.
     if (this._outbound && this.readyState === WebSocket.READY_STATE_CONNECTING) {
+      // Bind before the pump: the op registers this socket's queue on this
+      // thread, so the first `__ws_next` cannot run ahead of it.
+      if (this._boundTarget !== null && !this._bound) {
+        this._bound = true;
+        __ws_bind_target(
+          this._id,
+          JSON.stringify(this._boundTarget),
+          __actorEventStack[__actorEventStack.length - 1] || "",
+        );
+      }
       this.readyState = WebSocket.READY_STATE_OPEN;
       if (this._polled) this._startPump();
     }

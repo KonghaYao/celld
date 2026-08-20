@@ -61,6 +61,18 @@ nodes can read block files. The same reader-first requirement applies to a
 later L0 writer switch.
 
 `differential_xtool` checks LTX reads and writes against a real Litestream
-binary in three directions. It skips when the binary is absent, so the fast CI
-does not require the Go toolchain. The release gate builds the pinned binary
-and runs the real oracle.
+binary in four directions. Three directions cover the L0 writer, the reader,
+and a byte-identical cross-check. The fourth direction compacts L0 into an L1
+object, therefore a real reader must accept the block representation that the
+compactor publishes.
+
+The `PINNED_LITESTREAM_VERSION` constant in that file records the oracle
+version, and it is the only place this repository pins it. The CI compatibility
+job reads the constant, downloads that release, and verifies the hash of the
+published tarball, so CI does not need the Go toolchain and the two pins cannot
+drift apart.
+
+The job also sets `CELLD_LTX_LITESTREAM_REQUIRED=1`. A missing binary or a
+wrong-era binary therefore fails the job. Without that variable the tests skip,
+so a local run needs no Litestream binary. `LITESTREAM_BIN` points the tests at
+a specific binary.

@@ -233,9 +233,9 @@ pub fn place(load: &PoolLoad) -> Placement {
 ///
 /// That makes the balance different too. `place` balances `turns`, because
 /// an awaiting request occupies nothing and CPU is what a new turn contends
-/// for. Here the cost is a realm that stays, so this balances `cells` and
-/// leaves turns alone: an isolate running hot right now may still be the
-/// right home for a cell that will outlive the burst.
+/// for. Here the cost is a realm that stays, so this reads `cells` and leaves
+/// turns alone: an isolate running hot right now may still be the right home
+/// for a cell that will outlive the burst.
 ///
 /// Growth happens at `max_cells` rather than at a busy-ness threshold, and
 /// the ceiling is per-isolate for the reason in [`PoolLimits::max_cells`] —
@@ -246,16 +246,27 @@ pub fn place(load: &PoolLoad) -> Placement {
 /// admitted the cell, placement always provides enough isolates to preserve
 /// the per-isolate limit.
 pub fn place_cell(load: &PoolLoad) -> Placement {
-    match load.live().min_by_key(|(_, l)| l.cells) {
+    // The fullest isolate that still has room, not the emptiest.
+    //
+    // Packing is what makes a heap reclaimable. The walk down evicts from the
+    // isolate closest to empty, because only the cut that takes an isolate's
+    // last cell returns its heap. Spreading aimed new cells at that same
+    // isolate, so under any load that keeps admitting, eviction drained a heap
+    // and placement refilled it: the isolate never reached zero, `retire`
+    // refused it, and the node paid an eviction and a cold start per cell for
+    // no memory back.
+    //
+    // Packing costs nothing that `max_cells` was not already bounding. That
+    // ceiling is what limits how many cells one OOM can take, and it applies
+    // either way.
+    match load
+        .live()
+        .filter(|(_, l)| l.cells < load.limits.max_cells)
+        .max_by_key(|(id, l)| (l.cells, std::cmp::Reverse(*id)))
+    {
         // No isolate, or every one of them is draining.
         None => Placement::Grow,
-        Some((id, l)) => {
-            if l.cells >= load.limits.max_cells {
-                Placement::Grow
-            } else {
-                Placement::Existing(id)
-            }
-        }
+        Some((id, _)) => Placement::Existing(id),
     }
 }
 
@@ -283,6 +294,19 @@ pub fn place_cell(load: &PoolLoad) -> Placement {
 /// Cell and stateless pools both run this maintenance decision. The cell pool
 /// uses this filter to reclaim empty heaps after eviction while preserving
 /// every isolate that still holds a realm.
+/// May a RETIRING isolate's worker and heap be freed? Only when it is
+/// provably drained: no queued or running turn, and no live affiliation.
+/// An affiliation is any dispatched event's claim on the isolate, held
+/// across suspensions — a suspended event holds no turn, so `turns`
+/// alone is not drained-ness, and freeing on it re-enters a freed heap
+/// when the event's host I/O completes (denoland/celld#147). `cells` is
+/// deliberately NOT consulted: retirement already refused a housed
+/// isolate, and a cell whose residency dropped mid-event is exactly the
+/// case the affiliation covers.
+pub fn may_free(load: &IsolateLoad) -> bool {
+    load.retiring && load.turns == 0 && load.requests == 0
+}
+
 pub fn retire(load: &PoolLoad) -> Option<IsolateId> {
     let live = load.live().count();
     if live == 0 {

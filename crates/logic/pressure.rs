@@ -165,7 +165,7 @@ impl PressureConfig {
     /// and a hard-cap crossing then holds it on a ceiling it never crossed.
     pub fn classify(self, s: Load, was: Latches) -> (Latches, Option<&'static str>) {
         let over = |ceiling: Option<u64>, sample: u64, latched: bool| {
-            ceiling.is_some_and(|c| sample >= c || (latched && sample > c.saturating_mul(4) / 5))
+            ceiling.is_some_and(|c| sample >= c || (latched && sample > Self::low_watermark(c)))
         };
         let latches = Latches {
             memory: over(self.high_bytes, s.in_use_bytes, was.memory),
@@ -179,6 +179,29 @@ impl PressureConfig {
             None
         };
         (latches, reason)
+    }
+
+    /// The sample a latched ceiling releases at: 80% of the ceiling.
+    ///
+    /// One definition, because two callers read it. `classify` decides whether
+    /// the latch still holds, and the walk down's stopping condition asks
+    /// whether shedding can still get the sample down here. Two copies of the
+    /// arithmetic drift, and a walk down that aims at the wrong number either
+    /// stops above the line it could have reached or never stops at all.
+    fn low_watermark(ceiling: u64) -> u64 {
+        ceiling.saturating_mul(4) / 5
+    }
+
+    /// Where the walk down against `metric` has to get the sample to.
+    ///
+    /// `None` means no ceiling is configured for that measurement, so nothing
+    /// can latch on it and no walk down works against it.
+    pub fn resume_line(self, metric: Metric) -> Option<u64> {
+        let ceiling = match metric {
+            Metric::InUse => self.high_bytes,
+            Metric::Rss => self.rss_hard_bytes,
+        };
+        ceiling.map(Self::low_watermark)
     }
 
     /// Which measurement the walk down must work against, given the latches.

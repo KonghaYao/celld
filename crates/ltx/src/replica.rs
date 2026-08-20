@@ -15,7 +15,7 @@
 //!   `1..=commit`, lock page zero-filled, written verbatim — to a temp file that
 //!   is fsync'd and atomically renamed into place.
 //!
-//! ## Scope (KEEP set, PLAN.md §2 / D-7): L0-only, single replica
+//! ## Scope: L0-only, single replica
 //! The real `litestream v0.5.11` L0-only architecture stores **everything at
 //! level 0** — the snapshot (MinTXID==1) and every incremental — under
 //! `ltx/0/` (verified against `tests/fixtures/golden/replica`, captured from
@@ -25,15 +25,14 @@
 //! adding compaction later "just works"), but in this scope the plan is the
 //! contiguous L0 chain `1..=N`.
 //!
-//! ## Deferred (logged in OPEN_QUESTIONS.md — need the background runtime / extra
-//! scope, NOT on the G2 round-trip path):
+//! ## Deferred work that needs a background runtime or additional scope
 //! * **Follow mode** (`replica.go:730-987`, `applyLTXFile`/`fillFollowGap`): the
 //!   continuous tail-restore loop. The one-shot G2 gate is a single restore.
 //! * **The background monitor goroutine + backoff** (`replica.go:326-441`,
 //!   footgun F-13) and `Start`/`Stop`: need a Tokio task owning the `Db`; the
 //!   synchronous `sync()` primitive it would call is implemented and tested here.
-//! * **V3 (v0.3.x generation) restore** (`RestoreV3`, replica.go:990-1096):
-//!   DROPPED (PLAN.md §2 — greenfield, nothing to be backward-compatible with).
+//! * **V3 (v0.3.x generation) restore** (`RestoreV3`, replica.go:990-1096) is not
+//!   included because celld has no earlier replica generation to support.
 //! * **Timestamp / `-txid` targeted restore plumbing through the public API**:
 //!   [`calc_restore_plan`] honors a target TXID (used by tests), but the
 //!   timestamp path and `RestoreOptions` surface stay minimal for the one-shot.
@@ -260,16 +259,11 @@ impl<C: ReplicaClient> Replica<C> {
             .ok_or_else(|| Error::Other("no database attached to replica".into()))?;
         let filename = db.ltx_path(level as u32, min_txid, max_txid);
 
-        let data = match std::fs::read(&filename) {
+        let data = match db.read_ltx_file(level as u32, min_txid, max_txid) {
             Ok(b) => b,
             Err(e) => {
                 return Err(Error::Ltx(Box::new(new_ltx_error(
-                    "open",
-                    &filename,
-                    level,
-                    min_txid.0,
-                    max_txid.0,
-                    e.into(),
+                    "open", &filename, level, min_txid.0, max_txid.0, e,
                 ))));
             }
         };
@@ -396,7 +390,14 @@ pub async fn restore<C: ReplicaClient>(
     output_path: impl AsRef<Path>,
     txid: TXID,
 ) -> Result<RestorePlanStats> {
-    restore_with_download_slots(client, output_path, txid, Arc::new(Semaphore::new(1))).await
+    restore_with_host_and_download_slots(
+        client,
+        output_path,
+        txid,
+        crate::LtxHost::default(),
+        Arc::new(Semaphore::new(1)),
+    )
+    .await
 }
 
 /// What a restore read: the plan's shape, for the caller's telemetry.
@@ -417,10 +418,28 @@ pub async fn restore_with_download_slots<C: ReplicaClient>(
     txid: TXID,
     download_slots: Arc<Semaphore>,
 ) -> Result<RestorePlanStats> {
+    restore_with_host_and_download_slots(
+        client,
+        output_path,
+        txid,
+        crate::LtxHost::default(),
+        download_slots,
+    )
+    .await
+}
+
+/// Restores a database through an injected local filesystem.
+pub async fn restore_with_host_and_download_slots<C: ReplicaClient>(
+    client: &C,
+    output_path: impl AsRef<Path>,
+    txid: TXID,
+    host: crate::LtxHost,
+    download_slots: Arc<Semaphore>,
+) -> Result<RestorePlanStats> {
     let output_path = output_path.as_ref();
 
     // Ensure output path does not already exist (replica.go:591-595).
-    match std::fs::metadata(output_path) {
+    match host.metadata(output_path) {
         Ok(_) => {
             return Err(Error::Other(
                 format!(
@@ -495,13 +514,13 @@ pub async fn restore_with_download_slots<C: ReplicaClient>(
     // Create the parent directory if needed (replica.go:649-655).
     if let Some(parent) = output_path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
+            host.create_dir_all(parent)?;
         }
     }
 
     // Output to a temp file & atomically rename (replica.go:657-694).
     let tmp_output_path = append_ext(output_path, "tmp");
-    write_file_atomic(&tmp_output_path, output_path, &image)?;
+    write_file_atomic(&host, &tmp_output_path, output_path, &image)?;
 
     Ok(stats)
 }
@@ -518,8 +537,21 @@ pub async fn restore_with_download_slots<C: ReplicaClient>(
 pub async fn calc_restore_plan<C: ReplicaClient>(client: &C, txid: TXID) -> Result<Vec<FileInfo>> {
     let mut infos: Vec<FileInfo> = Vec::new();
 
-    // Start with the latest snapshot before the target TXID (replica.go:1430-1452).
-    let snapshot_files = client.ltx_files(SNAPSHOT_LEVEL, TXID(0)).await?;
+    // One listing per level, issued CONCURRENTLY: the plan consumes every
+    // level's listing regardless, and a serial walk costs one storage
+    // round trip per level — measured as the whole eviction durability
+    // proof and most of a cold restore's planning time on a real object
+    // store. The consumption order below is unchanged.
+    let level_lists = futures_util::future::join_all(
+        (0..=SNAPSHOT_LEVEL).map(|level| client.ltx_files(level, TXID(0))),
+    )
+    .await;
+    let mut level_lists: Vec<Vec<FileInfo>> = level_lists
+        .into_iter()
+        .collect::<Result<Vec<Vec<FileInfo>>>>()?;
+    let snapshot_files = level_lists
+        .pop()
+        .expect("SNAPSHOT_LEVEL listing is always requested");
     let mut snapshot: Option<FileInfo> = None;
     for info in snapshot_files {
         if txid != TXID(0) && info.max_txid > txid {
@@ -543,8 +575,8 @@ pub async fn calc_restore_plan<C: ReplicaClient>(client: &C, txid: TXID) -> Resu
 
     // Build a cursor per level, highest level first (replica.go:1463-1473).
     let mut cursors: Vec<RestoreLevelCursor> = Vec::with_capacity((max_level + 1) as usize);
-    for level in (0..=max_level).rev() {
-        let files = client.ltx_files(level, TXID(0)).await?;
+    for _ in (0..=max_level).rev() {
+        let files = level_lists.pop().expect("one listing per level");
         cursors.push(RestoreLevelCursor::new(files));
     }
 
@@ -823,23 +855,29 @@ fn append_ext(path: &Path, ext: &str) -> PathBuf {
 /// Writes `data` to `tmp_path`, fsyncs, then renames onto `final_path` — the
 /// crash-consistent atomic-write idiom (replica.go:661-694). On any failure the
 /// temp file is removed.
-fn write_file_atomic(tmp_path: &Path, final_path: &Path, data: &[u8]) -> Result<()> {
-    use std::io::Write;
+fn write_file_atomic(
+    host: &crate::LtxHost,
+    tmp_path: &Path,
+    final_path: &Path,
+    data: &[u8],
+) -> Result<()> {
     let result = (|| -> Result<()> {
-        let mut f = std::fs::File::create(tmp_path)?;
-        f.write_all(data)?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(tmp_path, final_path)?;
+        let mut file = host.create(tmp_path)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        host.rename(tmp_path, final_path)?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(tmp_path);
+        let _ = host.remove_file(tmp_path);
     }
     result
 }
 
 #[cfg(test)]
+// Unit tests inspect materialized file-format fixtures outside production.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::client::file::FileReplicaClient;

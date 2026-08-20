@@ -1,6 +1,9 @@
+// This integration test damages and inspects fixture files by design.
+#![allow(clippy::disallowed_methods)]
+
 //! faults_inject — T14: fault injection on the replica, then restore.
 //!
-//! The contract under test (PLAN.md §6.4 resilience / G4): when the replica is
+//! The contract under test is that, when the replica is
 //! damaged — a **truncated LTX file**, an **empty (partial) upload**, **corrupt
 //! bytes**, or **missing/missed frames** (a deleted mid-chain L0 file) — a
 //! restore must *always* either

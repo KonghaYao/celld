@@ -35,6 +35,7 @@ pub(crate) enum Action {
         read_only: bool,
     },
     Deploy(Vec<String>),
+    D1(Vec<String>),
     Connect(Vec<String>),
     Credentials(Vec<String>),
     Token(Vec<String>),
@@ -49,6 +50,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
         let arguments = arguments[1..].to_vec();
         match action {
             "deploy" => return Ok(Action::Deploy(arguments)),
+            "d1" => return Ok(Action::D1(arguments)),
             "connect" => return Ok(Action::Connect(arguments)),
             "credentials" => return Ok(Action::Credentials(arguments)),
             "token" => return Ok(Action::Token(arguments)),
@@ -222,19 +224,23 @@ pub(crate) fn print_help() {
         r#"celld — self-hosted, distributed Durable Objects
 
 USAGE:
-  celld --bucket [s3://|gs://]NAME[/PREFIX] [OPTIONS]
-  celld deploy [PROJECT] --bucket [s3://|gs://]NAME[/PREFIX] [OPTIONS]
-  celld diagnose --bucket [s3://|gs://]NAME[/PREFIX] [OPTIONS] [--peer NODE_ID]...
+  celld --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  celld d1 migrations apply DATABASE [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  celld d1 execute DATABASE --command SQL [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  celld diagnose --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS] [--peer NODE_ID]...
 
 Production install: celld --bucket s3://NAME [OPTIONS]
                     celld --bucket gs://NAME [OPTIONS]
 
 OPTIONS:
-  --bucket [s3://|gs://]NAME[/PREFIX]
+  --bucket [s3://|gs://|az://]NAME[/PREFIX]
                          Fleet bucket; s3:// (or no scheme) uses the standard
                          AWS credential chain, gs:// selects Google Cloud
-                         Storage via Application Default Credentials (celld
-                         then rejects --endpoint and ignores --region). A
+                         Storage via Application Default Credentials, az://
+                         names an Azure Blob Storage container and takes its
+                         account from AZURE_STORAGE_ACCOUNT_NAME (celld
+                         rejects --endpoint and ignores --region for both). A
                          PREFIX puts every object under it, so several fleets
                          can share one bucket
   --endpoint URL         Optional S3-compatible endpoint
@@ -307,6 +313,9 @@ TUNING:
   RUST_LOG                        Runtime log filter (default: info)
 
 EXPERIMENTAL:
+  CELLD_DURABILITY                `fleet` acks writes at follower-fsync
+                                  quorum and tiers to the bucket behind
+                                  (default: `fleet`; `bucket` waits for storage)
   CELLD_WORKER_LOADER             Worker Loader binding name for Code Mode
   CELLD_AI_BINDING, CELLD_AI_URL  AI binding name and endpoint
 

@@ -1,5 +1,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
+#![warn(clippy::disallowed_macros)]
+
 //! Compatibility garbage collection for dead celld process generations.
 //!
 //! Wake entries and lazy ownership takeover provide serving correctness.
@@ -11,8 +13,8 @@ use anyhow::Context as _;
 use futures_util::stream::{self, StreamExt as _};
 use serde::Deserialize;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 use tracing::{info, warn};
 
 const MARKER_GC_CONCURRENCY: usize = 64;
@@ -23,6 +25,16 @@ struct NodeWire {
     expires_ms: u64,
     #[serde(default, rename = "ownership_index_generation")]
     generation: String,
+    /// The folded node log: this record IS
+    /// the fleet log's root of truth, so retirement must respect its
+    /// state and the tombstone must carry it through unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    log: Option<serde_json::Value>,
+    /// Every other lease field, preserved verbatim: a crash between the
+    /// tombstone and the delete must never publish a record poorer than
+    /// the one it fences.
+    #[serde(flatten)]
+    rest: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -50,8 +62,8 @@ struct MarkerGcSummary {
 /// remains, while `retries` bounds a persistently failing marker store.
 #[derive(Default)]
 pub struct DeadNodeGc {
-    swept: HashSet<String>,
-    retries: HashMap<String, (String, u32, Instant)>,
+    swept: BTreeSet<String>,
+    retries: BTreeMap<String, (String, u32, u64)>,
 }
 
 impl DeadNodeGc {
@@ -72,14 +84,13 @@ impl DeadNodeGc {
         }
 
         let renew_ms = (lease_ttl_ms / 3).max(1);
-        let mut renewal = tokio::time::interval(Duration::from_millis(renew_ms));
-        renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut renewal = crate::asyncrt::interval(Duration::from_millis(renew_ms));
+        renewal.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);
         renewal.tick().await;
         let pass = self.run_pass(bucket, tick_ms);
         tokio::pin!(pass);
         loop {
-            tokio::select! {
-                _ = &mut pass => return,
+            crate::asyncrt::select! {
                 _ = renewal.tick() => {
                     if !crate::wake::try_hold_waker(
                         bucket,
@@ -90,7 +101,8 @@ impl DeadNodeGc {
                         warn!("waker lease renewal failed; cancelling dead-node GC");
                         return;
                     }
-                }
+                },
+                _ = &mut pass => return,
             }
         }
     }
@@ -98,13 +110,13 @@ impl DeadNodeGc {
     async fn run_pass(&mut self, bucket: &Bucket, tick_ms: u64) {
         let observed_ms = crate::ownership_store::now_ms();
         let dead = dead_nodes(bucket, observed_ms).await;
-        let dead_names: HashSet<&str> = dead.iter().map(|record| record.node.as_str()).collect();
+        let dead_names: BTreeSet<&str> = dead.iter().map(|record| record.node.as_str()).collect();
         self.swept.retain(|node| dead_names.contains(node.as_str()));
         self.retries
             .retain(|node, _| dead_names.contains(node.as_str()));
 
-        let retry_now = Instant::now();
-        let indexed: HashMap<String, String> = dead
+        let retry_now = crate::asyncrt::mono_ms();
+        let indexed: BTreeMap<String, String> = dead
             .iter()
             .filter(|record| {
                 !self.swept.contains(&record.node)
@@ -120,7 +132,7 @@ impl DeadNodeGc {
             .collect();
 
         let indexed = if indexed.is_empty() {
-            Some(HashMap::new())
+            Some(BTreeMap::new())
         } else {
             match cells_indexed_by_nodes(bucket, &indexed).await {
                 Ok(indexed) => Some(indexed),
@@ -132,7 +144,7 @@ impl DeadNodeGc {
         };
         let mut summaries = match indexed {
             Some(indexed) => gc_markers(bucket, indexed).await,
-            None => HashMap::new(),
+            None => BTreeMap::new(),
         };
 
         for record in dead {
@@ -176,7 +188,7 @@ impl DeadNodeGc {
                         (
                             generation,
                             failure_count,
-                            Instant::now() + Duration::from_millis(retry_ms),
+                            crate::asyncrt::mono_ms().saturating_add(retry_ms),
                         ),
                     );
                     continue;
@@ -185,9 +197,10 @@ impl DeadNodeGc {
                 self.swept.insert(node.clone());
             }
             match retire_dead_node(bucket, &node, observed_ms).await {
-                Ok(_) => {
+                Ok(true) => {
                     self.swept.remove(&node);
                 }
+                Ok(false) => {}
                 Err(error) => warn!(%node, %error, "dead-node lease retirement failed"),
             }
         }
@@ -234,9 +247,9 @@ async fn dead_nodes(bucket: &Bucket, now_ms: u64) -> Vec<DeadNode> {
 
 async fn cells_indexed_by_nodes(
     bucket: &Bucket,
-    nodes: &HashMap<String, String>,
-) -> anyhow::Result<HashMap<String, IndexedOwnership>> {
-    let mut indexed: HashMap<String, IndexedOwnership> = nodes
+    nodes: &BTreeMap<String, String>,
+) -> anyhow::Result<BTreeMap<String, IndexedOwnership>> {
+    let mut indexed: BTreeMap<String, IndexedOwnership> = nodes
         .keys()
         .cloned()
         .map(|node| (node, IndexedOwnership::default()))
@@ -255,9 +268,9 @@ async fn cells_indexed_by_nodes(
 
 async fn gc_markers(
     bucket: &Bucket,
-    indexed: HashMap<String, IndexedOwnership>,
-) -> HashMap<String, MarkerGcSummary> {
-    let mut summaries = HashMap::new();
+    indexed: BTreeMap<String, IndexedOwnership>,
+) -> BTreeMap<String, MarkerGcSummary> {
+    let mut summaries = BTreeMap::new();
     let mut work = Vec::new();
     for (node, indexed) in indexed {
         summaries
@@ -302,6 +315,34 @@ async fn retire_dead_node(bucket: &Bucket, node: &str, now_ms: u64) -> anyhow::R
         record.expires_ms,
         now_ms,
     ) {
+        return Ok(false);
+    }
+    // A folded record is never deleted (lease-fold, second cold review,
+    // finding 1). Two reasons compose. An unsealed log is the fleet's
+    // only pointer to an unrecovered tail, so the record must outlive
+    // recovery — the dead-leader sweep seals it, and a later pass
+    // retires it here. And object_store has no conditional delete, so
+    // an unconditional delete can land arbitrarily late — after the
+    // node's successor generation reinstalled the key and activated its
+    // log — and erase an acked tail. So a dead folded record's terminal
+    // state is the tombstone: still dead, still sealed, expiry zero.
+    // Node keys are stable across restarts, so retained tombstones
+    // number the decommissioned nodes, not the restarts, and the
+    // dead-leader sweep can always find a sealed session to GC its
+    // bundles. `Ok(false)` keeps the marker latch held: the record
+    // remains listed, and only true deletion clears the latch.
+    if let Some(log) = record.log.as_ref() {
+        if log.get("state").and_then(|state| state.as_str()) != Some("sealed") {
+            return Ok(false);
+        }
+        if record.expires_ms == 0 {
+            return Ok(false);
+        }
+        let tombstone = serde_json::to_vec(&NodeWire {
+            expires_ms: 0,
+            ..record
+        })?;
+        bucket.put_cas(&key, tombstone, Some(&etag)).await?;
         return Ok(false);
     }
     // No conditional delete in object_store: fence with a CAS tombstone

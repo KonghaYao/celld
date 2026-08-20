@@ -495,6 +495,12 @@
     return asU8(bytes);
   };
 
+  // The ciphers celld can seal a PKCS#8 export under. Node reaches every
+  // cipher OpenSSL carries, so this list is the short one, and a name outside
+  // it is refused by name -- a silent fall back to one of these would seal the
+  // key under a cipher the caller never asked for.
+  const PKCS8_CIPHERS = ["aes-128-cbc", "aes-192-cbc", "aes-256-cbc"];
+
   function validateExportOptions(options, type, name = "options") {
     validateObject(options, name);
     if (options.format !== undefined)
@@ -505,12 +511,30 @@
     if (type === "private" && "cipher" in options &&
         options.cipher !== undefined) {
       validateString(options.cipher, `${name}.cipher`);
+      // OpenSSL resolves a cipher name case-insensitively, so Node takes
+      // "AES-256-CBC" as readily as the lower-case spelling. The host matches
+      // the lower-case name only, so normalize here, once, for both callers.
+      options.cipher = options.cipher.toLowerCase();
+      if (!PKCS8_CIPHERS.includes(options.cipher))
+        throw ERR_METHOD_NOT_IMPLEMENTED(`${name}.cipher ${options.cipher}`);
+      // Encryption here is the PKCS#8 wrapper and nothing else. For sec1 and
+      // pkcs1 Node writes a traditional PEM instead -- an "EC PRIVATE KEY"
+      // body behind Proc-Type and DEK-Info headers -- which celld cannot
+      // produce, so it is refused rather than answered with a PKCS#8 key
+      // under a header the caller did not ask for.
+      if (options.type !== undefined && options.type !== "pkcs8")
+        throw ERR_METHOD_NOT_IMPLEMENTED(`an encrypted ${options.type} export`);
       if (typeof options.passphrase === "string")
         options.passphrase = Buffer.from(options.passphrase, options.encoding);
       if (!isUint8Array(options.passphrase)) {
         throw ERR_INVALID_ARG_TYPE(
           `${name}.passphrase`, ["string", "Uint8Array"], options.passphrase);
       }
+    } else if (type === "private" && options.passphrase !== undefined) {
+      // A passphrase with no cipher named nothing to encrypt under. Node
+      // refuses it, and so must celld: the alternative is to pick a cipher
+      // the caller never asked for, or to write the key out in the clear.
+      throw ERR_INVALID_ARG_VALUE(`${name}.cipher`, options.cipher);
     }
   }
 
@@ -561,9 +585,9 @@
           visibility: this.type,
           format: options.format,
           type: options.type,
-          // A passphrase makes this an encrypted PKCS#8 export. The cipher
-          // name is accepted but not honoured -- pkcs5 picks its own scheme,
-          // and the result re-imports either way.
+          // A passphrase makes this an encrypted PKCS#8 export, and the
+          // cipher names the scheme the host encrypts under.
+          cipher: options.cipher,
           passphrase: options.passphrase === undefined ? null : Array.from(
             asU8(typeof options.passphrase === "string"
               ? Buffer.from(options.passphrase)
@@ -905,12 +929,18 @@
           { keyType: pair.keyType, der, details: pair.details }, visibility);
       }
       // With an encoding, Node returns the encoded key itself rather than a
-      // KeyObject: a string for pem, a Buffer for der.
+      // KeyObject: a string for pem, a Buffer for der. A private encoding
+      // can carry a cipher and a passphrase, which seal the key the same way
+      // `KeyObject.export` does -- celld dropped them before, so a caller
+      // that asked for an encrypted key got a plaintext one.
       const out = keyOp("asym-key-reencode", {
         der,
         visibility,
         format: encoding.format,
         type: encoding.type,
+        cipher: encoding.cipher,
+        passphrase: encoding.passphrase === undefined ? null : Array.from(
+          asU8(encoding.passphrase)),
       });
       return out.pem !== undefined ? out.pem : Buffer.from(out.der);
     };

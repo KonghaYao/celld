@@ -1,5 +1,8 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
+// Telemetry is observational and explicitly excluded from the World trace.
+#![allow(clippy::disallowed_methods)]
+
 //! Telemetry: wide events out of the shell, Parquet into the bucket.
 //!
 //! This is v1's substrate. Off by default, and off is structural: `init`

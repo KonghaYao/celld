@@ -25,6 +25,12 @@ pub struct Manifest {
     pub modules: Vec<ModuleRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assets: Option<AssetManifestRef>,
+    /// Cron trigger expressions from the config's `triggers.crons`. They are
+    /// deployment state rather than cell state: the reserved cron cell reads
+    /// them from the manifest it is running under, so changing a schedule
+    /// needs no migration of an already-armed alarm.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crons: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_features: Vec<String>,
     /// wrangler's raw metadata, retained verbatim for anything we don't yet model.
@@ -39,10 +45,24 @@ fn legacy_manifest_schema_version() -> u32 {
 /// requiring anything else must be rejected up front: `ModuleRef` tolerates
 /// unknown fields, so an older node would otherwise deserialize the manifest
 /// partially and fail (or misbehave) at worker load instead.
-pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] =
-    &[FEATURE_ASSETS_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1];
+pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
+    FEATURE_ASSETS_V1,
+    FEATURE_CRON_V1,
+    FEATURE_D1_V1,
+    FEATURE_SQLITE_VEC_V1,
+    FEATURE_WASM_V1,
+];
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
+/// A deployment with D1 databases. Required because a build without the
+/// reserved `__D1Database` class would load the manifest and then fail every
+/// `env.DB` call at request time, on a node the developer is not watching —
+/// the gate moves that failure to the deploy.
+pub const FEATURE_D1_V1: &str = "d1-v1";
+/// A deployment with cron triggers. Required because a build without the
+/// reserved cron cell would load the manifest, ignore `crons`, and silently
+/// never fire — the quiet failure the gate exists to prevent.
+pub const FEATURE_CRON_V1: &str = "cron-v1";
 pub const FEATURE_SQLITE_VEC_V1: &str = "sqlite-vec-v1";
 pub const FEATURE_WASM_V1: &str = "wasm-v1";
 
@@ -180,6 +200,11 @@ pub struct Rollout {
 ///
 /// `metadata_json` is the exact byte serialization the sender stores as
 /// `Manifest::raw_metadata`; callers pass the same bytes to both.
+/// Cron trigger expressions are deliberately NOT an input. A version names
+/// the code and its bindings; a schedule is configuration layered on top,
+/// which is also how Cloudflare models it — schedules are their own resource,
+/// set by their own API call after the script upload. Hashing them would make
+/// the native and managed paths disagree about what a version is.
 pub fn deployment_version(
     modules: &[(String, Vec<u8>)],
     metadata_json: &[u8],

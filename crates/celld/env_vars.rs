@@ -52,7 +52,6 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_ADMISSION_WAIT_MS",
         "CELLD_ALARM_RESIDENT_MS",
         "CELLD_ASSET_CACHE_BYTES",
-        "CELLD_LEASE_LINGER_MS",
         "CELLD_LOCAL_CACHE_MAX_BYTES",
         "CELLD_MAX_RESIDENT_CELLS",
         "CELLD_MAX_RSS_MB",
@@ -72,11 +71,6 @@ pub fn validate() -> anyhow::Result<()> {
         }
     }
 
-    if let Some(value) = value("CELLD_LAZY_NODE_LEASE")? {
-        if !matches!(value.as_str(), "continuous" | "lazy" | "shadow") {
-            bail!("CELLD_LAZY_NODE_LEASE must be continuous, lazy, or shadow, not {value:?}");
-        }
-    }
     if let Some(value) = value("CELLD_PRESSURE_OWNERSHIP")? {
         if !matches!(value.as_str(), "release" | "sticky") {
             bail!("CELLD_PRESSURE_OWNERSHIP must be release or sticky, not {value:?}");

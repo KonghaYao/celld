@@ -52,10 +52,21 @@ bypass the host policy through the request line.
 
 ## Protect the internal listener
 
-The operator API does not authenticate its requests. A client that can reach
-the internal listener can inspect state, start direct work, evict a cell, or
-stop the process. Therefore, a firewall or a private overlay must restrict
-access to trusted operators and fleet nodes.
+Most of the operator API does not authenticate its requests. A client that
+can reach the internal listener can inspect state, start direct work, evict a
+cell, or stop the process. Therefore, a firewall or a private overlay must
+restrict access to trusted operators and fleet nodes.
+
+The D1 route is the exception, because a D1 database holds application data
+and runs the SQL that a caller sends. That route authenticates each request
+with the fleet secret, and the unauthenticated `/do/NAME` route refuses a D1
+database. An unauthenticated client on the internal listener can therefore
+stop a node, but it cannot read or change the contents of a D1 database.
+The refusal protects only the D1 database: the `/do/NAME` route still sends
+an unauthenticated request to the `fetch` handler of an ordinary Durable
+Object, so that handler runs whatever code it contains for that request. The
+difference is the SQL: only the D1 route runs arbitrary SQL that the caller
+wrote, and a Durable Object runs only its own code.
 
 Peer requests on the same listener keep their protocol authentication. Each
 peer request has an HMAC, a body signature, a clock limit, and replay
@@ -75,7 +86,11 @@ alpha interface, so a release can change its paths or response formats.
   remains available while a graceful shutdown drains existing work.
 - `/cell/NAME` resolves or activates a cell for an operator check.
 - `/evict/NAME` evicts a resident cell.
-- `/do/NAME` sends a direct Durable Object request.
+- `/do/NAME` sends a direct Durable Object request. This route refuses a D1
+  database, because the route does not authenticate its caller.
+- `/__d1/SCOPE` sends SQL to a D1 database. This route authenticates each
+  request with the fleet secret, so a caller needs the bucket credentials.
+  The `celld d1` command uses this route.
 - `POST /shutdown` starts a graceful ownership handoff.
 - `POST /shutdown?handoff=preserve` prepares a clean same-node reload and keeps
   the ownership records.

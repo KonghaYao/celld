@@ -1,3 +1,6 @@
+// This file-backend integration test deletes and inspects crash fixtures.
+#![allow(clippy::disallowed_methods)]
+
 //! integration_resilience — T11: the resilience half of the round-trip gate.
 //!
 //! Where `integration_file.rs` proves the happy-path G2 round-trip, this file
@@ -346,4 +349,101 @@ async fn checkpoint_truncate_continuity_break_still_restores() {
 
     db_equal("A", &src_path, &restored_path)
         .expect("Oracle A: restored == source across TRUNCATE checkpoints");
+}
+
+/// CELLD #150: a passive checkpoint must seal the WAL before SQLite backfills
+/// it. The restored replica must contain every transaction that completed while
+/// the checkpoint loop and the application writer ran concurrently.
+#[tokio::test(flavor = "multi_thread")]
+async fn passive_checkpoint_with_concurrent_growth_restores_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("source.db");
+    let replica_root = dir.path().join("replica");
+    let restored_path = dir.path().join("restored.db");
+
+    let writer = open_writer(&src_path);
+    writer
+        .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB NOT NULL)")
+        .unwrap();
+
+    let db = Db::open(&src_path).unwrap();
+    let client = FileReplicaClient::new(replica_root.to_string_lossy().into_owned());
+    let mut replica = Replica::new(db, client);
+    replica.db_mut().unwrap().sync().unwrap();
+    replica.sync().await.unwrap();
+    drop(writer);
+
+    let writer_path = src_path.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    let writer = std::thread::spawn(move || {
+        let writer = open_writer(&writer_path);
+        for id in 0..120i64 {
+            writer
+                .execute(
+                    "INSERT INTO t VALUES (?, ?)",
+                    rusqlite::params![id, vec![id as u8; 4000]],
+                )
+                .unwrap();
+            if id == 0 {
+                started_tx.send(()).unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        done_tx.send(()).unwrap();
+    });
+    started_rx.recv().unwrap();
+
+    let mut checkpoint_n = 0;
+    loop {
+        match done_rx.try_recv() {
+            Ok(()) => break,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!("writer completion channel disconnected")
+            }
+        }
+
+        match replica
+            .db_mut()
+            .unwrap()
+            .checkpoint(CheckpointMode::Passive)
+        {
+            Ok(()) => checkpoint_n += 1,
+            Err(error)
+                if error.to_string().contains("database is locked")
+                    || error.to_string().contains("SQLITE_BUSY") => {}
+            Err(error) => panic!("passive checkpoint failed: {error}"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    writer.join().unwrap();
+    assert!(
+        checkpoint_n > 0,
+        "the concurrent checkpoint loop made no progress"
+    );
+
+    replica.db_mut().unwrap().sync().unwrap();
+    replica.sync().await.unwrap();
+    replica.restore(&restored_path).await.expect("restore");
+
+    let source = Connection::open(&src_path).unwrap();
+    let restored = Connection::open(&restored_path).unwrap();
+    let summary = |conn: &Connection| {
+        conn.query_row(
+            "SELECT count(*), min(id), max(id), sum(length(data)) FROM t",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(summary(&source), (120, 0, 119, 480_000));
+    assert_eq!(summary(&restored), summary(&source));
 }

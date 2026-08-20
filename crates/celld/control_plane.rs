@@ -1,5 +1,12 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
+// Managed control-plane sessions do not execute in the engine World.
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::disallowed_types
+)]
+
 use crate::bucket::Bucket;
 use crate::protocol::{asset_blob_key, AssetIndex, DeployPointer, Manifest};
 use anyhow::{anyhow, Context};
@@ -983,11 +990,6 @@ async fn presence_session(
             if let Some(observation) = lease_shadow {
                 message["lease_shadow"] = observation;
             }
-            if !snapshot.lazy_lease_shadow.decisions.is_empty()
-                || snapshot.lazy_lease_shadow.dropped > 0
-            {
-                message["lazy_lease_shadow"] = lazy_lease_shadow_json(&snapshot.lazy_lease_shadow);
-            }
             Ok(message.to_string())
         },
         move |text| async move {
@@ -1034,7 +1036,7 @@ async fn presence_session(
 /// loses the header. The next read then treats a payload byte as a frame header
 /// and the stream never realigns. An earlier version of this session read the
 /// socket in the same `tokio::select!` as the heartbeat timer, so every tick
-/// dropped a read in progress; `tests/p0/runtime/presence_cancel.rs` fails
+/// dropped a read in progress; a test that cancels a read mid-payload fails
 /// against that shape.
 ///
 /// One async block therefore owns each direction, and the socket is split so
@@ -1133,49 +1135,6 @@ where
     }
 }
 
-fn lazy_lease_shadow_json(batch: &celld_logic::LeaseLifecycleShadowBatch) -> serde_json::Value {
-    let decisions = batch
-        .decisions
-        .iter()
-        .map(|decision| {
-            let snapshot = &decision.snapshot;
-            let mode = match snapshot.mode {
-                celld_logic::NodeLeaseMode::Continuous => "continuous",
-                celld_logic::NodeLeaseMode::Shadow => "shadow",
-                celld_logic::NodeLeaseMode::Lazy => "lazy",
-            };
-            let authority_action = match decision.expected.authority_action {
-                celld_logic::NodeLeaseAuthorityAction::Hold => "hold",
-                celld_logic::NodeLeaseAuthorityAction::Renew => "renew",
-            };
-            serde_json::json!({
-                "sequence": decision.sequence,
-                "observed_at_ms": decision.observed_at_ms,
-                "snapshot": {
-                    "mode": mode,
-                    "active_cells": snapshot.active_cells,
-                    "serving_cells": snapshot.serving_cells,
-                    "idle_ms": snapshot.idle_ms,
-                    "linger_ms": snapshot.linger_ms,
-                    "lease_active": snapshot.lease_active,
-                    "elapsed_since_ok_ms": snapshot.elapsed_since_ok_ms,
-                    "elapsed_since_renew_ms": snapshot.elapsed_since_renew_ms,
-                    "ttl_ms": snapshot.ttl_ms,
-                    "shadow_release_reported": snapshot.shadow_release_reported,
-                },
-                "expected": {
-                    "shadow_release": decision.expected.shadow_release,
-                    "authority_action": authority_action,
-                },
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({
-        "dropped": batch.dropped,
-        "decisions": decisions,
-    })
-}
-
 /// Independently observe bucket truth for rollout comparison. This is an
 /// off-by-default management diagnostic: it never feeds the lease record back
 /// into the core or changes whether the node serves.
@@ -1206,6 +1165,16 @@ async fn lease_shadow_observation(runtime: &PresenceRuntime) -> serde_json::Valu
     }
 }
 
+/// How long a read-only exploration can spend in object storage.
+///
+/// A person waits for this answer in the Managed Control Plane, and the
+/// presence read loop runs the handler inline, so an exploration that never
+/// finishes holds every later presence message behind it. The bounded replica
+/// retry policy already keeps an ordinary failure well under this, therefore
+/// reaching this deadline means the store stopped answering rather than
+/// answering with an error.
+const EXPLORER_STORAGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn handle_explorer_request(
     message: &serde_json::Value,
     runtime: &PresenceRuntime,
@@ -1231,7 +1200,23 @@ async fn handle_explorer_request(
                 }
                 _ => return explorer_error(request_id, "invalid_request"),
             };
-            list_durable_cells(&runtime.s3, cursor).await
+            match tokio::time::timeout(
+                EXPLORER_STORAGE_DEADLINE,
+                list_durable_cells(&runtime.s3, cursor),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        event = "control_plane_explorer_deadline",
+                        request_id,
+                        operation = "list_cells",
+                        "read-only exploration passed its storage deadline"
+                    );
+                    return explorer_error(request_id, "inspection_timed_out");
+                }
+            }
         }
         Some("inspect_cell") => {
             let Some(cell) = message
@@ -1279,7 +1264,25 @@ async fn handle_explorer_request(
                     Err(error) => Err(anyhow!("active inspection task failed: {error}")),
                 }
             } else {
-                match replication.restore_snapshot(cell).await {
+                let restored = match tokio::time::timeout(
+                    EXPLORER_STORAGE_DEADLINE,
+                    replication.restore_snapshot(cell),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        warn!(
+                            event = "control_plane_explorer_deadline",
+                            request_id,
+                            operation = "inspect_cell",
+                            cell,
+                            "read-only exploration passed its storage deadline"
+                        );
+                        return explorer_error(request_id, "inspection_timed_out");
+                    }
+                };
+                match restored {
                     Ok(Some(snapshot)) => {
                         let cell = cell.to_string();
                         match tokio::task::spawn_blocking(move || {

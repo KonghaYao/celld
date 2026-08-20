@@ -1,6 +1,6 @@
 [package]
 name = "celld"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.94.1"
 license = "Apache-2.0"
@@ -39,7 +39,7 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 md-5.workspace = true
-object_store = { workspace = true, features = ["aws", "gcp"] }
+object_store = { workspace = true, features = ["aws", "azure", "gcp"] }
 parquet.workspace = true
 percent-encoding.workspace = true
 p256.workspace = true
@@ -78,3 +78,8 @@ webpki-roots.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+nix.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+lz4_flex.workspace = true

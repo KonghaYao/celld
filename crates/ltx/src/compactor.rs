@@ -197,6 +197,8 @@ struct CompactorInput<R> {
 }
 
 #[cfg(test)]
+// Unit tests inspect materialized file-format fixtures outside production.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::ltx::{

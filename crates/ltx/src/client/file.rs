@@ -1,7 +1,11 @@
+// The stand-alone file replica is an external ReplicaClient backend. Celld
+// production uses the injected local node filesystem and an object client.
+#![allow(clippy::disallowed_methods)]
+
 //! client::file — file-backed `ReplicaClient`.
 //!
 //! Ported from litestream@v0.5.11 `file/replica_client.go` (the v0.5 methods
-//! only; the `*V3` legacy generation shim is dropped, PLAN.md §2). On-disk
+//! only; the `*V3` legacy generation shim is not included). On-disk
 //! layout matches upstream: `<root>/ltx/<level>/<minTXID>-<maxTXID>.ltx`, the
 //! same tree the golden fixtures were captured from.
 

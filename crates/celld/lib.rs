@@ -1,30 +1,77 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
+#![warn(clippy::disallowed_methods, clippy::disallowed_types)]
+#![allow(clippy::disallowed_macros)]
+
 //! Effect adapters for the clean-sheet core.
 //!
 //! The executable owns one serial actor which is the only caller of
 //! `celld_logic::on_event`. Adapter futures never borrow core state; they send
 //! versioned completion events back through its mailbox.
 
+#[macro_export]
+macro_rules! __celld_domain_select {
+    (
+        $first_pattern:pat = $first_future:expr => $first_output:expr,
+        $second_pattern:pat = $second_future:expr => $second_output:expr $(,)?
+    ) => {{
+        let mut first = std::pin::pin!($first_future);
+        let mut second = std::pin::pin!($second_future);
+        let selected = std::future::poll_fn(|context| {
+            if let std::task::Poll::Ready(value) =
+                std::future::Future::poll(first.as_mut(), context)
+            {
+                return std::task::Poll::Ready(futures_util::future::Either::Left(value));
+            }
+            if let std::task::Poll::Ready(value) =
+                std::future::Future::poll(second.as_mut(), context)
+            {
+                return std::task::Poll::Ready(futures_util::future::Either::Right(value));
+            }
+            std::task::Poll::Pending
+        })
+        .await;
+        match selected {
+            futures_util::future::Either::Left($first_pattern) => $first_output,
+            futures_util::future::Either::Right($second_pattern) => $second_output,
+        }
+    }};
+}
+
+pub mod actor;
 pub mod assets;
+#[cfg(not(all(test, celld_internal_tests)))]
 pub mod asyncrt;
+#[cfg(all(test, celld_internal_tests))]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+#[warn(clippy::disallowed_macros)]
+pub mod asyncrt {
+    include!(env!("CELLD_INTERNAL_ASYNCRT"));
+}
 pub mod bucket;
 pub mod control_plane;
+pub mod d1_cli;
 pub mod dead_node_gc;
 pub mod deploy;
 pub mod env_vars;
-/// Test-only SQLite fault injection, ported from celld unchanged.
+/// Test-only SQLite VFS fault and persistence instrumentation.
 ///
-/// Gated to an external conformance build rather than merely `#[cfg(test)]`:
-/// celld reaches it only from `open_with_fault_vfs_for_test`, which carries
-/// the same gate, so an ordinary build compiles none of it and offers no seam
-/// for it.
+/// The external conformance build owns every caller, and the same gate covers
+/// each test control. An ordinary build compiles none of this module and
+/// offers no control seam.
 #[cfg(all(test, celld_internal_tests))]
-mod fault;
+// The fault harness materializes private crash fixtures outside production.
+#[allow(clippy::disallowed_methods)]
+mod fault {
+    include!(env!("CELLD_INTERNAL_SQLITE_FAULT"));
+}
 pub mod fleet;
+pub mod host_services;
 pub mod js;
 pub mod ltx_repl;
+pub mod machine;
 pub mod memory;
+pub mod node_log;
 mod otlp;
 pub mod ownership_store;
 pub mod peer_auth;
@@ -45,8 +92,67 @@ mod conformance_main_tests {
 }
 
 #[cfg(all(test, celld_internal_tests))]
-mod conformance_replication_tests {
-    include!(env!("CELLD_CONFORMANCE_REPLICATION_TESTS"));
+mod conformance_world_tests {
+    include!(env!("CELLD_CONFORMANCE_WORLD_TESTS"));
+}
+
+#[cfg(all(test, celld_internal_tests))]
+pub(crate) mod conformance_sim_store {
+    include!(env!("CELLD_CONFORMANCE_SIM_STORE_TESTS"));
+}
+
+#[cfg(all(test, celld_internal_tests))]
+// The private CellHost test inspects its materialized SQLite files.
+#[allow(clippy::disallowed_methods)]
+pub(crate) mod conformance_sim_cell_host {
+    include!(env!("CELLD_CONFORMANCE_SIM_CELL_HOST_TESTS"));
+}
+
+#[cfg(all(test, celld_internal_tests))]
+// The private oracle reads and writes independent file-format fixtures.
+#[allow(clippy::disallowed_methods)]
+pub(crate) mod conformance_o3_oracle {
+    include!(env!("CELLD_CONFORMANCE_O3_ORACLE_TESTS"));
+}
+
+#[cfg(all(test, celld_internal_tests))]
+// The World test persists explicit replay and SQLite oracle artifacts.
+#[allow(clippy::disallowed_methods)]
+pub(crate) mod conformance_world_s1_tests {
+    include!(env!("CELLD_CONFORMANCE_WORLD_S1_TESTS"));
+}
+
+#[cfg(all(test, celld_internal_tests))]
+// The World test copies and inspects deliberate crash images.
+#[allow(clippy::disallowed_methods)]
+mod conformance_world_s2_tests {
+    include!(env!("CELLD_CONFORMANCE_WORLD_S2_TESTS"));
+}
+
+#[cfg(all(test, celld_internal_tests))]
+// The World test copies and inspects deliberate fleet-disk images.
+#[allow(clippy::disallowed_methods)]
+mod conformance_world_s3_tests {
+    include!(env!("CELLD_CONFORMANCE_WORLD_S3_TESTS"));
+}
+
+#[cfg(all(test, celld_internal_tests))]
+// The World test owns the materialized SQLite persistence oracle.
+#[allow(clippy::disallowed_methods)]
+mod conformance_world_s5a_tests {
+    include!(env!("CELLD_CONFORMANCE_WORLD_S5A_TESTS"));
+}
+
+#[cfg(all(test, celld_internal_tests))]
+// The World model owns and inspects its materialized filesystem images.
+#[allow(clippy::disallowed_methods)]
+mod conformance_world_s5b_tests {
+    include!(env!("CELLD_CONFORMANCE_WORLD_S5B_TESTS"));
+}
+
+#[cfg(all(test, celld_internal_tests))]
+mod conformance_ltx_eviction_tests {
+    include!(env!("CELLD_CONFORMANCE_LTX_EVICTION_TESTS"));
 }
 
 /// Completion token for a resident-isolate reservation made by the decision
@@ -77,7 +183,7 @@ pub enum WorkerJob {
         queued_at: std::time::Instant,
         url: String,
         method: String,
-        body: Vec<u8>,
+        body: js::RequestBody,
         headers: Vec<(String, String)>,
         request_id: Option<js::RequestId>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<js::HttpResponse>>,
