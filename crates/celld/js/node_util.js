@@ -4425,7 +4425,7 @@ globalThis.Buffer.prototype[customInspectSymbol] =
 
 // ---- platform-object inspect registry --------------------------------------
 // See formatJsgResourceType above. Property order in each stamp matches
-// Workerd's inspect output exactly (http-test's `test` group asserts it).
+// Workerd's inspect output exactly.
 const stamp = (ctor, config) => {
   if (typeof ctor !== "function") return;
   Object.defineProperty(ctor.prototype, internal.kResourceTypeInspect, {

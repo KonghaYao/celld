@@ -1,7 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-#![warn(clippy::disallowed_macros)]
-
 //! Bucket ownership effect adapter, over either conditional-write dialect.
 //!
 //! This module deliberately contains serialization, wall-clock sampling, SDK
@@ -40,6 +38,11 @@ pub(crate) struct NodeLeaseWire {
     pub(crate) probe_public_key: String,
     #[serde(default)]
     pub(crate) peer_protocol: u16,
+    /// This node accepts a signed shutdown-adoption request and responds only
+    /// after it publishes the requested cell. The default keeps old node
+    /// records readable during a mixed-version rollout.
+    #[serde(default)]
+    pub(crate) paced_handoff: bool,
     #[serde(default, rename = "ownership_index_generation")]
     pub(crate) generation: String,
     /// The folded node log: absent until the
@@ -80,7 +83,7 @@ pub struct NodeLoadWire {
     pub resident_cells: usize,
     pub host_websockets: usize,
     pub rss_bytes: u64,
-    /// What the pressure classifier reads, published next to `rss_bytes` so a
+    /// The allocator-adjusted RSS fallback, published next to `rss_bytes` so a
     /// gap between the two is visible.
     ///
     /// `None` means the node did not report it, which a node before this field
@@ -89,16 +92,37 @@ pub struct NodeLoadWire {
     /// fleet for the length of a rolling upgrade.
     #[serde(default)]
     pub in_use_bytes: Option<u64>,
+    /// The cgroup working set (`memory.current - inactive_file`).
+    #[serde(default)]
+    pub cgroup_working_set_bytes: Option<u64>,
+    /// The complete cgroup charge from `memory.current`.
+    #[serde(default)]
+    pub cgroup_current_bytes: Option<u64>,
     pub cpu_percent_x100: u64,
     pub open_fds: u64,
     pub fd_limit: u64,
     pub pressured: bool,
+    /// Every configured memory measurement is below its low watermark. `None`
+    /// means that a peer predates this field.
+    #[serde(default)]
+    pub memory_headroom: Option<bool>,
     pub shed_cells: u64,
     /// Cold demand queued behind the activation ceiling. Zero in steady
     /// state; positive only while a restore burst saturates the node, so a
     /// rollout waits it out before it restarts the next node.
     #[serde(default)]
     pub restoring: u64,
+}
+
+#[cfg(all(test, celld_internal_tests))]
+#[derive(Clone)]
+pub(crate) struct AmbientLoadSample {
+    pub rss_bytes: u64,
+    pub in_use_bytes: u64,
+    pub cgroup_working_set_bytes: Option<u64>,
+    pub cgroup_current_bytes: Option<u64>,
+    pub open_fds: u64,
+    pub fd_limit: u64,
 }
 
 /// A node record older than this is not worth reading. Three lease
@@ -127,12 +151,21 @@ pub struct BucketOwnership {
     probe_public_key: String,
     live: Arc<LiveLoad>,
     lease_ttl_ms: u64,
+    /// A deterministic execution must not publish ambient process telemetry into
+    /// its authoritative store. The override leaves the simulated clock and
+    /// the live Actor counters load-bearing.
+    #[cfg(all(test, celld_internal_tests))]
+    ambient_load_override: Option<AmbientLoadSample>,
+    /// A gated tooth observes whether a deterministic override reached the
+    /// production sampler. Such a call advances jemalloc's epoch and reads
+    /// process resources even if the caller later replaces the values.
+    #[cfg(all(test, celld_internal_tests))]
+    production_load_samples: AtomicUsize,
     /// The full folded log object this node's OWN lease record carries,
     /// tagged with a publish sequence.
     /// Renewals snapshot (seq, object) ONCE when they serialize the wire
     /// body, and the applied notification reports the seq of the body
-    /// that actually landed — never a re-read of this slot, which is what
-    /// made the first protocol unsound (cold review, B1): a confirmation
+    /// that actually landed — never a re-read of this slot. A confirmation
     /// must carry the identity of the write it confirms.
     own_log: std::sync::Mutex<(u64, Option<NodeLogWire>)>,
     /// Every APPLIED write of our own lease record, as (etag, the publish
@@ -165,6 +198,8 @@ pub struct LiveLoad {
     pub host_websockets: AtomicUsize,
     pub cpu_percent_x100: AtomicU64,
     pub pressured: AtomicBool,
+    /// Stricter than not pressured: the last sample cleared every resume line.
+    pub memory_headroom: AtomicBool,
     /// Cells shed since this process started. Monotonic, and only ever read
     /// by a human or a diagnostic -- placement uses the levels, not the rate.
     pub shed_cells: AtomicU64,
@@ -189,6 +224,10 @@ impl BucketOwnership {
             probe_public_key,
             live: Arc::new(LiveLoad::default()),
             lease_ttl_ms: 0,
+            #[cfg(all(test, celld_internal_tests))]
+            ambient_load_override: None,
+            #[cfg(all(test, celld_internal_tests))]
+            production_load_samples: AtomicUsize::new(0),
             own_log: std::sync::Mutex::new((0, None)),
             applied: tokio::sync::watch::channel((String::new(), 0)).0,
         }
@@ -199,6 +238,22 @@ impl BucketOwnership {
     pub fn with_lease_ttl_ms(mut self, ttl_ms: u64) -> Self {
         self.lease_ttl_ms = ttl_ms;
         self
+    }
+
+    #[cfg(all(test, celld_internal_tests))]
+    pub(crate) fn with_ambient_load_for_test(mut self, load: AmbientLoadSample) -> Self {
+        self.ambient_load_override = Some(load);
+        self
+    }
+
+    #[cfg(all(test, celld_internal_tests))]
+    pub(crate) fn load_sample_for_test(&self) -> NodeLoadWire {
+        self.process_load()
+    }
+
+    #[cfg(all(test, celld_internal_tests))]
+    pub(crate) fn production_load_samples_for_test(&self) -> usize {
+        self.production_load_samples.load(Ordering::Relaxed)
     }
 
     pub fn lease_ttl_ms(&self) -> u64 {
@@ -305,6 +360,9 @@ impl BucketOwnership {
                     rss_bytes: lease.load.rss_bytes,
                     in_use_bytes: lease.load.in_use_bytes,
                     pressured: lease.load.pressured,
+                    memory_headroom: lease.load.memory_headroom,
+                    restoring: lease.load.restoring,
+                    paced_handoff: lease.paced_handoff,
                 },
             ))
         }))
@@ -375,12 +433,11 @@ impl BucketOwnership {
         let key = format!("nodes/{}.json", self.node);
         // Snapshot the folded log ONCE, before serialization: the applied
         // notification below reports THIS seq — the identity of the body
-        // that landed — never a re-read of the slot (cold review, B1).
+        // that landed — never a re-read of the slot.
         let (log_seq, log) = self.own_log.lock().unwrap().clone();
         // Report the stamp through the out-parameter, synchronously,
         // before the first await: a caller that times this future out
-        // still learns what the possibly-landed body carried (second
-        // cold review, finding 3).
+        // still learns what the possibly-landed body carried.
         *stamped = log_state_from_wire(&log);
         let body = serde_json::to_vec(&NodeLeaseWire {
             node: record.node.clone(),
@@ -388,8 +445,9 @@ impl BucketOwnership {
             addr: record.addr.clone(),
             probe_public_key: self.probe_public_key.clone(),
             peer_protocol: record.peer_protocol,
+            paced_handoff: true,
             generation: record.generation.clone(),
-            load: process_load(&self.live),
+            load: self.process_load(),
             // The CORE's lease writes carry the folded log through
             // UNCHANGED: the full object lives in own_log, written only by
             // the log tier's own core-mediated updates.
@@ -406,6 +464,32 @@ impl BucketOwnership {
             }
             None => Ok(LeaseCasOutcome::Rejected),
         }
+    }
+
+    fn process_load(&self) -> NodeLoadWire {
+        #[cfg(all(test, celld_internal_tests))]
+        if let Some(ambient) = &self.ambient_load_override {
+            let rss_bytes = ambient.rss_bytes.max(1);
+            return NodeLoadWire {
+                sampled_ms: now_ms(),
+                resident_cells: self.live.resident_cells.load(Ordering::Relaxed),
+                host_websockets: self.live.host_websockets.load(Ordering::Relaxed),
+                rss_bytes,
+                in_use_bytes: Some(ambient.in_use_bytes.max(1).min(rss_bytes)),
+                cgroup_working_set_bytes: ambient.cgroup_working_set_bytes,
+                cgroup_current_bytes: ambient.cgroup_current_bytes,
+                cpu_percent_x100: self.live.cpu_percent_x100.load(Ordering::Relaxed),
+                open_fds: ambient.open_fds,
+                fd_limit: ambient.fd_limit,
+                pressured: self.live.pressured.load(Ordering::Relaxed),
+                memory_headroom: Some(self.live.memory_headroom.load(Ordering::Relaxed)),
+                shed_cells: self.live.shed_cells.load(Ordering::Relaxed),
+                restoring: self.live.restoring.load(Ordering::Relaxed),
+            };
+        }
+        #[cfg(all(test, celld_internal_tests))]
+        self.production_load_samples.fetch_add(1, Ordering::Relaxed);
+        process_load(&self.live)
     }
 }
 
@@ -499,12 +583,15 @@ fn process_load(live: &LiveLoad) -> NodeLoadWire {
         sampled_ms: now_ms(),
         rss_bytes,
         in_use_bytes: Some(in_use_bytes),
+        cgroup_working_set_bytes: memory.cgroup_working_set_bytes,
+        cgroup_current_bytes: memory.cgroup_current_bytes,
         open_fds,
         fd_limit,
         cpu_percent_x100: live.cpu_percent_x100.load(Ordering::Relaxed),
         resident_cells: live.resident_cells.load(Ordering::Relaxed),
         host_websockets: live.host_websockets.load(Ordering::Relaxed),
         pressured: live.pressured.load(Ordering::Relaxed),
+        memory_headroom: Some(live.memory_headroom.load(Ordering::Relaxed)),
         shed_cells: live.shed_cells.load(Ordering::Relaxed),
         restoring: live.restoring.load(Ordering::Relaxed),
     }

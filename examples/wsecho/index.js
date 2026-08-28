@@ -1,10 +1,7 @@
-// Hibernatable WebSocket: a DO whose webSocketMessage echoes and persists a
-// count. The socket is held by the host, so the DO can hibernate between
-// messages and wake with count intact.
-// Connect with a WebSocket upgrade against the node's listener, e.g.:
-//   websocat ws://127.0.0.1:8080/
 export class W {
-  constructor(state, env) { this.state = state; }
+  constructor(state, env) {
+    this.state = state;
+  }
   async fetch(request) {
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return new Response("websocket upgrade required", { status: 426 });
@@ -24,5 +21,5 @@ export class W {
 export default {
   async fetch(request, env) {
     return env.W.get(env.W.idFromName("w")).fetch(request);
-  }
+  },
 };

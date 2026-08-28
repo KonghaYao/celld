@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-// This is V8-thread SQLite plumbing, not the Actor/LTX World boundary.
+// This is V8-thread SQLite plumbing outside the Actor execution domain.
 #![allow(clippy::disallowed_methods)]
 
 //! Cell storage: SQLite backing for the Durable Object storage API.
@@ -33,7 +33,7 @@ use std::sync::Arc;
 /// instead.
 #[derive(Default)]
 pub struct Cells {
-    dbs: RefCell<HashMap<String, Connection>>,
+    dbs: RefCell<HashMap<String, OpenCell>>,
     active_alarms: RefCell<HashMap<String, ActiveAlarm>>,
     /// Committed alarm mutations no turn has taken yet, `-1` for a delete.
     /// The turn that committed one drains it (`take_alarm_moves`) and the
@@ -47,6 +47,16 @@ pub struct Cells {
     sql_critical_errors: RefCell<HashMap<String, String>>,
     /// The schema cookie last read for a cell, and what it was read against.
     schema_cookies: RefCell<HashMap<String, SchemaCookie>>,
+}
+
+/// The database and the ownership epoch that authorized its activation.
+///
+/// These values are one residency invariant. Keeping them in one map entry
+/// prevents asynchronous object-store work from recovering an epoch through a
+/// later ownership lookup after a takeover.
+struct OpenCell {
+    connection: Connection,
+    epoch: u64,
 }
 
 /// A cached `PRAGMA schema_version`, and the two things that can invalidate
@@ -78,6 +88,23 @@ struct SchemaCookie {
 /// pragma when *another* cell ran SQL, and never returns a stale answer.
 static SQL_PREPARES: AtomicU64 = AtomicU64::new(0);
 
+/// The KV statements. One text per operation, shared by every call site, so
+/// the connection's statement cache holds one compiled statement for each
+/// and a request pays no SQL parse for its gets and puts: at 7,000 writes/s
+/// the fleet profile put ~7% of a node's CPU in `sqlite3Prepare` for these
+/// three texts alone.
+const KV_GET_SQL: &str = "SELECT v FROM _cf_KV WHERE scope=?1 AND k=?2";
+const KV_PUT_SQL: &str = "INSERT INTO _cf_KV(scope,k,v) VALUES(?1,?2,?3) \
+     ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v";
+const KV_DELETE_SQL: &str = "DELETE FROM _cf_KV WHERE scope=?1 AND k=?2";
+
+/// The number of SQL compilations so far, for the internal test hooks: a
+/// warm cell's gets and puts must not move it.
+#[cfg(celld_internal_tests)]
+pub fn sql_prepares_for_test() -> u64 {
+    SQL_PREPARES.load(Ordering::Relaxed)
+}
+
 /// SAFETY: the cursors and statement caches hold raw SQLite handles, so this
 /// is not `Send` by inference. It is `Send` in fact: the handles move
 /// between threads only with the isolate that owns them, and a thread
@@ -92,8 +119,7 @@ thread_local! {
     /// for one turn, so the pointer is live exactly when a turn is running.
     static CURRENT_CELLS: std::cell::Cell<*const Cells> =
         const { std::cell::Cell::new(std::ptr::null()) };
-    /// Set once a test has given this thread cells of its own. Production
-    /// never sets it, because no thread there owns a cell's storage.
+    #[cfg(celld_internal_tests)]
     static THREAD_OWNS_CELLS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -104,10 +130,8 @@ impl Cells {
     /// blocking cell run loop still does — leaves the outer turn's cells in
     /// place on the way out.
     pub fn install(&self) -> Installed {
+        #[cfg(celld_internal_tests)]
         if THREAD_OWNS_CELLS.get() {
-            // A test opened this cell's database on the thread, before the
-            // isolate that serves it existed. There the thread's cells are
-            // the isolate's, so entering must not shadow them.
             return Installed(CURRENT_CELLS.get());
         }
         Installed(CURRENT_CELLS.replace(self))
@@ -122,12 +146,7 @@ impl Drop for Installed {
     }
 }
 
-/// Give this thread cells of its own, as though it were an isolate.
-///
-/// A test drives the storage API directly and has no isolate to own the
-/// state. Production has one and must use it: `cells` asserts rather than
-/// falling back to a per-thread map, so a storage call that escapes a turn
-/// fails loudly instead of quietly reading state no cell can see.
+#[cfg(celld_internal_tests)]
 pub fn install_for_test() {
     thread_local! {
         static OWN: Cells = Cells::default();
@@ -148,7 +167,7 @@ fn cells<T>(f: impl FnOnce(&Cells) -> T) -> T {
 
 // One accessor per map, so a call site names the state it wants and nothing
 // else. Each takes the closure the thread-local `with` took, unchanged.
-fn dbs<T>(f: impl FnOnce(&RefCell<HashMap<String, Connection>>) -> T) -> T {
+fn dbs<T>(f: impl FnOnce(&RefCell<HashMap<String, OpenCell>>) -> T) -> T {
     cells(|c| f(&c.dbs))
 }
 
@@ -255,7 +274,8 @@ impl Drop for SqlCursor {
     }
 }
 
-fn schema(c: &Connection) -> anyhow::Result<()> {
+#[doc(hidden)]
+pub fn schema(c: &Connection) -> anyhow::Result<()> {
     // OFF while schema() runs, then NORMAL for the steady state. schema()
     // writes only pragmas and celld's own tables, never user data, so a
     // crash mid-schema loses nothing a re-open does not rebuild. The point
@@ -356,9 +376,13 @@ fn as_user_sql<T>(callback: impl FnOnce() -> T) -> T {
 
 fn is_reserved_sql_name(name: &str) -> bool {
     USER_SQL.with(std::cell::Cell::get)
-        && name
+        && (name
             .get(..4)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("_cf_"))
+            // The ltx replicator's control tables predate the `_cf_` prefix
+            // convention; application SQL that touches them breaks WAL
+            // capture for the cell, so they are reserved the same way.
+            || celld_ltx::db::is_control_table(name))
 }
 
 fn valid_sql_boolean(value: &str) -> bool {
@@ -620,16 +644,27 @@ pub fn open(scope: &str, path: &str) -> anyhow::Result<()> {
 }
 
 pub fn open_with_compat(scope: &str, path: &str, sqlite_vec: bool) -> anyhow::Result<()> {
-    finish_open(scope, Connection::open(path)?, sqlite_vec)
+    open_at_epoch(scope, path, 1, sqlite_vec)
 }
 
-/// Open `scope` through the fault-injection VFS so tests can fail its writes.
-#[cfg(all(test, celld_internal_tests))]
+/// Open a production cell database with the epoch that authorized the
+/// activation.
+pub(crate) fn open_at_epoch(
+    scope: &str,
+    path: &str,
+    epoch: u64,
+    sqlite_vec: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(epoch > 0, "a cell activation epoch must be positive");
+    finish_open(scope, Connection::open(path)?, epoch, sqlite_vec)
+}
+
+#[cfg(celld_internal_tests)]
 pub fn open_with_fault_vfs_for_test(scope: &str, path: &str) -> anyhow::Result<()> {
-    finish_open(scope, crate::fault::open_database(path)?, false)
+    finish_open(scope, crate::fault::open_database(path)?, 1, false)
 }
 
-fn finish_open(scope: &str, c: Connection, sqlite_vec: bool) -> anyhow::Result<()> {
+fn finish_open(scope: &str, c: Connection, epoch: u64, sqlite_vec: bool) -> anyhow::Result<()> {
     if sqlite_vec {
         register_vec0_extension(&c)?;
     }
@@ -658,11 +693,22 @@ fn finish_open(scope: &str, c: Connection, sqlite_vec: bool) -> anyhow::Result<(
         }
     }
     c.authorizer(Some(authorize_sql));
+    // rusqlite's default holds 16 statements; the KV texts plus a cell's
+    // few hot user statements fit in 64 without evicting each other.
+    c.set_prepared_statement_cache_capacity(64);
     close_sync_list_cursors(scope);
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
     sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
-    dbs(|d| d.borrow_mut().insert(scope.to_string(), c));
+    dbs(|d| {
+        d.borrow_mut().insert(
+            scope.to_string(),
+            OpenCell {
+                connection: c,
+                epoch,
+            },
+        )
+    });
     Ok(())
 }
 
@@ -685,11 +731,20 @@ pub fn close(scope: &str) {
 }
 
 fn with<T>(scope: &str, f: impl FnOnce(&Connection) -> T) -> Option<T> {
-    dbs(|d| d.borrow().get(scope).map(f))
+    dbs(|d| d.borrow().get(scope).map(|cell| f(&cell.connection)))
 }
 
 fn with_mut<T>(scope: &str, f: impl FnOnce(&mut Connection) -> T) -> Option<T> {
-    dbs(|d| d.borrow_mut().get_mut(scope).map(f))
+    dbs(|d| {
+        d.borrow_mut()
+            .get_mut(scope)
+            .map(|cell| f(&mut cell.connection))
+    })
+}
+
+/// Return the epoch installed with the active cell database.
+pub(crate) fn activation_epoch(scope: &str) -> Option<u64> {
+    dbs(|d| d.borrow().get(scope).map(|cell| cell.epoch))
 }
 
 static NEXT_BATCH_SAVEPOINT: AtomicU64 = AtomicU64::new(1);
@@ -742,14 +797,22 @@ fn json_to_sql(v: &serde_json::Value) -> rusqlite::types::Value {
     }
 }
 
-fn vref_to_json(v: rusqlite::types::ValueRef) -> serde_json::Value {
+const INVALID_UTF8_TEXT: &str = "TEXT result is not valid UTF-8; store arbitrary bytes as a BLOB";
+
+fn sql_text(bytes: &[u8]) -> Result<String, &'static str> {
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| INVALID_UTF8_TEXT)
+}
+
+fn vref_to_json(v: rusqlite::types::ValueRef) -> Result<serde_json::Value, &'static str> {
     use rusqlite::types::ValueRef;
     match v {
-        ValueRef::Null => serde_json::Value::Null,
-        ValueRef::Integer(i) => serde_json::json!(i),
-        ValueRef::Real(f) => serde_json::json!(f),
-        ValueRef::Text(t) => serde_json::Value::String(String::from_utf8_lossy(t).into_owned()),
-        ValueRef::Blob(b) => serde_json::json!({ "__celld_bytes": b }),
+        ValueRef::Null => Ok(serde_json::Value::Null),
+        ValueRef::Integer(i) => Ok(serde_json::json!(i)),
+        ValueRef::Real(f) => Ok(serde_json::json!(f)),
+        ValueRef::Text(bytes) => sql_text(bytes).map(serde_json::Value::String),
+        ValueRef::Blob(b) => Ok(serde_json::json!({ "__celld_bytes": b })),
     }
 }
 
@@ -770,8 +833,12 @@ fn total_changes(connection: &Connection) -> u64 {
 /// one: this runs from egress paths that can overlap an active cursor, where
 /// toggling the authorizer or borrowing the statement cache is not safe.
 fn schema_version(connection: &Connection) -> u64 {
+    // Through the statement cache: the output gate reads the cookie after
+    // every write, and a fresh `PRAGMA` per read was one SQL compilation
+    // per write request.
     connection
-        .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+        .prepare_cached("PRAGMA schema_version")
+        .and_then(|mut statement| statement.query_row([], |row| row.get::<_, i64>(0)))
         .unwrap_or(0) as u64
 }
 
@@ -835,7 +902,11 @@ fn stored_value(value: rusqlite::types::ValueRef<'_>) -> StoredValue {
         rusqlite::types::ValueRef::Text(bytes) => {
             StoredValue::LegacyJson(String::from_utf8_lossy(bytes).into_owned())
         }
-        value => StoredValue::LegacyJson(vref_to_json(value).to_string()),
+        value => StoredValue::LegacyJson(
+            vref_to_json(value)
+                .expect("the TEXT arm is handled before JSON conversion")
+                .to_string(),
+        ),
     }
 }
 
@@ -868,7 +939,10 @@ pub fn sql_exec(scope: &str, query: &str, binds: &[serde_json::Value]) -> Result
             while let Some(row) = rows.next().map_err(|e| e.to_string())? {
                 let mut r = Vec::with_capacity(n);
                 for i in 0..n {
-                    r.push(vref_to_json(row.get_ref(i).map_err(|e| e.to_string())?));
+                    r.push(
+                        vref_to_json(row.get_ref(i).map_err(|e| e.to_string())?)
+                            .map_err(str::to_string)?,
+                    );
                 }
                 out.push(r);
             }
@@ -1006,27 +1080,44 @@ unsafe fn sql_cursor_columns(statement: *mut rusqlite::ffi::sqlite3_stmt) -> Vec
         .collect()
 }
 
-unsafe fn sql_cursor_row(statement: *mut rusqlite::ffi::sqlite3_stmt) -> Vec<serde_json::Value> {
+/// One column of one SQL result row, in SQLite's own five types.
+///
+/// Both cursor ops turn this straight into V8 values, so a result row never
+/// becomes a JSON string. `serde_json::Value` cannot carry the type faithfully
+/// anyway: it holds no byte string, so a BLOB had to travel as a
+/// `__celld_bytes` array of decimal numbers, and it holds no infinity, so
+/// SQLite's `9e999` collapsed to null.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+unsafe fn sql_cursor_row(
+    statement: *mut rusqlite::ffi::sqlite3_stmt,
+) -> Result<Vec<SqlValue>, &'static str> {
     let count = rusqlite::ffi::sqlite3_column_count(statement);
     (0..count)
         .map(
             |index| match rusqlite::ffi::sqlite3_column_type(statement, index) {
-                rusqlite::ffi::SQLITE_INTEGER => {
-                    serde_json::json!(rusqlite::ffi::sqlite3_column_int64(statement, index))
-                }
-                rusqlite::ffi::SQLITE_FLOAT => {
-                    serde_json::json!(rusqlite::ffi::sqlite3_column_double(statement, index))
-                }
+                rusqlite::ffi::SQLITE_INTEGER => Ok(SqlValue::Integer(
+                    rusqlite::ffi::sqlite3_column_int64(statement, index),
+                )),
+                rusqlite::ffi::SQLITE_FLOAT => Ok(SqlValue::Real(
+                    rusqlite::ffi::sqlite3_column_double(statement, index),
+                )),
                 rusqlite::ffi::SQLITE_TEXT => {
                     let length = rusqlite::ffi::sqlite3_column_bytes(statement, index) as usize;
                     let pointer = rusqlite::ffi::sqlite3_column_text(statement, index);
-                    let value = if length == 0 {
-                        String::new()
+                    let bytes = if length == 0 {
+                        &[][..]
                     } else {
-                        String::from_utf8_lossy(std::slice::from_raw_parts(pointer, length))
-                            .into_owned()
+                        std::slice::from_raw_parts(pointer, length)
                     };
-                    serde_json::Value::String(value)
+                    sql_text(bytes).map(SqlValue::Text)
                 }
                 rusqlite::ffi::SQLITE_BLOB => {
                     let length = rusqlite::ffi::sqlite3_column_bytes(statement, index) as usize;
@@ -1037,9 +1128,9 @@ unsafe fn sql_cursor_row(statement: *mut rusqlite::ffi::sqlite3_stmt) -> Vec<ser
                     } else {
                         std::slice::from_raw_parts(pointer, length).to_vec()
                     };
-                    serde_json::json!({ "__celld_bytes": bytes })
+                    Ok(SqlValue::Blob(bytes))
                 }
-                _ => serde_json::Value::Null,
+                _ => Ok(SqlValue::Null),
             },
         )
         .collect()
@@ -1196,7 +1287,7 @@ fn discard_in_use_sql_statement(
 
 /// (cursor id, column names, first row, rows written, reused-cached-query)
 /// from starting a SQL cursor.
-type SqlCursorStart = (u64, Vec<String>, Option<Vec<serde_json::Value>>, u64, bool);
+type SqlCursorStart = (u64, Vec<String>, Option<Vec<SqlValue>>, u64, bool);
 
 /// Prepare and step a SQL statement once. The returned cursor owns the native
 /// statement and yields at most one copied row per subsequent call.
@@ -1324,7 +1415,17 @@ pub fn sql_cursor_start(
                             // Read metadata after the first step so SQLite has
                             // automatically recompiled an expired cached statement.
                             let columns = sql_cursor_columns(statement);
-                            let row = sql_cursor_row(statement);
+                            let row = match sql_cursor_row(statement) {
+                                Ok(row) => row,
+                                Err(error) => {
+                                    discard_in_use_sql_statement(
+                                        scope,
+                                        cache_query.as_deref(),
+                                        statement,
+                                    );
+                                    return Err(anyhow::anyhow!(error));
+                                }
+                            };
                             Ok((
                                 database,
                                 statement,
@@ -1393,7 +1494,11 @@ pub fn sql_cursor_start(
     Ok((id, columns, row, rows_written, reused_cached_query))
 }
 
-pub fn sql_cursor_next(cursor_id: u64) -> Result<(Option<Vec<serde_json::Value>>, u64), String> {
+/// Step one row. `Some(row)` is a row and carries no write count, because a
+/// cursor's `rowsWritten` is only final once SQLite reports DONE; `None`
+/// carries that final count. The two are returned together so a caller cannot
+/// read a mid-cursor write count that SQLite has not finished producing.
+pub fn sql_cursor_next(cursor_id: u64) -> Result<(Option<Vec<SqlValue>>, u64), String> {
     sql_cursors(|cursors| {
         let mut cursors = cursors.borrow_mut();
         let cursor = cursors
@@ -1409,10 +1514,13 @@ pub fn sql_cursor_next(cursor_id: u64) -> Result<(Option<Vec<serde_json::Value>>
             unsafe { rusqlite::ffi::sqlite3_get_autocommit(cursor.database) == 0 };
         let step = unsafe { rusqlite::ffi::sqlite3_step(cursor.statement) };
         match step {
-            rusqlite::ffi::SQLITE_ROW => {
-                let row = unsafe { sql_cursor_row(cursor.statement) };
-                Ok((Some(row), 0))
-            }
+            rusqlite::ffi::SQLITE_ROW => match unsafe { sql_cursor_row(cursor.statement) } {
+                Ok(row) => Ok((Some(row), 0)),
+                Err(error) => {
+                    cursors.remove(&cursor_id);
+                    Err(error.to_string())
+                }
+            },
             rusqlite::ffi::SQLITE_DONE => {
                 let rows_written = unsafe {
                     total_changes_for_handle(cursor.database).saturating_sub(cursor.changes_before)
@@ -1443,6 +1551,17 @@ pub fn sql_cursor_close(cursor_id: u64) {
     sql_cursors(|cursors| {
         cursors.borrow_mut().remove(&cursor_id);
     });
+}
+
+/// `(last_insert_rowid, changes)` for the cell's connection. D1 reports both in
+/// a statement's `meta`; the DO `SqlStorage` surface exposes neither, so this
+/// is a separate read rather than a new field on the cursor result.
+pub fn sql_write_meta(scope: &str) -> Result<(i64, u64), String> {
+    require_sql_healthy(scope)?;
+    with(scope, |connection| {
+        Ok((connection.last_insert_rowid(), connection.changes()))
+    })
+    .unwrap_or_else(|| Err(format!("no db for {scope}")))
 }
 
 pub fn sql_database_size(scope: &str) -> Result<u64, String> {
@@ -1678,12 +1797,12 @@ unsafe fn d1_row_value(
     statement: *mut rusqlite::ffi::sqlite3_stmt,
     index: i32,
     available: usize,
-) -> Result<(serde_json::Value, usize), usize> {
+) -> Result<(serde_json::Value, usize), D1RowValueError> {
     let scalar_bytes = std::mem::size_of::<serde_json::Value>();
     match rusqlite::ffi::sqlite3_column_type(statement, index) {
         rusqlite::ffi::SQLITE_INTEGER => {
             if scalar_bytes > available {
-                return Err(scalar_bytes);
+                return Err(D1RowValueError::ResultLimit);
             }
             Ok((
                 serde_json::json!(rusqlite::ffi::sqlite3_column_int64(statement, index)),
@@ -1692,7 +1811,7 @@ unsafe fn d1_row_value(
         }
         rusqlite::ffi::SQLITE_FLOAT => {
             if scalar_bytes > available {
-                return Err(scalar_bytes);
+                return Err(D1RowValueError::ResultLimit);
             }
             Ok((
                 serde_json::json!(rusqlite::ffi::sqlite3_column_double(statement, index)),
@@ -1707,17 +1826,13 @@ unsafe fn d1_row_value(
             } else {
                 std::slice::from_raw_parts(pointer, length)
             };
-            let value = if bytes.is_empty() {
-                String::new()
-            } else {
-                String::from_utf8_lossy(bytes).into_owned()
-            };
+            let value = sql_text(bytes).map_err(|_| D1RowValueError::InvalidUtf8Text)?;
             // serde_json escapes quotes, backslashes, and controls when the
             // response crosses into V8. Charge that wire shape now: decoded
             // bytes let NUL-heavy TEXT expand sixfold after the cap passed.
             let expanded = scalar_bytes.saturating_add(d1_json_string_len(&value));
             if expanded > available {
-                return Err(expanded);
+                return Err(D1RowValueError::ResultLimit);
             }
             Ok((serde_json::Value::String(value), expanded))
         }
@@ -1732,7 +1847,7 @@ unsafe fn d1_row_value(
                 .saturating_add(scalar_bytes)
                 .saturating_add(2);
             if expanded > available {
-                return Err(expanded);
+                return Err(D1RowValueError::ResultLimit);
             }
             let pointer: *const u8 = rusqlite::ffi::sqlite3_column_blob(statement, index).cast();
             let bytes = if length == 0 {
@@ -1749,21 +1864,34 @@ unsafe fn d1_row_value(
         }
         _ => {
             if scalar_bytes > available {
-                return Err(scalar_bytes);
+                return Err(D1RowValueError::ResultLimit);
             }
             Ok((serde_json::Value::Null, scalar_bytes))
         }
     }
 }
 
+enum D1RowValueError {
+    ResultLimit,
+    InvalidUtf8Text,
+}
+
+fn d1_result_limit_error() -> String {
+    format!(
+        "query result exceeds {} bytes, which is more than one D1 result set can carry across a \
+         binding; narrow the query, or iterate inside a Durable Object where the cursor streams",
+        D1_MAX_RESULT_BYTES
+    )
+}
+
 /// What stepping one statement to completion left behind.
 struct D1Stepped {
     rows: Vec<Vec<serde_json::Value>>,
     rows_read: u64,
-    /// The cap message, when one fired. The statement still ran to
-    /// completion: a statement's effects happen as its steps do
-    /// (`INSERT ... RETURNING`), so stopping at the cap would silently lose
-    /// the writes the remaining steps carry. Drain first, refuse after.
+    /// The result refusal, when one fired. The statement still ran to
+    /// completion because its effects happen as its steps do. Stopping an
+    /// `INSERT ... RETURNING` at a bad result would silently lose the writes
+    /// that the remaining steps carry. Drain first, then refuse the result.
     over: Option<String>,
 }
 
@@ -1810,7 +1938,12 @@ unsafe fn d1_step_to_done(
                     let available = budget.saturating_sub(row_bytes);
                     let (value, size) = match d1_row_value(statement, index, available) {
                         Ok(value) => value,
-                        Err(_) => {
+                        Err(D1RowValueError::ResultLimit) => {
+                            row_over = true;
+                            break;
+                        }
+                        Err(D1RowValueError::InvalidUtf8Text) => {
+                            stepped.over = Some(INVALID_UTF8_TEXT.to_string());
                             row_over = true;
                             break;
                         }
@@ -1818,13 +1951,14 @@ unsafe fn d1_step_to_done(
                     row_bytes += size;
                     row.push(value);
                 }
-                let Some(remaining) = budget.checked_sub(row_bytes).filter(|_| !row_over) else {
-                    stepped.over = Some(format!(
-                        "query result exceeds {} bytes, which is more than one D1 result \
-                         set can carry across a binding; narrow the query, or iterate \
-                         inside a Durable Object where the cursor streams",
-                        D1_MAX_RESULT_BYTES
-                    ));
+                if row_over {
+                    if stepped.over.is_none() {
+                        stepped.over = Some(d1_result_limit_error());
+                    }
+                    continue;
+                }
+                let Some(remaining) = budget.checked_sub(row_bytes) else {
+                    stepped.over = Some(d1_result_limit_error());
                     continue;
                 };
                 *budget = remaining;
@@ -2121,7 +2255,7 @@ fn d1_poison_transaction(scope: &str, error: String) {
 }
 
 fn d1_rollback_after_commit_failure(scope: &str, connection: &Connection) -> Result<(), String> {
-    #[cfg(all(test, celld_internal_tests))]
+    #[cfg(celld_internal_tests)]
     if let Some(result_code) = D1_ROLLBACK_FAULT.with(std::cell::Cell::take) {
         // SAFETY: the handle belongs to this live connection.
         let database = unsafe { connection.handle() };
@@ -2148,13 +2282,13 @@ fn d1_transaction_control(
     operation: D1TransactionOperation,
     failure: fn(String) -> D1Failure,
 ) -> Result<(), D1Failure> {
-    #[cfg(all(test, celld_internal_tests))]
+    #[cfg(celld_internal_tests)]
     let injected = if operation == D1TransactionOperation::Commit {
         D1_COMMIT_FAULT.with(std::cell::Cell::take)
     } else {
         None
     };
-    #[cfg(not(all(test, celld_internal_tests)))]
+    #[cfg(not(celld_internal_tests))]
     let injected: Option<i32> = None;
 
     let result = if let Some(result_code) = injected {
@@ -2227,18 +2361,18 @@ fn d1_critical_transaction_failure(
     error
 }
 
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 thread_local! {
     static D1_COMMIT_FAULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     static D1_ROLLBACK_FAULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub fn set_d1_commit_fault_for_test(result_code: i32) {
     D1_COMMIT_FAULT.with(|fault| fault.set(Some(result_code)));
 }
 
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub fn set_d1_rollback_fault_for_test(result_code: i32) {
     D1_ROLLBACK_FAULT.with(|fault| fault.set(Some(result_code)));
 }
@@ -2576,7 +2710,7 @@ pub fn transaction_control(
     result
 }
 
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub fn set_query_only_for_test(scope: &str, enabled: bool) -> anyhow::Result<()> {
     with(scope, |connection| {
         without_sql_authorizer(connection, || {
@@ -2588,7 +2722,7 @@ pub fn set_query_only_for_test(scope: &str, enabled: bool) -> anyhow::Result<()>
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
 }
 
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub fn set_max_page_count_for_test(scope: &str, pages: u32) -> anyhow::Result<()> {
     with(scope, |connection| {
         without_sql_authorizer(connection, || {
@@ -2600,16 +2734,13 @@ pub fn set_max_page_count_for_test(scope: &str, pages: u32) -> anyhow::Result<()
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
 }
 
-/// Arm or clear the thread-local write fault of the test VFS. Only databases
-/// opened by `open_with_fault_vfs_for_test` are affected.
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub fn set_write_fault_for_test(enabled: bool) {
     crate::fault::set_write_fault(enabled);
 }
 
-/// Shrink the page cache so a large write spills to disk mid-statement, the
-/// same trick Workerd's SQLITE_IOERR test uses.
-#[cfg(all(test, celld_internal_tests))]
+/// Shrink the page cache so a large write spills to disk mid-statement.
+#[cfg(celld_internal_tests)]
 pub fn set_cache_size_for_test(scope: &str, pages: i32) -> anyhow::Result<()> {
     with(scope, |connection| {
         without_sql_authorizer(connection, || {
@@ -2623,7 +2754,7 @@ pub fn set_cache_size_for_test(scope: &str, pages: i32) -> anyhow::Result<()> {
 
 /// Interrupt the next statement on `scope` through SQLite's real interrupt
 /// machinery: a progress handler that aborts on its first callback.
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub fn set_interrupt_fault_for_test(scope: &str, enabled: bool) -> anyhow::Result<()> {
     unsafe extern "C" fn interrupt(_: *mut std::ffi::c_void) -> std::ffi::c_int {
         1
@@ -2648,11 +2779,9 @@ pub fn set_interrupt_fault_for_test(scope: &str, enabled: bool) -> anyhow::Resul
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
 }
 
-/// Register `cells_nomem_for_test()`, a scalar that reports allocation
-/// failure through SQLite's own OOM path (`sqlite3_result_error_nomem`), so a
-/// statement fails with SQLITE_NOMEM exactly as a real allocator failure
-/// would.
-#[cfg(all(test, celld_internal_tests))]
+/// Register `cells_nomem_for_test()`, a scalar that reports allocation failure
+/// through SQLite's own OOM path (`sqlite3_result_error_nomem`).
+#[cfg(celld_internal_tests)]
 pub fn register_nomem_function_for_test(scope: &str) -> anyhow::Result<()> {
     unsafe extern "C" fn nomem(
         context: *mut rusqlite::ffi::sqlite3_context,
@@ -2686,35 +2815,40 @@ pub fn register_nomem_function_for_test(scope: &str) -> anyhow::Result<()> {
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
 }
 
-// Test-only single-key helpers; the runtime goes through the batched forms.
-#[cfg(test)]
+#[cfg(celld_internal_tests)]
 pub fn get(scope: &str, key: &str) -> Option<String> {
     with(scope, |c| {
-        c.query_row(
-            "SELECT v FROM _cf_KV WHERE scope=?1 AND k=?2",
-            [scope, key],
-            |r| r.get::<_, String>(0),
-        )
-        .ok()
+        c.prepare_cached(KV_GET_SQL)
+            .ok()?
+            .query_row([scope, key], |r| r.get::<_, String>(0))
+            .ok()
     })?
 }
 
 pub fn get_stored(scope: &str, key: &str) -> anyhow::Result<Option<StoredValue>> {
     with(scope, |c| {
-        c.query_row(
-            "SELECT v FROM _cf_KV WHERE scope=?1 AND k=?2",
-            [scope, key],
-            |row| Ok(stored_value(row.get_ref(0)?)),
-        )
-        .optional()
-        .map_err(Into::into)
+        c.prepare_cached(KV_GET_SQL)?
+            .query_row([scope, key], |row| Ok(stored_value(row.get_ref(0)?)))
+            .optional()
+            .map_err(Into::into)
+    })
+    .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
+}
+
+#[cfg(celld_internal_tests)]
+pub fn key_names_for_test(scope: &str) -> anyhow::Result<Vec<String>> {
+    with(scope, |connection| {
+        let mut statement = connection.prepare("SELECT k FROM _cf_KV WHERE scope=?1 ORDER BY k")?;
+        let rows = statement.query_map([scope], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     })
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
 }
 
 /// Fetch multiple keys in storage order, omitting absent keys. Duplicate input
 /// keys are coalesced, matching Durable Object storage's map-like result.
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub fn get_many(scope: &str, keys: &[String]) -> anyhow::Result<Vec<(String, String)>> {
     get_many_stored(scope, keys)?
         .into_iter()
@@ -2732,7 +2866,7 @@ pub fn get_many_stored(scope: &str, keys: &[String]) -> anyhow::Result<Vec<(Stri
     keys.sort();
     keys.dedup();
     with(scope, |c| {
-        let mut statement = c.prepare("SELECT v FROM _cf_KV WHERE scope=?1 AND k=?2")?;
+        let mut statement = c.prepare_cached(KV_GET_SQL)?;
         let mut values = Vec::new();
         for key in keys {
             if let Some(value) = statement
@@ -2749,32 +2883,26 @@ pub fn get_many_stored(scope: &str, keys: &[String]) -> anyhow::Result<Vec<(Stri
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
 }
 
-#[cfg(test)]
+#[cfg(celld_internal_tests)]
 pub fn put(scope: &str, key: &str, val: &str) {
     with(scope, |c| {
-        c.execute(
-            "INSERT INTO _cf_KV(scope,k,v) VALUES(?1,?2,?3) \
-         ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v",
-            [scope, key, val],
-        )
+        c.prepare_cached(KV_PUT_SQL)
+            .and_then(|mut statement| statement.execute([scope, key, val]))
     });
 }
 
 pub fn put_serialized(scope: &str, key: &str, value: &[u8]) -> anyhow::Result<()> {
     with(scope, |c| {
-        c.execute(
-            "INSERT INTO _cf_KV(scope,k,v) VALUES(?1,?2,?3) \
-             ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v",
-            rusqlite::params![scope, key, value],
-        )
-        .map(|_| ())
-        .map_err(Into::into)
+        c.prepare_cached(KV_PUT_SQL)?
+            .execute(rusqlite::params![scope, key, value])
+            .map(|_| ())
+            .map_err(Into::into)
     })
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
 }
 
 /// Atomically apply a multi-key put.
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub fn put_many(scope: &str, entries: &[(String, String)]) -> anyhow::Result<()> {
     if entries.is_empty() {
         return with(scope, |_| ()).ok_or_else(|| anyhow::anyhow!("no db for {scope}"));
@@ -2783,10 +2911,7 @@ pub fn put_many(scope: &str, entries: &[(String, String)]) -> anyhow::Result<()>
         without_sql_authorizer_mut(c, |c| {
             if !c.is_autocommit() {
                 return with_batch_savepoint(c, |c| {
-                    let mut statement = c.prepare(
-                        "INSERT INTO _cf_KV(scope,k,v) VALUES(?1,?2,?3) \
-                     ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v",
-                    )?;
+                    let mut statement = c.prepare_cached(KV_PUT_SQL)?;
                     for (key, value) in entries {
                         statement.execute(rusqlite::params![scope, key, value])?;
                     }
@@ -2796,10 +2921,7 @@ pub fn put_many(scope: &str, entries: &[(String, String)]) -> anyhow::Result<()>
             let transaction =
                 c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             {
-                let mut statement = transaction.prepare(
-                    "INSERT INTO _cf_KV(scope,k,v) VALUES(?1,?2,?3) \
-                 ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v",
-                )?;
+                let mut statement = transaction.prepare_cached(KV_PUT_SQL)?;
                 for (key, value) in entries {
                     statement.execute(rusqlite::params![scope, key, value])?;
                 }
@@ -2818,10 +2940,7 @@ pub fn put_many_serialized(scope: &str, entries: &[(String, Vec<u8>)]) -> anyhow
     with_mut(scope, |c| {
         without_sql_authorizer_mut(c, |c| {
             let write = |c: &Connection| -> anyhow::Result<()> {
-                let mut statement = c.prepare(
-                    "INSERT INTO _cf_KV(scope,k,v) VALUES(?1,?2,?3) \
-                 ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v",
-                )?;
+                let mut statement = c.prepare_cached(KV_PUT_SQL)?;
                 for (key, value) in entries {
                     statement.execute(rusqlite::params![scope, key, value])?;
                 }
@@ -2842,7 +2961,8 @@ pub fn put_many_serialized(scope: &str, entries: &[(String, Vec<u8>)]) -> anyhow
 
 pub fn delete(scope: &str, key: &str) -> anyhow::Result<bool> {
     with(scope, |c| {
-        c.execute("DELETE FROM _cf_KV WHERE scope=?1 AND k=?2", [scope, key])
+        c.prepare_cached(KV_DELETE_SQL)?
+            .execute([scope, key])
             .map(|n| n > 0)
             .map_err(Into::into)
     })
@@ -2858,7 +2978,7 @@ pub fn delete_many(scope: &str, keys: &[String]) -> anyhow::Result<usize> {
         without_sql_authorizer_mut(c, |c| {
             if !c.is_autocommit() {
                 return with_batch_savepoint(c, |c| {
-                    let mut statement = c.prepare("DELETE FROM _cf_KV WHERE scope=?1 AND k=?2")?;
+                    let mut statement = c.prepare_cached(KV_DELETE_SQL)?;
                     let mut deleted = 0;
                     for key in keys {
                         deleted += statement.execute(rusqlite::params![scope, key])?;
@@ -2870,8 +2990,7 @@ pub fn delete_many(scope: &str, keys: &[String]) -> anyhow::Result<usize> {
                 c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let mut deleted = 0;
             {
-                let mut statement =
-                    transaction.prepare("DELETE FROM _cf_KV WHERE scope=?1 AND k=?2")?;
+                let mut statement = transaction.prepare_cached(KV_DELETE_SQL)?;
                 for key in keys {
                     deleted += statement.execute(rusqlite::params![scope, key])?;
                 }
@@ -2884,7 +3003,7 @@ pub fn delete_many(scope: &str, keys: &[String]) -> anyhow::Result<usize> {
 }
 
 /// List a half-open key range in bytewise SQLite text order.
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub fn list(
     scope: &str,
     begin: Option<&str>,
@@ -2897,7 +3016,7 @@ pub fn list(
 
 /// List storage using the full Durable Object key-filter surface. Predicates
 /// stay in SQLite so large objects are not materialized and filtered in V8.
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub fn list_with_options(
     scope: &str,
     begin: Option<&str>,
@@ -3220,20 +3339,20 @@ fn prefix_upper_bound(prefix: &str) -> Option<String> {
 
 /// A local SQLite transaction implementing the portable portion of Workerd's
 /// ActorCache transaction contract.
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub struct KvTransaction<'connection> {
     scope: String,
     transaction: rusqlite::Transaction<'connection>,
 }
 
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 impl KvTransaction<'_> {
     pub fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
-        match self.transaction.query_row(
-            "SELECT v FROM _cf_KV WHERE scope=?1 AND k=?2",
-            rusqlite::params![self.scope, key],
-            |row| row.get(0),
-        ) {
+        match self
+            .transaction
+            .prepare_cached(KV_GET_SQL)?
+            .query_row(rusqlite::params![self.scope, key], |row| row.get(0))
+        {
             Ok(value) => Ok(Some(value)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(error.into()),
@@ -3244,9 +3363,7 @@ impl KvTransaction<'_> {
         let mut keys = keys.to_vec();
         keys.sort();
         keys.dedup();
-        let mut statement = self
-            .transaction
-            .prepare("SELECT v FROM _cf_KV WHERE scope=?1 AND k=?2")?;
+        let mut statement = self.transaction.prepare_cached(KV_GET_SQL)?;
         let mut values = Vec::new();
         for key in keys {
             if let Some(value) = statement
@@ -3262,19 +3379,14 @@ impl KvTransaction<'_> {
     }
 
     pub fn put(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        self.transaction.execute(
-            "INSERT INTO _cf_KV(scope,k,v) VALUES(?1,?2,?3) \
-             ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v",
-            rusqlite::params![self.scope, key, value],
-        )?;
+        self.transaction
+            .prepare_cached(KV_PUT_SQL)?
+            .execute(rusqlite::params![self.scope, key, value])?;
         Ok(())
     }
 
     pub fn put_many(&self, entries: &[(String, String)]) -> anyhow::Result<()> {
-        let mut statement = self.transaction.prepare(
-            "INSERT INTO _cf_KV(scope,k,v) VALUES(?1,?2,?3) \
-             ON CONFLICT(scope,k) DO UPDATE SET v=excluded.v",
-        )?;
+        let mut statement = self.transaction.prepare_cached(KV_PUT_SQL)?;
         for (key, value) in entries {
             statement.execute(rusqlite::params![self.scope, key, value])?;
         }
@@ -3282,9 +3394,7 @@ impl KvTransaction<'_> {
     }
 
     pub fn delete_many(&self, keys: &[String]) -> anyhow::Result<usize> {
-        let mut statement = self
-            .transaction
-            .prepare("DELETE FROM _cf_KV WHERE scope=?1 AND k=?2")?;
+        let mut statement = self.transaction.prepare_cached(KV_DELETE_SQL)?;
         let mut deleted = 0;
         for key in keys {
             deleted += statement.execute(rusqlite::params![self.scope, key])?;
@@ -3350,7 +3460,7 @@ impl KvTransaction<'_> {
 }
 
 /// Run a KV transaction and commit only if the callback succeeds.
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub fn transaction<T>(
     scope: &str,
     callback: impl FnOnce(&KvTransaction<'_>) -> anyhow::Result<T>,
@@ -3427,6 +3537,14 @@ pub fn delete_all_with_alarm(scope: &str, delete_alarm: bool) -> anyhow::Result<
             let result = (|| -> anyhow::Result<()> {
                 for table in tables {
                     if table == "_cf_METADATA" || (!delete_alarm && table == "_cf_ALARM") {
+                        continue;
+                    }
+                    // The ltx replicator owns its control tables. Dropping
+                    // them here fails every subsequent WAL capture for the
+                    // cell ("no such table: _litestream_seq") until the
+                    // database is reopened, which also wedges the output
+                    // gate: writes after deleteAll() can never prove durable.
+                    if celld_ltx::db::is_control_table(&table) {
                         continue;
                     }
                     let quoted = table.replace('"', "\"\"");
@@ -3664,7 +3782,7 @@ pub fn finish_alarm_handler_with_retry_policy(
 }
 
 /// Delete the fired alarm unless the handler re-armed it to the future.
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub fn clear_alarm_if_due(scope: &str, fired_at_ms: i64) {
     with(scope, |c| {
         c.execute(
@@ -3702,79 +3820,5 @@ pub fn bump_alarm_with_policy(scope: &str, now_ms: i64, counts_against_limit: bo
     publish_alarm(scope);
 }
 
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 include!(env!("CELLD_INTERNAL_STORAGE_OBSERVERS"));
-
-/// Externally injected storage tests.
-///
-/// These cases drive this module's own functions, so unlike the Web-platform
-/// suites they say nothing about the shell around them.
-#[cfg(all(test, celld_internal_tests))]
-mod conformance_actor_cache_tests {
-    include!(env!("CELLD_CONFORMANCE_ACTOR_CACHE_TESTS"));
-}
-
-#[cfg(all(test, celld_internal_tests))]
-mod conformance_actor_sqlite_tests {
-    include!(env!("CELLD_CONFORMANCE_ACTOR_SQLITE_TESTS"));
-}
-
-#[cfg(all(test, celld_internal_tests))]
-mod conformance_sqlite_kv_tests {
-    include!(env!("CELLD_CONFORMANCE_SQLITE_KV_TESTS"));
-}
-
-#[cfg(test)]
-mod internal_table_names {
-    use super::*;
-
-    /// denoland/celld#122: celld's tables were `kv`, `alarms` and
-    /// `cell_metadata`, which an application can collide with and which a
-    /// library that keeps only `_cf_*` will drop. Opening an existing cell
-    /// must carry it to the Cloudflare names without losing a row.
-    #[test]
-    fn legacy_tables_are_renamed_in_place() {
-        let file = std::env::temp_dir().join(format!("celld-rename-{}.sqlite", std::process::id()));
-        let _ = std::fs::remove_file(&file);
-        let connection = Connection::open(&file).expect("open");
-
-        // The pre-2026-08-06 schema, with a row worth keeping.
-        connection
-            .execute_batch(
-                "CREATE TABLE kv (scope TEXT, k TEXT, v TEXT, PRIMARY KEY(scope,k));
-                 CREATE TABLE alarms (scope TEXT PRIMARY KEY, at_ms INTEGER);
-                 CREATE TABLE cell_metadata (scope TEXT PRIMARY KEY, actor_name TEXT);
-                 INSERT INTO kv VALUES('s','k','v');",
-            )
-            .expect("legacy schema");
-
-        schema(&connection).expect("migrate");
-
-        let names: Vec<String> = {
-            let mut statement = connection
-                .prepare(
-                    "SELECT name FROM sqlite_schema WHERE type='table' \
-                     AND name NOT LIKE 'sqlite_%' ORDER BY name",
-                )
-                .expect("prepare");
-            let rows = statement
-                .query_map([], |row| row.get::<_, String>(0))
-                .expect("query");
-            rows.collect::<rusqlite::Result<Vec<_>>>().expect("collect")
-        };
-        assert_eq!(names, ["_cf_ALARM", "_cf_KV", "_cf_METADATA"]);
-
-        let kept: String = connection
-            .query_row("SELECT v FROM _cf_KV WHERE k='k'", [], |row| row.get(0))
-            .expect("the row survives the rename");
-        assert_eq!(kept, "v");
-
-        // Idempotent: opening an already-migrated cell is a no-op.
-        schema(&connection).expect("second open");
-        let kept_again: String = connection
-            .query_row("SELECT v FROM _cf_KV WHERE k='k'", [], |row| row.get(0))
-            .expect("still there");
-        assert_eq!(kept_again, "v");
-        let _ = std::fs::remove_file(&file);
-    }
-}

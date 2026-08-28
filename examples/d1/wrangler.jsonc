@@ -2,10 +2,6 @@
   "name": "d1",
   "main": "index.js",
   "compatibility_date": "2026-01-01",
-  // The binding is the whole configuration: a D1 database is a cell of a class
-  // the runtime supplies, so there is no `durable_objects` or `migrations`
-  // entry. `database_name` addresses the cell. celld has no account to scope a
-  // `database_id` to, so it accepts the field and ignores it.
   "d1_databases": [
     {
       "binding": "DB",

@@ -18,8 +18,7 @@
 //! ## Scope: L0-only, single replica
 //! The real `litestream v0.5.11` L0-only architecture stores **everything at
 //! level 0** — the snapshot (MinTXID==1) and every incremental — under
-//! `ltx/0/` (verified against `tests/fixtures/golden/replica`, captured from
-//! `litestream replicate -once`). The snapshot level (`SnapshotLevel = 9`,
+//! `ltx/0/`. The snapshot level (`SnapshotLevel = 9`,
 //! compaction_level.go:9) is empty without compaction. [`calc_restore_plan`] is
 //! ported faithfully (snapshot anchor at `SnapshotLevel` + per-level cursors so
 //! adding compaction later "just works"), but in this scope the plan is the
@@ -27,15 +26,19 @@
 //!
 //! ## Deferred work that needs a background runtime or additional scope
 //! * **Follow mode** (`replica.go:730-987`, `applyLTXFile`/`fillFollowGap`): the
-//!   continuous tail-restore loop. The one-shot G2 gate is a single restore.
-//! * **The background monitor goroutine + backoff** (`replica.go:326-441`,
-//!   footgun F-13) and `Start`/`Stop`: need a Tokio task owning the `Db`; the
-//!   synchronous `sync()` primitive it would call is implemented and tested here.
+//!   continuous tail-restore loop. The current API performs one restore.
+//! * **The background monitor goroutine + backoff** (`replica.go:326-441`) and
+//!   `Start`/`Stop`: need a Tokio task owning the `Db`; the
+//!   synchronous `sync()` primitive it would call is implemented here.
 //! * **V3 (v0.3.x generation) restore** (`RestoreV3`, replica.go:990-1096) is not
 //!   included because celld has no earlier replica generation to support.
 //! * **Timestamp / `-txid` targeted restore plumbing through the public API**:
-//!   [`calc_restore_plan`] honors a target TXID (used by tests), but the
+//!   [`calc_restore_plan`] honors a target TXID, but the
 //!   timestamp path and `RestoreOptions` surface stay minimal for the one-shot.
+
+// Restore phase durations are diagnostics in this stand-alone public crate.
+// celld injects its scheduling facilities at the engine boundary.
+#![allow(clippy::disallowed_methods)]
 
 use crate::client::ReplicaClient;
 use crate::db::Db;
@@ -45,10 +48,10 @@ use crate::{Pos, TXID};
 use futures_util::stream;
 use futures_util::StreamExt;
 use futures_util::TryStreamExt;
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Semaphore;
 
 /// Keep enough reads in flight to hide an object store's round-trip latency,
@@ -62,6 +65,10 @@ const RESTORE_DOWNLOAD_CONCURRENCY: usize = 64;
 /// [`calc_restore_plan`] still probes it first so the algorithm stays a faithful
 /// port that works the moment compaction is added.
 pub use crate::compaction_level::SNAPSHOT_LEVEL;
+
+/// The number of compaction levels that one restore-plan calculation can list
+/// concurrently. A caller-supplied semaphore still bounds all remote requests.
+const RESTORE_PLAN_CONCURRENCY: usize = SNAPSHOT_LEVEL as usize + 1;
 
 /// Whether a sync error means the cached replica position can no longer be
 /// trusted and must be re-derived from the store on the next sync.
@@ -89,7 +96,7 @@ fn pos_untrustworthy(err: &Error) -> bool {
 /// are intentionally omitted here (see module docs).
 pub struct Replica<C: ReplicaClient> {
     /// The database being replicated. `None` for a restore-only replica (the Go
-    /// `NewReplicaWithClient(nil, client)` shape used by the restore tests).
+    /// `NewReplicaWithClient(nil, client)` restore-only shape).
     db: Option<Db>,
 
     /// Client used to connect to the remote replica.
@@ -409,6 +416,15 @@ pub struct RestorePlanStats {
     pub by_level: BTreeMap<i32, usize>,
 }
 
+/// Wall-clock phases for one successful restore.
+#[derive(Debug, Clone)]
+pub struct RestoreTimingStats {
+    pub plan: RestorePlanStats,
+    pub plan_us: u64,
+    pub download_us: u64,
+    pub apply_us: u64,
+}
+
 /// Restores a database like [`restore`], but downloads independent LTX files
 /// concurrently. All restores that share `download_slots` share one hard I/O
 /// ceiling, so a cold cohort cannot multiply the limit per cell.
@@ -436,8 +452,64 @@ pub async fn restore_with_host_and_download_slots<C: ReplicaClient>(
     host: crate::LtxHost,
     download_slots: Arc<Semaphore>,
 ) -> Result<RestorePlanStats> {
-    let output_path = output_path.as_ref();
+    Ok(
+        restore_timed_with_host_and_download_slots(client, output_path, txid, host, download_slots)
+            .await?
+            .plan,
+    )
+}
 
+/// Restores a database and reports the plan, download, and local apply times.
+pub async fn restore_timed_with_download_slots<C: ReplicaClient>(
+    client: &C,
+    output_path: impl AsRef<Path>,
+    txid: TXID,
+    download_slots: Arc<Semaphore>,
+) -> Result<RestoreTimingStats> {
+    restore_timed_with_host_and_download_slots(
+        client,
+        output_path,
+        txid,
+        crate::LtxHost::default(),
+        download_slots,
+    )
+    .await
+}
+
+/// Restores a database through an injected local filesystem and reports the
+/// plan, download, and local apply times.
+pub async fn restore_timed_with_host_and_download_slots<C: ReplicaClient>(
+    client: &C,
+    output_path: impl AsRef<Path>,
+    txid: TXID,
+    host: crate::LtxHost,
+    download_slots: Arc<Semaphore>,
+) -> Result<RestoreTimingStats> {
+    let output_path = output_path.as_ref();
+    ensure_restore_output_absent(&host, output_path)?;
+    let plan_started = Instant::now();
+    let infos = calc_restore_plan_with_slots(client, txid, download_slots.clone()).await?;
+    let plan_us = plan_started.elapsed().as_micros() as u64;
+    restore_from_plan_inner(client, output_path, infos, host, download_slots, plan_us).await
+}
+
+/// Restores a database from a plan which [`calc_restore_plan`] produced.
+///
+/// This path lets a caller reuse the exact plan that fixed an epoch seal. It
+/// therefore avoids a second remote listing before it downloads the files.
+pub async fn restore_from_plan_with_download_slots<C: ReplicaClient>(
+    client: &C,
+    output_path: impl AsRef<Path>,
+    plan: Vec<FileInfo>,
+    download_slots: Arc<Semaphore>,
+) -> Result<RestoreTimingStats> {
+    let output_path = output_path.as_ref();
+    let host = crate::LtxHost::default();
+    ensure_restore_output_absent(&host, output_path)?;
+    restore_from_plan_inner(client, output_path, plan, host, download_slots, 0).await
+}
+
+fn ensure_restore_output_absent(host: &crate::LtxHost, output_path: &Path) -> Result<()> {
     // Ensure output path does not already exist (replica.go:591-595).
     match host.metadata(output_path) {
         Ok(_) => {
@@ -452,10 +524,17 @@ pub async fn restore_with_host_and_download_slots<C: ReplicaClient>(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
+    Ok(())
+}
 
-    // Build the restore plan (replica.go:611).
-    let infos = calc_restore_plan(client, txid).await?;
-
+async fn restore_from_plan_inner<C: ReplicaClient>(
+    client: &C,
+    output_path: &Path,
+    infos: Vec<FileInfo>,
+    host: crate::LtxHost,
+    download_slots: Arc<Semaphore>,
+    plan_us: u64,
+) -> Result<RestoreTimingStats> {
     // Validate the whole plan before starting I/O. An invalid later entry must
     // not cause a partial download burst before the restore fails.
     for info in &infos {
@@ -486,6 +565,7 @@ pub async fn restore_with_host_and_download_slots<C: ReplicaClient>(
     // Files are independent reads. `buffered` overlaps them but yields them in
     // plan order, which preserves the compactor input contract. The shared
     // semaphore is the node-level ceiling across every concurrent restore.
+    let download_started = Instant::now();
     let files: Vec<Vec<u8>> = stream::iter(infos)
         .map(|info| {
             let download_slots = download_slots.clone();
@@ -503,12 +583,14 @@ pub async fn restore_with_host_and_download_slots<C: ReplicaClient>(
         .buffered(RESTORE_DOWNLOAD_CONCURRENCY)
         .try_collect()
         .await?;
+    let download_us = download_started.elapsed().as_micros() as u64;
 
     if files.is_empty() {
         return Err(Error::Other("no matching backup files available".into()));
     }
 
     // Merge the files (compactor) and reconstruct the SQLite database image.
+    let apply_started = Instant::now();
     let image = build_database_image(&files)?;
 
     // Create the parent directory if needed (replica.go:649-655).
@@ -521,8 +603,14 @@ pub async fn restore_with_host_and_download_slots<C: ReplicaClient>(
     // Output to a temp file & atomically rename (replica.go:657-694).
     let tmp_output_path = append_ext(output_path, "tmp");
     write_file_atomic(&host, &tmp_output_path, output_path, &image)?;
+    let apply_us = apply_started.elapsed().as_micros() as u64;
 
-    Ok(stats)
+    Ok(RestoreTimingStats {
+        plan: stats,
+        plan_us,
+        download_us,
+        apply_us,
+    })
 }
 
 /// Returns the ordered list of LTX files needed to restore the database at
@@ -535,23 +623,43 @@ pub async fn restore_with_host_and_download_slots<C: ReplicaClient>(
 /// snapshot anchor lives at L0 (MinTXID==1) and the only cursor with files is
 /// level 0, so the result is the contiguous chain `1..=N` (capped at `txid`).
 pub async fn calc_restore_plan<C: ReplicaClient>(client: &C, txid: TXID) -> Result<Vec<FileInfo>> {
+    calc_restore_plan_with_slots(
+        client,
+        txid,
+        Arc::new(Semaphore::new(RESTORE_PLAN_CONCURRENCY)),
+    )
+    .await
+}
+
+/// Calculates a restore plan while a shared semaphore bounds remote listings.
+pub async fn calc_restore_plan_with_slots<C: ReplicaClient>(
+    client: &C,
+    txid: TXID,
+    request_slots: Arc<Semaphore>,
+) -> Result<Vec<FileInfo>> {
     let mut infos: Vec<FileInfo> = Vec::new();
 
-    // One listing per level, issued CONCURRENTLY: the plan consumes every
-    // level's listing regardless, and a serial walk costs one storage
-    // round trip per level — measured as the whole eviction durability
-    // proof and most of a cold restore's planning time on a real object
-    // store. The consumption order below is unchanged.
-    let level_lists = futures_util::future::join_all(
-        (0..=SNAPSHOT_LEVEL).map(|level| client.ltx_files(level, TXID(0))),
-    )
-    .await;
-    let mut level_lists: Vec<Vec<FileInfo>> = level_lists
-        .into_iter()
-        .collect::<Result<Vec<Vec<FileInfo>>>>()?;
-    let snapshot_files = level_lists
-        .pop()
-        .expect("SNAPSHOT_LEVEL listing is always requested");
+    // Every level is independent. List them together instead of paying ten
+    // object-store round trips in series. The shared request slots keep a cold
+    // cohort from multiplying this fan-out by its activation count.
+    let levels: Vec<(i32, Vec<FileInfo>)> = stream::iter((0..=SNAPSHOT_LEVEL).rev())
+        .map(|level| {
+            let request_slots = request_slots.clone();
+            async move {
+                let _permit = request_slots
+                    .acquire_owned()
+                    .await
+                    .expect("restore request semaphore closed");
+                Ok::<_, Error>((level, client.ltx_files(level, TXID(0)).await?))
+            }
+        })
+        .buffered(RESTORE_PLAN_CONCURRENCY)
+        .try_collect()
+        .await?;
+    let mut levels = levels.into_iter().collect::<BTreeMap<_, _>>();
+
+    // Start with the latest snapshot before the target TXID (replica.go:1430-1452).
+    let snapshot_files = levels.remove(&SNAPSHOT_LEVEL).unwrap_or_default();
     let mut snapshot: Option<FileInfo> = None;
     for info in snapshot_files {
         if txid != TXID(0) && info.max_txid > txid {
@@ -575,8 +683,8 @@ pub async fn calc_restore_plan<C: ReplicaClient>(client: &C, txid: TXID) -> Resu
 
     // Build a cursor per level, highest level first (replica.go:1463-1473).
     let mut cursors: Vec<RestoreLevelCursor> = Vec::with_capacity((max_level + 1) as usize);
-    for _ in (0..=max_level).rev() {
-        let files = level_lists.pop().expect("one listing per level");
+    for level in (0..=max_level).rev() {
+        let files = levels.remove(&level).unwrap_or_default();
         cursors.push(RestoreLevelCursor::new(files));
     }
 
@@ -800,13 +908,29 @@ fn build_database_image(files: &[Vec<u8>]) -> Result<Vec<u8>> {
         } else {
             page_size = Some(header.page_size);
         }
-        commit = Some(header.commit);
+        let previous_commit = commit.unwrap_or(0);
+        if header.commit > previous_commit {
+            let present: HashSet<u32> = pages.iter().map(|(pgno, _)| *pgno).collect();
+            let lock = ltx::lock_pgno(header.page_size);
+            for pgno in (previous_commit + 1)..=header.commit {
+                if pgno != lock && !present.contains(&pgno) && !merged.contains_key(&pgno) {
+                    return Err(Error::Other(
+                        format!(
+                            "missing newly committed page {pgno} in LTX transaction {} (database grew from {previous_commit} to {} pages)",
+                            header.max_txid, header.commit,
+                        )
+                        .into(),
+                    ));
+                }
+            }
+        }
 
         // Inputs arrive oldest to newest, so moving each page into the map makes
         // the latest input win without a second staging collection or clone.
         for (pgno, data) in pages {
             merged.insert(pgno, data);
         }
+        commit = Some(header.commit);
     }
 
     let (Some(page_size), Some(commit)) = (page_size, commit) else {
@@ -875,484 +999,26 @@ fn write_file_atomic(
     result
 }
 
-#[cfg(test)]
-// Unit tests inspect materialized file-format fixtures outside production.
-#[allow(clippy::disallowed_methods)]
-mod tests {
+#[doc(hidden)]
+pub mod internal {
     use super::*;
-    use crate::client::file::FileReplicaClient;
-    use crate::ltx::{Header, HEADER_FLAG_NO_CHECKSUM, VERSION};
 
-    /// Builds a single-page incremental LTX file (`NoChecksum`), mirroring the Go
-    /// `mustBuildIncrementalLTX` helper (replica_internal_test.go:285-315): one
-    /// page `pgno` filled with `fill`, `commit = pgno`.
-    fn build_incremental_ltx(
+    pub const RESTORE_PLAN_CONCURRENCY: usize = super::RESTORE_PLAN_CONCURRENCY;
+
+    pub async fn upload_ltx_file<C: ReplicaClient>(
+        replica: &mut Replica<C>,
+        level: i32,
         min_txid: TXID,
         max_txid: TXID,
-        page_size: u32,
-        pgno: u32,
-        fill: u8,
-    ) -> Vec<u8> {
-        let header = Header {
-            version: VERSION,
-            flags: HEADER_FLAG_NO_CHECKSUM,
-            page_size,
-            commit: pgno,
-            min_txid,
-            max_txid,
-            timestamp: 1_000,
-            pre_apply_checksum: 0,
-            wal_offset: 0,
-            wal_size: 0,
-            wal_salt1: 0,
-            wal_salt2: 0,
-            node_id: 0,
-        };
-        let pages = vec![(pgno, vec![fill; page_size as usize])];
-        ltx::encode_file(&header, &pages, 0).expect("encode incremental ltx")
+    ) -> Result<()> {
+        replica.upload_ltx_file(level, min_txid, max_txid).await
     }
 
-    /// Builds a snapshot LTX file (MinTXID==1, tracked checksum) covering pages
-    /// `1..=commit`, each page filled with a per-page byte. The lock page is
-    /// skipped, exactly as the capture loop does.
-    fn build_snapshot_ltx(max_txid: TXID, page_size: u32, commit: u32) -> Vec<u8> {
-        let lock = ltx::lock_pgno(page_size);
-        let mut pages: Vec<(u32, Vec<u8>)> = Vec::new();
-        let mut rolling = crate::CHECKSUM_FLAG;
-        for pgno in 1..=commit {
-            if pgno == lock {
-                continue;
-            }
-            let data = vec![(pgno & 0xff) as u8; page_size as usize];
-            rolling = crate::CHECKSUM_FLAG | (rolling ^ ltx::checksum_page(pgno, &data));
-            pages.push((pgno, data));
-        }
-        let header = Header {
-            version: VERSION,
-            flags: 0,
-            page_size,
-            commit,
-            min_txid: TXID(1),
-            max_txid,
-            timestamp: 1_000,
-            pre_apply_checksum: 0,
-            wal_offset: 0,
-            wal_size: 0,
-            wal_salt1: 0,
-            wal_salt2: 0,
-            node_id: 0,
-        };
-        ltx::encode_file(&header, &pages, rolling).expect("encode snapshot ltx")
+    pub fn build_database_image(files: &[Vec<u8>]) -> Result<Vec<u8>> {
+        super::build_database_image(files)
     }
 
-    // Port of TestReplica_UploadLTXFile_OpenErrorReturnsLTXError/MissingFile
-    // (replica_internal_test.go:143-160): a missing local LTX file makes
-    // uploadLTXFile return an LTXError{op:"open"}.
-    #[tokio::test]
-    async fn upload_ltx_file_missing_returns_ltx_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(dir.path().join("test.db")).unwrap();
-        let client =
-            FileReplicaClient::new(dir.path().join("replica").to_string_lossy().into_owned());
-        let mut r = Replica::new(db, client);
-
-        // No local LTX file for TXID 1 exists yet (we never synced the Db).
-        let err = r
-            .upload_ltx_file(0, TXID(1), TXID(1))
-            .await
-            .expect_err("expected error for missing LTX file");
-        match err {
-            Error::Ltx(e) => assert_eq!(e.op, "open", "op must be open"),
-            other => panic!("expected LTXError, got {other:?}"),
-        }
-    }
-
-    // check_database_behind_replica is a NO-OP when the replica is empty: it must
-    // never disturb local state just because there is nothing remote (issue #781
-    // guard, db.go:1228-1230). A restore-only replica (no DB) is also a clean
-    // no-op (the `db is None` branch).
-    #[tokio::test]
-    async fn check_behind_replica_noop_when_remote_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(dir.path().join("test.db")).unwrap();
-        let client =
-            FileReplicaClient::new(dir.path().join("replica").to_string_lossy().into_owned());
-        let mut r = Replica::new(db, client);
-        // Empty remote → Ok, no panic, no state change.
-        r.check_database_behind_replica()
-            .await
-            .expect("empty remote is a clean no-op");
-
-        // Same for a client-only replica with no DB.
-        let client2 =
-            FileReplicaClient::new(dir.path().join("replica2").to_string_lossy().into_owned());
-        let mut r2 = Replica::new_client_only(client2);
-        r2.check_database_behind_replica()
-            .await
-            .expect("no-DB replica is a clean no-op");
-    }
-
-    // When the database is already at or ahead of the replica, the check is a
-    // no-op and must NOT delete the local L0 chain (db.go:1232-1235). We build a
-    // tiny local+remote pair at the same TXID and assert the local snapshot
-    // survives the call.
-    #[tokio::test]
-    async fn check_behind_replica_noop_when_db_ahead_preserves_local() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(dir.path().join("test.db")).unwrap();
-        let client =
-            FileReplicaClient::new(dir.path().join("replica").to_string_lossy().into_owned());
-        let mut r = Replica::new(db, client);
-
-        // Seed BOTH local and remote with a snapshot at TXID 1 (DB == replica).
-        let page_size = 512u32;
-        let snap = build_snapshot_ltx(TXID(1), page_size, 2);
-        // Local L0 file (so db.pos() == 1).
-        let local_path = r.db().unwrap().ltx_path(0, TXID(1), TXID(1));
-        std::fs::create_dir_all(Path::new(&local_path).parent().unwrap()).unwrap();
-        std::fs::write(&local_path, &snap).unwrap();
-        // Remote L0 file at the same TXID.
-        r.client
-            .write_ltx_file(0, TXID(1), TXID(1), &snap)
-            .await
-            .unwrap();
-
-        let before = std::fs::read(&local_path).unwrap();
-        r.check_database_behind_replica()
-            .await
-            .expect("db == replica is a no-op");
-        let after = std::fs::read(&local_path).expect("local L0 file must survive");
-        assert_eq!(
-            before, after,
-            "local L0 chain untouched when DB is not behind"
-        );
-    }
-
-    // build_database_image merges a snapshot + incrementals like the compactor:
-    // the latest input wins per page, and the final Commit bounds the size.
-    #[test]
-    fn build_image_latest_page_wins_and_commit_bounds() {
-        let page_size = 512u32;
-        // Snapshot: 3 pages (commit=3), page bytes 1,2,3.
-        let snap = build_snapshot_ltx(TXID(1), page_size, 3);
-        // Incremental at TXID 2 rewrites page 2 to 0xEE (commit stays 2 in the
-        // helper, but the final image size is the LAST input's commit).
-        let inc2 = build_incremental_ltx(TXID(2), TXID(2), page_size, 2, 0xEE);
-        // Incremental at TXID 3 grows to page 4 (commit=4), page 4 = 0x44.
-        let inc3 = build_incremental_ltx(TXID(3), TXID(3), page_size, 4, 0x44);
-
-        let image = build_database_image(&[snap, inc2, inc3]).expect("merge");
-        assert_eq!(
-            image.len(),
-            4 * page_size as usize,
-            "final commit=4 bounds size"
-        );
-
-        let page =
-            |n: u32| &image[(n - 1) as usize * page_size as usize..n as usize * page_size as usize];
-        assert_eq!(page(1)[0], 1, "page 1 from snapshot");
-        assert_eq!(
-            page(2)[0],
-            0xEE,
-            "page 2 overwritten by the latest input (TXID 2)"
-        );
-        assert_eq!(page(3)[0], 3, "page 3 from snapshot, untouched");
-        assert_eq!(page(4)[0], 0x44, "page 4 added by TXID 3");
-    }
-
-    // A page beyond the final commit is dropped (compactor truncation,
-    // compactor.go:217).
-    #[test]
-    fn build_image_drops_pages_beyond_final_commit() {
-        let page_size = 512u32;
-        // Snapshot has 5 pages; the final incremental shrinks commit to 2.
-        let snap = build_snapshot_ltx(TXID(1), page_size, 5);
-        let inc = build_incremental_ltx(TXID(2), TXID(2), page_size, 2, 0xAB);
-        let image = build_database_image(&[snap, inc]).expect("merge");
-        assert_eq!(
-            image.len(),
-            2 * page_size as usize,
-            "shrunk to commit=2; pages 3-5 dropped"
-        );
-    }
-
-    // restore() reconstructs a DB byte-image equal to decoding the snapshot alone
-    // when there are no incrementals (the single-file plan).
-    #[test]
-    fn build_image_single_snapshot_matches_decode_database_image() {
-        let page_size = 1024u32;
-        let snap = build_snapshot_ltx(TXID(1), page_size, 4);
-        let via_merge = build_database_image(std::slice::from_ref(&snap)).expect("merge");
-        let via_decoder = ltx::decode_database_image(&snap).expect("decode image");
-        assert_eq!(
-            via_merge, via_decoder,
-            "single-file merge == DecodeDatabaseTo"
-        );
-    }
-
-    // A corrupt input is rejected by build_database_image (decode_file verifies
-    // the file checksum before any page is used).
-    #[test]
-    fn build_image_rejects_corrupt_input() {
-        let page_size = 512u32;
-        let mut snap = build_snapshot_ltx(TXID(1), page_size, 2);
-        let mid = ltx::HEADER_SIZE + (snap.len() - ltx::HEADER_SIZE) / 2;
-        snap[mid] ^= 0x01;
-        let err = build_database_image(&[snap]).expect_err("corruption must be caught");
-        assert!(
-            matches!(err, Error::ChecksumMismatch | Error::LTXCorrupted),
-            "corrupt LTX rejected, got {err:?}"
-        );
-    }
-
-    // calc_restore_plan over a file client with an L0-only chain returns the
-    // contiguous snapshot+incrementals in TXID order, and refusing to restore
-    // when nothing is present returns TxNotAvailable.
-    #[tokio::test]
-    async fn calc_restore_plan_l0_chain_and_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let client = FileReplicaClient::new(dir.path().to_string_lossy().into_owned());
-
-        // Empty replica -> TxNotAvailable.
-        let err = calc_restore_plan(&client, TXID(0))
-            .await
-            .expect_err("empty replica");
-        assert!(
-            matches!(err, Error::TxNotAvailable),
-            "empty -> TxNotAvailable"
-        );
-
-        // Write a snapshot at TXID 1 (L0) + two incrementals.
-        let page_size = 512u32;
-        let snap = build_snapshot_ltx(TXID(1), page_size, 2);
-        client
-            .write_ltx_file(0, TXID(1), TXID(1), &snap)
-            .await
-            .unwrap();
-        let inc2 = build_incremental_ltx(TXID(2), TXID(2), page_size, 2, 0x22);
-        client
-            .write_ltx_file(0, TXID(2), TXID(2), &inc2)
-            .await
-            .unwrap();
-        let inc3 = build_incremental_ltx(TXID(3), TXID(3), page_size, 2, 0x33);
-        client
-            .write_ltx_file(0, TXID(3), TXID(3), &inc3)
-            .await
-            .unwrap();
-
-        let plan = calc_restore_plan(&client, TXID(0)).await.expect("plan");
-        let txids: Vec<u64> = plan.iter().map(|f| f.max_txid.0).collect();
-        assert_eq!(txids, vec![1, 2, 3], "contiguous L0 chain in TXID order");
-
-        // Targeted restore to TXID 2 stops the plan at 2.
-        let plan2 = calc_restore_plan(&client, TXID(2)).await.expect("plan@2");
-        let txids2: Vec<u64> = plan2.iter().map(|f| f.max_txid.0).collect();
-        assert_eq!(txids2, vec![1, 2], "plan capped at the target TXID");
-    }
-
-    // After a continuity break, the L0-only capture loop re-emits a FULL snapshot
-    // at a later TXID (MinTXID==1, MaxTXID==N) alongside the earlier per-txn
-    // files. calc_restore_plan must select that wider snapshot (it extends the
-    // longest contiguous range), exactly as the compactor needs — and the merged
-    // image must reconstruct correctly from snapshot 1-3 + incremental 4.
-    #[tokio::test]
-    async fn calc_restore_plan_prefers_wider_reemitted_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
-        let client = FileReplicaClient::new(dir.path().to_string_lossy().into_owned());
-        let page_size = 512u32;
-
-        // Original chain: snapshot 1-1 + incrementals 2,3 (each rewrites page 2).
-        client
-            .write_ltx_file(
-                0,
-                TXID(1),
-                TXID(1),
-                &build_snapshot_ltx(TXID(1), page_size, 2),
-            )
-            .await
-            .unwrap();
-        client
-            .write_ltx_file(
-                0,
-                TXID(2),
-                TXID(2),
-                &build_incremental_ltx(TXID(2), TXID(2), page_size, 2, 0x22),
-            )
-            .await
-            .unwrap();
-        client
-            .write_ltx_file(
-                0,
-                TXID(3),
-                TXID(3),
-                &build_incremental_ltx(TXID(3), TXID(3), page_size, 2, 0x33),
-            )
-            .await
-            .unwrap();
-        // Continuity break: a re-emitted snapshot 1-3 (covers the whole DB at TXID 3).
-        client
-            .write_ltx_file(
-                0,
-                TXID(1),
-                TXID(3),
-                &build_snapshot_ltx(TXID(3), page_size, 2),
-            )
-            .await
-            .unwrap();
-        // A new incremental on top of the re-emitted snapshot.
-        client
-            .write_ltx_file(
-                0,
-                TXID(4),
-                TXID(4),
-                &build_incremental_ltx(TXID(4), TXID(4), page_size, 2, 0x44),
-            )
-            .await
-            .unwrap();
-
-        let plan = calc_restore_plan(&client, TXID(0)).await.expect("plan");
-        // The wider snapshot (1-3) is chosen over snapshot 1-1, then incremental 4
-        // extends it — a contiguous, minimal chain reaching TXID 4.
-        let pairs: Vec<(u64, u64)> = plan.iter().map(|f| (f.min_txid.0, f.max_txid.0)).collect();
-        assert_eq!(
-            pairs,
-            vec![(1, 3), (4, 4)],
-            "wider re-emitted snapshot anchors the plan; incremental 4 extends it"
-        );
-
-        // And the merge reconstructs: page 2 takes incremental 4's 0x44.
-        let mut datas = Vec::new();
-        for info in &plan {
-            datas.push(
-                client
-                    .open_ltx_file(info.level, info.min_txid, info.max_txid)
-                    .await
-                    .unwrap(),
-            );
-        }
-        let image = build_database_image(&datas).expect("merge re-emitted chain");
-        assert_eq!(image.len(), 2 * page_size as usize, "commit=2");
-        assert_eq!(
-            image[page_size as usize], 0x44,
-            "page 2 reflects the newest incremental"
-        );
-    }
-
-    // A client that fails the first `write_ltx_file` with a preloaded error and
-    // then delegates, so a single sync's upload can be made to fail on demand.
-    // `poison_list` makes every `ltx_files` (the `calc_pos` listing) fail, so a
-    // test can prove a seeded sync never lists.
-    struct FaultyClient {
-        inner: FileReplicaClient,
-        fail_first_write: std::sync::Mutex<Option<Error>>,
-        poison_list: bool,
-    }
-
-    impl FaultyClient {
-        fn new(inner: FileReplicaClient, err: Error) -> Self {
-            Self {
-                inner,
-                fail_first_write: std::sync::Mutex::new(Some(err)),
-                poison_list: false,
-            }
-        }
-        fn poisoning_list(inner: FileReplicaClient) -> Self {
-            Self {
-                inner,
-                fail_first_write: std::sync::Mutex::new(None),
-                poison_list: true,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ReplicaClient for FaultyClient {
-        async fn ltx_files(&self, l: i32, s: TXID) -> Result<Vec<FileInfo>> {
-            if self.poison_list {
-                return Err(Error::Other("list poisoned".into()));
-            }
-            self.inner.ltx_files(l, s).await
-        }
-        async fn open_ltx_file(&self, l: i32, mn: TXID, mx: TXID) -> Result<Vec<u8>> {
-            self.inner.open_ltx_file(l, mn, mx).await
-        }
-        async fn write_ltx_file(&self, l: i32, mn: TXID, mx: TXID, d: &[u8]) -> Result<FileInfo> {
-            if let Some(e) = self.fail_first_write.lock().unwrap().take() {
-                return Err(e);
-            }
-            self.inner.write_ltx_file(l, mn, mx, d).await
-        }
-        async fn delete_ltx_files(&self, f: &[FileInfo]) -> Result<()> {
-            self.inner.delete_ltx_files(f).await
-        }
-        async fn delete_all(&self) -> Result<()> {
-            self.inner.delete_all().await
-        }
-    }
-
-    // The classifier that decides whether a sync error invalidates the cached
-    // position: only state-divergence errors do; transient store/IO ones do not.
-    #[test]
-    fn pos_untrustworthy_splits_divergence_from_transient() {
-        assert!(pos_untrustworthy(&Error::ChecksumMismatch));
-        assert!(pos_untrustworthy(&Error::LTXCorrupted));
-        assert!(pos_untrustworthy(&Error::LTXMissing));
-        assert!(pos_untrustworthy(&Error::TxNotAvailable));
-        assert!(pos_untrustworthy(&Error::NoSnapshots));
-        assert!(!pos_untrustworthy(&Error::Other("429 slow down".into())));
-        assert!(!pos_untrustworthy(&Error::Io(std::io::Error::from(
-            std::io::ErrorKind::TimedOut
-        ))));
-    }
-
-    // A failed upload must NOT discard the cached position: a fenced single
-    // writer keeps it and retries (an idempotent overwrite) rather than re-
-    // deriving it with a `calc_pos` listing. `sync_inner` wraps every store
-    // error as `Error::Other`, so this is the shape every real upload/list
-    // failure takes -- the exact case the old clear-on-any-error turned into a
-    // listing storm on a rate-limiting store.
-    #[tokio::test]
-    async fn transient_upload_error_keeps_position() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(dir.path().join("test.db")).unwrap();
-        let inner =
-            FileReplicaClient::new(dir.path().join("replica").to_string_lossy().into_owned());
-        let mut r = Replica::new(db, FaultyClient::new(inner, Error::Other("s3: 503".into())));
-        // One decodable L0 file at TXID 2 makes db.pos()==2 and is the local
-        // file the upload reads before the client write is rigged to fail.
-        let l0 = r.db().unwrap().ltx_path(0, TXID(2), TXID(2));
-        std::fs::create_dir_all(Path::new(&l0).parent().unwrap()).unwrap();
-        std::fs::write(&l0, build_incremental_ltx(TXID(2), TXID(2), 512, 2, 0x22)).unwrap();
-        // Seed TXID 1 as known-replicated, so sync tries to upload TXID 2.
-        r.seed_pos(Pos::new(TXID(1), 0));
-        r.sync().await.expect_err("upload was rigged to fail");
-        assert_eq!(
-            r.pos().txid,
-            TXID(1),
-            "a transient error keeps the position"
-        );
-    }
-
-    // A seeded position skips the `calc_pos` listing entirely: with listing
-    // poisoned, an unseeded replica's first sync would fail there, but a seeded
-    // one uploads without ever listing. This is the fix for the activation
-    // listing that storms a rate-limiting store on every fresh cell.
-    #[tokio::test]
-    async fn seeded_position_skips_calc_pos_listing() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(dir.path().join("test.db")).unwrap();
-        let inner =
-            FileReplicaClient::new(dir.path().join("replica").to_string_lossy().into_owned());
-        let mut r = Replica::new(db, FaultyClient::poisoning_list(inner));
-        // Local L0 snapshot at TXID 1: db.pos()==1 and a file to upload.
-        let l0 = r.db().unwrap().ltx_path(0, TXID(1), TXID(1));
-        std::fs::create_dir_all(Path::new(&l0).parent().unwrap()).unwrap();
-        std::fs::write(&l0, build_snapshot_ltx(TXID(1), 512, 2)).unwrap();
-        // Seed as a fresh cell (known 0); the first sync must not list.
-        r.seed_pos(Pos::ZERO);
-        r.sync()
-            .await
-            .expect("a seeded sync must not list, so the poisoned list is never hit");
-        assert_eq!(r.pos().txid, TXID(1), "uploaded TXID 1 with no listing");
+    pub fn pos_untrustworthy(error: &Error) -> bool {
+        super::pos_untrustworthy(error)
     }
 }

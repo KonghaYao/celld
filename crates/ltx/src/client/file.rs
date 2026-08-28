@@ -139,39 +139,3 @@ async fn write_then_rename(tmp: &str, final_path: &str, data: &[u8]) -> Result<(
     tokio::fs::rename(tmp, final_path).await?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::client::run_client_suite;
-
-    #[tokio::test]
-    async fn passes_conformance_suite() {
-        let dir = tempfile::tempdir().unwrap();
-        let client = FileReplicaClient::new(dir.path().to_string_lossy().into_owned());
-        run_client_suite(&client).await;
-    }
-
-    // The file client reads the real golden replica tree (captured from the
-    // litestream binary): 6 L0 files, in order, each decoding byte-exact.
-    #[tokio::test]
-    async fn lists_and_reads_golden_replica() {
-        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/golden/replica");
-        let client = FileReplicaClient::new(root);
-
-        let files = client.ltx_files(0, TXID(0)).await.unwrap();
-        assert_eq!(files.len(), 6, "golden L0 file count");
-        let order: Vec<u64> = files.iter().map(|f| f.min_txid.0).collect();
-        assert_eq!(order, vec![1, 2, 3, 4, 5, 6], "ascending by txid");
-
-        for f in &files {
-            let bytes = client
-                .open_ltx_file(0, f.min_txid, f.max_txid)
-                .await
-                .unwrap();
-            assert_eq!(bytes.len() as i64, f.size, "read size matches listing");
-            let decoded = ltx::decode_file(&bytes).expect("golden file decodes via client");
-            assert_eq!(decoded.header.min_txid, f.min_txid);
-        }
-    }
-}

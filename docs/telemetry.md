@@ -53,10 +53,10 @@ The sampler decides at the start of a request. An unsampled request
 records nothing and costs almost nothing. Under load, telemetry sheds
 before requests do, and celld counts what it sheds.
 
-celld records no metrics yet. This is a known gap, not a silent one:
-the spans carry the durations and the queue waits, so many questions
-a metric answers have an answer in the traces, and a metrics signal
-can come later without a change to the trace schema.
+celld records no metrics yet. The spans carry the durations and the
+queue waits, so many questions a metric answers have an answer in the
+traces, and a metrics signal can come later without a change to the
+trace schema.
 
 ## Query the bucket with DuckDB
 

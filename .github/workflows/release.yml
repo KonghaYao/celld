@@ -140,8 +140,8 @@ jobs:
             test -f "celld-$target.gz"
           done
 
-      # Attestations require a public repository; until the visibility flip
-      # this step is skipped and drafts carry checksums only.
+      # Attestations require a public repository. Other repository visibilities
+      # skip this step and retain the release asset digests.
       - name: Attest build provenance
         if: github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@v2
@@ -296,8 +296,7 @@ jobs:
             --format '{{json .Manifest.Digest}}' | tr -d '"')
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
-      # Attestations require a public repository; skipped until the
-      # visibility flip.
+      # Attestations require a public repository.
       - name: Attest image provenance
         if: github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@v2

@@ -1,8 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! The production selector which the deterministic World replaces.
-
-#![allow(clippy::disallowed_macros)]
+//! The production selector for the Actor execution domain.
 
 use super::*;
 use futures_util::StreamExt as _;
@@ -10,9 +8,9 @@ use futures_util::StreamExt as _;
 impl Actor {
     /// Runs the production start-select-step loop.
     ///
-    /// This selector stays unbiased because production has always permitted
-    /// every ready-input order. The World calls [`Actor::start`] and
-    /// [`Actor::step`] directly, so it never executes this raw Tokio select.
+    /// This selector stays unbiased because production permits every
+    /// ready-input order. Direct callers can use [`Actor::start`] and
+    /// [`Actor::step`] without this raw Tokio select.
     pub async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Message>) {
         let mut effects = FuturesUnordered::new();
         let mut delays = DelayQueue::new();
@@ -21,7 +19,7 @@ impl Actor {
         self.start(&mut out);
         drain_step_output(&mut out, &mut effects, &mut delays, &mut timer_slots);
         loop {
-            tokio::select! {
+            crate::asyncrt::select! {
                 message = rx.recv() => {
                     let Some(message) = message else {
                         break;

@@ -73,6 +73,18 @@ if (!globalThis.__buffer) (() => {
     lut[45] = 62; lut[95] = 63; // '-' '_'
     return lut;
   })();
+  // Nibble value per code unit, -1 for anything else. Node's own table is
+  // 256 wide and indexed with `& 0xff`, so it decodes 'Ł' (U+0141) as 'A';
+  // a 128-entry table with the guard below rejects every non-ASCII code
+  // unit instead, which is what the regex it replaces did.
+  const __hexlut = (() => {
+    const lut = new Int8Array(128).fill(-1);
+    const lower = "0123456789abcdef", upper = "0123456789ABCDEF";
+    for (let i = 0; i < 16; i++) {
+      lut[lower.charCodeAt(i)] = i; lut[upper.charCodeAt(i)] = i;
+    }
+    return lut;
+  })();
   // string -> bytes. Hex stops at the first invalid pair; base64 is
   // forgiving (skips invalid characters, '=' terminates), like Node.
   const __encodeStr = (string, enc) => {
@@ -93,24 +105,36 @@ if (!globalThis.__buffer) (() => {
         const out = new Uint8Array(n);
         let i = 0;
         for (; i < n; i++) {
-          const pair = string.slice(i * 2, i * 2 + 2);
-          if (!/^[0-9a-fA-F]{2}$/.test(pair)) break;
-          out[i] = parseInt(pair, 16);
+          const hi = string.charCodeAt(i * 2);
+          const lo = string.charCodeAt(i * 2 + 1);
+          const a = hi < 128 ? __hexlut[hi] : -1;
+          const b = lo < 128 ? __hexlut[lo] : -1;
+          if (a < 0 || b < 0) break;
+          out[i] = (a << 4) | b;
         }
         return i === n ? out : out.subarray(0, i);
       }
       default: { // base64 / base64url
-        const out = [];
-        let acc = 0, bits = 0;
+        // Four source characters carry at most three bytes, and a skipped
+        // character or an interior '=' only shrinks that, so this is an
+        // upper bound and the subarray below trims any slack. Sizing the
+        // output up front replaces one push and one copy per byte.
+        // Discounting the trailing padding matters: without it a padded
+        // input, which is most base64, always overshoots and always pays
+        // for the trim. `byteLength` computes the same bound.
+        const pad = string.charCodeAt(string.length - 1) === 61
+          ? (string.charCodeAt(string.length - 2) === 61 ? 2 : 1) : 0;
+        const out = new Uint8Array(((string.length - pad) * 3) >>> 2);
+        let n = 0, acc = 0, bits = 0;
         for (let i = 0; i < string.length; i++) {
           const c = string.charCodeAt(i);
           if (c === 61) break; // '='
           const v = c < 128 ? __b64lut[c] : -1;
           if (v < 0) continue;
           acc = (acc << 6) | v; bits += 6;
-          if (bits >= 8) { bits -= 8; out.push((acc >>> bits) & 255); }
+          if (bits >= 8) { bits -= 8; out[n++] = (acc >>> bits) & 255; }
         }
-        return Uint8Array.from(out);
+        return n === out.length ? out : out.subarray(0, n);
       }
     }
   };

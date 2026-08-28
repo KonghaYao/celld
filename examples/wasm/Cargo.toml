@@ -3,7 +3,7 @@ name = "counter-demo-rs"
 version = "0.1.0"
 edition = "2021"
 
-# Standalone: keeps cargo and wasm-pack out of the engine workspace above.
+# This table keeps the example outside the engine workspace.
 [workspace]
 
 [lib]

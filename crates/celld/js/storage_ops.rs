@@ -234,25 +234,6 @@ pub(super) fn op_storage_cancel_pending_puts(
         .remove(&cell);
 }
 
-/// `ctx.storage.sql.exec(query, ...binds)` — args: scope, query, binds(JSON).
-/// Returns a JSON `{columns, rows, rowsWritten}` (or `{error}`).
-pub(super) fn op_sql_exec(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let sc = args.get(0).to_rust_string_lossy(scope);
-    let query = args.get(1).to_rust_string_lossy(scope);
-    let binds: Vec<serde_json::Value> =
-        serde_json::from_str(&args.get(2).to_rust_string_lossy(scope)).unwrap_or_default();
-    let out = match storage::sql_exec(&sc, &query, &binds) {
-        Ok((columns, rows, rows_written)) => serde_json::json!({
-            "columns": columns, "rows": rows, "rowsWritten": rows_written,
-        }),
-        Err(e) => serde_json::json!({ "error": e }),
-    };
-    rv.set(v8::String::new(scope, &out.to_string()).unwrap().into());
-}
 pub(super) fn op_sql_ingest(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -270,6 +251,22 @@ pub(super) fn op_sql_ingest(
     };
     rv.set(v8::String::new(scope, &out.to_string()).unwrap().into());
 }
+/// `__sql_cursor_start(cell, query, bindsJson)` — open a native SQL cursor and
+/// hand back its first row.
+///
+/// Returns a `v8::Object` with `cursorId`, `columns`, `row`, `rowsWritten` and
+/// `reusedCachedQuery`. A failure throws.
+///
+/// An object and not a fixed-position array, because this op answers once per
+/// result set rather than once per row, so the per-call cost of five string
+/// keys is paid once and buys a named payload that `SqlCursor` reads field by
+/// field. `op_sql_cursor_next` runs per row and therefore tells its two
+/// answers apart by type instead; there is only one answer shape here, so
+/// there is nothing to tell apart.
+///
+/// `row` and every value inside it are V8 values, as in `op_sql_cursor_next`.
+/// One result set is therefore carried by one encoding, so row 1 and row 2 of
+/// the same `SELECT` cannot disagree about a value.
 pub(super) fn op_sql_cursor_start(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -277,35 +274,140 @@ pub(super) fn op_sql_cursor_start(
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
     let query = args.get(1).to_rust_string_lossy(scope);
+    // An undecodable bind payload used to become an empty bind list, and the
+    // query ran anyway. `sql_cursor_start` executes every parameter-free
+    // prefix statement before it compares the final statement's parameter
+    // count against the binds, so an empty default committed a prefix write
+    // and then reported a parameter-count mismatch that named nothing the
+    // caller had done. Refuse the call before SQLite sees any of it.
     let binds: Vec<serde_json::Value> =
-        serde_json::from_str(&args.get(2).to_rust_string_lossy(scope)).unwrap_or_default();
-    let out = match storage::sql_cursor_start(&cell, &query, &binds) {
-        Ok((cursor, columns, row, rows_written, reused_cached_query)) => serde_json::json!({
-            "native": true,
-            "cursorId": cursor,
-            "columns": columns,
-            "row": row,
-            "rowsWritten": rows_written,
-            "reusedCachedQuery": reused_cached_query,
-        }),
-        Err(error) => serde_json::json!({ "error": error }),
-    };
-    rv.set(v8::String::new(scope, &out.to_string()).unwrap().into());
+        match serde_json::from_str(&args.get(2).to_rust_string_lossy(scope)) {
+            Ok(binds) => binds,
+            Err(error) => {
+                return loader_throw(
+                    scope,
+                    &format!("sql: the bind payload is not a JSON array: {error}"),
+                )
+            }
+        };
+    match storage::sql_cursor_start(&cell, &query, &binds) {
+        Ok((cursor, columns, row, rows_written, reused_cached_query)) => {
+            let result = v8::Object::new(scope);
+            let set = |scope: &mut v8::PinScope, name: &str, value: v8::Local<v8::Value>| {
+                let key = v8::String::new(scope, name).unwrap();
+                result.set(scope, key.into(), value);
+            };
+            let cursor_id = v8::Number::new(scope, cursor as f64).into();
+            set(scope, "cursorId", cursor_id);
+            let names = v8::Array::new(scope, columns.len() as i32);
+            for (index, name) in columns.iter().enumerate() {
+                let name = v8::String::new(scope, name).unwrap();
+                names.set_index(scope, index as u32, name.into());
+            }
+            set(scope, "columns", names.into());
+            let first: v8::Local<v8::Value> = match row {
+                Some(row) => sql_row_to_v8(scope, row).into(),
+                None => v8::null(scope).into(),
+            };
+            set(scope, "row", first);
+            let written = v8::Number::new(scope, rows_written as f64).into();
+            set(scope, "rowsWritten", written);
+            let reused = v8::Boolean::new(scope, reused_cached_query).into();
+            set(scope, "reusedCachedQuery", reused);
+            rv.set(result.into());
+        }
+        // `SQL error: ` and not `storage.`, because that is the prefix a Worker
+        // already sees from a failing `exec()`. The message stays byte for
+        // byte what `SqlCursor`'s constructor used to build from the in-band
+        // `{"error": ...}` field, following 229da324.
+        Err(error) => throw_sql_error(scope, error),
+    }
 }
+/// `__sql_cursor_next(cursorId)` — one step of a native SQL cursor.
+///
+/// Returns a `v8::Array` of column values for a row, and a `v8::Number` with
+/// the cursor's final `rowsWritten` once SQLite reports DONE. The two answers
+/// are told apart by type, as `op_storage_sync_list_next` tells a pair from
+/// null. A failure throws.
+///
+/// This op used to serialise the row to JSON and let JS `JSON.parse` it back,
+/// once per row. A 100k-row `SELECT` therefore paid 100k serialise/parse
+/// round-trips, and a BLOB column paid about four text bytes per data byte,
+/// because JSON carries bytes as an array of decimal numbers. Its `start`
+/// sibling above carries row 1 through the same converter.
 pub(super) fn op_sql_cursor_next(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cursor = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    let out = match storage::sql_cursor_next(cursor) {
-        Ok((row, rows_written)) => serde_json::json!({
-            "row": row,
-            "rowsWritten": rows_written,
-        }),
-        Err(error) => serde_json::json!({ "error": error }),
-    };
-    rv.set(v8::String::new(scope, &out.to_string()).unwrap().into());
+    match storage::sql_cursor_next(cursor) {
+        Ok((Some(row), _)) => rv.set(sql_row_to_v8(scope, row).into()),
+        Ok((None, rows_written)) => rv.set(v8::Number::new(scope, rows_written as f64).into()),
+        Err(error) => throw_sql_error(scope, error),
+    }
+}
+
+/// A SQL failure as the Worker sees it. Both cursor ops raise through here, so
+/// the two halves of one result set cannot report the same fault differently.
+///
+/// The prefix is `SQL error: ` and not `storage.`, because that is the prefix
+/// `SqlCursor` built in JS from the in-band `{"error": ...}` field that both
+/// ops used to answer with, and a Worker already matches on it.
+fn throw_sql_error(scope: &mut v8::PinScope, error: impl std::fmt::Display) {
+    let message = v8::String::new(scope, &format!("SQL error: {error}")).unwrap();
+    let exception = v8::Exception::error(scope, message);
+    scope.throw_exception(exception);
+}
+
+/// One SQL result row as a `v8::Array` of column values.
+fn sql_row_to_v8<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    row: Vec<storage::SqlValue>,
+) -> v8::Local<'s, v8::Array> {
+    let array = v8::Array::new(scope, row.len() as i32);
+    for (index, value) in row.into_iter().enumerate() {
+        let value = sql_value_to_v8(scope, value);
+        array.set_index(scope, index as u32, value);
+    }
+    array
+}
+
+/// One SQL column value as a V8 value, matching what `JSON.parse` plus the
+/// removed `_decode` closure in `harness.js` used to produce, except for a
+/// non-finite REAL, which JSON could not carry at all.
+fn sql_value_to_v8<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: storage::SqlValue,
+) -> v8::Local<'s, v8::Value> {
+    match value {
+        storage::SqlValue::Null => v8::null(scope).into(),
+        // A SQLite integer is an i64 and a JS number is a double, so an
+        // integer above 2^53 loses its low bits. `JSON.parse` rounded the
+        // decimal literal the same way, so this keeps the old value exactly
+        // rather than introducing a new loss. A Smi is used where it fits.
+        storage::SqlValue::Integer(i) => match i32::try_from(i) {
+            Ok(small) => v8::Integer::new(scope, small).into(),
+            Err(_) => v8::Number::new(scope, i as f64).into(),
+        },
+        // A REAL crosses as a double, including a non-finite one: SQLite reads
+        // `9e999` as REAL infinity, and a JS number holds infinity.
+        // The JSON path had no such literal and answered null, which lost a
+        // value SQLite had stored. Both cursor ops read this arm, so row 1 and
+        // row 2 of one result set report the same value.
+        storage::SqlValue::Real(f) => v8::Number::new(scope, f).into(),
+        storage::SqlValue::Text(text) => v8::String::new(scope, &text).unwrap().into(),
+        // An ArrayBuffer, because that is what the `_decode` closure produced
+        // from `{__celld_bytes: [...]}`. The bytes move into the backing store
+        // without a copy, as `bytes_value` in `js.rs` does.
+        storage::SqlValue::Blob(bytes) => {
+            if bytes.is_empty() {
+                return v8::ArrayBuffer::new(scope, 0).into();
+            }
+            let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+            v8::ArrayBuffer::with_backing_store(scope, &store).into()
+        }
+    }
 }
 pub(super) fn op_sql_cursor_close(
     scope: &mut v8::PinScope,
@@ -340,7 +442,7 @@ pub(super) fn op_d1_run(
     let out = storage::d1_run_json(&cell, &request);
     rv.set(v8::String::new(scope, &out).unwrap().into());
 }
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub(super) fn op_sql_set_max_page_count_for_test(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -352,7 +454,7 @@ pub(super) fn op_sql_set_max_page_count_for_test(
         throw_storage_error(scope, "sql.setMaxPageCountForTest", error);
     }
 }
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub(super) fn op_sql_set_write_fault_for_test(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -360,7 +462,7 @@ pub(super) fn op_sql_set_write_fault_for_test(
 ) {
     storage::set_write_fault_for_test(args.get(0).boolean_value(scope));
 }
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub(super) fn op_sql_set_cache_size_for_test(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -372,7 +474,7 @@ pub(super) fn op_sql_set_cache_size_for_test(
         throw_storage_error(scope, "sql.setCacheSizeForTest", error);
     }
 }
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub(super) fn op_sql_set_interrupt_fault_for_test(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -384,7 +486,7 @@ pub(super) fn op_sql_set_interrupt_fault_for_test(
         throw_storage_error(scope, "sql.setInterruptFaultForTest", error);
     }
 }
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 pub(super) fn op_sql_register_nomem_function_for_test(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -407,8 +509,8 @@ pub(super) fn op_storage_transaction_control(
     match storage::transaction_control(&cell, &action, nested, &savepoint) {
         Err(error) => throw_storage_error(scope, "transaction", error),
         // An outermost commit published a dirty alarm: register its
-        // wake-entry PUT against the cell's output gate.
-        Ok(Some(at)) if at >= 0 => spawn_arm_gate(&cell, at),
+        // wake-entry PUT against the current event's output gate.
+        Ok(Some(at)) if at >= 0 => spawn_arm_gate(&cell, at, current_reaction_io_context(scope)),
         Ok(_) => {}
     }
 }

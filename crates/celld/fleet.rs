@@ -1,7 +1,10 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-// Fleet CLI and peer-diagnostic work is outside the Actor-backed World.
+// Fleet CLI and peer-diagnostic work executes outside the Actor execution
+// domain.
 #![allow(clippy::disallowed_methods)]
+// Diagnose used to split by verdict rather than by kind, so a redirect kept
+// the passes and lost the failures. Every check now goes through `Output`.
 
 //! Production bucket deployment adapters reused by the clean-sheet host.
 
@@ -9,8 +12,101 @@ use crate::bucket::{Bucket, CasVerdict};
 use crate::deploy;
 use crate::js::{ModuleSource, WorkerConfigOptions};
 use crate::ownership_store::NodeLeaseWire;
-use crate::protocol::{DeployPointer, Manifest, ModuleKind};
+use crate::protocol::{DeployPointer, Manifest, ModuleKind, Rollout};
 use anyhow::{bail, Context};
+use std::borrow::Cow;
+
+use crate::cli_output::Format;
+use crate::cli_output::Output;
+use crate::cli_output::Record;
+use crate::note;
+
+/// What a deployment produced.
+///
+/// Deploy is a narrative, so its progress belongs on stderr — but the
+/// version is the datum a release script reads back, so it stays a row on
+/// stdout rather than a line to grep out of the prose.
+pub(crate) struct Deployed {
+    worker: String,
+    version: String,
+    location: String,
+    dry_run: bool,
+}
+
+impl Record for Deployed {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "worker": self.worker,
+            "version": self.version,
+            "location": self.location,
+            "dry_run": self.dry_run,
+        })
+    }
+
+    fn text(&self) -> Cow<'_, str> {
+        Cow::Owned(if self.dry_run {
+            format!(
+                "Current Version ID: {} (dry run; nothing written)",
+                self.version
+            )
+        } else {
+            format!("Current Version ID: {}", self.version)
+        })
+    }
+}
+
+/// One diagnostic verdict.
+///
+/// Every check is a row, whatever its verdict. The old shape sent `ok` and
+/// `skip` to stdout and `fail` to stderr, so `celld diagnose > report.txt`
+/// saved the passes and lost the failures. The exit code still carries the
+/// summary, so a redirect and `$?` together say everything.
+pub struct Check {
+    verdict: &'static str,
+    subject: String,
+    detail: String,
+}
+
+impl Check {
+    fn new(verdict: &'static str, subject: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            verdict,
+            subject: subject.into(),
+            detail: detail.into(),
+        }
+    }
+
+    pub fn ok(subject: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new("ok", subject, detail)
+    }
+
+    pub fn fail(subject: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new("fail", subject, detail)
+    }
+
+    pub fn skip(subject: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new("skip", subject, detail)
+    }
+}
+
+impl Record for Check {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "verdict": self.verdict,
+            "check": self.subject,
+            "detail": self.detail,
+        })
+    }
+
+    fn text(&self) -> Cow<'_, str> {
+        // The long-standing shape: `ok bucket ...`, `fail peer X: ...`.
+        Cow::Owned(if self.detail.is_empty() {
+            format!("{} {}", self.verdict, self.subject)
+        } else {
+            format!("{} {}: {}", self.verdict, self.subject, self.detail)
+        })
+    }
+}
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::info;
@@ -138,26 +234,28 @@ async fn validate_managed_bucket_once(bucket: &Bucket, report: bool) -> anyhow::
 ///
 /// The probe writes and deletes one small object, which a read-only
 /// credential cannot do; `--read-only` skips it for that operator.
-async fn probe_storage(bucket: &Bucket, read_only: bool) -> anyhow::Result<()> {
+async fn probe_storage(out: &mut Output, bucket: &Bucket, read_only: bool) -> anyhow::Result<()> {
     if read_only {
-        println!("skip bucket write probe (--read-only)");
+        out.row(&Check::skip("bucket write probe", "--read-only"))?;
         return Ok(());
     }
     match bucket.probe_cas().await {
         Ok(()) => {
-            println!("ok bucket conditional write (create, reject-create, update, reject-stale)");
+            out.row(&Check::ok(
+                "bucket conditional write",
+                "create, reject-create, update, reject-stale",
+            ))?;
             Ok(())
         }
         Err(error) => {
-            if crate::bucket::is_unauthorized(&error) {
-                eprintln!(
-                    "fail bucket conditional write: the credential cannot write to the bucket, \
-                     and a celld node requires write access; pass --read-only to diagnose with a \
-                     read-only credential"
-                );
+            let detail = if crate::bucket::is_unauthorized(&error) {
+                "the credential cannot write to the bucket, and a celld node requires write \
+                 access; pass --read-only to diagnose with a read-only credential"
+                    .to_string()
             } else {
-                eprintln!("fail bucket conditional write: {error:#}");
-            }
+                format!("{error:#}")
+            };
+            out.row(&Check::fail("bucket conditional write", detail))?;
             bail!("bucket failed the storage conformance probe")
         }
     }
@@ -210,17 +308,48 @@ pub async fn diagnose(
     peers: Vec<String>,
     unsafe_public_advertise: bool,
     read_only: bool,
+    json: bool,
+    // Checks the caller already made, printed through this command's one
+    // `Output`. The listener binds happen before a bucket is even opened,
+    // and printing them from there put three text lines in front of the
+    // JSON, which broke `celld diagnose --json | jq` at its first line.
+    preamble: Vec<Check>,
+) -> anyhow::Result<()> {
+    let mut out = Output::new(if json { Format::Json } else { Format::Text });
+    for check in &preamble {
+        out.row(check)?;
+    }
+    // Every verdict is flushed before the exit status is decided, so a
+    // failing diagnosis still leaves the operator the checks that passed.
+    let verdict =
+        diagnose_checks(&mut out, bucket, peers, unsafe_public_advertise, read_only).await;
+    out.finish()?;
+    verdict
+}
+
+async fn diagnose_checks(
+    out: &mut Output,
+    bucket: &Bucket,
+    peers: Vec<String>,
+    unsafe_public_advertise: bool,
+    read_only: bool,
 ) -> anyhow::Result<()> {
     validate_bucket(bucket).await?;
-    println!("ok bucket {}://{}", bucket.scheme(), bucket.name);
+    out.row(&Check::ok(
+        format!("bucket {}://{}", bucket.scheme(), bucket.name),
+        "",
+    ))?;
     // A store that cannot fence makes every peer result moot, so the
     // storage verdict comes before the fleet walk.
-    probe_storage(bucket, read_only).await?;
+    probe_storage(out, bucket, read_only).await?;
 
     let enumerated = peers.is_empty();
     let peers = if enumerated {
         let peers = node_lease_ids(bucket).await?;
-        println!("ok fleet {} node lease(s) enumerated", peers.len());
+        out.row(&Check::ok(
+            "fleet",
+            format!("{} node lease(s) enumerated", peers.len()),
+        ))?;
         peers
     } else {
         peers
@@ -245,17 +374,20 @@ pub async fn diagnose(
             Ok(Some(node)) => node,
             Ok(None) if enumerated => {
                 expired += 1;
-                println!("skip peer {peer}: lease is expired");
+                out.row(&Check::skip(format!("peer {peer}"), "lease is expired"))?;
                 continue;
             }
             Ok(None) => {
                 failures += 1;
-                eprintln!("fail peer {peer}: node {peer} lease is expired");
+                out.row(&Check::fail(
+                    format!("peer {peer}"),
+                    format!("node {peer} lease is expired"),
+                ))?;
                 continue;
             }
             Err(error) => {
                 failures += 1;
-                eprintln!("fail peer {peer}: {error}");
+                out.row(&Check::fail(format!("peer {peer}"), format!("{error}")))?;
                 continue;
             }
         };
@@ -263,24 +395,31 @@ pub async fn diagnose(
             Ok(advertise) => advertise,
             Err(error) => {
                 failures += 1;
-                eprintln!(
-                    "fail peer {peer}: malformed advertise address {:?}: {error}",
-                    node.addr
-                );
+                out.row(&Check::fail(
+                    format!("peer {peer}"),
+                    format!("malformed advertise address {:?}: {error}", node.addr),
+                ))?;
                 continue;
             }
         };
         if advertise.is_public_ip() && !unsafe_public_advertise {
             failures += 1;
-            eprintln!(
-                "fail peer {peer}: unsafe public advertise address {}; use a private overlay or --unsafe-public-advertise",
-                node.addr
-            );
+            out.row(&Check::fail(
+                format!("peer {peer}"),
+                format!(
+                    "unsafe public advertise address {}; use a private overlay or \
+                     --unsafe-public-advertise",
+                    node.addr
+                ),
+            ))?;
             continue;
         }
         if let Err(error) = crate::peer_probe::probe(&http, &node, &auth).await {
             failures += 1;
-            eprintln!("fail peer {peer} at {}: {error}", node.addr);
+            out.row(&Check::fail(
+                format!("peer {peer} at {}", node.addr),
+                format!("{error}"),
+            ))?;
             continue;
         }
         let load_age_ms = if node.load.sampled_ms == 0 {
@@ -306,28 +445,32 @@ pub async fn diagnose(
             .load
             .in_use_bytes
             .map_or_else(|| "unknown".to_string(), |bytes| bytes.to_string());
-        println!(
-            "ok peer {} at {} (signed direct probe) protocol={} resident_cells={} \
-             websockets={} rss_bytes={} in_use_bytes={} cpu_percent={:.2} fds={}/{} \
-             pressured={} shed_cells={} restoring={} load_age_ms={}",
-            node.node,
-            node.addr,
-            node.peer_protocol,
-            node.load.resident_cells,
-            node.load.host_websockets,
-            rss_bytes,
-            in_use_bytes,
-            node.load.cpu_percent_x100 as f64 / 100.0,
-            node.load.open_fds,
-            node.load.fd_limit,
-            node.load.pressured,
-            node.load.shed_cells,
-            node.load.restoring,
-            load_age_ms,
-        );
+        out.row(&Check::ok(
+            format!("peer {} at {}", node.node, node.addr),
+            format!(
+                "(signed direct probe) protocol={} resident_cells={} \
+                 websockets={} rss_bytes={} in_use_bytes={} cpu_percent={:.2} fds={}/{} \
+                 pressured={} shed_cells={} restoring={} load_age_ms={}",
+                node.peer_protocol,
+                node.load.resident_cells,
+                node.load.host_websockets,
+                rss_bytes,
+                in_use_bytes,
+                node.load.cpu_percent_x100 as f64 / 100.0,
+                node.load.open_fds,
+                node.load.fd_limit,
+                node.load.pressured,
+                node.load.shed_cells,
+                node.load.restoring,
+                load_age_ms,
+            ),
+        ))?;
     }
     if expired > 0 {
-        println!("ok fleet skipped {expired} expired node lease(s)");
+        out.row(&Check::ok(
+            "fleet",
+            format!("skipped {expired} expired node lease(s)"),
+        ))?;
     }
     if failures > 0 {
         bail!("fleet diagnostics failed for {failures} peer(s)");
@@ -381,23 +524,39 @@ pub(crate) async fn node_lease_ids(bucket: &Bucket) -> anyhow::Result<Vec<String
     Ok(nodes)
 }
 
-pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
-    let Some(mut options) = deploy::options_from_arguments(arguments)? else {
-        deploy::print_help();
-        return Ok(());
-    };
+pub(crate) fn resolve_storage_location(
+    bucket: &mut Option<String>,
+    endpoint: &mut Option<String>,
+    region: Option<&str>,
+) -> String {
     let env = |name: &str| {
         std::env::var(name)
             .ok()
             .filter(|value| !value.trim().is_empty())
     };
-    if options.bucket.is_none() {
-        options.bucket =
-            env("CELLD_BUCKET").map(|value| value.trim_start_matches("s3://").to_string());
+    if bucket.is_none() {
+        *bucket = env("CELLD_BUCKET").map(|value| value.trim_start_matches("s3://").to_string());
     }
-    if options.endpoint.is_none() {
-        options.endpoint = env("S3_ENDPOINT");
+    if endpoint.is_none() {
+        *endpoint = env("S3_ENDPOINT");
     }
+    region
+        .map(str::to_string)
+        .or_else(|| env("AWS_REGION"))
+        .or_else(|| env("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|| "us-east-1".to_string())
+}
+
+pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
+    let Some(mut options) = deploy::options_from_arguments(arguments)? else {
+        deploy::print_help();
+        return Ok(());
+    };
+    let region = resolve_storage_location(
+        &mut options.bucket,
+        &mut options.endpoint,
+        options.region.as_deref(),
+    );
     if !options.dry_run && options.bucket.is_none() {
         bail!(
             "celld deploy requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
@@ -406,39 +565,47 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     }
     let built = deploy::build(&options)?;
     built.report();
+    let mut out = Output::new(if options.json {
+        Format::Json
+    } else {
+        Format::Text
+    });
     if options.dry_run {
-        println!(
-            "Current Version ID: {} (dry run; nothing written)",
-            built.version
-        );
-        return Ok(());
+        out.row(&Deployed {
+            worker: built.script_name.clone(),
+            version: built.version.clone(),
+            location: String::new(),
+            dry_run: true,
+        })?;
+        return out.finish();
     }
 
     let bucket = options.bucket.expect("validated deployment bucket");
-    let region = options
-        .region
-        .or_else(|| env("AWS_REGION"))
-        .or_else(|| env("AWS_DEFAULT_REGION"))
-        .unwrap_or_else(|| "us-east-1".to_string());
     let store = bucket_client(&bucket, options.endpoint.as_deref(), &region)?;
     validate_bucket(&store).await?;
     let started = std::time::Instant::now();
     deploy::write(&store, &built).await?;
-    println!(
-        "Uploaded {} ({:.2} sec)",
-        built.script_name,
-        started.elapsed().as_secs_f64()
-    );
-    println!(
-        "  {}://{}/{}{}",
+    let location = format!(
+        "{}://{}/{}{}",
         store.scheme(),
         store.name,
         store.prefix,
         built.prefix
     );
-    println!("Current Version ID: {}", built.version);
-    println!("Nodes load a deployment at startup; restart them to serve this version.");
-    Ok(())
+    note!(
+        "Uploaded {} ({:.2} sec)",
+        built.script_name,
+        started.elapsed().as_secs_f64()
+    );
+    note!("  {location}");
+    out.row(&Deployed {
+        worker: built.script_name.clone(),
+        version: built.version.clone(),
+        location,
+        dry_run: false,
+    })?;
+    note!("Nodes adopt this version at their next pointer poll, without a restart.");
+    out.finish()
 }
 
 async fn get_string(bucket: &Bucket, key: &str) -> anyhow::Result<String> {
@@ -457,11 +624,21 @@ async fn get_bytes(bucket: &Bucket, key: &str) -> anyhow::Result<bytes::Bytes> {
     Ok(bytes)
 }
 
+/// The fleet-wide pointer: the bucket's only application commit point.
+pub const CURRENT_POINTER_KEY: &str = "deploy/current.json";
+
 pub async fn load_current_worker(
     bucket: &Bucket,
     node: String,
 ) -> anyhow::Result<LoadedDeployment> {
-    load_worker_from_pointer(bucket, "deploy/current.json", node).await
+    load_worker_from_pointer(bucket, CURRENT_POINTER_KEY, node).await
+}
+
+/// Read the fleet-wide pointer without loading what it names. The watcher
+/// compares it with the serving generation before it loads anything.
+pub async fn read_current_pointer(bucket: &Bucket) -> anyhow::Result<DeployPointer> {
+    serde_json::from_str(&get_string(bucket, CURRENT_POINTER_KEY).await?)
+        .with_context(|| format!("decode {CURRENT_POINTER_KEY}"))
 }
 
 pub async fn load_named_worker(
@@ -472,6 +649,48 @@ pub async fn load_named_worker(
     load_worker_from_pointer(bucket, &format!("deploy/{script}/current.json"), node).await
 }
 
+pub async fn load_queue_consumer_attachment(
+    bucket: &Bucket,
+    queue: &str,
+) -> anyhow::Result<Option<crate::protocol::QueueConsumerDeployment>> {
+    let key = crate::protocol::queue_consumer_attachment_key(queue)
+        .with_context(|| format!("invalid queue name {queue:?} in deployment manifest"))?;
+    let Some((body, _)) = bucket.get(&key).await? else {
+        return Ok(None);
+    };
+    let attachment: crate::protocol::QueueConsumerAttachment = serde_json::from_slice(&body)
+        .with_context(|| format!("decode queue consumer attachment {key}"))?;
+    crate::protocol::validate_queue_consumer_attachment(queue, &attachment)?;
+    Ok(attachment.consumer)
+}
+
+pub async fn load_queue_consumer_worker(
+    bucket: &Bucket,
+    queue: &str,
+    consumer: &crate::protocol::QueueConsumerDeployment,
+    node: String,
+) -> anyhow::Result<LoadedDeployment> {
+    let pointer = DeployPointer {
+        script_name: Some(consumer.script_name.clone()),
+        version: consumer.version.clone(),
+        prefix: consumer.prefix.clone(),
+        rollout: Rollout { percent: 100 },
+    };
+    let pointer_key = format!("deploy/{}/current.json", consumer.script_name);
+    let loaded = load_worker_at_pointer(bucket, pointer, &pointer_key, node).await?;
+    anyhow::ensure!(
+        loaded
+            .options
+            .queue_consumers
+            .iter()
+            .any(|config| config.queue == queue),
+        "queue {queue:?} attachment resolved deployment {} of script {:?}, which does not consume that queue",
+        consumer.version,
+        consumer.script_name
+    );
+    Ok(loaded)
+}
+
 async fn load_worker_from_pointer(
     bucket: &Bucket,
     pointer_key: &str,
@@ -479,11 +698,34 @@ async fn load_worker_from_pointer(
 ) -> anyhow::Result<LoadedDeployment> {
     let pointer: DeployPointer = serde_json::from_str(&get_string(bucket, pointer_key).await?)
         .with_context(|| format!("decode {pointer_key}"))?;
+    load_worker_at_pointer(bucket, pointer, pointer_key, node).await
+}
+
+async fn load_worker_at_pointer(
+    bucket: &Bucket,
+    pointer: DeployPointer,
+    pointer_key: &str,
+    node: String,
+) -> anyhow::Result<LoadedDeployment> {
     let manifest: Manifest = serde_json::from_str(
         &get_string(bucket, &format!("{}/manifest.json", pointer.prefix)).await?,
     )
     .context("decode deployment manifest")?;
+    anyhow::ensure!(
+        manifest.version == pointer.version,
+        "deployment pointer for version {:?} resolved manifest version {:?}",
+        pointer.version,
+        manifest.version
+    );
+    if let Some(script_name) = &pointer.script_name {
+        anyhow::ensure!(
+            manifest.script_name == *script_name,
+            "deployment pointer for script {script_name:?} resolved script {:?}",
+            manifest.script_name
+        );
+    }
     crate::protocol::validate_required_features(&manifest.required_features)?;
+    crate::protocol::validate_queue_manifest(&manifest)?;
     let src = match manifest.main_module.as_deref() {
         Some(main) => get_string(bucket, &format!("{}/{main}", pointer.prefix)).await?,
         None if manifest.assets.is_some() => {
@@ -528,8 +770,15 @@ async fn load_worker_from_pointer(
             ))
         })
         .collect();
+    // (env name, bucket name). The bucket name is the key space the
+    // binding owns inside the fleet bucket; see [[r2]].
     let r2_bindings = bindings(&manifest, "r2_bucket")
-        .filter_map(|binding| binding.get("name")?.as_str().map(str::to_string))
+        .filter_map(|binding| {
+            Some((
+                binding.get("name")?.as_str()?.to_string(),
+                binding.get("bucket_name")?.as_str()?.to_string(),
+            ))
+        })
         .collect();
     // (env name, stable database identity). A Cloudflare database_id survives
     // Worker renames and lets several Workers share the resource. A celld-only
@@ -546,6 +795,39 @@ async fn load_worker_from_pointer(
             ))
         })
         .collect();
+    // (env name, namespace identity). The identity is the config's `id`
+    // verbatim: upstream's `kv_namespaces` has no human-readable name field, so
+    // there is no second key to fall back to and none is invented.
+    let kv_bindings = bindings(&manifest, "kv")
+        .filter_map(|binding| {
+            Some((
+                binding.get("name")?.as_str()?.to_string(),
+                binding.get("id")?.as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    let queue_bindings = bindings(&manifest, "queue")
+        .filter_map(|binding| {
+            Some(crate::js::QueueBinding {
+                environment: binding.get("name")?.as_str()?.to_string(),
+                queue: binding.get("queue")?.as_str()?.to_string(),
+                delivery_delay: binding
+                    .get("delivery_delay")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(0),
+            })
+        })
+        .collect();
+    let workflow_bindings = bindings(&manifest, "workflow")
+        .filter_map(|binding| {
+            Some(crate::js::WorkflowBinding {
+                environment: binding.get("name")?.as_str()?.to_string(),
+                workflow: binding.get("workflow_name")?.as_str()?.to_string(),
+                class: binding.get("class_name")?.as_str()?.to_string(),
+            })
+        })
+        .collect();
     let ai_binding = configured_ai_binding(
         bindings(&manifest, "ai")
             .find_map(|binding| binding.get("name")?.as_str().map(str::to_string)),
@@ -560,6 +842,15 @@ async fn load_worker_from_pointer(
                 &pointer.prefix,
                 reference,
                 manifest.main_module.is_none(),
+                // The resolver can consult this pointer again later: a
+                // rolling restart serves new HTML from upgraded nodes while
+                // this process still holds the boot index, and the fallback
+                // is what keeps the new content-hashed assets servable
+                // everywhere (denoland/celld#161).
+                Some(crate::assets::FallbackSource {
+                    pointer_key: pointer_key.to_string(),
+                    boot_prefix: pointer.prefix.clone(),
+                }),
             )
             .await?,
         ),
@@ -570,6 +861,8 @@ async fn load_worker_from_pointer(
         .and_then(crate::assets::AssetResolver::binding_name)
         .map(str::to_string);
     let script_name = manifest.script_name.clone();
+    let version = manifest.version.clone();
+    let prefix = pointer.prefix.clone();
     let crons = manifest.crons.clone();
     Ok(LoadedDeployment {
         options: WorkerConfigOptions {
@@ -579,6 +872,10 @@ async fn load_worker_from_pointer(
             bindings: do_bindings,
             r2_bindings,
             d1_bindings,
+            kv_bindings,
+            queue_bindings,
+            queue_consumers: manifest.queue_consumers,
+            workflow_bindings,
             ai_binding,
             vars,
             node,
@@ -586,6 +883,8 @@ async fn load_worker_from_pointer(
             compat,
         },
         script_name,
+        version,
+        prefix,
         asset_binding,
         assets,
         services,
@@ -603,6 +902,8 @@ pub fn configured_ai_binding(manifest_binding: Option<String>) -> Option<String>
 pub struct LoadedDeployment {
     pub options: WorkerConfigOptions,
     pub script_name: String,
+    pub version: String,
+    pub prefix: String,
     pub asset_binding: Option<String>,
     pub assets: Option<crate::assets::AssetResolver>,
     pub services: Vec<(String, String, Option<String>)>,

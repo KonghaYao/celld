@@ -10,6 +10,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// The first retry delay for a cell-release operation.
+///
+/// The actor uses this delay when a host keeps a cell. The snapshot publisher
+/// uses it as the first step of a linear backoff after the L0 proof passes.
+pub(crate) const CELL_RELEASE_RETRY_BASE_MS: u64 = 50;
+
+/// The remote artifact that a successor can use after an eviction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictionRestoreArtifact {
+    /// A full L9 snapshot covers the closed database.
+    Snapshot,
+    /// The proven additive L0 chain remains the restore path.
+    L0Chain,
+}
+
 /// Outcome of a blocking replication wait on one cell db.
 pub enum SyncWait {
     /// The latest local commit is in the bucket.
@@ -362,7 +377,7 @@ pub(crate) fn sqlite_snapshot(
 ) -> anyhow::Result<()> {
     {
         let open = |path: &std::path::Path, flags, role| {
-            #[cfg(all(test, celld_internal_tests))]
+            #[cfg(celld_internal_tests)]
             {
                 match vfs {
                     Some(vfs) => crate::fault::with_connection_role(role, || {
@@ -371,7 +386,7 @@ pub(crate) fn sqlite_snapshot(
                     None => Connection::open_with_flags(path, flags),
                 }
             }
-            #[cfg(not(all(test, celld_internal_tests)))]
+            #[cfg(not(celld_internal_tests))]
             {
                 let _ = role;
                 debug_assert!(vfs.is_none());
@@ -394,10 +409,9 @@ pub(crate) fn sqlite_snapshot(
     Ok(())
 }
 
-/// Exercise the shipping snapshot helper through a named VFS in a
-/// persistence-order test. Ordinary callers keep `None` through `LtxRepl`.
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) fn sqlite_snapshot_on_vfs_for_test(
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn sqlite_snapshot_on_vfs_for_test(
     source: &std::path::Path,
     destination: &std::path::Path,
     vfs: &str,

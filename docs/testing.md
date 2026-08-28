@@ -102,7 +102,7 @@ liveness (each armed alarm fires, and ownership settles on one node after
 a crash). A property must survive tens of thousands of seeds, and the
 core protocols have run through millions of different schedules.
 
-Simulation has a known failure mode: the checker that cannot fail. Thus
+Simulation has a known failure mode: the checker that cannot fail. So
 we also test the checkers: we run deliberately broken variants of the
 protocol against the properties, and the properties must find the damage.
 A suite that stays green against a broken protocol is a broken suite.
@@ -130,23 +130,28 @@ clean picture before the fault and after it. A cell can be unavailable
 for a short time while its ownership moves, but its committed state must
 stay complete, and a live node must serve that state again.
 
-The scenarios attack every seam that we know. We stop a node with
-`SIGKILL` in the middle of a write stream and delete its local database,
-so the recovery can only come from the bucket: every acknowledged write
-comes back, because the output gate held each response until the write
-was durable. We freeze an owner node, write to its cells through other
-nodes, and unfreeze it: the node sees that its lease moved and refuses to
-serve the old state, and each write from the other nodes lands exactly
-one time. One epoch has at most one writer. We cut a node off from the
-bucket, and it fences itself, because a node that cannot replicate must
-not own cells. We throttle the bucket, so it answers each request with a
-429: the engine slows to the write rate of the store and does not amplify
-the throttle, because a node that knows its replicated position does not
-ask a slow store for extra listings. We stop a full host at the provider
-level in the middle of a workload: its cells move to the other nodes, and
-when the host returns, it joins again with no duplicate residency. Across
-every run of every scenario, no acknowledged write was lost and no
-committed state was damaged; the verification sweeps show zero body
+The scenarios attack every seam that we know:
+
+- Stop a node with `SIGKILL` in the middle of a write stream and delete
+  its local database, so recovery can only come from the bucket. Every
+  acknowledged write comes back, because the output gate held each
+  response until the write was durable.
+- Freeze an owner node, write to its cells through other nodes, and
+  unfreeze it. The node sees that its lease moved and refuses to serve
+  the old state, and each write from the other nodes lands exactly one
+  time: one epoch has at most one writer.
+- Cut a node off from the bucket. It fences itself, because a node that
+  cannot replicate must not own cells.
+- Throttle the bucket, so it answers each request with a 429. The engine
+  slows to the write rate of the store and does not amplify the
+  throttle, because a node that knows its replicated position does not
+  ask a slow store for extra listings.
+- Stop a full host at the provider level in the middle of a workload.
+  Its cells move to the other nodes, and the returning host joins again
+  with no duplicate residency.
+
+Across every run of every scenario, no acknowledged write was lost and
+no committed state was damaged; the verification sweeps show zero body
 faults, zero status faults, and zero lost messages.
 
 ## A few numbers we trust
@@ -160,11 +165,16 @@ its conditions has no value.
 - **A warm resident request is local.** A request to a resident cell does
   zero bucket operations and returns in p50 ~1.1 ms and p99 ~7 ms (a
   fixed-host measurement). Only a cold activation touches object storage.
-- **A durable write costs one bucket round trip.** The response waits
-  until the write is in the bucket; that is the meaning of RPO=0, and the
-  storage round trip is therefore the minimum latency for one write.
-  Concurrent writes to one cell join one shared upload, so the throughput
-  of one cell is not one round trip for each write.
+- **A durable write waits for a durability proof.** A single node proves
+  each write through the bucket, so one storage round trip is the minimum
+  latency for that write. A fleet of two or more nodes can prove a write
+  when each follower holds it on disk, and a follower fsync is much
+  faster than a storage round trip: a lab fleet measured about 600 ms for
+  a bucket proof and about 25 ms for a fleet proof. The bucket upload
+  races every fleet proof and either one proves the write, so a slow
+  follower cannot make a write slower than a bucket proof. Concurrent
+  writes to one cell join one shared upload, so the throughput of one
+  cell is not one round trip for each write.
 - **A restore is normal work.** Placement handles the restore of an
   inactive cell as ordinary work, and not as an emergency procedure. The
   measured restore times come from the retired external replicator, so this

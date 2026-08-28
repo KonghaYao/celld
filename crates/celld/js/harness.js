@@ -159,8 +159,16 @@ async function __drainBody(target) {
   return bytes;
 }
 class CelldBodyStream extends ReadableStream {
-  constructor(body) {
-    const bytes = __bodyBytes(body);
+  constructor(owner) {
+    // Couple the stream to its buffered owner, so _bodyBytes and the stream
+    // cannot be installed from different arrays. Copying the owner's bytes
+    // again here doubles the external memory held for every constructed body.
+    if (!(owner instanceof globalThis.Request) &&
+        !(owner instanceof globalThis.Response))
+      throw new TypeError("CelldBodyStream requires a buffered body owner");
+    const bytes = owner._bodyBytes;
+    if (!(bytes instanceof Uint8Array))
+      throw new TypeError("CelldBodyStream owner requires buffered body bytes");
     const st = { bytes, off: 0 };
     super({
       pull(controller) {
@@ -248,9 +256,15 @@ globalThis.Response = class Response {
     this._bodyBytes = stream !== null
       ? null
       : typed ? typed.bytes : __bodyBytes(body);
-    this._body = stream !== null
-      ? null
-      : new TextDecoder().decode(this._bodyBytes);
+    // Never decoded eagerly: a whole-body UTF-8 decode costs seconds for a
+    // large binary body (an archive, a git pack) and can exceed V8's string
+    // length. On Response the field is deliberately write-only — text()
+    // decodes fresh from _bodyBytes and only Request.text() memoizes into
+    // _body — but the assignment stays: __drainBody and __adoptBody assign
+    // _body on both classes, so defining it here keeps the hidden-class
+    // shape stable. Do not add a Response reader; do not "simplify" this
+    // away.
+    this._body = undefined;
     // Hono rebuilds a response after middleware with
     // `new Response(response.body, response)`; the held stream (or a
     // fresh CelldBodyStream) preserves the payload across that
@@ -259,7 +273,7 @@ globalThis.Response = class Response {
       ? null
       : stream !== null
         ? stream
-        : new CelldBodyStream(this._bodyBytes);
+        : new CelldBodyStream(this);
     this.status = init.status === undefined ? 200 : Number(init.status);
     this.statusText = init.statusText === undefined ? "" : String(init.statusText);
     this.headers = new Headers(init.headers);
@@ -280,6 +294,31 @@ globalThis.Response = class Response {
       headers.set("content-type", "application/json");
     return new Response(JSON.stringify(data), { ...init, headers });
   }
+  static redirect(url, status = 302) {
+    const input = String(url);
+    const statusCode = Number(status) | 0;
+    if (![301, 302, 303, 307, 308].includes(statusCode)) {
+      throw new RangeError(
+        `${statusCode} is not a redirect status code. ` +
+        "It must be one of: 301, 302, 303, 307, or 308.");
+    }
+    const response = new Response(null, {
+      status: statusCode,
+      headers: { Location: new URL(input).href },
+    });
+    // A redirect response owns a guarded header list. Without the guard, an
+    // application can rewrite Location after construction, which differs
+    // from both Fetch and Workerd even though the initial response is valid.
+    Object.defineProperty(response.headers, "_immutable", { value: true });
+    return response;
+  }
+  static error() {
+    const response = new Response(null);
+    response.status = 0;
+    response.ok = false;
+    response.type = "error";
+    return response;
+  }
   async _consume() {
     if (this._bodyBytes !== null) {
       if (this.body !== null && this.body._cancelled)
@@ -296,8 +335,12 @@ globalThis.Response = class Response {
   }
   async json() { return JSON.parse(await this.text()); }
   async formData() {
+    // The undecoded bytes, not `text()`: a UTF-8 decode replaces each invalid
+    // sequence in a binary file part with one U+FFFD, so both the bytes and
+    // the length change.
+    this.bodyUsed = true;
     return __parseFormData(
-      await this.text(), this.headers.get('content-type'));
+      await this._consume(), this.headers.get('content-type'));
   }
   async arrayBuffer() {
     this.bodyUsed = true;
@@ -311,10 +354,15 @@ globalThis.Response = class Response {
     if (this.bodyUsed) throw new TypeError("Body has already been consumed");
     if (this._bodyBytes === null)
       throw new TypeError("Cannot clone a streaming response before consumption");
-    return new Response(this._bodyBytes, {
-      status: this.status, statusText: this.statusText, headers: this.headers,
-      webSocket: this.webSocket, __wsTarget: this._wsTarget, cf: this.cf,
-    });
+    const response = new Response(
+      this.body === null ? null : this._bodyBytes,
+      {
+        status: this.status, statusText: this.statusText, headers: this.headers,
+        webSocket: this.webSocket, __wsTarget: this._wsTarget, cf: this.cf,
+      },
+    );
+    response.type = this.type;
+    return response;
   }
 };
 // Hoisted: this would otherwise allocate an array and scan it on
@@ -378,7 +426,14 @@ globalThis.Request = class Request {
       this._headersInit = undefined;
     } else if (init.headers === undefined && prior) {
       this._headersJson = prior._headersJson;
-      this._headersInit = prior._headers ?? prior._headersInit;
+      // Per spec `new Request(request)` copies the header list. The prior
+      // request's `Headers` object cannot stand in for it: `new Headers(h)`
+      // reads `h` through its iterator, which sorts, lower-cases and
+      // combines, so forwarding a request whose headers were read would
+      // undo the wire shape the outbound paths preserve.
+      this._headersInit = prior._headers
+        ? prior._headers.__celldHeaderList
+        : prior._headersInit;
     } else {
       this._headersJson = undefined;
       this._headersInit = init.headers;
@@ -399,7 +454,7 @@ globalThis.Request = class Request {
     this.body = stream !== null
       ? stream
       : ["GET", "HEAD"].includes(this.method)
-        ? null : new CelldBodyStream(this._bodyBytes);
+        ? null : new CelldBodyStream(this);
     this.redirect = init.redirect || (prior ? prior.redirect : "follow");
     const cf = init.cf === undefined
       ? (prior ? prior.cf : undefined) : init.cf;
@@ -440,8 +495,12 @@ globalThis.Request = class Request {
   }
   async json() { return JSON.parse(await this.text()); }
   async formData() {
+    // The undecoded bytes, not `text()`: a UTF-8 decode replaces each invalid
+    // sequence in a binary file part with one U+FFFD, so both the bytes and
+    // the length change.
+    this.bodyUsed = true;
     return __parseFormData(
-      await this.text(), this.headers.get('content-type'));
+      await this._consume(), this.headers.get('content-type'));
   }
   async arrayBuffer() {
     this.bodyUsed = true;
@@ -484,6 +543,25 @@ globalThis.console = {
 };
 
 // async-op shims: outbound fetch + timers, driven by the host event loop.
+// Move one request body through a host subrequest seam. A body that already
+// names a host stream keeps that stream incremental. An ordinary JavaScript
+// stream has no host owner, so it uses the existing byte fallback.
+const __subrequestBody = async (req, absent = false) => {
+  if (absent) return { body: undefined, streamId: undefined };
+  if (req._bodyBytes !== null)
+    return { body: req._bodyBytes, streamId: undefined };
+  const streamId = req.body?.__celldStreamId;
+  if (streamId === undefined) {
+    req.bodyUsed = true;
+    return { body: await req._consume(), streamId: undefined };
+  }
+  // The receiver now owns the one host source. Lock the wrapper so a later
+  // read fails instead of racing the receiver, and expose the transfer through
+  // the standard Body flag.
+  req.bodyUsed = true;
+  req.body.getReader();
+  return { body: new Uint8Array(), streamId };
+};
 globalThis.fetch = async (input, init) => {
   const req = new Request(input, init);
   // `fetch(url, { headers: { Upgrade: "websocket" } })` is the other way
@@ -491,12 +569,21 @@ globalThis.fetch = async (input, init) => {
   if ((req.headers.get("upgrade") ?? "").toLowerCase() === "websocket") {
     return await __fetchWebSocketUpgrade(req);
   }
-  const bytes = ["GET", "HEAD"].includes(req.method)
-    ? null : await req._consume();
-  const body = bytes === null
-    ? undefined : JSON.stringify(Array.from(bytes));
+  // The bytes go to the host as a typed array, the same way every other
+  // subrequest op takes a body. Encoding them as a JSON number array cost
+  // roughly ten times the body in transient allocation, and it corrupted
+  // nothing only because the host decoded the same shape back.
+  const { body, streamId } = await __subrequestBody(
+    req, ["GET", "HEAD"].includes(req.method));
+  // The header list, not the iterator: the iterator sorts, lower-cases and
+  // combines, so `Array.from(req.headers)` would send one `X-Trace: a, b`
+  // for two appends and put celld's casing on the wire in place of the
+  // author's. `op_fetch` builds the request with `RequestBuilder::header`,
+  // which appends, so repeats survive.
   const r = JSON.parse(await __op_fetch(
-    req.method, req.url, body, JSON.stringify(Array.from(req.headers)), req.redirect,
+    req.method, req.url, body,
+    JSON.stringify(req.headers.__celldHeaderList), req.redirect,
+    streamId,
   ));
   const response = new Response(
     new CelldHttpBodyStream(r.streamId),
@@ -520,6 +607,14 @@ globalThis.__fetchWebSocketUpgrade = async (req) => {
       id,
       scope,
       req.url,
+      // The iterator, not the header list, unlike every other outbound
+      // path. The handshake builder on the host side puts these into a
+      // `HeaderMap` with `insert`, which replaces, and it reads the
+      // offered subprotocols with a first-match `find`. Both would drop
+      // every repeat but one. Sending the combined form keeps
+      // `Sec-WebSocket-Protocol: a` plus `: b` meaning `a, b`, which is
+      // what the peer must see. Moving this to the header list needs the
+      // host to append instead, so it is a separate change.
       JSON.stringify(Array.from(req.headers)),
     ));
   } catch (error) {
@@ -560,23 +655,460 @@ globalThis.__makeAssetsBinding = (script) => ({
     return response;
   },
 });
-// R2 is deliberately not implemented. The binding exists so a worker
-// that declares r2_buckets still loads, but every method fails loudly
-// instead of pretending to be a bucket.
-globalThis.__makeR2Bucket = (name) => {
-  const fail = (method) => () => {
-    throw new Error(
-      `R2 is not implemented in celld (binding ${name}, ` +
-        `method ${method})`,
-    );
-  };
-  const bucket = {};
-  for (const method of ["head", "get", "put", "delete", "list",
-    "createMultipartUpload", "resumeMultipartUpload"]) {
-    bucket[method] = fail(method);
-  }
-  return bucket;
+// An `r2_buckets` binding, served out of the fleet bucket under the
+// reserved `r2/<bucketName>/` prefix. celld runs on blob storage rather
+// than providing it, so a binding gets the store the node already holds
+// credentials for; a node started without a bucket has nowhere to put a
+// blob and every method says so.
+//
+// The whole `R2Bucket` surface is here: `head`, `get`, `put`, `delete`,
+// `list`, `createMultipartUpload` and `resumeMultipartUpload`, with
+// `httpMetadata`, `customMetadata`, `checksums`, `storageClass`, `onlyIf`
+// and every range spelling. What celld cannot honor still fails loudly
+// rather than pretending — a silent gap is the failure mode the binding
+// is written to avoid. Those are `ssecKey` (celld has no customer-key
+// encryption), a conditional `put` of a body too big for one request, and
+// a multipart upload resumed on a node other than the one that opened it.
+const __r2Reject = (bucket, method, detail) => {
+  throw new Error(
+    `R2 ${method} is not implemented in celld (binding ${bucket})` +
+      (detail ? `: ${detail}` : ""),
+  );
 };
+// R2's key rules, checked here so a key the real thing refuses is refused
+// here too rather than quietly written.
+const __r2Key = (binding, method, key) => {
+  const text = String(key);
+  const length = new TextEncoder().encode(text).length;
+  if (length === 0 || length > 1024) {
+    throw new Error(
+      `R2 ${method} (binding ${binding}): a key is 1 to 1024 bytes, not ${length}`,
+    );
+  }
+  return text;
+};
+const __r2Hex = (value) => {
+  if (typeof value === "string") return value.trim().toLowerCase();
+  const bytes = value instanceof ArrayBuffer
+    ? new Uint8Array(value)
+    : ArrayBuffer.isView(value)
+    ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+    : null;
+  if (!bytes) return null;
+  let out = "";
+  for (const byte of bytes) out += byte.toString(16).padStart(2, "0");
+  return out;
+};
+const __r2Bytes = (hex) => {
+  const out = new Uint8Array(hex.length >> 1);
+  for (let at = 0; at < out.length; at++) {
+    out[at] = parseInt(hex.substr(at * 2, 2), 16);
+  }
+  return out.buffer;
+};
+// Read a `ReadableStream` to one `Uint8Array`. Bodies drained this way
+// are the ones the caller asked to have whole.
+const __r2Drain = async (stream) => {
+  const reader = stream.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.length;
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.length;
+  }
+  return out;
+};
+const __r2Ms = (value) => {
+  if (value === undefined || value === null) return undefined;
+  const ms = value instanceof Date ? value.getTime() : Number(value);
+  return Number.isFinite(ms) ? ms : undefined;
+};
+// `httpMetadata` is either an `R2HTTPMetadata` or a `Headers`, and R2
+// takes both on the way in.
+const __r2Http = (value) => {
+  if (value === undefined || value === null) return {};
+  const from = (name, key) =>
+    typeof value.get === "function" ? value.get(name) ?? undefined : value[key];
+  const http = {
+    contentType: from("content-type", "contentType"),
+    contentLanguage: from("content-language", "contentLanguage"),
+    contentDisposition: from("content-disposition", "contentDisposition"),
+    contentEncoding: from("content-encoding", "contentEncoding"),
+    cacheControl: from("cache-control", "cacheControl"),
+    cacheExpiry: __r2Ms(
+      typeof value.get === "function" ? value.get("expires") : value.cacheExpiry,
+    ),
+  };
+  for (const [name, entry] of Object.entries(http)) {
+    if (entry === undefined || entry === null) delete http[name];
+    else if (name !== "cacheExpiry") http[name] = String(entry);
+  }
+  return http;
+};
+// `onlyIf` is either an `R2Conditional` or a `Headers`; the header
+// spelling of "only if it has not changed since" is If-Unmodified-Since,
+// which is `uploadedBefore`.
+const __r2OnlyIf = (value) => {
+  if (value === undefined || value === null) return undefined;
+  const only = typeof value.get === "function"
+    ? {
+      etagMatches: value.get("if-match") ?? undefined,
+      etagDoesNotMatch: value.get("if-none-match") ?? undefined,
+      uploadedAfter: __r2Ms(Date.parse(value.get("if-modified-since") ?? "")),
+      uploadedBefore: __r2Ms(Date.parse(value.get("if-unmodified-since") ?? "")),
+    }
+    : {
+      etagMatches: value.etagMatches,
+      etagDoesNotMatch: value.etagDoesNotMatch,
+      uploadedAfter: __r2Ms(value.uploadedAfter),
+      uploadedBefore: __r2Ms(value.uploadedBefore),
+    };
+  for (const [name, entry] of Object.entries(only)) {
+    if (entry === undefined || entry === null || Number.isNaN(entry)) {
+      delete only[name];
+    } else if (name.startsWith("etag")) only[name] = String(entry);
+  }
+  return Object.keys(only).length ? only : undefined;
+};
+// A range is an `R2Range` or a `Headers` carrying a Range header. R2
+// takes `offset` alone, `length` alone, both, or `suffix`.
+const __r2Range = (binding, value) => {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value.get === "function") {
+    const header = value.get("range");
+    if (!header) return undefined;
+    const parsed = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+    if (!parsed) {
+      __r2Reject(binding, "get(range)", `celld cannot parse ${header}`);
+    }
+    const [, first, last] = parsed;
+    if (first === "") return { suffix: Number(last) };
+    if (last === "") return { offset: Number(first) };
+    return { offset: Number(first), length: Number(last) - Number(first) + 1 };
+  }
+  const range = {};
+  if (value.suffix !== undefined && value.suffix !== null) {
+    range.suffix = Number(value.suffix);
+  }
+  if (value.offset !== undefined && value.offset !== null) {
+    range.offset = Number(value.offset);
+  }
+  if (value.length !== undefined && value.length !== null) {
+    range.length = Number(value.length);
+  }
+  for (const [name, entry] of Object.entries(range)) {
+    if (!Number.isFinite(entry) || entry < 0) {
+      __r2Reject(binding, "get(range)", `\`${name}\` must be a whole number`);
+    }
+  }
+  return Object.keys(range).length ? range : undefined;
+};
+// R2 hashes an object's bytes and hands the digests back as
+// `ArrayBuffer`s, with a `toJSON()` that spells them in hex.
+const __r2Checksums = (hex) => {
+  const checksums = {
+    toJSON() {
+      const json = {};
+      for (const [name, digest] of Object.entries(hex)) json[name] = digest;
+      return json;
+    },
+  };
+  for (const [name, digest] of Object.entries(hex)) {
+    checksums[name] = __r2Bytes(digest);
+  }
+  return checksums;
+};
+// One object as R2 describes it. `object` is the host's record; `body`,
+// when there is one, makes this an `R2ObjectBody`.
+const __r2Object = (object, body) => {
+  const http = { ...object.http };
+  if (http.cacheExpiry !== undefined) {
+    http.cacheExpiry = new Date(http.cacheExpiry);
+  }
+  const etag = object.etag ? String(object.etag).replace(/^"|"$/g, "") : "";
+  const r2 = {
+    key: object.key,
+    version: object.version ?? etag,
+    size: object.size,
+    etag,
+    httpEtag: etag ? `"${etag}"` : "",
+    uploaded: new Date(object.uploaded),
+    httpMetadata: http,
+    customMetadata: object.custom ?? {},
+    checksums: __r2Checksums(object.checksums ?? {}),
+    storageClass: object.storageClass ?? "Standard",
+    // R2 fills the response headers from the object's own metadata, which
+    // is what makes `return new Response(object.body, { headers })` serve
+    // a stored file correctly.
+    writeHttpMetadata(headers) {
+      const write = (name, value) => {
+        if (value !== undefined && value !== null) headers.set(name, value);
+      };
+      write("content-type", http.contentType);
+      write("content-language", http.contentLanguage);
+      write("content-disposition", http.contentDisposition);
+      write("content-encoding", http.contentEncoding);
+      write("cache-control", http.cacheControl);
+      if (http.cacheExpiry !== undefined) {
+        headers.set("expires", http.cacheExpiry.toUTCString());
+      }
+    },
+  };
+  if (object.range) r2.range = { ...object.range };
+  if (!body) return r2;
+  const drain = () => __r2Drain(body);
+  r2.body = body;
+  Object.defineProperty(r2, "bodyUsed", {
+    get: () => body.locked || body._disturbed === true,
+  });
+  r2.arrayBuffer = async () => (await drain()).buffer;
+  r2.bytes = drain;
+  r2.text = async () => new TextDecoder().decode(await drain());
+  r2.json = async () => JSON.parse(new TextDecoder().decode(await drain()));
+  r2.blob = async () => new Blob([await drain()]);
+  return r2;
+};
+// The write-side options every writing method shares, in the shape the
+// host ops read.
+const __r2WriteOptions = (binding, method, options) => {
+  const o = options ?? {};
+  if (o.ssecKey !== undefined) {
+    __r2Reject(
+      binding,
+      `${method}(ssecKey)`,
+      "celld has no customer-key encryption",
+    );
+  }
+  const custom = {};
+  for (const [name, value] of Object.entries(o.customMetadata ?? {})) {
+    custom[name] = String(value);
+  }
+  const verify = {};
+  for (const name of ["md5", "sha1", "sha256", "sha384", "sha512"]) {
+    if (o[name] === undefined || o[name] === null) continue;
+    const hex = __r2Hex(o[name]);
+    if (hex === null) {
+      __r2Reject(
+        binding,
+        `${method}(${name})`,
+        "a checksum is hex or an ArrayBuffer",
+      );
+    }
+    verify[name] = hex;
+  }
+  const storageClass = o.storageClass === undefined || o.storageClass === null
+    ? undefined
+    : String(o.storageClass);
+  if (storageClass !== undefined &&
+    !["Standard", "InfrequentAccess"].includes(storageClass)
+  ) {
+    __r2Reject(
+      binding,
+      `${method}(storageClass)`,
+      `${storageClass} is not an R2 storage class`,
+    );
+  }
+  return {
+    http: __r2Http(o.httpMetadata),
+    custom,
+    storageClass,
+    onlyIf: __r2OnlyIf(o.onlyIf),
+    verify,
+  };
+};
+// A `put` body, as either the bytes to send in one request or the stream
+// to feed the host chunk by chunk. R2 takes all of these.
+const __r2Value = async (binding, value) => {
+  if (value === undefined || value === null) return new Uint8Array(0);
+  if (typeof value === "string") return new TextEncoder().encode(value);
+  if (value instanceof Uint8Array) return value;
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (typeof Blob !== "undefined" && value instanceof Blob) {
+    return new Uint8Array(await value.arrayBuffer());
+  }
+  if (value && typeof value.getReader === "function") return value;
+  return __r2Reject(
+    binding,
+    "put",
+    "a body is a string, an ArrayBuffer, a view, a Blob, a ReadableStream, or null",
+  );
+};
+// Feed a `ReadableStream` body to the host one chunk at a time. The host
+// writes one request when the whole body fits in a part and a multipart
+// upload when it does not, so a Worker can stream a body far larger than
+// its heap.
+const __r2PutStream = async (bucketName, key, stream, options) => {
+  const id = Number(await __r2_put_begin(bucketName, key, JSON.stringify(options)));
+  const reader = stream.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.length === 0) continue;
+      await __r2_put_chunk(
+        id,
+        value instanceof Uint8Array
+          ? value
+          : new Uint8Array(value.buffer, value.byteOffset, value.byteLength),
+      );
+    }
+  } catch (error) {
+    await __r2_put_end(id, true);
+    throw error;
+  }
+  return JSON.parse(await __r2_put_end(id, false));
+};
+// One open multipart upload. `id` resolves to the host's upload id, so
+// `resumeMultipartUpload` can hand back a handle without awaiting — as R2
+// does — and surface a bad id on the first method that uses it.
+const __r2Multipart = (binding, bucketName, key, id) => ({
+  key,
+  get uploadId() {
+    return String(id.value ?? "");
+  },
+  async uploadPart(partNumber, value, options) {
+    if (options?.ssecKey !== undefined) {
+      __r2Reject(binding, "uploadPart(ssecKey)", "celld has no customer-key encryption");
+    }
+    const body = await __r2Value(binding, value);
+    const bytes = body instanceof Uint8Array ? body : await __r2Drain(body);
+    const r = JSON.parse(await __r2_mp_part(await id.host, partNumber | 0, bytes));
+    // The object store owns the part list this completion acts on, so it
+    // never hands back a part etag to name one with.
+    return { partNumber: r.partNumber, etag: "" };
+  },
+  async complete(parts) {
+    const numbers = (parts ?? []).map((part) => part.partNumber | 0);
+    return __r2Object(JSON.parse(
+      await __r2_mp_complete(await id.host, JSON.stringify(numbers)),
+    ));
+  },
+  async abort() {
+    await __r2_mp_abort(await id.host);
+  },
+});
+globalThis.__makeR2Bucket = (binding, bucketName) => ({
+  async head(key) {
+    const name = __r2Key(binding, "head", key);
+    const r = JSON.parse(await __r2_head(bucketName, name));
+    return r.state === "miss" ? null : __r2Object(r.object);
+  },
+  async get(key, options) {
+    const name = __r2Key(binding, "get", key);
+    const o = options ?? {};
+    if (o.ssecKey !== undefined) {
+      __r2Reject(binding, "get(ssecKey)", "celld has no customer-key encryption");
+    }
+    const request = {
+      range: __r2Range(binding, o.range),
+      onlyIf: __r2OnlyIf(o.onlyIf),
+    };
+    const r = JSON.parse(await __r2_get(bucketName, name, JSON.stringify(request)));
+    if (r.state === "miss") return null;
+    // A refused `onlyIf` answers the object without its body, which is how
+    // a caller tells "not modified" from "not there".
+    if (r.state === "unmet") return __r2Object(r.object);
+    return __r2Object(r.object, new CelldHttpBodyStream(r.streamId));
+  },
+  async put(key, value, options) {
+    const name = __r2Key(binding, "put", key);
+    const write = __r2WriteOptions(binding, "put", options);
+    const body = await __r2Value(binding, value);
+    const r = body instanceof Uint8Array
+      ? JSON.parse(await __r2_put(bucketName, name, body, JSON.stringify(write)))
+      : await __r2PutStream(bucketName, name, body, write);
+    // R2 answers a refused `onlyIf` with `null` rather than throwing.
+    return r.stored ? __r2Object(r.object) : null;
+  },
+  async delete(keys) {
+    const list = (Array.isArray(keys) ? keys : [keys]).map((key) =>
+      __r2Key(binding, "delete", key)
+    );
+    if (list.length > 1000) {
+      throw new Error(
+        `R2 delete (binding ${binding}) takes at most 1000 keys, not ${list.length}`,
+      );
+    }
+    if (list.length) await __r2_delete(bucketName, JSON.stringify(list));
+  },
+  async list(options) {
+    const o = options ?? {};
+    const include = Array.isArray(o.include) ? o.include : [];
+    for (const entry of include) {
+      if (!["httpMetadata", "customMetadata"].includes(entry)) {
+        __r2Reject(binding, "list(include)", `${entry} is not an R2 listing extra`);
+      }
+    }
+    const request = {
+      prefix: o.prefix === undefined || o.prefix === null ? "" : String(o.prefix),
+      cursor: o.cursor === undefined || o.cursor === null ? null : String(o.cursor),
+      startAfter: o.startAfter === undefined || o.startAfter === null
+        ? null
+        : String(o.startAfter),
+      limit: o.limit === undefined || o.limit === null ? 0 : o.limit | 0,
+      delimiter: o.delimiter === undefined || o.delimiter === null
+        ? null
+        : String(o.delimiter),
+      include: include.length > 0,
+    };
+    const r = JSON.parse(await __r2_list(bucketName, JSON.stringify(request)));
+    const objects = r.objects.map((object) => {
+      // A listing carries the extras it was asked for and nothing else,
+      // so a caller cannot mistake an empty map for an empty object.
+      if (!include.includes("httpMetadata")) object.http = {};
+      if (!include.includes("customMetadata")) object.custom = {};
+      return __r2Object(object);
+    });
+    // R2 omits `cursor` entirely when the listing is complete, and callers
+    // test `truncated` before reading it.
+    const page = { objects, truncated: r.truncated, delimitedPrefixes: r.prefixes };
+    if (r.truncated && r.cursor) page.cursor = r.cursor;
+    return page;
+  },
+  async createMultipartUpload(key, options) {
+    const name = __r2Key(binding, "createMultipartUpload", key);
+    const write = __r2WriteOptions(binding, "createMultipartUpload", options);
+    if (write.onlyIf) {
+      __r2Reject(
+        binding,
+        "createMultipartUpload(onlyIf)",
+        "a multipart completion takes no precondition",
+      );
+    }
+    // R2 takes a checksum on `put`, which sees the whole body, and not on a
+    // multipart upload, which never does.
+    for (const name of Object.keys(write.verify)) {
+      __r2Reject(binding, `createMultipartUpload(${name})`, "R2 takes a checksum on `put`");
+    }
+    const uploadId = await __r2_mp_begin(bucketName, name, JSON.stringify(write));
+    return __r2Multipart(binding, bucketName, name, {
+      value: uploadId,
+      host: Promise.resolve(Number(uploadId)),
+    });
+  },
+  // R2 hands back a handle without checking it; so does this, and the
+  // first method that uses it says whether the upload is still open.
+  resumeMultipartUpload(key, uploadId) {
+    const name = __r2Key(binding, "resumeMultipartUpload", key);
+    const id = String(uploadId);
+    const host = __r2_mp_resume(bucketName, name, id).then(Number);
+    // A handle nobody uses must not become an unhandled rejection; the
+    // first method that awaits `host` still sees the failure.
+    host.catch(() => {});
+    return __r2Multipart(binding, bucketName, name, { value: id, host });
+  },
+});
 globalThis.__makeAiBinding = (url) => ({
   async run(model, input) {
     const response = await fetch(url, {
@@ -639,36 +1171,23 @@ const __sqlCursorFinalizer = typeof FinalizationRegistry === "function"
 
 // A `SqlStorageCursor` over one exec's result (Cloudflare DO SQL API).
 class SqlCursor {
+  // `res` is what `__sql_cursor_start` returns: V8 values throughout, with the
+  // first row already stepped. A failing query throws out of the op, so there
+  // is no in-band error field to test here.
   constructor(res) {
-    if (res.error) throw new Error("SQL error: " + res.error);
-    this._decode = (value) => value && typeof value === "object" &&
-      Array.isArray(value.__celld_bytes)
-      ? Uint8Array.from(value.__celld_bytes).buffer
-      : value;
     this.columns = res.columns;
     this.rowsWritten = Number(res.rowsWritten || 0);
     this.reusedCachedQueryForTest = Boolean(res.reusedCachedQuery);
     this._deferredError = null;
-    if (res.native) {
-      this._native = true;
-      this._cursorId = Number(res.cursorId || 0);
-      this._prefetched = res.row === null
-        ? null
-        : res.row.map(this._decode);
-      this.rowsRead = this._prefetched === null ? 0 : 1;
-      this._finalizerToken = null;
-      if (this._cursorId && __sqlCursorFinalizer) {
-        this._finalizerToken = {};
-        __sqlCursorFinalizer.register(
-          this, this._cursorId, this._finalizerToken,
-        );
-      }
-    } else {
-      this._native = false;
-      this._rows = res.rows.map((row) => row.map(this._decode));
-      this._rowCount = this._rows.length;
-      this._index = 0;
-      this.rowsRead = Math.min(1, this._rowCount);
+    this._cursorId = Number(res.cursorId || 0);
+    this._prefetched = res.row;
+    this.rowsRead = this._prefetched === null ? 0 : 1;
+    this._finalizerToken = null;
+    if (this._cursorId && __sqlCursorFinalizer) {
+      this._finalizerToken = {};
+      __sqlCursorFinalizer.register(
+        this, this._cursorId, this._finalizerToken,
+      );
     }
   }
   _obj(r) { const o = {}; for (let i = 0; i < this.columns.length; i++) o[this.columns[i]] = r[i]; return o; }
@@ -683,40 +1202,37 @@ class SqlCursor {
       this._prefetched = null;
       return;
     }
-    const result = JSON.parse(__sql_cursor_next(this._cursorId));
-    if (result.error) {
-      this._deferredError = new Error("SQL error: " + result.error);
+    // The op answers with V8 values, not JSON: an array is a row, a number is
+    // the cursor's final rowsWritten, and a failure throws. The throw is
+    // caught and deferred, because a consumer must still receive the last good
+    // row -- the error belongs to the call after it, not to this one.
+    let result;
+    try {
+      result = __sql_cursor_next(this._cursorId);
+    } catch (error) {
+      this._deferredError = error;
       this._prefetched = null;
       this._finishNative();
       return;
     }
-    this.rowsWritten = Number(result.rowsWritten || this.rowsWritten);
-    if (result.row === null) {
-      this._prefetched = null;
-      this._finishNative();
-    } else {
-      this._prefetched = result.row.map(this._decode);
+    if (Array.isArray(result)) {
+      this._prefetched = result;
       this.rowsRead++;
+      return;
     }
+    this.rowsWritten = Number(result || this.rowsWritten);
+    this._prefetched = null;
+    this._finishNative();
   }
   _nextRaw() {
-    if (this._native) {
-      if (this._deferredError) {
-        const error = this._deferredError;
-        this._deferredError = null;
-        throw error;
-      }
-      if (this._prefetched === null) return { done: true };
-      const value = this._prefetched;
-      this._advanceNative();
-      return { done: false, value };
+    if (this._deferredError) {
+      const error = this._deferredError;
+      this._deferredError = null;
+      throw error;
     }
-    if (this._index >= this._rowCount) return { done: true };
-    const index = this._index++;
-    const value = this._rows[index];
-    // Release consumed rows even if the cursor itself remains reachable.
-    this._rows[index] = null;
-    this.rowsRead = Math.min(this._index + 1, this._rowCount);
+    if (this._prefetched === null) return { done: true };
+    const value = this._prefetched;
+    this._advanceNative();
     return { done: false, value };
   }
   toArray() {
@@ -770,9 +1286,9 @@ class SqlStorage {
         ) };
       return value;
     };
-    return new SqlCursor(JSON.parse(__sql_cursor_start(
+    return new SqlCursor(__sql_cursor_start(
       this._scope, query, JSON.stringify(binds.map(encode)),
-    )));
+    ));
   }
   ingest(input) {
     const result = JSON.parse(__sql_ingest(this._scope, String(input)));
@@ -1486,7 +2002,16 @@ const __STATUS_TEXT = {
   507: "Insufficient Storage", 508: "Loop Detected",
   510: "Not Extended", 511: "Network Authentication Required",
 };
+const __ERROR_RESPONSE_MESSAGE =
+  "Return value from serve handler must not be an error " +
+  "response (like Response.error())";
 const __wrapServiceResponse = (res, url) => {
+  // Response.error() represents a Fetch network error, not an HTTP response.
+  // Letting status 0 cross this seam turns it into an ordinary response and
+  // makes callers continue after the target explicitly reported failure.
+  if (res.type === "error" || res.status === 0) {
+    throw new TypeError(__ERROR_RESPONSE_MESSAGE);
+  }
   // A 101 that crossed isolates carries a target rather than a socket: the
   // pair's other end is in the isolate that answered, and the two cannot be
   // linked the way the loopback below links them. Give the caller a client
@@ -1557,16 +2082,18 @@ globalThis.__makeLoader = () => {
       async fetch(input, init) {
         const id = await idPromise;
         const req = new Request(input, init);
-        const headers = JSON.stringify(Array.from(req.headers));
-        const body_ = req._bodyBytes === null
-          ? await req._consume() : req._bodyBytes;
+        // The verbatim header list; see the note on the outbound `fetch`.
+        // The loaded worker rebuilds a `Headers` from these pairs, so a
+        // repeat and its casing survive the isolate boundary.
+        const headers = JSON.stringify(req.headers.__celldHeaderList);
+        const { body, streamId } = await __subrequestBody(req);
         const r = JSON.parse(
-          await __loader_fetch(id, req.url, req.method, body_, headers));
-        const body = r.streamId !== undefined
+          await __loader_fetch(id, req.url, req.method, body, headers, streamId));
+        const responseBody = r.streamId !== undefined
           ? new CelldHttpBodyStream(r.streamId)
           : r.body !== undefined ? r.body : Uint8Array.from(r.bodyBytes || []);
         return __wrapServiceResponse(
-          new Response(body, { status: r.status, headers: r.headers }),
+          new Response(responseBody, { status: r.status, headers: r.headers }),
           req.url);
       },
     };
@@ -1724,25 +2251,27 @@ globalThis.__makeServiceBinding = (script, entrypoint = null) => {
         __endEvent();
       }
     }
-    const headers = JSON.stringify(Array.from(req.headers));
-    // Cross-isolate calls carry exact bytes; a stream body is drained
-    // (and per spec disturbed) first.
-    const body_ = req._bodyBytes === null
-      ? await req._consume() : req._bodyBytes;
+    // The verbatim header list; see the note on the outbound `fetch`. The
+    // target isolate rebuilds a `Headers` from these pairs, so a repeat and
+    // its casing survive the crossing.
+    const headers = JSON.stringify(req.headers.__celldHeaderList);
+    // Cross-isolate calls carry exact bytes. A host-backed stream transfers
+    // its one source to the target, and another stream uses the byte fallback.
+    const { body, streamId } = await __subrequestBody(req);
     const r = JSON.parse(await (signal
       ? __awaitCancellableDoCall(
         __svc_call_cancellable(
-          script, req.url, req.method, body_, headers),
+          script, req.url, req.method, body, headers, streamId),
         signal)
       : __svc_call(
-        script, req.url, req.method, body_, headers)));
-    const body = r.streamId !== undefined
+        script, req.url, req.method, body, headers, streamId)));
+    const responseBody = r.streamId !== undefined
       ? new CelldHttpBodyStream(r.streamId)
       : r.body !== undefined
         ? r.body
         : Uint8Array.from(r.bodyBytes || []);
     return __wrapServiceResponse(
-      new Response(body, {
+      new Response(responseBody, {
         status: r.status, headers: r.headers, __wsTarget: r.wsTarget,
       }),
       req.url);
@@ -1929,8 +2458,8 @@ const __ctxAbortCurrent =
 // A stub entry owns a local target; `refs` counts live handles
 // across dup()s. When the last handle is disposed the target's own
 // Symbol.dispose runs (async, matching Workerd's disposal callback).
-// Stubs cross same-isolate transports only (the DO owned fast path
-// and same-script entrypoint RPC); a marker revived elsewhere fails
+// Stubs cross same-isolate transports only (same-script entrypoint
+// RPC and same-process routed dispatch); a marker revived elsewhere fails
 // loudly on use instead of aliasing an unrelated local entry.
 // `ctx` records the owning request context: the entry's for
 // running its target, the handle's for the serialize-elsewhere
@@ -2032,6 +2561,11 @@ const __rpcNoClone = () => {};
 // Proxy handlers participate, as in Workerd.
 const __rpcNoSuchMethod = (prop) => new TypeError(
   'The RPC receiver does not implement the method "' + prop + '".');
+// Bind through the intrinsic because a callable proxy can implement `.bind`
+// as a remote property. Reading that property can turn a valid named RPC
+// method into a non-function. Keep this rule shared by every RPC binding site.
+const __rpcBindMethod = (value, receiver) =>
+  Reflect.apply(Function.prototype.bind, value, [receiver]);
 const __stubResolve = (target, prop) => {
   if (target instanceof __cf.RpcTarget) {
     if (Object.hasOwn(target, prop) || !(prop in target) ||
@@ -2040,12 +2574,12 @@ const __stubResolve = (target, prop) => {
     throw __rpcNoSuchMethod(prop);
   }
   const value = target[prop];
-  // Bind plain methods to their receiver, but never touch `.bind` on
-  // a stub or pipeline node — property access on those is remote.
+  // Keep celld's own stubs and pipeline nodes unwrapped because the wrapper
+  // would lose their metadata.
   return typeof value === "function" && !__stubMeta.has(value) &&
       !(value instanceof __cf.RpcPromise) &&
       !(value instanceof __cf.RpcProperty)
-    ? value.bind(target) : value;
+    ? __rpcBindMethod(value, target) : value;
 };
 // ---- streams over RPC ------------------------------------------
 // A live stream crosses as a handle in the caps table: the sender
@@ -2231,6 +2765,7 @@ const __stubLift = (value) => {
                  t: v.statusText ||
                     __STATUS_TEXT[v.status] || "",
                  h: [...v.headers], c: v.cf,
+                 e: v.type === "error",
                  b: v.body === null ? null : liftBody(v) };
     } else if (v instanceof ReadableStream ||
                v instanceof WritableStream) {
@@ -2269,7 +2804,7 @@ const __stubLift = (value) => {
     if (!Array.isArray(v) && typeof disposer === "function") {
       lifted = true;
       caps = true;
-      out["__celld$disp"] = __newEntry(disposer.bind(v)).id;
+      out["__celld$disp"] = __newEntry(__rpcBindMethod(disposer, v)).id;
     }
     return out;
   };
@@ -2289,7 +2824,7 @@ const __reviveBlob = (marker, bytes) => {
 };
 const __adoptBody = (target, bytes) => {
   target._bodyBytes = bytes;
-  target._body = new TextDecoder().decode(bytes);
+  target._body = undefined; // decoded lazily on the first text()/json()
   const body = target.body;
   if (body !== null) {
     body._st.bytes = bytes;
@@ -2316,6 +2851,7 @@ const __reviveResponse = (marker, revive) => {
       status: marker["__celld$res"], statusText: marker.t,
       headers: marker.h, cf: marker.c });
   if (bytes) __adoptBody(res, marker.b);
+  if (marker.e) res.type = "error";
   return res;
 };
 // Wire a received stream handle to a local endpoint built with
@@ -2473,7 +3009,7 @@ const __entrypointResolve = (inst, prop) => {
   return typeof value === "function" && !__stubMeta.has(value) &&
       !(value instanceof __cf.RpcPromise) &&
       !(value instanceof __cf.RpcProperty)
-    ? value.bind(inst) : value;
+    ? __rpcBindMethod(value, inst) : value;
 };
 // A pipeline hop may continue only through plain data, functions,
 // RpcTargets, and stubs — never through an RPC promise/property
@@ -3104,37 +3640,51 @@ class DurableObjectNamespace {
         const req = new Request(input, init);
         const signal = req._signalForSubrequests;
         if (signal?.aborted) throw signal.reason;
-        // The DO seam carries exact bytes; a stream body is drained
-        // (and per spec disturbed) first.
-        const body_ = req._bodyBytes === null
-          ? await req._consume() : req._bodyBytes;
+        // A body already backed by a host stream forwards to the cell as its
+        // stream id, so a proxied upload to a cell on this node costs a chunk
+        // rather than the whole body (#156). The host keeps it a stream for a
+        // local cell and collects it only to sign a cross-node frame. A held
+        // body -- or a stream with no host id -- crosses as its bytes.
+        const bodyStreamId =
+          req._bodyBytes === null && req.body && req.body.__celldStreamId !== undefined
+            ? req.body.__celldStreamId
+            : undefined;
+        const body_ = bodyStreamId !== undefined
+          ? new Uint8Array()
+          : req._bodyBytes === null
+            ? await req._consume()
+            : req._bodyBytes;
+        if (bodyStreamId !== undefined) {
+          // The cell reads this upload through the same host stream id, so the
+          // Worker's wrapper must not also read it: lock it (a late read throws
+          // instead of racing the cell over one host stream) and mark it used,
+          // which is what awaiting the old _consume() did and what workerd
+          // reports as request.bodyUsed after the forward.
+          req.bodyUsed = true;
+          req.body.getReader();
+        }
         // Forward the request's headers to the cell as JSON. When they were
         // never materialized -- a Worker that only routes to a cell reads
         // none -- pass the raw header string straight through, so the whole
         // dispatch never builds a Headers object on either side.
+        //
+        // Both branches now carry the same shape. The raw string is the
+        // wire list the host handed in, so the materialized branch must send
+        // the header list too, not the iterator; see the note on the
+        // outbound `fetch`. Reading `.headers` on a forwarded request used
+        // to change what the cell received.
         const headersJson = req._headersJson !== undefined
           ? req._headersJson
-          : JSON.stringify(Array.from(req.headers));
-        // Fast path: this isolate owns the target cell — run the DO
-        // in-isolate, avoiding the __do_call host round trip.
-        if (__cell.owned[scope]) {
-          return await invoke(() => __dispatchTo(
-            scope, req.url, req.method, body_,
-            headersJson,
-            null,
-            true,
-            signal,
-          ));
-        }
+          : JSON.stringify(req.headers.__celldHeaderList);
         const r = JSON.parse(await invoke(() => {
           if (!signal) return __do_call(
             scope, dispatchName ?? null, req.url, req.method, body_,
-            headersJson,
+            headersJson, bodyStreamId,
           );
           return __awaitCancellableDoCall(
             __do_call_cancellable(
               scope, dispatchName ?? null, req.url, req.method, body_,
-              headersJson,
+              headersJson, bodyStreamId,
             ),
             signal,
           );
@@ -3166,20 +3716,10 @@ class DurableObjectNamespace {
       if (__cell.compat.fetcherGetPutDelete &&
           (prop === "get" || prop === "put" || prop === "delete"))
         return __fetcherHelper(doFetch, prop);
-      // Fast path: this isolate owns the target cell — run the DO RPC
-      // in-isolate, avoiding the __rpc_call host round trip. Still a
-      // structured clone each way: Workerd extracts a copy even for a
-      // same-isolate call, and JSON round-tripped here before. The
-      // reply decodes inside invoke() so abort/exit markers rethrown
-      // from the envelope still trip the broken-stub sniffing.
-      if (__cell.owned[scope])
-        return async (...args) => invoke(
-          async () => __rpcDes(await __dispatchRpc(
-            scope, prop, __rpcOut(args, true))),
-        );
-      // The routed channel also lifts: same-process dispatch
-      // re-enters this isolate, where the markers revive; bytes
-      // that land elsewhere revive as loud foreign stubs.
+      // Every cell RPC goes out through the host, whichever node owns the
+      // target. Same-process dispatch re-enters this isolate, where the
+      // abort and exit markers revive; bytes that land elsewhere revive as
+      // loud foreign stubs.
       return async (...args) => invoke(
         async () => __rpcDes(await __rpc_call(
           scope, dispatchName ?? null, prop, __rpcOut(args, true),
@@ -3249,9 +3789,11 @@ globalThis.__makeIncomingRequest = (
   streamId === undefined ? body : new CelldHttpBodyStream(streamId),
   headersJson, undefined, true);
 globalThis.__dispatchTo = async (
-  scope, url, method, body, headersJson, requestId = null, inline = false,
-  callerSignal = null,
+  scope, url, method, body, headersJson, requestId = null, bodyStreamId = null,
 ) => {
+  // A routed body that must not be collected crosses as a host stream id; the
+  // handler here reads it in parts. A held body arrives as its bytes.
+  if (bodyStreamId !== null) body = new CelldHttpBodyStream(bodyStreamId);
   // Request already allocates a default controller for an absent signal.
   // Retain that same allocation so a streamed response can report reader
   // cancellation after the handler has returned.
@@ -3261,10 +3803,6 @@ globalThis.__dispatchTo = async (
       String(requestId), requestController.signal);
   __actorEventStack.push(scope);
   try {
-    // Output gate for the co-hosted fast path: the routed path is gated in the
-    // host, but an owned in-isolate dispatch bypasses it, so sample the cell's
-    // committed-write position here and hold the response below until durable.
-    const gateBefore = inline ? __writePosition(scope) : null;
     const dispatch = (async () => {
       const inst = await _readyInstance(scope);
       return await __ctxRun(undefined, () => inst.fetch(
@@ -3277,23 +3815,14 @@ globalThis.__dispatchTo = async (
           true,
         )));
     })();
-    // The owned in-isolate fast path carries the caller's signal here
-    // directly (the routed channel reaches this signal through
-    // __do_call_cancel/__abortIncomingRequest instead). Mirror those
-    // semantics: abandonment aborts the target's fresh incoming signal
-    // with the canonical disconnect reason and rejects the caller with
-    // its own reason; the abandoned dispatch keeps its settle handlers
-    // and drains its waitUntil work.
-    const response = callerSignal === null
-      ? await dispatch
-      : await __raceCallerAbort(dispatch, callerSignal, () =>
-          requestController.abort(
-            new Error("The client has disconnected")));
-    __attachResponseRequestCancellation(
-      response,
-      requestController,
-      inline,
-    );
+    // The caller's abandonment reaches the target through
+    // __do_call_cancel/__abortIncomingRequest, which aborts the fresh incoming
+    // signal made above; the host dispatcher passes no caller signal here.
+    const response = await dispatch;
+    // Not wrapped: the host holds this response and gates it, and the caller
+    // that would cancel the body reaches it through the routed channel's own
+    // controller rather than this one.
+    __attachResponseRequestCancellation(response, requestController, false);
     if (response instanceof Response && response.status === 101 &&
         response.webSocket && !response.webSocket._target) {
       const socket = response.webSocket._peer;
@@ -3306,16 +3835,6 @@ globalThis.__dispatchTo = async (
         __sockets.set(socket._id, socket);
         socket._flushPending();
       }
-    }
-    // Hold the inline response until the write is durable (rejects if it can
-    // not be proved, breaking the call as a routed gate failure would). A null
-    // `before` means this thread opened the cell's connection during the
-    // handler; a fresh connection's change counter starts at zero, so treat it
-    // as zero — a write advances past it, a read leaves it there.
-    if (inline) {
-      const after = __writePosition(scope);
-      const wrote = after !== null && after > (gateBefore ?? 0);
-      await __gateWrite(scope, wrote ? after : null);
     }
     return response;
   } finally {
@@ -3341,14 +3860,14 @@ const __rpcTargetMethod = async (scope, method) => {
 };
 // The byte path always lifts stub-able values into the reply: the
 // markers carry the isolate token, so they revive only back in this
-// isolate (the owned fast path and same-process routed dispatch)
-// and fail loudly on use anywhere else. Callee exceptions cross in
+// isolate (same-process routed dispatch re-enters it) and fail loudly
+// on use anywhere else. Callee exceptions cross in
 // the error envelope on every flavor.
 globalThis.__dispatchRpc = async (scope, method, args) => {
   __actorEventStack.push(scope);
   try {
-    // A string is the legacy JSON flavor (test harness, old cross-node
-    // envelope); bytes are V8 structured clone. Answer in kind.
+    // A string is the legacy JSON flavor; bytes are V8 structured clone.
+    // Answer in kind.
     if (typeof args === "string") {
       const [inst, fn] = await __rpcTargetMethod(scope, method);
       const result = await fn.apply(inst, JSON.parse(args));
@@ -3437,10 +3956,126 @@ const __dispatchEntrypointMethod = async (name, method, arg) => {
       `Entrypoint ${JSON.stringify(name)} has no ${method} handler`);
   return await __ctxRun(undefined, () => inst[method](arg));
 };
+// Invoke a handler inside the event frame that the host already opened. A
+// Queue dispatch uses this form because its host driver must receive and keep
+// driving the handler's waitUntil aggregate after the settlement is returned.
+const __dispatchEntrypointMethodInCurrentEvent = async (name, method, arg) => {
+  const handler = __cell.objectEntrypoints[name];
+  if (handler !== undefined) {
+    if (typeof handler[method] !== "function")
+      throw new TypeError(
+        `Entrypoint ${JSON.stringify(name)} has no ${method} handler`);
+    return await __ctxRun(undefined,
+      () => handler[method](arg, __cell.env, __entrypointContext()));
+  }
+  const inst = __entrypointInstance(name);
+  if (typeof inst[method] !== "function")
+    throw new TypeError(
+      `Entrypoint ${JSON.stringify(name)} has no ${method} handler`);
+  return await __ctxRun(undefined, () => inst[method](arg));
+};
 globalThis.__dispatchEntrypointFetch = (name, request) =>
   __dispatchEntrypointMethod(name, "fetch", request);
 globalThis.__dispatchEntrypointScheduled = (name, ctrl) =>
   __dispatchEntrypointMethod(name, "scheduled", ctrl);
+// A queue batch owns mutable settlement state only while its handler runs.
+// Keeping a batch alive after dispatch must not keep authority to settle its
+// lease, because that lease can have expired and been handed out again.
+globalThis.__dispatchEntrypointQueue = async (name, incoming) => {
+  let active = true;
+  let ackAll = false;
+  const explicitAcks = new Set();
+  const retries = new Map();
+  const retryBatch = { retry: false, delaySeconds: undefined };
+  const checkActive = () => {
+    if (!active)
+      throw new Error("Queue event methods cannot be called after the handler returns.");
+  };
+  const retryDelay = (options) => {
+    const value = options?.delaySeconds;
+    if (value === undefined) return undefined;
+    if (!Number.isInteger(value) || value < -0x8000_0000 || value > 0x7fff_ffff)
+      throw new TypeError("delaySeconds must be a 32-bit integer");
+    return value;
+  };
+  const decode = (message) => {
+    switch (message.contentType) {
+      case "text": return new TextDecoder().decode(message.body);
+      case "bytes": return message.body;
+      case "json": return JSON.parse(new TextDecoder().decode(message.body));
+      case "v8": return __sc_decode(message.body);
+      default: throw new TypeError(`Unknown queue content type: ${message.contentType}`);
+    }
+  };
+  const messages = incoming.messages.map((message) => ({
+    id: message.id,
+    timestamp: new Date(message.timestamp),
+    body: decode(message),
+    attempts: message.attempts,
+    ack() {
+      checkActive();
+      if (ackAll || retryBatch.retry || retries.has(message.id)) return;
+      explicitAcks.add(message.id);
+    },
+    retry(options) {
+      checkActive();
+      if (ackAll || explicitAcks.has(message.id)) return;
+      const delaySeconds = retryDelay(options);
+      if (delaySeconds !== undefined || !retries.has(message.id))
+        retries.set(message.id, delaySeconds);
+    },
+  }));
+  const oldest = incoming.metrics.oldestMessageTimestamp;
+  const batch = {
+    queue: incoming.queue,
+    messages,
+    metadata: {
+      metrics: {
+        backlogCount: incoming.metrics.backlogCount,
+        backlogBytes: incoming.metrics.backlogBytes,
+        oldestMessageTimestamp: oldest === undefined ? undefined : new Date(oldest),
+      },
+    },
+    ackAll() {
+      checkActive();
+      if (!retryBatch.retry) ackAll = true;
+    },
+    retryAll(options) {
+      checkActive();
+      if (ackAll) return;
+      retryBatch.retry = true;
+      const delaySeconds = retryDelay(options);
+      if (delaySeconds !== undefined) retryBatch.delaySeconds = delaySeconds;
+    },
+  };
+  let outcome = "ok";
+  let errorText;
+  try {
+    await __dispatchEntrypointMethodInCurrentEvent(name, "queue", batch);
+  } catch (error) {
+    // A handler exception retries the batch but keeps explicit acks that the
+    // handler made before it threw. The caller needs both facts together.
+    outcome = "exception";
+    try {
+      errorText = String(error);
+    } catch {
+      errorText = "queue handler rejected";
+    }
+  } finally {
+    active = false;
+  }
+  return {
+    outcome,
+    error: errorText,
+    ackAll,
+    retryBatch,
+    explicitAcks: [...explicitAcks],
+    retryMessages: [...retries].map(([msgId, delaySeconds]) => ({
+      msgId,
+      delaySeconds,
+    })),
+  };
+};
 // Workerd's simple-handler RPC rules (worker-rpc.c++): a non-class
 // handler method is called as fn(arg, env, ctx), the client must send
 // exactly one argument, and the handler must not declare more than
@@ -3755,17 +4390,2453 @@ globalThis.__cell = {
   doExports: {},
   classes: { ".cron": CelldCronSchedule },
   crons: [],
+  workflows: {},
   instances: {},
   env: {},
-  owned: {},
   idNames: {},
   namespaceKeys: {},
   node: "",
   deleteAllDeletesAlarm: false,
-  compat: { jsRpc: false, fetcherGetPutDelete: false },
+  compat: { jsRpc: false, fetcherGetPutDelete: false, queueJsonMessages: false },
   makeNamespace,
   release: __cellRelease,
 };
+// ---- KV ------------------------------------------------------------------
+// A KV namespace is a cell of a runtime-supplied Durable Object class, so it
+// inherits ownership, fencing, LTX replication and durable acknowledgement
+// from the cell it already is. This half is the server; `__makeKvNamespace`
+// below is the client the binding hands to a Worker.
+//
+// Reads here are strongly consistent and the published contract is upstream's:
+// a value can be up to 60 seconds old. That gap is deliberate. A node-local
+// read cache is the obvious next optimisation and it would make reads
+// genuinely stale, and a freshness promise made now could not be withdrawn
+// then. Implement strong, promise weak.
+//
+// Storage is ordinary cell SQL rather than the KV surface, because a namespace
+// is read by ordered prefix scan and `list` is the operation that decides the
+// schema. `celld_logic::kv` owns every decision about a key, a deadline or a
+// limit; nothing here re-derives one.
+
+// Run one bounded reclamation transaction. A cell supplies only its ordered
+// candidate query and its per-row transition, so KV expiry and Queue retention
+// share the turn bound and the transaction shape without pretending their SQL
+// state machines are the same.
+const __cellSweepBatch = (storage, select, reclaim, limit) => {
+  let processed = 0;
+  storage.transactionSync(() => {
+    const rows = select(limit);
+    if (rows.length > limit) throw new Error("a cell sweep exceeded its row bound");
+    for (const row of rows) {
+      reclaim(row);
+      processed += 1;
+    }
+  });
+  return processed;
+};
+
+const __KV_TABLE = "__kv";
+const __KV_META_TABLE = "__kv_meta";
+
+// Upstream's four content types. The wire form is what `get` returns for
+// `type: "text"`; the binding converts from there, so the cell stores bytes
+// and a tag and never a parsed value.
+const __kvError = (message) => new Error("KV_ERROR: " + String(message));
+
+// One op for the whole large-value path, following `__d1_run`. Bytes cross as
+// a typed view in both directions. Encoding a 25 MiB value as a JSON number
+// array creates millions of heap objects and can crash an otherwise valid put.
+const __kvBlob = async (request, value) => {
+  const reply = await __kv_blob(JSON.stringify(request), value);
+  return reply instanceof Uint8Array
+    ? { found: true, value: reply }
+    : JSON.parse(reply);
+};
+
+// The authenticated operator route still uses JSON for its control envelope.
+// A byte array is acceptable for an inline value, but a 25 MiB array creates
+// 25 million JavaScript numbers and exhausts the isolate. The raw base64 ops
+// accept typed views for this internal wire form; the public atob() and btoa()
+// wrappers keep their standard string-only behaviour.
+const __kvOperatorValue = (value) => {
+  const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+  return bytes.byteLength > __kvLimits().maxInlineValueBytes
+    ? { value: $$btoa(bytes), valueEncoding: "base64" }
+    : { value: [...bytes] };
+};
+
+// Content addressing, so the same value written twice in one ownership epoch
+// stores once and a retry after an uncertain failure costs nothing. A later
+// epoch deliberately uses a different object. SHA-256 makes an accidental
+// collision infeasible. The host adds the active cell scope and epoch to the
+// object key, because one activation cannot prove another activation's live
+// set and therefore cannot safely collect from a shared digest prefix.
+const __kvDigest = async (bytes) => {
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  let out = "";
+  for (const byte of hash) out += byte.toString(16).padStart(2, "0");
+  return out;
+};
+
+class __KvNamespaceCell {
+  constructor(ctx) {
+    this.ctx = ctx;
+    this._ready = false;
+    // Blob references written to the bucket whose row has not committed yet. A sweep
+    // must spare these, or it collects bytes a put is about to reference.
+    this._pending = new Set();
+    // Blob writes and the mark-and-sweep protocol share one per-cell queue.
+    // The pending set is live state, not a snapshot that stays valid across an
+    // await, so collection cannot overlap a put from its announcement through
+    // its row commit. Other cells and ordinary reads stay independent.
+    this._blobProtocolTail = Promise.resolve();
+  }
+
+  async _withBlobProtocol(operation) {
+    const previous = this._blobProtocolTail;
+    let release;
+    this._blobProtocolTail = new Promise((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  // Schedule collection before a blob can leave the process or a row can drop
+  // its reference. `setAlarm()` writes cell state, and the following bucket
+  // egress waits on that write's output gate. A crash can therefore leave an
+  // orphan only together with the durable wake that will collect it.
+  async _armBlobSweep() {
+    this._open().exec(
+      `INSERT INTO ${__KV_META_TABLE} (name, value) VALUES ('blob-sweep-due', 1)
+       ON CONFLICT(name) DO UPDATE SET value = excluded.value`,
+    );
+    const now = Date.now();
+    const deadline = now + __kvLimits().blobSweepMs;
+    const armed = await this.ctx.storage.getAlarm();
+    // During an alarm event, `getAlarm()` can still report the timestamp that
+    // caused the current delivery. It is not a future wake and cannot cover a
+    // reference removed by an event that interleaves with this one.
+    if (armed === null || armed <= now || armed > deadline) {
+      await this.ctx.storage.setAlarm(deadline);
+    }
+  }
+
+  _blobSweepDue() {
+    return this._open().exec(
+      `SELECT 1 AS due FROM ${__KV_META_TABLE}
+        WHERE name = 'blob-sweep-due' AND value = 1`,
+    ).toArray().length > 0;
+  }
+
+  _clearBlobSweepDue() {
+    this._open().exec(
+      `DELETE FROM ${__KV_META_TABLE} WHERE name = 'blob-sweep-due'`,
+    );
+  }
+
+  // Created on first touch rather than at construction, so a namespace that is
+  // only ever read costs no write, and an eviction that drops the isolate does
+  // not need the table rebuilt before the cell can answer.
+  _open() {
+    if (this._ready) return this.ctx.storage.sql;
+    const sql = this.ctx.storage.sql;
+    // Recreate the first release's table before the normal open path. The
+    // migration test then reaches the same `CREATE IF NOT EXISTS` boundary as
+    // an upgraded cell and starts with a row it must preserve.
+    if (__kvLimits().legacySchema) {
+      sql.exec(
+        `CREATE TABLE IF NOT EXISTS ${__KV_TABLE} (
+           name TEXT PRIMARY KEY,
+           value BLOB,
+           tag TEXT NOT NULL,
+           metadata TEXT,
+           expires_at INTEGER
+         ) WITHOUT ROWID`,
+      );
+      sql.exec(
+        `INSERT OR IGNORE INTO ${__KV_TABLE}
+           (name, value, tag, metadata, expires_at)
+         VALUES ('before-upgrade', CAST('legacy' AS BLOB), 'text', NULL, NULL)`,
+      );
+    }
+    sql.exec(
+      `CREATE TABLE IF NOT EXISTS ${__KV_TABLE} (
+         name TEXT PRIMARY KEY,
+         value BLOB,
+         blob_id TEXT,
+         size INTEGER NOT NULL,
+         tag TEXT NOT NULL,
+         metadata TEXT,
+         expires_at INTEGER
+       ) WITHOUT ROWID`,
+    );
+    // Inline KV shipped before `blob_id` and `size`. `CREATE IF NOT EXISTS`
+    // does not change that table, so migrate each column independently. A
+    // crash between the ALTER statements is safe because the next open reads
+    // the surviving shape and resumes at the missing column.
+    const columns = new Set(
+      sql.exec(`PRAGMA table_info(${__KV_TABLE})`).toArray().map((row) => row.name),
+    );
+    if (!columns.has("blob_id")) {
+      sql.exec(`ALTER TABLE ${__KV_TABLE} ADD COLUMN blob_id TEXT`);
+    }
+    if (!columns.has("size")) {
+      sql.exec(
+        `ALTER TABLE ${__KV_TABLE}
+           ADD COLUMN size INTEGER NOT NULL DEFAULT 0`,
+      );
+      sql.exec(`UPDATE ${__KV_TABLE} SET size = LENGTH(value)`);
+    }
+    // `list` walks the primary key in order, so the only index worth carrying
+    // is the sweeper's. Without it the sweep is a full scan of a namespace
+    // whose whole point is being large.
+    sql.exec(
+      `CREATE INDEX IF NOT EXISTS ${__KV_TABLE}_expires
+         ON ${__KV_TABLE} (expires_at) WHERE expires_at IS NOT NULL`,
+    );
+    // The due bit is durable because the isolate that wrote a blob can die
+    // before its row commit. In-memory state cannot schedule that orphan's
+    // collector on the next owner.
+    sql.exec(
+      `CREATE TABLE IF NOT EXISTS ${__KV_META_TABLE} (
+         name TEXT PRIMARY KEY,
+         value INTEGER NOT NULL
+       ) WITHOUT ROWID`,
+    );
+    this._ready = true;
+    return sql;
+  }
+
+  // A key past its deadline is invisible from the instant it expires, not from
+  // whenever the sweeper next runs. The read path filters and the sweep only
+  // reclaims space, so the two can never disagree about which side of the
+  // boundary a key is on.
+  async __kvGet({ keys, withMetadata, now }) {
+    const sql = this._open();
+    const out = [];
+    for (const key of keys) {
+      const row = sql.exec(
+        `SELECT value, blob_id, tag, metadata, expires_at FROM ${__KV_TABLE}
+          WHERE name = ? AND (expires_at IS NULL OR expires_at > ?)`,
+        key,
+        now,
+      ).toArray()[0];
+      if (row === undefined) {
+        out.push({ key, found: false });
+        continue;
+      }
+      let value = row.value;
+      if (row.blob_id !== null && row.blob_id !== undefined) {
+        const blob = await __kvBlob({ mode: "get", reference: row.blob_id });
+        // A row naming a blob the bucket does not hold is the failure the
+        // commit order exists to prevent, so it is reported as itself rather
+        // than as a missing key: an absent key and a broken one need different
+        // answers from an operator.
+        if (!blob.found) {
+          throw __kvError(
+            `the value for ${JSON.stringify(key)} is missing from the fleet ` +
+              `bucket (blob ${row.blob_id})`,
+          );
+        }
+        value = new Uint8Array(blob.value);
+      }
+      const entry = { key, found: true, value, tag: row.tag };
+      if (withMetadata) entry.metadata = row.metadata ?? null;
+      out.push(entry);
+    }
+    return out;
+  }
+
+  // One transaction for the whole batch, so a bulk put is all-or-nothing
+  // rather than a prefix of itself. Upstream gives no such guarantee, and
+  // giving a stronger one here costs nothing and cannot surprise a caller.
+  // Blob first, row second. An orphan blob is bytes the collector reclaims; a
+  // row naming a blob that was never written is a read that fails forever, and
+  // no sweep repairs it. The opposite commit order can leave that dangling
+  // row when a process stops between the two writes.
+  //
+  // The blob reference travels in `_pending` until the row commits, so a sweep that
+  // runs mid-put does not collect bytes that are about to be referenced. That
+  // costs the put and not the read -- the commit requires the blob, so a
+  // collected blob means the commit cannot fire -- which is why the model's
+  // tooth for it is an action property and not an invariant.
+  async _store(value) {
+    if (value.byteLength <= __kvLimits().maxInlineValueBytes) {
+      return { value, blobId: null };
+    }
+    const digest = await __kvDigest(value);
+    await this._armBlobSweep();
+    // The host mints the reference from the epoch installed with this cell.
+    // JavaScript never guesses that authority or recovers it after an await.
+    const { reference } = await __kvBlob({ mode: "prepare", digest });
+    this._pending.add(reference);
+    try {
+      await __kvBlob({ mode: "put", reference }, value);
+      // Force the collector race at its real seam. The alarm took its mark
+      // snapshot before this put started and waits briefly after the put
+      // announces itself. Without blob-protocol serialization, this write
+      // lands during that wait and must stay here until the stale sweep runs.
+      if (
+        __kvLimits().raceSweepPut && this._testSweepMarked &&
+        !this._testSweepFinished
+      ) {
+        await new Promise((resolve) => {
+          this._testResumePut = resolve;
+        });
+      }
+      // The crash window the commit order exists for: the blob is in the
+      // bucket and the row is not written yet. The failed operation no longer
+      // protects the digest in memory, so the durable wake can reclaim it even
+      // when this isolate remains resident.
+      if (__kvLimits().failAfterBlobWrite) {
+        throw __kvError("CELLD_TEST_KV_FAIL_AFTER_BLOB_WRITE");
+      }
+      return { value: null, blobId: reference };
+    } catch (error) {
+      this._pending.delete(reference);
+      throw error;
+    }
+  }
+
+  async __kvPut({ entries }) {
+    if (
+      __kvLimits().raceSweepPut &&
+      entries.some((entry) =>
+        entry.value.byteLength > __kvLimits().maxInlineValueBytes
+      )
+    ) {
+      if (!this._testSweepMarked || this._testPutAttempted === undefined) {
+        throw __kvError("the test blob sweep did not reach its mark snapshot");
+      }
+      this._testPutAttempted();
+      this._testPutAttempted = undefined;
+    }
+    return this._withBlobProtocol(() => this._putLocked(entries));
+  }
+
+  async _putLocked(entries) {
+    const sql = this._open();
+    // An inline replacement can remove the final row reference to an old
+    // blob, so arm before changing the row. A new large value also arms in
+    // `_store`, before its own bucket write.
+    const replacesBlob = entries.some((entry) =>
+      sql.exec(
+        `SELECT 1 AS found FROM ${__KV_TABLE}
+          WHERE name = ? AND blob_id IS NOT NULL`,
+        entry.key,
+      ).toArray().length > 0
+    );
+    if (replacesBlob) await this._armBlobSweep();
+    const stored = [];
+    try {
+      for (const entry of entries) {
+        stored.push({ entry, ...(await this._store(entry.value)) });
+      }
+      this.ctx.storage.transactionSync(() => {
+        for (const { entry, value, blobId } of stored) {
+          sql.exec(
+            `INSERT INTO ${__KV_TABLE}
+               (name, value, blob_id, size, tag, metadata, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(name) DO UPDATE SET
+               value = excluded.value,
+               blob_id = excluded.blob_id,
+               size = excluded.size,
+               tag = excluded.tag,
+               metadata = excluded.metadata,
+               expires_at = excluded.expires_at`,
+            entry.key,
+            value,
+            blobId,
+            entry.value.byteLength,
+            entry.tag,
+            entry.metadata ?? null,
+            entry.expiresAt ?? null,
+          );
+        }
+      });
+    } finally {
+      // A committed row protects the blob durably. A failed put protects
+      // nothing, so it must not pin an orphan until this isolate is evicted.
+      for (const { blobId } of stored) {
+        if (blobId !== null) this._pending.delete(blobId);
+      }
+    }
+    // Only when something in this batch can expire. A namespace of permanent
+    // keys arms no alarm and wakes for nothing.
+    if (entries.some((entry) => entry.expiresAt !== null && entry.expiresAt !== undefined)) {
+      await this._rearm();
+    }
+  }
+
+  async __kvDelete({ keys }) {
+    return this._withBlobProtocol(() => this._deleteLocked(keys));
+  }
+
+  async _deleteLocked(keys) {
+    const sql = this._open();
+    const removesBlob = keys.some((key) =>
+      sql.exec(
+        `SELECT 1 AS found FROM ${__KV_TABLE}
+          WHERE name = ? AND blob_id IS NOT NULL`,
+        key,
+      ).toArray().length > 0
+    );
+    if (removesBlob) await this._armBlobSweep();
+    this.ctx.storage.transactionSync(() => {
+      for (const key of keys) {
+        sql.exec(`DELETE FROM ${__KV_TABLE} WHERE name = ?`, key);
+      }
+    });
+  }
+
+  // Arm for the earliest deadline the table holds, or disarm when it holds
+  // none. Asked from the row rather than held in memory, so the answer does
+  // not depend on what this activation happens to remember -- an evicted cell
+  // that wakes for an alarm re-derives the same deadline from the same rows.
+  //
+  // What carries the deadline across an eviction is the alarm itself, which is
+  // durable cell state. This is *not* recomputed when a cell is merely opened,
+  // so the one gap is a `_rearm` that throws after its put committed: the rows
+  // are written, the caller sees an error, and nothing is armed until the next
+  // put with a deadline. That costs space and never correctness, because the
+  // read path filters an expired key whether or not it was reclaimed.
+  async _rearm() {
+    // A test that means to pin the read filter must be able to stop the sweep,
+    // or it cannot tell which mechanism hid the key -- and a test that cannot
+    // tell will pass when the filter is broken. This seam exists because that
+    // is exactly what happened: the first version of the expiry test stayed
+    // green with the filter removed.
+    if (__kvLimits().sweepDisabled) return;
+    const sql = this._open();
+    const row = sql.exec(
+      `SELECT MIN(expires_at) AS next FROM ${__KV_TABLE} WHERE expires_at IS NOT NULL`,
+    ).toArray()[0];
+    const next = row === undefined ? null : row.next;
+    const blobDue = this._blobSweepDue();
+    if ((next === null || next === undefined) && !blobDue) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    const now = Date.now();
+    const deadlines = [];
+    // Never in the past: a deadline already due is swept on this wake, and
+    // arming behind `now` would spin.
+    if (next !== null && next !== undefined) {
+      deadlines.push(Math.max(next, now + 1));
+    }
+    if (blobDue) deadlines.push(now + __kvLimits().blobSweepMs);
+    const deadline = Math.min(...deadlines);
+    const armed = await this.ctx.storage.getAlarm();
+    if (armed === null || armed <= now || armed > deadline) {
+      await this.ctx.storage.setAlarm(deadline);
+    }
+  }
+
+  // Reclaiming space, never deciding visibility. A key is invisible from the
+  // instant it expires because the read path filters, so a late sweep costs
+  // storage and never correctness — which is what lets this be bounded and
+  // re-armed rather than obliged to finish.
+  // Every reference a row names, plus every reference a put has written and
+  // not yet committed. The two go in one list because the bucket end cannot
+  // tell them apart and does not need to: it only needs "do not delete these".
+  _liveBlobs() {
+    const rows = this._open().exec(
+      `SELECT blob_id FROM ${__KV_TABLE} WHERE blob_id IS NOT NULL`,
+    ).toArray();
+    return [...new Set([...rows.map((row) => row.blob_id), ...this._pending])];
+  }
+
+  async alarm() {
+    const removed = await this._withBlobProtocol(async () => {
+      const now = Date.now();
+      // If expiry will remove a blob reference, persist the due bit and a
+      // future wake before deleting the row. A crash later in this alarm then
+      // leaves the next owner enough durable state to finish collection.
+      const expiresBlob = this._open().exec(
+        `SELECT 1 AS found FROM ${__KV_TABLE}
+          WHERE expires_at IS NOT NULL AND expires_at <= ?
+            AND blob_id IS NOT NULL
+          LIMIT ?`,
+        now,
+        __kvLimits().sweepBatchRows,
+      ).toArray().length > 0;
+      if (expiresBlob) await this._armBlobSweep();
+
+      const { removed } = this.__kvSweep({
+        now,
+        limit: __kvLimits().sweepBatchRows,
+      });
+      // The blob sweep runs after the row sweep, on the same wake, so a row
+      // reclaimed above has already dropped its reference by the time the live
+      // set is read. A durable due bit distinguishes a GC wake from an inline
+      // expiry wake and survives isolate eviction or a failed bucket request.
+      if (this._blobSweepDue() || __kvLimits().raceSweepPut) {
+        const live = this._liveBlobs();
+        if (__kvLimits().raceSweepPut && !this._testSweepFinished) {
+          const putAttempted = new Promise((resolve) => {
+            this._testPutAttempted = resolve;
+          });
+          this._testSweepMarked = true;
+          await putAttempted;
+          // The fixture bucket is local. This bounded pause lets an
+          // unprotected put finish its blob write; a protected put is waiting
+          // for this protocol lock and therefore cannot enter the window.
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        let swept = false;
+        try {
+          await __kvBlob({ mode: "sweep", live });
+          swept = true;
+        } catch (error) {
+          // Reclaiming space is not deciding visibility, so a bucket that
+          // refuses a delete costs storage and never correctness. The next
+          // wake tries again.
+          console.error("kv blob sweep failed:", error);
+        } finally {
+          if (__kvLimits().raceSweepPut) {
+            this._testSweepFinished = true;
+            this._testResumePut?.();
+            this._testResumePut = undefined;
+          }
+        }
+        if (swept) this._clearBlobSweepDue();
+      }
+      return removed;
+    });
+    // A full batch means there is more to reclaim, so come back promptly
+    // rather than waiting for the next natural deadline.
+    if (removed >= __kvLimits().sweepBatchRows) {
+      await this.ctx.storage.setAlarm(Date.now() + 1);
+      return;
+    }
+    await this._rearm();
+  }
+
+  // Pagination resumes at `name > after`, never at an offset. A caller holds
+  // no transaction across pages, so an offset would skip or repeat keys the
+  // moment a concurrent writer inserted or deleted inside the prefix.
+  //
+  // One row beyond the limit is read to decide `list_complete`, and discarded.
+  // Asking the database is the only honest answer: a page that happens to fill
+  // exactly is indistinguishable from a page that ended.
+  __kvList({ prefix, limit, after, now }) {
+    const sql = this._open();
+    const pattern = `${prefix.replace(/([%_\\])/g, "\\$1")}%`;
+    const rows = sql.exec(
+      `SELECT name, metadata, expires_at FROM ${__KV_TABLE}
+        WHERE name LIKE ? ESCAPE '\\'
+          AND name > ?
+          AND (expires_at IS NULL OR expires_at > ?)
+        ORDER BY name
+        LIMIT ?`,
+      pattern,
+      after ?? "",
+      now,
+      limit + 1,
+    ).toArray();
+    const complete = rows.length <= limit;
+    const page = complete ? rows : rows.slice(0, limit);
+    return {
+      keys: page.map((row) => ({
+        name: row.name,
+        metadata: row.metadata ?? null,
+        expiration: row.expires_at ?? null,
+      })),
+      complete,
+    };
+  }
+
+  // The operator's live key and byte counts. `size` stays in the row because
+  // a bucket-backed value has a NULL inline `value`; `LENGTH(value)` would
+  // report zero bytes for exactly the values whose size matters most.
+  __kvMetrics({ now }) {
+    const sql = this._open();
+    const row = sql.exec(
+      `SELECT COUNT(*) AS count,
+              COALESCE(SUM(size), 0) AS bytes
+         FROM ${__KV_TABLE}
+        WHERE expires_at IS NULL OR expires_at > ?`,
+      now,
+    ).toArray()[0];
+    return { count: row.count, bytes: row.bytes };
+  }
+
+  // Reclaim what the read path already treats as gone. Bounded per call so a
+  // namespace with a large expired population cannot hold the cell for an
+  // unbounded time; the caller re-arms while there is more.
+  __kvSweep({ now, limit }) {
+    const sql = this._open();
+    const removed = __cellSweepBatch(
+      this.ctx.storage,
+      (bound) => sql.exec(
+        `SELECT name FROM ${__KV_TABLE}
+          WHERE expires_at IS NOT NULL AND expires_at <= ?
+          ORDER BY expires_at
+          LIMIT ?`,
+        now,
+        bound,
+      ).toArray(),
+      (row) => {
+        sql.exec(`DELETE FROM ${__KV_TABLE} WHERE name = ?`, row.name);
+      },
+      limit,
+    );
+    return { removed };
+  }
+
+  // The operator surface, reached only over `/runtime/`, which authenticates
+  // with the fleet secret. `/do/` refuses every reserved class structurally,
+  // so adding this handler does not put a namespace on an unauthenticated
+  // route -- the trap d1.md decision 4 records paying for once, and the reason
+  // that refusal is one question rather than one per class.
+  //
+  // Values cross this boundary as arrays of bytes rather than as text, because
+  // a namespace holds bytes: a value written from a Worker as an ArrayBuffer
+  // has no faithful string form, and `celld kv` must be able to read back
+  // exactly what was written.
+  async fetch(request) {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return Response.json({ error: "KV_ERROR: invalid request body" }, { status: 400 });
+    }
+    const now = Date.now();
+    try {
+      let result;
+      switch (body.op) {
+        case "get": {
+          // Awaited: `__kvGet` resolves a bucket-backed value, so it is
+          // async. Destructuring the promise instead threw "object is not
+          // iterable" on every operator read, and only here -- the binding
+          // reaches the same method over RPC, which awaits for it.
+          const [row] = await this.__kvGet({
+            keys: [String(body.key)],
+            withMetadata: true,
+            now,
+          });
+          result = row.found
+            ? {
+              found: true,
+              ...__kvOperatorValue(row.value),
+              tag: row.tag,
+              metadata: row.metadata ?? null,
+            }
+            : { found: false };
+          break;
+        }
+        case "put":
+        case "put-base64": {
+          // Validated here, through the same helpers the binding calls, so a
+          // key written by `celld kv` is a key the binding could have written.
+          // The operator route used to arrive pre-validated by the CLI, which
+          // put the same bound in two processes -- and they disagreed the first
+          // time a test shortened one of them.
+          const key = String(body.key);
+          __kvCheckKey(key);
+          const value = body.op === "put-base64"
+            ? $$atob(String(body.value), true)
+            : new Uint8Array(body.value);
+          __kvCheckValue(value.byteLength);
+          const metadata = body.metadata === undefined ? null : body.metadata;
+          if (metadata !== null) __kvCheckMetadata(metadata);
+          // Resolved from the cell's clock, not the caller's, because that is
+          // the clock the read filter and the sweeper compare against.
+          const expiresAt = __kvExpiryAt(now, body.expiration, body.expirationTtl);
+          await this.__kvPut({
+            entries: [{
+              key,
+              value,
+              tag: String(body.tag ?? __KV_TAG_BYTES),
+              metadata,
+              expiresAt,
+            }],
+          });
+          result = { ok: true };
+          break;
+        }
+        case "delete":
+          for (const key of body.keys) __kvCheckKey(String(key));
+          await this.__kvDelete({ keys: body.keys.map(String) });
+          result = { ok: true };
+          break;
+        case "list":
+          result = this.__kvList({
+            prefix: String(body.prefix ?? ""),
+            limit: Number(body.limit),
+            after: String(body.after ?? ""),
+            now,
+          });
+          break;
+        // What `celld kv info` reports. `stored` counts every row and `live`
+        // counts only what a read would return, so the difference is exactly
+        // the population the sweeper still owes -- which is the one number
+        // that makes reclamation observable from outside the cell.
+        case "info": {
+          const live = this.__kvMetrics({ now });
+          const total = this._open().exec(
+            `SELECT COUNT(*) AS count FROM ${__KV_TABLE}`,
+          ).toArray()[0];
+          result = { live: live.count, bytes: live.bytes, stored: total.count };
+          break;
+        }
+        default:
+          return Response.json(
+            { error: `KV_ERROR: unknown operation ${JSON.stringify(body.op)}` },
+            { status: 400 },
+          );
+      }
+      return Response.json({ result });
+    } catch (error) {
+      return Response.json(
+        { error: String(error && error.message || error) },
+        { status: 400 },
+      );
+    }
+  }
+}
+
+__cell.classes.__KvNamespace = __KvNamespaceCell;
+// RPC on a stub needs `extends DurableObject` or the js_rpc flag. This class is
+// the runtime's own, so grant it here rather than making every KV user set a
+// compatibility flag to reach a namespace.
+__cell.doExports.__KvNamespace = true;
+
+// The client half.
+//
+// Every number below is injected from `celld_logic::kv` as `__cell.kvLimits`
+// rather than written here, so the binding, `celld kv` and deploy-time
+// validation cannot disagree about what a valid key is. No new host op: D1 set
+// the bar at one and Workflows came in under it, and a limit is data rather
+// than a decision, so shipping the values is enough. What stays in JS is the
+// presentation -- the error text is the binding's published contract, in
+// upstream's `KV <OP> failed:` shape, and belongs beside the calls that raise
+// it.
+//
+// The cursor codec is the one thing that must byte-match Rust's, and it is
+// plain hex: a total function with a single right answer, which two correct
+// implementations cannot disagree about. A policy would be a different matter
+// and none is duplicated here.
+const __kvLimits = () => __cell.kvLimits;
+
+const __kvCheckKey = (key) => {
+  if (key.length === 0) throw __kvError("a key must not be empty");
+  const bytes = __kvEncoder.encode(key).byteLength;
+  if (bytes > __kvLimits().maxKeyBytes) {
+    throw __kvError(
+      `a key is at most ${__kvLimits().maxKeyBytes} bytes, got ${bytes}`,
+    );
+  }
+};
+
+// A TTL becomes an absolute deadline here, once, at the call. Resolving it
+// again later against a newer clock would extend the life of the key every
+// time anything re-read the row -- the reason a workflow persists a sleep
+// deadline and not its duration.
+const __kvCheckValue = (size) => {
+  // Upstream's bound, and now the only one. A value above the inline bound is
+  // no longer refused: it goes to the fleet bucket, which is the split
+  // Cloudflare's own KV rearchitecture made and for the same reason — a cell
+  // replicates every write as LTX, so an inline value is paid for twice.
+  if (size > __kvLimits().maxValueBytes) {
+    throw __kvError(`a value is at most ${__kvLimits().maxValueBytes} bytes, got ${size}`);
+  }
+};
+
+const __kvCheckMetadata = (metadata) => {
+  const bytes = __kvEncoder.encode(metadata).byteLength;
+  if (bytes > __kvLimits().maxMetadataBytes) {
+    throw __kvError(
+      `metadata is at most ${__kvLimits().maxMetadataBytes} bytes, got ${bytes}`,
+    );
+  }
+};
+
+const __kvExpiryAt = (now, expiration, expirationTtl) => {
+  if (expirationTtl !== undefined && expirationTtl !== null) {
+    const ms = Math.floor(Number(expirationTtl) * 1000);
+    if (!Number.isFinite(ms) || ms < __kvLimits().minExpirationTtlMs) {
+      throw __kvError(
+        `expirationTtl is at least ${__kvLimits().minExpirationTtlMs / 1000} seconds`,
+      );
+    }
+    return now + ms;
+  }
+  if (expiration !== undefined && expiration !== null) {
+    const at = Math.floor(Number(expiration) * 1000);
+    if (!Number.isFinite(at) || at <= now) {
+      throw __kvError(`expiration ${expiration} is in the past`);
+    }
+    return at;
+  }
+  return null;
+};
+
+const __kvCursor = {
+  encode(key) {
+    let out = "";
+    for (const byte of __kvEncoder.encode(key)) {
+      out += byte.toString(16).padStart(2, "0");
+    }
+    return out;
+  },
+  decode(cursor) {
+    // A malformed cursor is refused, never read as "start from the
+    // beginning": that would hand a paginating caller its first page a second
+    // time and call it progress.
+    if (cursor.length % 2 !== 0 || /[^0-9a-f]/.test(cursor)) {
+      throw __kvError("the list cursor is malformed");
+    }
+    const bytes = new Uint8Array(cursor.length / 2);
+    for (let at = 0; at < bytes.length; at += 1) {
+      bytes[at] = Number.parseInt(cursor.slice(at * 2, at * 2 + 2), 16);
+    }
+    return __kvDecoder.decode(bytes);
+  },
+};
+
+const __kvListLimit = (requested) => {
+  const max = __kvLimits().maxListLimit;
+  if (requested === undefined || requested === null) return max;
+  const limit = Math.floor(Number(requested));
+  // Zero would be a page that never ends.
+  if (!Number.isFinite(limit) || limit <= 0) return max;
+  return Math.min(limit, max);
+};
+
+// Upstream's four content types, and what each one means on the way in and out.
+const __KV_TAG_TEXT = "text";
+const __KV_TAG_BYTES = "bytes";
+
+const __kvEncoder = new TextEncoder();
+const __kvDecoder = new TextDecoder();
+
+// A value becomes bytes plus a tag, once, at the public boundary. Storing the
+// tag is what lets `get(key, "text")` and `get(key)` answer differently from
+// the same row without the cell parsing anything.
+const __kvEncodeValue = (value) => {
+  if (typeof value === "string") {
+    return { value: __kvEncoder.encode(value), tag: __KV_TAG_TEXT };
+  }
+  if (value instanceof ArrayBuffer) {
+    return { value: new Uint8Array(value.slice(0)), tag: __KV_TAG_BYTES };
+  }
+  if (ArrayBuffer.isView(value)) {
+    // Copied, not referenced. `sendBatch`'s resizable-ArrayBuffer regression
+    // upstream is the same hazard: a caller may resize or reuse the buffer
+    // between this call and the write, and a shallow view would then read
+    // decommitted pages.
+    return {
+      value: new Uint8Array(
+        value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength),
+      ),
+      tag: __KV_TAG_BYTES,
+    };
+  }
+  throw __kvError(
+    "a KV value must be a string, an ArrayBuffer, or a typed array",
+  );
+};
+
+const __kvDecodeValue = (bytes, tag, type) => {
+  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  switch (type) {
+    case "arrayBuffer":
+      return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+    case "json":
+      return JSON.parse(__kvDecoder.decode(view));
+    case "stream":
+      return new Response(view).body;
+    case "text":
+    default:
+      // A value written as bytes still decodes as text when asked for text,
+      // which is upstream's behaviour and the reason the tag is advisory
+      // rather than a type check.
+      return __kvDecoder.decode(view);
+  }
+};
+
+const __kvReadOptions = (options) => {
+  if (typeof options === "string") return { type: options };
+  if (options === null || options === undefined) return { type: "text" };
+  return { type: options.type ?? "text", cacheTtl: options.cacheTtl };
+};
+
+class KvNamespace {
+  constructor(id, cellName) {
+    Object.defineProperty(this, "_id", { value: id });
+    Object.defineProperty(this, "_cellName", { value: cellName });
+  }
+
+  // Resolved per call rather than cached: a cell can move between calls, and
+  // `getByName` costs what the Durable Object path already pays.
+  get _stub() {
+    return __cell.makeNamespace("__KvNamespace").getByName(this._cellName);
+  }
+
+  async _read(keys, options, withMetadata) {
+    const { type } = __kvReadOptions(options);
+    for (const key of keys) __kvCheckKey(key);
+    const rows = await this._stub.__kvGet({
+      keys,
+      withMetadata,
+      now: Date.now(),
+    });
+    return rows.map((row) => {
+      if (!row.found) return { key: row.key, value: null, metadata: null };
+      return {
+        key: row.key,
+        value: __kvDecodeValue(row.value, row.tag, type),
+        metadata: row.metadata === null || row.metadata === undefined
+          ? null
+          : JSON.parse(row.metadata),
+      };
+    });
+  }
+
+  // `get(key)` answers a value; `get([keys])` answers a Map with a null hole
+  // for a key that is not there. Upstream's bulk form is a Map and not an
+  // object, which matters: an object would collide a key named `__proto__`
+  // with the prototype chain.
+  async get(key, options) {
+    if (Array.isArray(key)) {
+      const rows = await this._read(__kvBulkKeys(key), options, false);
+      return new Map(rows.map((row) => [row.key, row.value]));
+    }
+    const [row] = await this._read([String(key)], options, false);
+    return row.value;
+  }
+
+  async getWithMetadata(key, options) {
+    if (Array.isArray(key)) {
+      const rows = await this._read(__kvBulkKeys(key), options, true);
+      return new Map(
+        rows.map((row) => [row.key, { value: row.value, metadata: row.metadata }]),
+      );
+    }
+    const [row] = await this._read([String(key)], options, true);
+    return {
+      value: row.value,
+      metadata: row.metadata,
+      // Null, and honestly so: celld has no read cache, and reporting a HIT
+      // from a runtime that never cached anything would be a lie in a field
+      // applications read.
+      cacheStatus: null,
+    };
+  }
+
+  async put(key, value, options) {
+    const name = String(key);
+    __kvCheckKey(name);
+    const encoded = __kvEncodeValue(value);
+    __kvCheckValue(encoded.value.byteLength);
+    const metadata = options && options.metadata !== undefined
+      ? JSON.stringify(options.metadata)
+      : null;
+    if (metadata !== null) __kvCheckMetadata(metadata);
+    const expiresAt = __kvExpiryAt(
+      Date.now(),
+      options && options.expiration,
+      options && options.expirationTtl,
+    );
+    await this._stub.__kvPut({
+      entries: [{ key: name, value: encoded.value, tag: encoded.tag, metadata, expiresAt }],
+    });
+  }
+
+  async delete(key) {
+    const name = String(key);
+    __kvCheckKey(name);
+    await this._stub.__kvDelete({ keys: [name] });
+  }
+
+  // Upstream takes one key or an array, and caps the array at the same 100 a
+  // bulk get takes.
+  async deleteBulk(keys) {
+    const names = Array.isArray(keys) ? __kvBulkKeys(keys) : [String(keys)];
+    for (const name of names) __kvCheckKey(name);
+    await this._stub.__kvDelete({ keys: names });
+  }
+
+  async list(options) {
+    const prefix = options && options.prefix ? String(options.prefix) : "";
+    const limit = __kvListLimit(options && options.limit);
+    const after = options && options.cursor ? __kvCursor.decode(String(options.cursor)) : "";
+    const page = await this._stub.__kvList({ prefix, limit, after, now: Date.now() });
+    const keys = page.keys.map((entry) => {
+      const key = { name: entry.name };
+      if (entry.metadata !== null) key.metadata = JSON.parse(entry.metadata);
+      // Upstream reports an expiration in seconds.
+      if (entry.expiration !== null) key.expiration = Math.floor(entry.expiration / 1000);
+      return key;
+    });
+    if (page.complete) return { keys, list_complete: true, cacheStatus: null };
+    return {
+      keys,
+      list_complete: false,
+      cursor: __kvCursor.encode(keys[keys.length - 1].name),
+      cacheStatus: null,
+    };
+  }
+}
+
+// The bulk ceiling belongs to the binding, and a CLI chunks beneath it rather
+// than inheriting it. An empty array is refused because upstream refuses it:
+// answering an empty Map would look like "none of these keys exist".
+const __kvBulkKeys = (keys) => {
+  if (keys.length === 0) throw __kvError("a bulk get needs at least one key");
+  if (keys.length > __kvLimits().maxBulkKeys) {
+    throw __kvError(
+      `a bulk get takes at most ${__kvLimits().maxBulkKeys} keys, got ${keys.length}`,
+    );
+  }
+  return keys.map(String);
+};
+
+globalThis.__makeKvNamespace = (id, cellName) => new KvNamespace(id, cellName);
+
+// ---- Queues --------------------------------------------------------------
+// A Queue is one runtime-supplied Durable Object. The producer binding writes
+// bytes and a content tag through RPC, and the cell owns the durable order,
+// deadlines, leases, and alarms. `celld_logic::queue` owns every transition
+// that can invalidate a lease or choose a deadline; this code supplies SQL and
+// the Cloudflare-compatible presentation.
+
+const __QUEUE_MESSAGES = "__queue_messages";
+const __QUEUE_META = "__queue_meta";
+const __QUEUE_STATS = "__queue_stats";
+const __QUEUE_TRANSFER_RECEIPTS = "__queue_transfer_receipts";
+const __queueEncoder = new TextEncoder();
+
+const __queueError = (message) => new Error("QUEUE_ERROR: " + String(message));
+const __queueLimits = () => __cell.queueLimits;
+const __queuePolicy = (request) =>
+  JSON.parse(__queue_policy(JSON.stringify(request)));
+
+const __queueDelay = (value, fallback = 0) => {
+  if (value === undefined || value === null) return fallback;
+  const seconds = Number(value);
+  if (!Number.isInteger(seconds) || seconds < 0 ||
+      seconds > __queueLimits().maxDelaySeconds) {
+    throw __queueError(
+      `delaySeconds must be an integer from 0 to ${__queueLimits().maxDelaySeconds}`,
+    );
+  }
+  return seconds;
+};
+
+const __queueBytes = (value) => {
+  if (value instanceof ArrayBuffer) {
+    return new Uint8Array(value.slice(0));
+  }
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(
+      value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength),
+    );
+  }
+  throw __queueError("a bytes message must be an ArrayBuffer or a typed array");
+};
+
+// Encode before entering the cell. The copy makes `sendBatch()` immune to a
+// caller resizing or reusing a backing buffer while the durable write awaits.
+const __queueEncode = (body, requestedType) => {
+  const contentType = requestedType ??
+    (__cell.compat.queueJsonMessages ? "json" : "v8");
+  let bytes;
+  switch (contentType) {
+    case "text":
+      bytes = __queueEncoder.encode(String(body));
+      break;
+    case "bytes":
+      bytes = __queueBytes(body);
+      break;
+    case "json": {
+      let json;
+      try {
+        json = JSON.stringify(body);
+      } catch (error) {
+        throw __queueError("the JSON message body cannot be serialized", error);
+      }
+      if (json === undefined) {
+        throw __queueError("the JSON message body cannot be undefined");
+      }
+      bytes = __queueEncoder.encode(json);
+      break;
+    }
+    case "v8":
+      try {
+        bytes = __sc_encode(body);
+      } catch (error) {
+        throw __queueError("the message body cannot be cloned", error);
+      }
+      break;
+    default:
+      throw __queueError(
+        `contentType must be "text", "bytes", "json", or "v8", got ${JSON.stringify(contentType)}`,
+      );
+  }
+  if (bytes.byteLength > __queueLimits().maxMessageBytes) {
+    throw __queueError(
+      `a message is at most ${__queueLimits().maxMessageBytes} bytes, got ${bytes.byteLength}`,
+    );
+  }
+  return { body: bytes, contentType, size: bytes.byteLength };
+};
+
+// A lease-scoped read must seek, not walk the backlog. The plan is the only
+// evidence that says which, and it is cheap to ask for, so a gated test seam
+// reads it from the shipped query rather than from a copy that can drift.
+const __queueReportLeaseLookupPlan = (sql, query, leaseId) => {
+  if (typeof __test_queue_lease_lookup_plan !== "function") return;
+  const plan = sql.exec(`EXPLAIN QUERY PLAN ${query}`, leaseId)
+    .toArray()
+    .map((row) => row.detail)
+    .join("; ");
+  __test_queue_lease_lookup_plan(plan);
+};
+
+const __queueMetricsView = (metrics) => ({
+  backlogCount: metrics.backlogCount,
+  backlogBytes: metrics.backlogBytes,
+  oldestMessageTimestamp: metrics.oldestMessageTimestamp === null ||
+      metrics.oldestMessageTimestamp === undefined
+    ? undefined
+    : new Date(metrics.oldestMessageTimestamp),
+});
+
+class __QueueCell {
+  constructor(ctx) {
+    this.ctx = ctx;
+    this.queue = ctx.id.name;
+    this._ready = false;
+  }
+
+  _open() {
+    if (this._ready) return this.ctx.storage.sql;
+    const sql = this.ctx.storage.sql;
+    sql.exec(
+      `CREATE TABLE IF NOT EXISTS ${__QUEUE_MESSAGES} (
+         seq INTEGER PRIMARY KEY AUTOINCREMENT,
+         id TEXT NOT NULL UNIQUE,
+         body BLOB NOT NULL,
+         content_type TEXT NOT NULL,
+         size INTEGER NOT NULL,
+         enqueued_at INTEGER NOT NULL,
+         visible_at INTEGER NOT NULL,
+         attempts INTEGER NOT NULL DEFAULT 0,
+         lease_id TEXT,
+         lease_generation INTEGER NOT NULL DEFAULT 0,
+         leased_until INTEGER,
+         purge_on_settle INTEGER NOT NULL DEFAULT 0,
+         dlq_target TEXT,
+         dlq_transfer_id TEXT,
+         transfer_kind TEXT,
+         dead_letter_source TEXT,
+         CHECK ((dlq_target IS NULL AND transfer_kind IS NULL)
+             OR (dlq_target IS NOT NULL
+                 AND transfer_kind IN ('dead-letter', 'redrive')))
+       )`,
+    );
+    sql.exec(
+      `CREATE INDEX IF NOT EXISTS ${__QUEUE_MESSAGES}_visible
+         ON ${__QUEUE_MESSAGES} (visible_at, seq)`,
+    );
+    // Rearming is on every producer acknowledgement and settlement. Each
+    // scheduling lookup must therefore stop at one deadline or one batch;
+    // an aggregate over the backlog makes a large Queue quadratic to fill.
+    sql.exec(
+      `CREATE INDEX IF NOT EXISTS ${__QUEUE_MESSAGES}_ready
+         ON ${__QUEUE_MESSAGES} (visible_at, seq)
+         WHERE purge_on_settle = 0 AND dlq_target IS NULL
+           AND lease_id IS NULL`,
+    );
+    sql.exec(
+      `CREATE INDEX IF NOT EXISTS ${__QUEUE_MESSAGES}_enqueued
+         ON ${__QUEUE_MESSAGES} (enqueued_at, seq)`,
+    );
+    sql.exec(
+      `CREATE INDEX IF NOT EXISTS ${__QUEUE_MESSAGES}_retained
+         ON ${__QUEUE_MESSAGES} (enqueued_at, seq)
+         WHERE purge_on_settle = 0 AND dlq_target IS NULL`,
+    );
+    sql.exec(
+      `CREATE INDEX IF NOT EXISTS ${__QUEUE_MESSAGES}_lease
+         ON ${__QUEUE_MESSAGES} (leased_until, seq)
+         WHERE lease_id IS NOT NULL`,
+    );
+    sql.exec(
+      `CREATE INDEX IF NOT EXISTS ${__QUEUE_MESSAGES}_moving
+         ON ${__QUEUE_MESSAGES} (seq)
+         WHERE dlq_target IS NOT NULL`,
+    );
+    // Dispatch and settlement both select a whole batch by its lease. Without
+    // this index SQLite answers them by walking every row: the dispatch
+    // readback scans `_visible` and the settlement scan walks the table, so
+    // each delivered batch costs two passes over the backlog. The `_lease`
+    // index cannot serve them because it is keyed on `leased_until`.
+    // The partial predicate keeps only leased rows, which `max_concurrency`
+    // times `max_batch_size` bounds, and an inserted message has a null
+    // `lease_id`, so `send` pays nothing for it.
+    sql.exec(
+      `CREATE INDEX IF NOT EXISTS ${__QUEUE_MESSAGES}_lease_batch
+         ON ${__QUEUE_MESSAGES} (lease_id, visible_at, seq)
+         WHERE lease_id IS NOT NULL`,
+    );
+    // The live-row index catches an impossible duplicate while a received
+    // message remains queued. The receipt below is the durable deduplication
+    // record after a consumer or purge removes that message.
+    sql.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS ${__QUEUE_MESSAGES}_dlq_transfer
+         ON ${__QUEUE_MESSAGES} (dlq_transfer_id)
+         WHERE dlq_transfer_id IS NOT NULL AND dlq_target IS NULL`,
+    );
+    sql.exec(
+      `CREATE TABLE IF NOT EXISTS ${__QUEUE_META} (
+         name TEXT PRIMARY KEY,
+         value TEXT NOT NULL
+       ) WITHOUT ROWID`,
+    );
+    // The producer result and operator metrics are on hot paths. SQLite
+    // triggers keep the three values in the same transaction as every row
+    // transition, so a caller cannot observe a new message with old totals.
+    sql.exec(
+      `CREATE TABLE IF NOT EXISTS ${__QUEUE_STATS} (
+         id INTEGER PRIMARY KEY CHECK (id = 1),
+         stored_count INTEGER NOT NULL,
+         backlog_count INTEGER NOT NULL,
+         backlog_bytes INTEGER NOT NULL,
+         oldest_message_timestamp INTEGER
+       )`,
+    );
+    sql.exec(
+      `INSERT INTO ${__QUEUE_STATS}
+         (id, stored_count, backlog_count, backlog_bytes,
+          oldest_message_timestamp)
+       SELECT 1,
+              COUNT(*),
+              COALESCE(SUM(purge_on_settle = 0), 0),
+              COALESCE(SUM(CASE WHEN purge_on_settle = 0 THEN size ELSE 0 END), 0),
+              MIN(CASE WHEN purge_on_settle = 0 THEN enqueued_at END)
+         FROM ${__QUEUE_MESSAGES}
+        WHERE true
+       ON CONFLICT(id) DO NOTHING`,
+    );
+    sql.exec(
+      `CREATE TRIGGER IF NOT EXISTS ${__QUEUE_MESSAGES}_stored_insert
+       AFTER INSERT ON ${__QUEUE_MESSAGES}
+       BEGIN
+         UPDATE ${__QUEUE_STATS}
+            SET stored_count = stored_count + 1
+          WHERE id = 1;
+       END`,
+    );
+    sql.exec(
+      `CREATE TRIGGER IF NOT EXISTS ${__QUEUE_MESSAGES}_stored_delete
+       AFTER DELETE ON ${__QUEUE_MESSAGES}
+       BEGIN
+         UPDATE ${__QUEUE_STATS}
+            SET stored_count = stored_count - 1
+          WHERE id = 1;
+       END`,
+    );
+    sql.exec(
+      `CREATE TRIGGER IF NOT EXISTS ${__QUEUE_MESSAGES}_stats_insert
+       AFTER INSERT ON ${__QUEUE_MESSAGES}
+       WHEN new.purge_on_settle = 0
+       BEGIN
+         UPDATE ${__QUEUE_STATS}
+            SET backlog_count = backlog_count + 1,
+                backlog_bytes = backlog_bytes + new.size,
+                oldest_message_timestamp = CASE
+                  WHEN oldest_message_timestamp IS NULL
+                    OR new.enqueued_at < oldest_message_timestamp
+                  THEN new.enqueued_at ELSE oldest_message_timestamp END
+          WHERE id = 1;
+       END`,
+    );
+    sql.exec(
+      `CREATE TRIGGER IF NOT EXISTS ${__QUEUE_MESSAGES}_stats_delete
+       AFTER DELETE ON ${__QUEUE_MESSAGES}
+       WHEN old.purge_on_settle = 0
+       BEGIN
+         UPDATE ${__QUEUE_STATS}
+            SET backlog_count = backlog_count - 1,
+                backlog_bytes = backlog_bytes - old.size,
+                oldest_message_timestamp = CASE
+                  WHEN backlog_count <= 1 THEN NULL
+                  WHEN oldest_message_timestamp = old.enqueued_at
+                  THEN (SELECT MIN(enqueued_at) FROM ${__QUEUE_MESSAGES}
+                         WHERE purge_on_settle = 0)
+                  ELSE oldest_message_timestamp END
+          WHERE id = 1;
+       END`,
+    );
+    sql.exec(
+      `CREATE TRIGGER IF NOT EXISTS ${__QUEUE_MESSAGES}_stats_exclude
+       AFTER UPDATE OF purge_on_settle ON ${__QUEUE_MESSAGES}
+       WHEN old.purge_on_settle = 0 AND new.purge_on_settle != 0
+       BEGIN
+         UPDATE ${__QUEUE_STATS}
+            SET backlog_count = backlog_count - 1,
+                backlog_bytes = backlog_bytes - old.size,
+                oldest_message_timestamp = CASE
+                  WHEN backlog_count <= 1 THEN NULL
+                  WHEN oldest_message_timestamp = old.enqueued_at
+                  THEN (SELECT MIN(enqueued_at) FROM ${__QUEUE_MESSAGES}
+                         WHERE purge_on_settle = 0)
+                  ELSE oldest_message_timestamp END
+          WHERE id = 1;
+       END`,
+    );
+    sql.exec(
+      `CREATE TRIGGER IF NOT EXISTS ${__QUEUE_MESSAGES}_stats_include
+       AFTER UPDATE OF purge_on_settle ON ${__QUEUE_MESSAGES}
+       WHEN old.purge_on_settle != 0 AND new.purge_on_settle = 0
+       BEGIN
+         UPDATE ${__QUEUE_STATS}
+            SET backlog_count = backlog_count + 1,
+                backlog_bytes = backlog_bytes + new.size,
+                oldest_message_timestamp = CASE
+                  WHEN oldest_message_timestamp IS NULL
+                    OR new.enqueued_at < oldest_message_timestamp
+                  THEN new.enqueued_at ELSE oldest_message_timestamp END
+          WHERE id = 1;
+       END`,
+    );
+    sql.exec(
+      `CREATE TABLE IF NOT EXISTS ${__QUEUE_TRANSFER_RECEIPTS} (
+         transfer_id TEXT PRIMARY KEY,
+         message_id TEXT NOT NULL,
+         dead_letter_source TEXT,
+         expires_at INTEGER NOT NULL
+       ) WITHOUT ROWID`,
+    );
+    sql.exec(
+      `CREATE INDEX IF NOT EXISTS ${__QUEUE_TRANSFER_RECEIPTS}_expires
+         ON ${__QUEUE_TRANSFER_RECEIPTS} (expires_at, transfer_id)`,
+    );
+    this._ready = true;
+    return sql;
+  }
+
+  _meta(name) {
+    return this._open().exec(
+      `SELECT value FROM ${__QUEUE_META} WHERE name = ?`, name,
+    ).toArray()[0]?.value;
+  }
+
+  _setMeta(name, value) {
+    if (value === null || value === undefined) {
+      this._open().exec(`DELETE FROM ${__QUEUE_META} WHERE name = ?`, name);
+      return;
+    }
+    this._open().exec(
+      `INSERT INTO ${__QUEUE_META} (name, value) VALUES (?, ?)
+       ON CONFLICT(name) DO UPDATE SET value = excluded.value`,
+      name,
+      String(value),
+    );
+  }
+
+  _paused() {
+    return this._meta("paused") === "1";
+  }
+
+  _metrics(now = Date.now(), waitingOnly = false) {
+    const expiresBefore = now - __queueLimits().retentionMs;
+    const sql = this._open();
+    const stats = sql.exec(
+      `SELECT backlog_count, backlog_bytes, oldest_message_timestamp
+         FROM ${__QUEUE_STATS} WHERE id = 1`,
+    ).toArray()[0];
+    // Retention is a clock transition, not a row transition. Until the
+    // bounded sweep catches up, use the exact query only at that boundary;
+    // the normal hot path remains one materialized row at every depth.
+    if (stats.oldest_message_timestamp !== null &&
+        stats.oldest_message_timestamp <= expiresBefore) {
+      const row = sql.exec(
+        `SELECT COUNT(*) AS backlog_count,
+                COALESCE(SUM(size), 0) AS backlog_bytes,
+                MIN(enqueued_at) AS oldest_message_timestamp
+           FROM ${__QUEUE_MESSAGES}
+          WHERE purge_on_settle = 0 AND enqueued_at > ?
+            AND (? = 0 OR (lease_id IS NULL AND dlq_target IS NULL
+                           AND visible_at <= ?))`,
+        expiresBefore,
+        waitingOnly ? 1 : 0,
+        now,
+      ).toArray()[0];
+      return {
+        backlogCount: row.backlog_count,
+        backlogBytes: row.backlog_bytes,
+        oldestMessageTimestamp: row.oldest_message_timestamp ?? null,
+      };
+    }
+    if (!waitingOnly) {
+      if (typeof __test_queue_metrics_materialized === "function") {
+        __test_queue_metrics_materialized();
+      }
+      return {
+        backlogCount: stats.backlog_count,
+        backlogBytes: stats.backlog_bytes,
+        oldestMessageTimestamp: stats.oldest_message_timestamp ?? null,
+      };
+    }
+    const blocked = sql.exec(
+      `SELECT COALESCE(SUM(blocked_count), 0) AS blocked_count,
+              COALESCE(SUM(blocked_bytes), 0) AS blocked_bytes
+         FROM (
+           SELECT COUNT(*) AS blocked_count,
+                  COALESCE(SUM(size), 0) AS blocked_bytes
+             FROM ${__QUEUE_MESSAGES} INDEXED BY ${__QUEUE_MESSAGES}_lease
+            WHERE purge_on_settle = 0 AND lease_id IS NOT NULL
+           UNION ALL
+           SELECT COUNT(*) AS blocked_count,
+                  COALESCE(SUM(size), 0) AS blocked_bytes
+             FROM ${__QUEUE_MESSAGES} INDEXED BY ${__QUEUE_MESSAGES}_moving
+            WHERE purge_on_settle = 0 AND dlq_target IS NOT NULL
+           UNION ALL
+           SELECT COUNT(*) AS blocked_count,
+                  COALESCE(SUM(size), 0) AS blocked_bytes
+             FROM ${__QUEUE_MESSAGES} INDEXED BY ${__QUEUE_MESSAGES}_ready
+            WHERE purge_on_settle = 0 AND dlq_target IS NULL
+              AND lease_id IS NULL AND visible_at > ?
+         )`,
+      now,
+    ).toArray()[0];
+    const unleasedOldest = sql.exec(
+      `SELECT enqueued_at
+         FROM ${__QUEUE_MESSAGES} INDEXED BY ${__QUEUE_MESSAGES}_retained
+        WHERE purge_on_settle = 0 AND dlq_target IS NULL
+          AND lease_id IS NULL AND visible_at <= ?
+        ORDER BY enqueued_at, seq
+        LIMIT 1`,
+      now,
+    ).toArray()[0]?.enqueued_at ?? null;
+    return {
+      backlogCount: stats.backlog_count - blocked.blocked_count,
+      backlogBytes: stats.backlog_bytes - blocked.blocked_bytes,
+      oldestMessageTimestamp: unleasedOldest,
+    };
+  }
+
+  async _rearm(now = Date.now()) {
+    const sql = this._open();
+    const consumer = __cell.queueConsumers?.[this.queue];
+    const paused = this._paused();
+    const active = sql.exec(
+      `SELECT COUNT(DISTINCT lease_id) AS count
+         FROM ${__QUEUE_MESSAGES} INDEXED BY ${__QUEUE_MESSAGES}_lease
+        WHERE lease_id IS NOT NULL AND leased_until > ?`,
+      now,
+    ).toArray()[0].count;
+    const concurrency = consumer
+      ? consumer.maxConcurrency ?? __queueLimits().maxConcurrency
+      : 0;
+    const hasCapacity = !paused && consumer !== undefined && __queuePolicy({
+      op: "capacity",
+      active,
+      maximum: concurrency,
+    });
+    // We need only enough ready rows to distinguish a partial batch from a
+    // full one. The two indexed arms cover a new row and an expired lease,
+    // and the outer LIMIT keeps the work independent of backlog depth.
+    let ready = [];
+    if (hasCapacity) {
+      const visibleReady = sql.exec(
+        `SELECT visible_at AS ready_at, seq
+           FROM ${__QUEUE_MESSAGES} INDEXED BY ${__QUEUE_MESSAGES}_ready
+          WHERE purge_on_settle = 0 AND dlq_target IS NULL
+            AND lease_id IS NULL AND visible_at <= ?
+          ORDER BY visible_at, seq
+          LIMIT ?`,
+        now,
+        consumer.maxBatchSize,
+      ).toArray();
+      const expiredReady = sql.exec(
+        `SELECT leased_until AS ready_at, seq
+           FROM ${__QUEUE_MESSAGES} INDEXED BY ${__QUEUE_MESSAGES}_lease
+          WHERE purge_on_settle = 0 AND dlq_target IS NULL
+            AND lease_id IS NOT NULL AND leased_until <= ?
+          ORDER BY leased_until, seq
+          LIMIT ?`,
+        now,
+        consumer.maxBatchSize,
+      ).toArray();
+      ready = [...visibleReady, ...expiredReady]
+        .sort((left, right) => left.ready_at - right.ready_at || left.seq - right.seq)
+        .slice(0, consumer.maxBatchSize);
+    }
+    if (typeof __test_queue_rearm_bounded === "function") {
+      __test_queue_rearm_bounded(
+        ready.length <= (consumer?.maxBatchSize ?? 0),
+        ready.length > 0,
+      );
+    }
+    const earliestVisible = hasCapacity
+      ? sql.exec(
+        `SELECT visible_at
+           FROM ${__QUEUE_MESSAGES} INDEXED BY ${__QUEUE_MESSAGES}_ready
+          WHERE purge_on_settle = 0 AND dlq_target IS NULL
+            AND lease_id IS NULL AND visible_at > ?
+          ORDER BY visible_at, seq
+          LIMIT 1`,
+        now,
+      ).toArray()[0]?.visible_at ?? null
+      : null;
+    const earliestLeaseExpiry = paused
+      ? null
+      : sql.exec(
+        `SELECT leased_until
+           FROM ${__QUEUE_MESSAGES} INDEXED BY ${__QUEUE_MESSAGES}_lease
+          WHERE lease_id IS NOT NULL
+          ORDER BY leased_until
+          LIMIT 1`,
+      ).toArray()[0]?.leased_until ?? null;
+    const nextSweep = sql.exec(
+      `SELECT enqueued_at + ? AS next_sweep
+         FROM ${__QUEUE_MESSAGES} INDEXED BY ${__QUEUE_MESSAGES}_retained
+        WHERE dlq_target IS NULL AND purge_on_settle = 0
+        ORDER BY enqueued_at, seq
+        LIMIT 1`,
+      __queueLimits().retentionMs,
+    ).toArray()[0]?.next_sweep ?? null;
+    const dlqPending = sql.exec(
+      `SELECT 1 AS pending
+         FROM ${__QUEUE_MESSAGES} INDEXED BY ${__QUEUE_MESSAGES}_moving
+        WHERE dlq_target IS NOT NULL
+        LIMIT 1`,
+    ).toArray().length !== 0;
+    const receiptSweep = sql.exec(
+      `SELECT expires_at AS next_sweep
+         FROM ${__QUEUE_TRANSFER_RECEIPTS}
+        ORDER BY expires_at, transfer_id
+        LIMIT 1`,
+    ).toArray()[0]?.next_sweep ?? null;
+    // A queue without an attached consumer only wakes to reclaim retention.
+    // Consumer attachment will nudge the cell when the fleet catalog gains a
+    // registration; spinning on an already-visible row cannot make progress.
+    let batchDeadline = null;
+    if (ready.length > 0) {
+      batchDeadline = ready.length >= consumer.maxBatchSize
+        ? now
+        : ready[0].ready_at + consumer.maxBatchTimeoutMs;
+    }
+    if (dlqPending) {
+      batchDeadline = batchDeadline === null ? now : Math.min(batchDeadline, now);
+    }
+    const sweepDeadlines = [nextSweep, receiptSweep]
+      .filter((deadline) => deadline !== null && deadline !== undefined);
+    const armAt = __queuePolicy({
+      op: "rearm",
+      now,
+      batchDeadline,
+      earliestVisible,
+      // A live handler can settle after delivery pauses. Do not reclaim its
+      // lease while paused; resume re-arms the expired deadline immediately
+      // and only then can a new generation replace it.
+      earliestLeaseExpiry,
+      nextSweep: sweepDeadlines.length === 0 ? null : Math.min(...sweepDeadlines),
+    });
+    if (armAt !== null && !Number.isFinite(armAt)) {
+      throw __queueError("the Queue sweep deadline is invalid");
+    }
+    if (armAt === null) await this.ctx.storage.deleteAlarm();
+    else await this.ctx.storage.setAlarm(armAt);
+  }
+
+  async __queueSend({ entries }) {
+    const now = Date.now();
+    const sql = this._open();
+    this.ctx.storage.transactionSync(() => {
+      for (const entry of entries) {
+        sql.exec(
+          `INSERT INTO ${__QUEUE_MESSAGES}
+             (id, body, content_type, size, enqueued_at, visible_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          crypto.randomUUID(),
+          entry.body,
+          entry.contentType,
+          entry.size,
+          now,
+          now + entry.delaySeconds * 1000,
+        );
+      }
+    });
+    await this._rearm(now);
+    return this._metrics(now);
+  }
+
+  __queueMetrics() {
+    return this._metrics();
+  }
+
+  // Retention decides visibility through `_metrics` immediately, while this
+  // bounded sweep only reclaims space. A live lease is marked instead of
+  // deleted, so its handler can finish but settlement or expiry removes it
+  // without a redelivery.
+  _sweep(now) {
+    const sql = this._open();
+    const cutoff = now - __queueLimits().retentionMs;
+    const messages = __cellSweepBatch(
+      this.ctx.storage,
+      (limit) => sql.exec(
+        `SELECT seq, lease_id, leased_until FROM ${__QUEUE_MESSAGES}
+          WHERE enqueued_at <= ?
+            AND (purge_on_settle = 0
+              OR lease_id IS NULL OR leased_until <= ?)
+          ORDER BY enqueued_at, seq
+          LIMIT ?`,
+        cutoff,
+        now,
+        limit,
+      ).toArray(),
+      (row) => {
+        if (row.lease_id !== null && row.leased_until > now) {
+          sql.exec(
+            `UPDATE ${__QUEUE_MESSAGES} SET purge_on_settle = 1 WHERE seq = ?`,
+            row.seq,
+          );
+        } else {
+          sql.exec(`DELETE FROM ${__QUEUE_MESSAGES} WHERE seq = ?`, row.seq);
+        }
+      },
+      __queueLimits().sweepBatchRows,
+    );
+    const remaining = __queueLimits().sweepBatchRows - messages;
+    if (remaining === 0) return messages;
+    const receipts = __cellSweepBatch(
+      this.ctx.storage,
+      (limit) => sql.exec(
+        `SELECT transfer_id FROM ${__QUEUE_TRANSFER_RECEIPTS}
+          WHERE expires_at <= ?
+          ORDER BY expires_at, transfer_id
+          LIMIT ?`,
+        now,
+        limit,
+      ).toArray(),
+      (row) => {
+        sql.exec(
+          `DELETE FROM ${__QUEUE_TRANSFER_RECEIPTS} WHERE transfer_id = ?`,
+          row.transfer_id,
+        );
+      },
+      remaining,
+    );
+    return messages + receipts;
+  }
+
+  _candidateRows(now, limit) {
+    return this._open().exec(
+      `SELECT seq, id, body, content_type, size, enqueued_at, visible_at,
+              attempts, lease_id, lease_generation, leased_until,
+              purge_on_settle
+         FROM ${__QUEUE_MESSAGES}
+        WHERE dlq_target IS NULL AND ((purge_on_settle = 1
+                 AND (lease_id IS NULL OR leased_until <= ?))
+           OR (purge_on_settle = 0 AND visible_at <= ?
+                 AND (lease_id IS NULL OR leased_until <= ?)))
+        ORDER BY visible_at, seq
+        LIMIT ?`,
+      now,
+      now,
+      now,
+      limit,
+    ).toArray();
+  }
+
+  async _leaseBatch(now, consumer) {
+    const sql = this._open();
+    const active = sql.exec(
+      `SELECT COUNT(DISTINCT lease_id) AS count
+         FROM ${__QUEUE_MESSAGES}
+        WHERE lease_id IS NOT NULL AND leased_until > ?`,
+      now,
+    ).toArray()[0].count;
+    const concurrency = consumer.maxConcurrency ?? __queueLimits().maxConcurrency;
+    if (!__queuePolicy({ op: "capacity", active, maximum: concurrency })) return null;
+
+    // Read extra rows so expired purge markers cannot hide a deliverable
+    // batch. Policy chooses at most `maxBatchSize` rows and returns every
+    // purge deletion that precedes them in this bounded scan.
+    const rows = this._candidateRows(now, consumer.maxBatchSize + 256);
+    const deliverable = rows.filter((row) => row.purge_on_settle === 0);
+    if (deliverable.length === 0) {
+      if (rows.length > 0) {
+        this.ctx.storage.transactionSync(() => {
+          for (const row of rows) {
+            sql.exec(`DELETE FROM ${__QUEUE_MESSAGES} WHERE seq = ?`, row.seq);
+          }
+        });
+      }
+      return null;
+    }
+    const readySince = Math.min(...deliverable.map((row) =>
+      row.lease_id === null ? row.visible_at : row.leased_until
+    ));
+    if (deliverable.length < consumer.maxBatchSize &&
+        readySince + consumer.maxBatchTimeoutMs > now) {
+      return null;
+    }
+
+    const plan = __queuePolicy({
+      op: "batch",
+      now,
+      maxBatchSize: consumer.maxBatchSize,
+      rows: rows.map((row) => ({
+        seq: row.seq,
+        visibleAt: row.visible_at,
+        leaseGeneration: String(row.lease_generation),
+        leasedUntil: row.leased_until,
+        purgeOnSettle: row.purge_on_settle !== 0,
+      })),
+    });
+    if (plan.leases.length === 0 && plan.deletePurged.length === 0) return null;
+    const rowBySeq = new Map(rows.map((row) => [row.seq, row]));
+    const reclaimed = plan.leases.filter((lease) => lease.reclaimed);
+    const expiryPolicy = __queuePolicy({
+      op: "expiry",
+      now,
+      entries: reclaimed.map((lease) => {
+        const row = rowBySeq.get(lease.seq);
+        return {
+          priorFailures: row.attempts,
+          maxRetries: consumer.maxRetries,
+          configuredSeconds: consumer.retryDelaySeconds ?? null,
+          purgeOnSettle: row.purge_on_settle !== 0,
+        };
+      }),
+    });
+    const expiryBySeq = new Map(
+      reclaimed.map((lease, index) => [lease.seq, expiryPolicy[index]]),
+    );
+    const installs = plan.leases.filter((lease) => {
+      const expiry = expiryBySeq.get(lease.seq);
+      return expiry === undefined ||
+        (expiry.action.kind === "retry" && expiry.action.at <= now);
+    });
+    const exhaustedTransfers = new Map(
+      reclaimed
+        .filter((lease) =>
+          expiryBySeq.get(lease.seq).action.kind === "exhausted" &&
+          consumer.deadLetterQueue !== undefined
+        )
+        .map((lease) => [lease.seq, crypto.randomUUID()]),
+    );
+    const leaseId = crypto.randomUUID();
+    const leasedUntil = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      now + __cell.queueLeaseDurationMs,
+    );
+    this.ctx.storage.transactionSync(() => {
+      for (const seq of plan.deletePurged) {
+        sql.exec(
+          `DELETE FROM ${__QUEUE_MESSAGES}
+            WHERE seq = ? AND purge_on_settle = 1
+              AND (lease_id IS NULL OR leased_until <= ?)`,
+          seq,
+          now,
+        );
+      }
+      for (const lease of reclaimed) {
+        const expiry = expiryBySeq.get(lease.seq);
+        if (expiry.action.kind === "delete-purged") {
+          sql.exec(
+            `DELETE FROM ${__QUEUE_MESSAGES}
+              WHERE seq = ? AND leased_until <= ?`,
+            lease.seq,
+            now,
+          );
+        } else if (expiry.action.kind === "exhausted") {
+          if (consumer.deadLetterQueue === undefined) {
+            sql.exec(
+              `DELETE FROM ${__QUEUE_MESSAGES}
+                WHERE seq = ? AND leased_until <= ?`,
+              lease.seq,
+              now,
+            );
+          } else {
+            sql.exec(
+              `UPDATE ${__QUEUE_MESSAGES}
+                  SET attempts = ?, lease_id = NULL, leased_until = NULL,
+                      dlq_target = ?, dlq_transfer_id = ?,
+                      transfer_kind = 'dead-letter'
+                WHERE seq = ? AND leased_until <= ?`,
+              expiry.attempt,
+              consumer.deadLetterQueue,
+              exhaustedTransfers.get(lease.seq),
+              lease.seq,
+              now,
+            );
+          }
+        } else if (expiry.action.at > now) {
+          sql.exec(
+            `UPDATE ${__QUEUE_MESSAGES}
+                SET attempts = ?, visible_at = ?, lease_id = NULL,
+                    leased_until = NULL
+              WHERE seq = ? AND leased_until <= ?`,
+            expiry.attempt,
+            expiry.action.at,
+            lease.seq,
+            now,
+          );
+        }
+      }
+      for (const lease of installs) {
+        const generation = Number(lease.generation);
+        if (!Number.isSafeInteger(generation)) {
+          throw __queueError(`message ${lease.seq} exhausted its safe lease generation`);
+        }
+        sql.exec(
+          `UPDATE ${__QUEUE_MESSAGES}
+              SET lease_id = ?, lease_generation = ?, leased_until = ?,
+                  attempts = attempts + ?
+            WHERE seq = ? AND lease_generation = ?
+              AND (lease_id IS NULL OR leased_until <= ?)`,
+          leaseId,
+          generation,
+          leasedUntil,
+          lease.reclaimed ? 1 : 0,
+          lease.seq,
+          generation - 1,
+          now,
+        );
+      }
+    });
+    if (installs.length === 0) return null;
+    const leasedQuery =
+      `SELECT seq, id, body, content_type, enqueued_at, attempts,
+              lease_generation
+         FROM ${__QUEUE_MESSAGES}
+        WHERE lease_id = ?
+        ORDER BY visible_at, seq`;
+    __queueReportLeaseLookupPlan(sql, leasedQuery, leaseId);
+    const leased = sql.exec(leasedQuery, leaseId).toArray();
+    if (leased.length !== installs.length) {
+      throw __queueError("the Queue lease transaction changed fewer rows than its plan");
+    }
+    return {
+      leaseId,
+      leases: leased.map((row) => ({
+        message_id: row.id,
+        seq: row.seq,
+        generation: row.lease_generation,
+      })),
+      messages: leased.map((row) => ({
+        id: row.id,
+        timestampMs: row.enqueued_at,
+        // SQLite answers a BLOB as an ArrayBuffer. The raw base64 op accepts
+        // typed views, so normalize here; otherwise it encodes the text
+        // "[object ArrayBuffer]" and every consumer decoder sees corrupt data.
+        bodyBase64: $$btoa(
+          row.body instanceof Uint8Array ? row.body : new Uint8Array(row.body),
+        ),
+        contentType: row.content_type,
+        attempts: row.attempts + 1,
+      })),
+      // Miniflare removes every dispatched batch from its backlog before it
+      // invokes the consumer. Exclude every lease here for the same contract;
+      // the operator aggregate still includes durable in-flight messages.
+      metrics: this._metrics(now, true),
+    };
+  }
+
+  // The target deduplicates the stable transfer identity. The source can
+  // therefore repeat this call after a stop between the target commit and the
+  // source delete without creating a second message.
+  async __queueDlqAcceptBatch({ transfers }) {
+    if (!Array.isArray(transfers) || transfers.length === 0 ||
+        transfers.length > __queueLimits().maxBatchMessages) {
+      throw __queueError("a Queue transfer batch has an invalid size");
+    }
+    for (const transfer of transfers) {
+      if (transfer.deadLetterSource !== null &&
+          typeof transfer.deadLetterSource !== "string") {
+        throw __queueError("a Queue transfer has an invalid dead-letter source");
+      }
+    }
+    const now = Date.now();
+    const sql = this._open();
+    this.ctx.storage.transactionSync(() => {
+      for (const { transferId, entry, deadLetterSource } of transfers) {
+        const accepted = sql.exec(
+          `SELECT message_id, dead_letter_source
+             FROM ${__QUEUE_TRANSFER_RECEIPTS}
+            WHERE transfer_id = ?`,
+          transferId,
+        ).toArray()[0];
+        if (accepted !== undefined && (accepted.message_id !== entry.id ||
+            accepted.dead_letter_source !== deadLetterSource)) {
+          throw __queueError("a DLQ transfer collided with another message identity");
+        }
+        if (accepted !== undefined) continue;
+        sql.exec(
+          `INSERT INTO ${__QUEUE_TRANSFER_RECEIPTS}
+             (transfer_id, message_id, dead_letter_source, expires_at)
+           VALUES (?, ?, ?, ?)`,
+          transferId,
+          entry.id,
+          deadLetterSource,
+          now + __queueLimits().retentionMs,
+        );
+        sql.exec(
+          `INSERT INTO ${__QUEUE_MESSAGES}
+             (id, body, content_type, size, enqueued_at, visible_at,
+              attempts, dlq_transfer_id, dead_letter_source)
+           VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+          entry.id,
+          entry.body,
+          entry.contentType,
+          entry.size,
+          now,
+          now,
+          transferId,
+          deadLetterSource,
+        );
+      }
+    });
+    await this._rearm(now);
+    return this._metrics(now);
+  }
+
+  async _driveDlq(limit = 100) {
+    const now = Date.now();
+    const pending = this._open().exec(
+      `SELECT seq, id, body, content_type, size, dlq_target, dlq_transfer_id,
+              transfer_kind
+         FROM ${__QUEUE_MESSAGES}
+        WHERE dlq_target IS NOT NULL
+          AND enqueued_at > ?
+        ORDER BY seq
+        LIMIT ?`,
+      now - __queueLimits().retentionMs,
+      limit,
+    ).toArray();
+    const groups = new Map();
+    for (const row of pending) {
+      let group = groups.get(row.dlq_target);
+      if (group === undefined) groups.set(row.dlq_target, group = []);
+      group.push(row);
+    }
+    for (const [targetName, rows] of groups) {
+      const target = __cell.makeNamespace("__Queue").getByName(targetName);
+      await target.__queueDlqAcceptBatch({
+        transfers: rows.map((row) => ({
+          transferId: row.dlq_transfer_id,
+          // A dead-letter transfer records where redrive returns the message.
+          // A redrive returns it to ordinary queue state, so the source marker
+          // must not follow it and make a later redrive bounce it backwards.
+          deadLetterSource: row.transfer_kind === "dead-letter" ? this.queue : null,
+          entry: {
+            id: row.id,
+            body: row.body,
+            contentType: row.content_type,
+            size: row.size,
+          },
+        })),
+      });
+      if (typeof __test_queue_dlq_accepted === "function") {
+        __test_queue_dlq_accepted();
+      }
+      // The target committed every receipt before this reply. Delete the
+      // corresponding source marks together; a stop before this transaction
+      // leaves the whole group replayable through those stable receipts.
+      this.ctx.storage.transactionSync(() => {
+        for (const row of rows) {
+          this._open().exec(
+            `DELETE FROM ${__QUEUE_MESSAGES}
+              WHERE seq = ? AND dlq_target = ? AND dlq_transfer_id = ?
+                AND transfer_kind = ?`,
+            row.seq,
+            row.dlq_target,
+            row.dlq_transfer_id,
+            row.transfer_kind,
+          );
+        }
+      });
+    }
+    return pending.length;
+  }
+
+  async alarm() {
+    const now = Date.now();
+    try {
+      await this._driveDlq();
+    } catch (error) {
+      // The durable source mark is the retry record. An alarm stays armed at
+      // `now`, and the target's transfer identity makes a replay idempotent.
+      console.error("Queue DLQ transfer failed:", error);
+    }
+    const swept = this._sweep(now);
+    const consumer = this._paused()
+      ? undefined
+      : __cell.queueConsumers?.[this.queue];
+    // Install every lease that the configured concurrency admits before the
+    // first consumer can settle. One lease per alarm serialized full batches
+    // because the next alarm depended on a later scheduler turn, so a queue
+    // with maxConcurrency > 1 still used only one handler under backlog.
+    // `_leaseBatch` counts the durable lease IDs on every iteration, which
+    // makes the configured concurrency the structural bound for this loop.
+    const batches = [];
+    if (consumer !== undefined) {
+      while (true) {
+        const batch = await this._leaseBatch(now, consumer);
+        if (batch === null) break;
+        batches.push(batch);
+      }
+    }
+    try {
+      // `_leaseBatch` can exhaust an expired lease and create a new durable
+      // DLQ mark. Drive that mark in the same wake; the first call above is
+      // for a mark recovered from an earlier stopped process.
+      await this._driveDlq();
+    } catch (error) {
+      console.error("Queue DLQ transfer failed:", error);
+    }
+    await this._rearm(now);
+    if (swept >= __queueLimits().sweepBatchRows && batches.length === 0) {
+      await this.ctx.storage.setAlarm(now + 1);
+      return;
+    }
+    for (const batch of batches) {
+      // This await covers only the output-gated handoff to the host. The
+      // consumer runs after this alarm returns, and settlement comes back as
+      // an independent cell event. All admitted leases are durable before the
+      // first handoff, so a fast settlement cannot make this turn exceed the
+      // configured concurrency.
+      await __queue_dispatch(
+        consumer.script,
+        this.queue,
+        JSON.stringify(batch),
+      );
+    }
+  }
+
+  _matchingLease(body) {
+    if (typeof body.leaseId !== "string" || !Array.isArray(body.leases)) return null;
+    const matchQuery =
+      `SELECT seq, id, attempts, lease_generation, purge_on_settle
+         FROM ${__QUEUE_MESSAGES}
+        WHERE lease_id = ?
+        ORDER BY seq`;
+    __queueReportLeaseLookupPlan(this._open(), matchQuery, body.leaseId);
+    const rows = this._open().exec(matchQuery, body.leaseId).toArray();
+    for (const lease of body.leases) {
+      if (typeof lease?.message_id !== "string" ||
+          !Number.isSafeInteger(lease.seq) ||
+          !Number.isSafeInteger(lease.generation)) return null;
+    }
+    const matches = __queuePolicy({
+      op: "settlement",
+      current: rows.map((row) => ({
+        seq: String(row.seq),
+        messageId: row.id,
+        generation: String(row.lease_generation),
+      })),
+      submitted: body.leases.map((lease) => ({
+        seq: String(lease.seq),
+        messageId: lease.message_id,
+        generation: String(lease.generation),
+      })),
+    });
+    return matches ? rows : null;
+  }
+
+  async _settle(body) {
+    const rows = this._matchingLease(body);
+    if (rows === null) return false;
+    const consumer = __cell.queueConsumers?.[this.queue];
+    if (consumer === undefined) return false;
+    const explicitAcks = new Set(body.explicitAcks ?? []);
+    const retryMessages = new Map(
+      (body.retryMessages ?? []).map((retry) => [retry.msgId, retry.delaySeconds]),
+    );
+    const retryBatch = body.retryBatch?.retry === true;
+    const batchDelay = body.retryBatch?.delaySeconds;
+    const exception = body.outcome === "exception";
+    // An explicit ack-all survives a later handler exception, so it must
+    // override every batch-level and message-level retry signal.
+    const ackAll = body.ackAll === true;
+    const decisions = rows.map((row) => {
+      const retry = !ackAll && !explicitAcks.has(row.id) && (
+        retryMessages.has(row.id) || retryBatch || exception
+      );
+      return { row, retry };
+    });
+    const retrying = decisions.filter((decision) =>
+      decision.retry && decision.row.purge_on_settle === 0
+    );
+    const retryPolicy = __queuePolicy({
+      op: "retries",
+      now: Date.now(),
+      entries: retrying.map(({ row }) => ({
+        attempt: row.attempts + 1,
+        maxRetries: consumer.maxRetries,
+        explicitSeconds: retryMessages.has(row.id)
+          ? retryMessages.get(row.id)
+          : retryBatch ? batchDelay : null,
+        configuredSeconds: consumer.retryDelaySeconds ?? null,
+      })),
+    });
+    const retryById = new Map(
+      retrying.map(({ row }, index) => [row.id, retryPolicy[index]]),
+    );
+    const dlqTransferById = new Map(
+      retrying
+        .filter(({ row }) =>
+          retryById.get(row.id).exhausted && consumer.deadLetterQueue !== undefined
+        )
+        .map(({ row }) => [row.id, crypto.randomUUID()]),
+    );
+    const sql = this._open();
+    this.ctx.storage.transactionSync(() => {
+      for (const { row, retry } of decisions) {
+        const policy = retryById.get(row.id);
+        if (row.purge_on_settle !== 0 || !retry ||
+            (policy.exhausted && consumer.deadLetterQueue === undefined)) {
+          sql.exec(
+            `DELETE FROM ${__QUEUE_MESSAGES}
+              WHERE seq = ? AND lease_id = ? AND lease_generation = ?`,
+            row.seq,
+            body.leaseId,
+            row.lease_generation,
+          );
+          continue;
+        }
+        if (policy.exhausted) {
+          sql.exec(
+            `UPDATE ${__QUEUE_MESSAGES}
+                SET attempts = attempts + 1, lease_id = NULL,
+                    leased_until = NULL, dlq_target = ?, dlq_transfer_id = ?,
+                    transfer_kind = 'dead-letter'
+              WHERE seq = ? AND lease_id = ? AND lease_generation = ?`,
+            consumer.deadLetterQueue,
+            dlqTransferById.get(row.id),
+            row.seq,
+            body.leaseId,
+            row.lease_generation,
+          );
+          continue;
+        }
+        sql.exec(
+          `UPDATE ${__QUEUE_MESSAGES}
+              SET attempts = attempts + 1, visible_at = ?,
+                  lease_id = NULL, leased_until = NULL
+            WHERE seq = ? AND lease_id = ? AND lease_generation = ?`,
+          policy.at,
+          row.seq,
+          body.leaseId,
+          row.lease_generation,
+        );
+      }
+    });
+    try {
+      await this._driveDlq();
+    } catch (error) {
+      // Settlement is durable once the source mark commits. A failed transfer
+      // is alarm work now, not a reason to put the message back in delivery.
+      console.error("Queue DLQ transfer deferred:", error);
+    }
+    await this._rearm();
+    return true;
+  }
+
+  async _purge() {
+    const now = Date.now();
+    const sql = this._open();
+    let deleted = 0;
+    let leased = 0;
+    this.ctx.storage.transactionSync(() => {
+      let after = 0;
+      while (true) {
+        // Purge is necessarily proportional to the stored backlog, but its
+        // policy envelope stays bounded instead of materializing the Queue in
+        // V8 or Rust. One SQLite transaction keeps the visibility change
+        // atomic across all chunks.
+        const rows = sql.exec(
+          `SELECT seq, lease_id, leased_until FROM ${__QUEUE_MESSAGES}
+            WHERE seq > ?
+            ORDER BY seq
+            LIMIT 256`,
+          after,
+        ).toArray();
+        if (rows.length === 0) break;
+        after = rows[rows.length - 1].seq;
+        const plan = __queuePolicy({
+          op: "purge",
+          now,
+          rows: rows.map((row) => ({
+            seq: String(row.seq),
+            leaseIdPresent: row.lease_id !== null,
+            leasedUntil: row.leased_until,
+          })),
+        });
+        for (const seq of plan.delete) {
+          sql.exec(
+            `DELETE FROM ${__QUEUE_MESSAGES}
+              WHERE seq = ?
+                AND (lease_id IS NULL OR leased_until IS NULL OR leased_until <= ?)`,
+            Number(seq),
+            now,
+          );
+          deleted += 1;
+        }
+        for (const seq of plan.markForSettle) {
+          sql.exec(
+            `UPDATE ${__QUEUE_MESSAGES} SET purge_on_settle = 1
+              WHERE seq = ? AND lease_id IS NOT NULL AND leased_until > ?`,
+            Number(seq),
+            now,
+          );
+          leased += 1;
+        }
+      }
+    });
+    await this._rearm(now);
+    return { deleted, leased, metrics: this._metrics(now) };
+  }
+
+  async _setPaused(paused) {
+    this._setMeta("paused", paused ? "1" : null);
+    await this._rearm();
+    return { paused, ...this._metrics() };
+  }
+
+  _operatorLimit(value, fallback) {
+    const limit = value ?? fallback;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw __queueError("limit must be an integer from 1 through 100");
+    }
+    return limit;
+  }
+
+  _peek(limit) {
+    const now = Date.now();
+    const cutoff = now - __queueLimits().retentionMs;
+    const rows = this._open().exec(
+      `SELECT id, body, content_type, size, enqueued_at, visible_at, attempts,
+              lease_id, leased_until, purge_on_settle, dlq_target,
+              dead_letter_source
+         FROM ${__QUEUE_MESSAGES}
+        WHERE enqueued_at > ?
+        ORDER BY visible_at, seq
+        LIMIT ?`,
+      cutoff,
+      limit,
+    ).toArray();
+    return {
+      messages: rows.map((row) => ({
+        id: row.id,
+        bodyBase64: $$btoa(
+          row.body instanceof Uint8Array ? row.body : new Uint8Array(row.body),
+        ),
+        contentType: row.content_type,
+        size: row.size,
+        enqueuedAt: row.enqueued_at,
+        visibleAt: row.visible_at,
+        attempts: row.attempts,
+        state: row.dlq_target !== null
+          ? "moving"
+          : row.purge_on_settle !== 0
+          ? "purging"
+          : row.lease_id !== null && row.leased_until > now
+          ? "leased"
+          : row.visible_at <= now
+          ? "visible"
+          : "delayed",
+        leasedUntil: row.lease_id !== null && row.leased_until > now
+          ? row.leased_until
+          : null,
+        transferTarget: row.dlq_target,
+        deadLetterSource: row.dead_letter_source,
+      })),
+    };
+  }
+
+  async _redrive(limit) {
+    // Finish an interrupted move before selecting more work. A transfer mark
+    // is durable, so selecting it a second time would invent another identity
+    // where replaying the existing identity is sufficient.
+    await this._driveDlq(100);
+    const now = Date.now();
+    const cutoff = now - __queueLimits().retentionMs;
+    const candidates = this._open().exec(
+      `SELECT seq, dead_letter_source
+         FROM ${__QUEUE_MESSAGES}
+        WHERE dead_letter_source IS NOT NULL
+          AND dlq_target IS NULL
+          AND purge_on_settle = 0
+          AND enqueued_at > ?
+          AND (lease_id IS NULL OR leased_until <= ?)
+        ORDER BY visible_at, seq
+        LIMIT ?`,
+      cutoff,
+      now,
+      limit,
+    ).toArray();
+    const transfers = candidates.map((row) => ({
+      ...row,
+      transferId: crypto.randomUUID(),
+    }));
+    this.ctx.storage.transactionSync(() => {
+      for (const transfer of transfers) {
+        this._open().exec(
+          `UPDATE ${__QUEUE_MESSAGES}
+              SET dlq_target = ?, dlq_transfer_id = ?, transfer_kind = 'redrive',
+                  lease_id = NULL, leased_until = NULL
+            WHERE seq = ? AND dead_letter_source = ? AND dlq_target IS NULL
+              AND purge_on_settle = 0
+              AND (lease_id IS NULL OR leased_until <= ?)`,
+          transfer.dead_letter_source,
+          transfer.transferId,
+          transfer.seq,
+          transfer.dead_letter_source,
+          now,
+        );
+      }
+    });
+    // Arm before the cross-cell call. If the process stops after the durable
+    // mark, the alarm replays the same transfer identity.
+    await this._rearm(now);
+    await this._driveDlq(100);
+    await this._rearm();
+    return { redriven: transfers.length, metrics: this._metrics() };
+  }
+
+  async fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (request.method !== "POST") {
+      return new Response("Queue route not found", { status: 404 });
+    }
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return new Response("invalid Queue request", { status: 400 });
+    }
+    try {
+      if (path === "/__qSettle") {
+        return await this._settle(body)
+          ? new Response(null, { status: 204 })
+          : new Response("stale Queue settlement", { status: 409 });
+      }
+      if (body.op === "info") {
+        const metrics = this._metrics();
+        const stored = this._open().exec(
+          `SELECT stored_count FROM ${__QUEUE_STATS} WHERE id = 1`,
+        ).toArray()[0].stored_count;
+        return Response.json({ result: { ...metrics, stored, paused: this._paused() } });
+      }
+      if (body.op === "purge") {
+        return Response.json({ result: await this._purge() });
+      }
+      if (body.op === "pause") {
+        return Response.json({ result: await this._setPaused(true) });
+      }
+      if (body.op === "resume") {
+        return Response.json({ result: await this._setPaused(false) });
+      }
+      if (body.op === "peek") {
+        return Response.json({
+          result: this._peek(this._operatorLimit(body.limit, 10)),
+        });
+      }
+      if (body.op === "redrive") {
+        return Response.json({
+          result: await this._redrive(this._operatorLimit(body.limit, 100)),
+        });
+      }
+      return Response.json(
+        { error: `QUEUE_ERROR: unknown operation ${JSON.stringify(body.op)}` },
+        { status: 400 },
+      );
+    } catch (error) {
+      return Response.json(
+        { error: String(error?.message ?? error) },
+        { status: 400 },
+      );
+    }
+  }
+}
+
+__cell.classes.__Queue = __QueueCell;
+__cell.doExports.__Queue = true;
+
+class Queue {
+  constructor(queue, cellName, deliveryDelay) {
+    Object.defineProperties(this, {
+      _queue: { value: queue },
+      _cellName: { value: cellName },
+      _deliveryDelay: { value: deliveryDelay },
+    });
+  }
+
+  get _stub() {
+    return __cell.makeNamespace("__Queue").getByName(this._cellName);
+  }
+
+  async _send(entries) {
+    const metrics = await this._stub.__queueSend({ entries });
+    return { metadata: { metrics: __queueMetricsView(metrics) } };
+  }
+
+  send(body, options = {}) {
+    const encoded = __queueEncode(body, options.contentType);
+    return this._send([{
+      ...encoded,
+      delaySeconds: __queueDelay(options.delaySeconds, this._deliveryDelay),
+    }]);
+  }
+
+  sendBatch(messages, options = {}) {
+    if (messages === null || messages === undefined ||
+        typeof messages[Symbol.iterator] !== "function") {
+      throw __queueError("sendBatch() needs an iterable of messages");
+    }
+    const entries = [];
+    let bytes = 0;
+    const batchDelay = __queueDelay(options.delaySeconds, this._deliveryDelay);
+    for (const message of messages) {
+      if (entries.length >= __queueLimits().maxBatchMessages) {
+        throw __queueError(
+          `a batch has at most ${__queueLimits().maxBatchMessages} messages`,
+        );
+      }
+      if (message === null || typeof message !== "object" || !("body" in message)) {
+        throw __queueError("each batch entry needs a body");
+      }
+      const encoded = __queueEncode(message.body, message.contentType);
+      bytes += encoded.size;
+      if (bytes > __queueLimits().maxBatchBytes) {
+        throw __queueError(
+          `a batch is at most ${__queueLimits().maxBatchBytes} bytes, got ${bytes}`,
+        );
+      }
+      entries.push({
+        ...encoded,
+        delaySeconds: __queueDelay(message.delaySeconds, batchDelay),
+      });
+    }
+    if (entries.length === 0) {
+      throw __queueError("sendBatch() needs at least one message");
+    }
+    return this._send(entries);
+  }
+
+  async metrics() {
+    return __queueMetricsView(await this._stub.__queueMetrics());
+  }
+}
+
+globalThis.__makeQueue = (queue, cellName, deliveryDelay) =>
+  new Queue(queue, cellName, deliveryDelay);
+
 // ---- D1 -----------------------------------------------------------------
 // A D1 database is a cell of a runtime-supplied Durable Object class, so it
 // inherits ownership, fencing, LTX replication, RPO=0 acknowledgement and
@@ -3831,7 +6902,7 @@ class __D1DatabaseCell {
     });
   }
   // The CLI's way in. `celld d1` signs each request with the fleet secret
-  // and sends it to a live node's `/__d1/<scope>` route, which verifies the
+  // and sends it to a live node's `/runtime/<scope>` route, which verifies the
   // signature and then forwards to the owner over the same dispatch `/do/`
   // uses — so the CLI needs no ownership logic and the database is reached
   // the way a Worker reaches it. The unauthenticated `/do/` route refuses a
@@ -4106,6 +7177,1448 @@ class D1Database {
 }
 
 globalThis.__makeD1Database = (databaseName) => new D1Database(databaseName);
+// ---- Workflows ----------------------------------------------------------
+// A workflow instance is one cell of the runtime-supplied `__Workflow` class,
+// named `<workflow_name>/<instance_id>` through getByName, so it inherits
+// ownership, fencing, LTX replication and the output gate from the cell it
+// already is. Execution is replay: `run()` re-executes from the top on every
+// resume and only steps are memoized, in `ctx.storage` KV under `__wf.*`.
+// This half is the server; `__makeWorkflow` below is the client the binding
+// hands to a Worker. The public contract is in docs/cloudflare-compat.md.
+
+// Upstream's limit for a step return, an event payload, and the params. The
+// error is distinct and names the step, because "too large" and "the isolate
+// died" must not read the same (the D1 row-cap precedent).
+const __WF_VALUE_CAP = 1 << 20;
+// Workflow names, instance ids, and event types all share this charset.
+// `/` is outside it, which is what makes the `<name>/<id>` cell-name join
+// unambiguous.
+const __WF_NAME_RE = /^[a-zA-Z0-9_][a-zA-Z0-9-_]*$/;
+const __wfError = (message) => new Error("WORKFLOW_ERROR: " + message);
+// The suspension primitive: a blocked step returns a promise that never
+// settles in this invocation, so user code simply stops progressing. A
+// sentinel thrown through user code was rejected because `Promise.all` in
+// `run()` would observe it as a rejection and user try/catch would eat it.
+const __wfNever = new Promise(() => {});
+const __wfTerminal = (status) =>
+  status === "complete" || status === "errored" || status === "terminated";
+// Upstream's hard bounds: 10,000 retries per step, 365 days for any sleep or
+// event wait, one second under a waitForEvent timeout. Enforced loudly at the
+// call site -- a config outside them would otherwise misbehave only after
+// the instance is minutes or days into its run.
+const __WF_RETRY_LIMIT_CAP = 10000;
+const __WF_STEP_NAME_LIMIT = 256;
+const __WF_MAX_WAIT_MS = 365 * 86400000;
+const __WF_MIN_EVENT_TIMEOUT_MS = 1000;
+// How long run() can stay pending on non-step work while no step runs and
+// none is blocked before the instance fails. Upstream permits un-stepped
+// awaits between steps (they are merely non-durable), so erroring at the
+// first quiescent macrotask would kill any run() whose external await
+// outlives one turn of the loop. Sixty seconds is long enough for any
+// sane un-stepped await and short enough that a truly never-settling
+// promise fails the instance instead of wedging the alarm handler.
+const __WF_STALL_GRACE_MS = 60000;
+const __WF_UNITS = {
+  second: 1000,
+  minute: 60000,
+  hour: 3600000,
+  day: 86400000,
+  week: 604800000,
+  // Upstream does not document its month/year arithmetic; fixed 30/365-day
+  // units are used so one expression cannot mean two durations depending on
+  // when it runs.
+  month: 30 * 86400000,
+  year: 365 * 86400000,
+};
+const __wfDuration = (value, what) => {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+  if (typeof value !== "string") {
+    throw __wfError(
+      `invalid duration for ${what}: ${JSON.stringify(value)}; use milliseconds ` +
+        'or "<n> <second|minute|hour|day|week|month|year>[s]"',
+    );
+  }
+  const match = /^\s*(\d+(?:\.\d+)?)\s+(second|minute|hour|day|week|month|year)s?\s*$/
+    .exec(value);
+  if (!match) {
+    throw __wfError(
+      `invalid duration for ${what}: ${JSON.stringify(value)}; use milliseconds ` +
+        'or "<n> <second|minute|hour|day|week|month|year>[s]"',
+    );
+  }
+  return Number(match[1]) * __WF_UNITS[match[2]];
+};
+const __wfOwnObject = (value) =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+const __wfUnknownKey = (value, allowed) =>
+  Object.keys(value).find((key) => !allowed.includes(key));
+const __wfStepName = (name) => {
+  // The pinned workers-sdk validator has no minimum length. An empty name is
+  // therefore valid, although rejecting it looks safer at first glance. A
+  // non-empty check made celld reject Worker code that the upstream runtime
+  // accepts, so keep only the upstream length and control-character bounds.
+  if (
+    typeof name !== "string" || name.length > __WF_STEP_NAME_LIMIT ||
+    /[\x00-\x1f]/.test(name)
+  ) {
+    throw __wfError(
+      `invalid step name ${JSON.stringify(name)}: use at most ` +
+        `${__WF_STEP_NAME_LIMIT} characters and no control characters`,
+    );
+  }
+};
+const __wfEventType = (type) => {
+  if (typeof type !== "string" || type.length > 100 || !__WF_NAME_RE.test(type)) {
+    throw __wfError(
+      `invalid event type ${JSON.stringify(type)}: use at most 100 letters, ` +
+        "digits, hyphens, or underscores",
+    );
+  }
+};
+const __wfSleepDuration = (duration, name) => {
+  const durationMs = __wfDuration(
+    duration,
+    `the duration of sleep ${JSON.stringify(name)}`,
+  );
+  if (durationMs > __WF_MAX_WAIT_MS) {
+    throw __wfError(
+      `sleep ${JSON.stringify(name)} is ${durationMs} ms, above the upstream ` +
+        "limit of 365 days",
+    );
+  }
+  return durationMs;
+};
+const __wfSleepUntil = (timestamp, name) => {
+  const at = timestamp instanceof Date ? timestamp.getTime() : timestamp;
+  if (typeof at !== "number" || !Number.isFinite(at)) {
+    throw __wfError(
+      `invalid sleepUntil timestamp for ${JSON.stringify(name)}: use a Date ` +
+        "or a UNIX timestamp in milliseconds",
+    );
+  }
+  const delay = at - Date.now();
+  if (delay > __WF_MAX_WAIT_MS) {
+    throw __wfError(
+      `sleepUntil ${JSON.stringify(name)} is ${delay} ms away, above the ` +
+        "upstream limit of 365 days",
+    );
+  }
+  return at;
+};
+const __wfWaitOptions = (options, name) => {
+  if (!__wfOwnObject(options)) {
+    throw __wfError(`invalid waitForEvent options for ${JSON.stringify(name)}`);
+  }
+  __wfEventType(options.type);
+  const timeout = options.timeout ?? "24 hours";
+  const timeoutMs = __wfDuration(
+    timeout,
+    `the timeout of waitForEvent ${JSON.stringify(name)}`,
+  );
+  if (timeoutMs < __WF_MIN_EVENT_TIMEOUT_MS || timeoutMs > __WF_MAX_WAIT_MS) {
+    throw __wfError(
+      `the timeout of waitForEvent ${JSON.stringify(name)} is ${timeoutMs} ms; ` +
+        "upstream allows 1 second to 365 days",
+    );
+  }
+  return { type: options.type, timeout, timeoutMs };
+};
+const __wfEventOptions = (options) => {
+  if (!__wfOwnObject(options)) {
+    throw __wfError("sendEvent() needs an event object");
+  }
+  __wfEventType(options.type);
+  if (options.payload !== undefined) __wfCheckValue(options.payload, "the event payload");
+  return { type: options.type, payload: options.payload };
+};
+const __wfRestartOptions = (options) => {
+  if (options === undefined) return {};
+  if (!__wfOwnObject(options)) {
+    throw __wfError("restart() options must be an object");
+  }
+  const unknown = __wfUnknownKey(options, ["from"]);
+  if (unknown !== undefined) {
+    throw __wfError(`restart() has an unknown option ${JSON.stringify(unknown)}`);
+  }
+  if (options.from === undefined) return {};
+  const from = options.from;
+  if (!__wfOwnObject(from)) {
+    throw __wfError("restart() option from must be an object");
+  }
+  const fromUnknown = __wfUnknownKey(from, ["name", "count", "type"]);
+  if (fromUnknown !== undefined) {
+    throw __wfError(
+      `restart() option from has an unknown field ${JSON.stringify(fromUnknown)}`,
+    );
+  }
+  __wfStepName(from.name);
+  const count = from.count ?? 1;
+  if (!Number.isInteger(count) || count < 1) {
+    throw __wfError("restart() option from.count must be a positive integer");
+  }
+  const type = from.type ?? "do";
+  if (!["do", "sleep", "waitForEvent"].includes(type)) {
+    throw __wfError(
+      'restart() option from.type must be "do", "sleep", or "waitForEvent"',
+    );
+  }
+  return { from: { name: from.name, count, type } };
+};
+const __wfStepConfig = (config, name) => {
+  if (!__wfOwnObject(config)) {
+    throw __wfError(`invalid config for step ${JSON.stringify(name)}: use an object`);
+  }
+  let unknown = __wfUnknownKey(config, ["retries", "timeout", "sensitive"]);
+  if (unknown !== undefined) {
+    throw __wfError(
+      `invalid config for step ${JSON.stringify(name)}: unknown option ` +
+        JSON.stringify(unknown),
+    );
+  }
+  const retries = config.retries;
+  if (retries !== undefined) {
+    if (!__wfOwnObject(retries)) {
+      throw __wfError(`invalid retries config for step ${JSON.stringify(name)}`);
+    }
+    unknown = __wfUnknownKey(retries, ["limit", "delay", "backoff"]);
+    if (unknown !== undefined) {
+      throw __wfError(
+        `invalid retries config for step ${JSON.stringify(name)}: unknown option ` +
+          JSON.stringify(unknown),
+      );
+    }
+    if (
+      typeof retries.limit !== "number" || !Number.isFinite(retries.limit) ||
+      retries.limit < 0
+    ) {
+      throw __wfError(
+        `invalid retries config for step ${JSON.stringify(name)}: ` +
+          "limit must be a non-negative number",
+      );
+    }
+    if (retries.limit > __WF_RETRY_LIMIT_CAP) {
+      throw __wfError(
+        `invalid retries config for step ${JSON.stringify(name)}: limit is above ` +
+          String(__WF_RETRY_LIMIT_CAP),
+      );
+    }
+    if (typeof retries.delay !== "function") {
+      __wfDuration(retries.delay, `the retries config delay of step ${JSON.stringify(name)}`);
+    }
+    if (
+      retries.backoff !== undefined &&
+      !["constant", "linear", "exponential"].includes(retries.backoff)
+    ) {
+      throw __wfError(
+        `invalid retries config for step ${JSON.stringify(name)}: ` +
+          "backoff must be constant, linear, or exponential",
+      );
+    }
+  }
+  if (config.timeout !== undefined) {
+    const timeout = __wfDuration(
+      config.timeout,
+      `the config timeout of step ${JSON.stringify(name)}`,
+    );
+    if (timeout === 0) {
+      throw __wfError(
+        `invalid config timeout for step ${JSON.stringify(name)}: use a value above zero`,
+      );
+    }
+  }
+  if (config.sensitive !== undefined && config.sensitive !== "output") {
+    throw __wfError(
+      `invalid config sensitive value for step ${JSON.stringify(name)}: use "output"`,
+    );
+  }
+  return {
+    ...config,
+    ...(retries === undefined ? {} : { retries: { ...retries } }),
+  };
+};
+// Serialization is checked with the same encoder storage and RPC use, so a
+// value that passes here cannot fail later at the isolate boundary. The
+// thrown errors are permanent: retrying cannot make a value cloneable or
+// shrink it.
+const __wfEncodeValue = (value, what) => {
+  try {
+    return __sc_encode(value);
+  } catch (error) {
+    const failure = __wfError(
+      `${what} is not serializable: ${String(error && error.message || error)}. ` +
+        "It must survive structured clone; a ReadableStream return is not implemented in celld.",
+    );
+    failure.__wfPermanent = true;
+    throw failure;
+  }
+};
+const __wfCheckEncodedValue = (bytes, what) => {
+  if (bytes.byteLength > __WF_VALUE_CAP) {
+    const failure = __wfError(
+      `${what} is ${bytes.byteLength} bytes, above the 1 MiB limit; ` +
+        "store large output externally and return a reference",
+    );
+    failure.__wfPermanent = true;
+    throw failure;
+  }
+};
+const __wfCheckValue = (value, what) =>
+  __wfCheckEncodedValue(__wfEncodeValue(value, what), what);
+const __wfErrorRecord = (error) => ({
+  name: String(error && error.name || "Error"),
+  message: String(error && error.message || error),
+});
+// A permanently failed step rejects on every replay, so user try/catch
+// around step.do keeps working after a resume, not only on the attempt that
+// failed live.
+const __wfReviveError = (record) => {
+  const error = new Error(record.message);
+  error.name = record.name;
+  return error;
+};
+const __wfLedgerPrefix = (generation) => `__wf.${generation}.`;
+const __wfEventPrefix = (generation) =>
+  __wfLedgerPrefix(generation) + "event.";
+const __wfEventKey = (generation, sequence) =>
+  __wfEventPrefix(generation) + String(sequence).padStart(9, "0");
+// A ledger record replays only through the kind of call that wrote it. A
+// `do` renamed into a `sleep`, or two calls reordered under one name, would
+// otherwise read fields the other kind never wrote and continue on
+// undefined -- a deadline of NaN, a value of nothing -- instead of failing.
+const __wfKindCheck = (record, kind, name) => {
+  if (record === undefined || record.kind === kind) return record;
+  const failure = __wfError(
+    `step ${JSON.stringify(name)} replays as ${kind} but its ledger record ` +
+      `was written by ${record.kind}; a step keeps one kind across replays`,
+  );
+  failure.__wfPermanent = true;
+  throw failure;
+};
+// Each step callback runs under an async-context frame naming its step (the
+// same CPED-backed frame __ctxRun uses, so it survives the callback's
+// awaits). A step started inside another step's callback would wedge
+// quiescence: the outer callback cannot settle while it awaits the blocked
+// inner step, so `running` never reaches zero and the instance can neither
+// suspend nor finish. The frame is what lets the inner call refuse loudly
+// at the nesting site instead.
+const __wfStepKey = Symbol("celld.wfStep");
+const __wfEnclosingStep = () => {
+  const frame = __als_get();
+  return frame === undefined ? undefined : frame.get(__wfStepKey);
+};
+const __wfEnterStep = (name, fn) => {
+  const prior = __als_get();
+  const frame = new Map(prior);
+  frame.set(__wfStepKey, name);
+  __als_set(frame);
+  try {
+    return fn();
+  } finally {
+    __als_set(prior);
+  }
+};
+
+// Race an attempt against its deadline. The abandoned callback keeps
+// running -- there is no cancellation to send it -- but its result is
+// discarded and the timeout counts as a failed attempt, as upstream.
+const __wfTimeout = (promise, ms, name, attempt) =>
+  new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () =>
+        reject(new Error(
+          `step ${JSON.stringify(name)} timed out after ${ms} ms (attempt ${attempt})`,
+        )),
+      ms,
+    );
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+
+// Storage failures belong to the engine even when workflow code catches the
+// rejected step promise. Record them outside the Error object, so user code
+// cannot suppress a retry or forge one by returning a marked exception.
+const __wfTrackStorageFailures = (storage, driver) => {
+  const tracked = Object.create(storage);
+  for (const name of ["get", "put", "transactionSync"]) {
+    Object.defineProperty(tracked, name, {
+      value(...args) {
+        try {
+          const result = storage[name](...args);
+          if (result !== null && typeof result === "object" &&
+            typeof result.then === "function") {
+            return result.catch((error) => {
+              driver.storageFailure ??= error;
+              throw error;
+            });
+          }
+          return result;
+        } catch (error) {
+          driver.storageFailure ??= error;
+          throw error;
+        }
+      },
+    });
+  }
+  return tracked;
+};
+
+// The WorkflowStep the driver hands to run(). Each method resolves its step
+// record by (name, occurrence count) -- the count is assigned synchronously
+// at call time, so `Promise.all` of two same-named steps gets deterministic
+// distinct keys in call order, and a repeated name in a loop cannot collide.
+const __wfMakeStep = (driver) => {
+  const storage = driver.storage;
+  // The shared step frame. `body` resolves to {value} or {block: at, kind};
+  // a blocked step leaves its promise unsettled forever in this invocation.
+  // The running counter covers the whole body, ledger reads included, so
+  // quiescence cannot fire between a step's read and its decision.
+  const frame = (name, body) => {
+    // A stale replay -- one whose invocation already suspended -- can wake
+    // later if user code raced a step against an un-stepped await. It goes
+    // quiet instead of executing an attempt beside the fresh replay.
+    if (driver.finished) return __wfNever;
+    const enclosing = __wfEnclosingStep();
+    if (enclosing !== undefined) {
+      const failure = __wfError(
+        `step ${JSON.stringify(name)} cannot start inside the callback of ` +
+          `step ${JSON.stringify(enclosing)}; a step callback must not use ` +
+          "the step API",
+      );
+      failure.__wfPermanent = true;
+      return Promise.reject(failure);
+    }
+    const count = (driver.counts.get(name) ?? 0) + 1;
+    driver.counts.set(name, count);
+    const ordinal = ++driver.ordinal;
+    const key = driver.ledgerPrefix + `step.${count}.${name}`;
+    // Step activity restarts the stall clock: a pending grace timer was
+    // armed against a run() that looked stuck, and this call is progress.
+    driver.clearStall();
+    driver.running += 1;
+    return new Promise((resolve, reject) => {
+      (async () => {
+        const meta = await storage.get("__wf.meta");
+        if (
+          meta === undefined || meta.generation !== driver.generation ||
+          __wfTerminal(meta.status) || meta.status === "paused" ||
+          meta.status === "waitingForPause"
+        ) {
+          return { pause: true };
+        }
+        return await body(key, count, ordinal);
+      })().then(
+        (result) => {
+          driver.running -= 1;
+          driver.clearStall();
+          if (result.pause === true) {
+            driver.pauseRequested = true;
+            driver.check();
+            return;
+          }
+          if (result.block !== undefined) {
+            if (!driver.finished) {
+              driver.blocked.push({ at: result.block, kind: result.kind });
+            }
+            driver.check();
+            return;
+          }
+          driver.check();
+          resolve(result.value);
+        },
+        (error) => {
+          driver.running -= 1;
+          driver.clearStall();
+          driver.check();
+          reject(error);
+        },
+      );
+    });
+  };
+  const doStep = (name, configOrCallback, callbackOrRollback, maybeRollback) => {
+    const hasConfig = typeof configOrCallback !== "function";
+    let config = hasConfig ? (configOrCallback ?? {}) : {};
+    const callback = hasConfig ? callbackOrRollback : configOrCallback;
+    const rollback = hasConfig ? maybeRollback : callbackOrRollback;
+    try {
+      __wfStepName(name);
+      config = __wfStepConfig(config, name);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (rollback !== undefined) {
+      return Promise.reject(__wfError(
+        "step rollbackOptions are not implemented in celld; remove the rollback handler",
+      ));
+    }
+    if (config.sensitive !== undefined) {
+      return Promise.reject(__wfError(
+        "sensitive step output is not implemented in celld; remove `sensitive`",
+      ));
+    }
+    if (typeof callback !== "function") {
+      return Promise.reject(__wfError("step.do needs a callback function"));
+    }
+    return frame(name, async (key, count, ordinal) => {
+      const record = __wfKindCheck(await storage.get(key), "do", name);
+      if (record !== undefined && record.status === "completed") {
+        return { value: record.value };
+      }
+      if (record !== undefined && record.status === "failed") {
+        throw __wfReviveError(record.error);
+      }
+      // A pending retry whose backoff has not elapsed blocks without
+      // executing; the deadline was persisted when the attempt failed, so a
+      // replay cannot reset the backoff.
+      if (record !== undefined && record.nextAt > Date.now()) {
+        return { block: record.nextAt, kind: "retry" };
+      }
+      const attempt = (record === undefined ? 0 : record.attempt) + 1;
+      const historyOrdinal = record?.ordinal ?? ordinal;
+      const retries = config.retries ??
+        { limit: 5, delay: 10000, backoff: "exponential" };
+      const timeout = config.timeout ?? "10 minutes";
+      const timeoutMs = __wfDuration(
+        timeout,
+        `the timeout of step ${JSON.stringify(name)}`,
+      );
+      // Upstream omits a dynamic delay from the step context. Copying the
+      // config verbatim would expose the callback to itself as retry policy,
+      // while callers expect only the serializable limit and backoff fields.
+      const contextRetries = typeof retries.delay === "function"
+        ? { limit: retries.limit, ...(retries.backoff === undefined
+          ? {}
+          : { backoff: retries.backoff }) }
+        : retries;
+      const context = {
+        step: { name, count },
+        attempt,
+        config: { retries: contextRetries, timeout },
+      };
+      try {
+        // Persist the history entry before the callback starts. A concurrent
+        // selected restart can therefore name an in-flight occurrence, and
+        // its new generation fences the callback's eventual old-ledger write.
+        await storage.put(key, {
+          kind: "do",
+          status: "running",
+          attempt: attempt - 1,
+          ordinal: historyOrdinal,
+        });
+        const value = await __wfTimeout(
+          __wfEnterStep(name, async () => callback(context)),
+          timeoutMs,
+          name,
+          attempt,
+        );
+        if (value !== undefined) {
+          __wfCheckValue(value, `the return value of step ${JSON.stringify(name)}`);
+        }
+        await storage.put(key, {
+          kind: "do",
+          status: "completed",
+          value,
+          ordinal: historyOrdinal,
+        });
+        return { value };
+      } catch (error) {
+        // NonRetryableError skips retries by contract; a value-cap or
+        // serialization failure is marked permanent above because another
+        // attempt returns the same value.
+        const permanent = error instanceof NonRetryableError ||
+          (error !== null && typeof error === "object" &&
+            (error.name === "NonRetryableError" || error.__wfPermanent === true)) ||
+          attempt > retries.limit;
+        if (permanent) {
+          await storage.put(key, {
+            kind: "do",
+            status: "failed",
+            error: __wfErrorRecord(error),
+            ordinal: historyOrdinal,
+          });
+          throw error;
+        }
+        // Upstream documents the backoff names, not the arithmetic; the
+        // simplest reading is used and recorded in the design page. When
+        // `retries` is given without `backoff`, celld uses constant -- the
+        // documented exponential default is the whole-config-omitted case.
+        const dynamic = typeof retries.delay === "function";
+        const delay = dynamic
+          ? await __wfEnterStep(name, () => retries.delay({ ctx: context, error }))
+          : retries.delay;
+        const base = __wfDuration(
+          delay,
+          `the retry delay of step ${JSON.stringify(name)}`,
+        );
+        // A delay callback replaces the fixed base duration, not the backoff
+        // policy. Skipping this factor makes a dynamic exponential or linear
+        // policy retry earlier than the same policy with a fixed base.
+        const factor = retries.backoff === "exponential"
+          ? 2 ** (attempt - 1)
+          : retries.backoff === "linear"
+          ? attempt
+          : 1;
+        const nextAt = Date.now() + base * factor;
+        await storage.put(key, {
+          kind: "do",
+          status: "retrying",
+          attempt,
+          nextAt,
+          ordinal: historyOrdinal,
+        });
+        return { block: nextAt, kind: "retry" };
+      }
+    });
+  };
+  const sleepUntilDeadline = (name, key, ordinal, deadline) => (async () => {
+    const record = __wfKindCheck(await storage.get(key), "sleep", name);
+    if (record !== undefined && record.status === "completed") {
+      return { value: undefined };
+    }
+    const historyOrdinal = record?.ordinal ?? ordinal;
+    let at = record === undefined ? undefined : record.deadline;
+    if (at === undefined) {
+      // The absolute deadline is computed once and persisted. Recomputing
+      // from "now" on replay would extend the sleep by however long the
+      // instance was down, so a crash could postpone a deadline forever.
+      at = deadline();
+      if (at - Date.now() > __WF_MAX_WAIT_MS) {
+        throw __wfError(
+          `sleep ${JSON.stringify(name)} ends ${at - Date.now()} ms from now, ` +
+            "above the upstream limit of 365 days",
+        );
+      }
+      await storage.put(key, {
+        kind: "sleep",
+        status: "sleeping",
+        deadline: at,
+        ordinal: historyOrdinal,
+      });
+    }
+    if (at <= Date.now()) {
+      await storage.put(key, {
+        kind: "sleep",
+        status: "completed",
+        ordinal: historyOrdinal,
+      });
+      return { value: undefined };
+    }
+    return { block: at, kind: "sleep" };
+  })();
+  return {
+    do: doStep,
+    sleep: (name, duration) => {
+      let durationMs;
+      try {
+        __wfStepName(name);
+        durationMs = __wfSleepDuration(duration, name);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      return frame(name, (key, _count, ordinal) =>
+        sleepUntilDeadline(
+          name,
+          key,
+          ordinal,
+          () => Date.now() + durationMs,
+        ));
+    },
+    sleepUntil: (name, timestamp) => {
+      let at;
+      try {
+        __wfStepName(name);
+        at = __wfSleepUntil(timestamp, name);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      return frame(name, (key, _count, ordinal) =>
+        sleepUntilDeadline(name, key, ordinal, () => {
+          // A replay uses the persisted deadline after it has passed. Check
+          // the moving future bound only while the deadline is first installed,
+          // or every successful sleep would fail on the resume that completes it.
+          if (at - Date.now() < 0) {
+            throw __wfError(
+              `sleepUntil ${JSON.stringify(name)} needs a future timestamp`,
+            );
+          }
+          return at;
+        }));
+    },
+    waitForEvent: (name, options) => {
+      let checked;
+      try {
+        __wfStepName(name);
+        checked = __wfWaitOptions(options, name);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      return frame(name, async (key, _count, ordinal) => {
+        let record = __wfKindCheck(await storage.get(key), "event", name);
+        if (record !== undefined && record.status === "completed") {
+          return { value: record.value };
+        }
+        if (record !== undefined && record.status === "failed") {
+          throw __wfReviveError(record.error);
+        }
+        if (record === undefined) {
+          record = {
+            kind: "event",
+            status: "waiting",
+            type: checked.type,
+            deadline: Date.now() + checked.timeoutMs,
+            ordinal,
+          };
+          await storage.put(key, record);
+        }
+        // The deadline is checked before the buffer: an event that arrived
+        // after the persisted deadline must time the step out, not succeed
+        // because the replay that noticed it ran late.
+        if (record.deadline <= Date.now()) {
+          const error = new Error(
+            `waitForEvent ${JSON.stringify(name)} timed out waiting for an event ` +
+              `of type ${JSON.stringify(record.type)}`,
+          );
+          await storage.put(key, {
+            kind: "event",
+            status: "failed",
+            error: __wfErrorRecord(error),
+            ordinal: record.ordinal,
+          });
+          throw error;
+        }
+        // Delivered events persist until a matching step consumes one, in
+        // arrival order -- the zero-padded sequence key makes list order
+        // arrival order -- so an event sent before the step is reached is
+        // buffered, not lost.
+        const consumed = storage.transactionSync((transaction) => {
+          const current = __wfKindCheck(transaction.kv.get(key), "event", name);
+          if (current !== undefined && current.status === "completed") {
+            return { value: current.value };
+          }
+          if (current !== undefined && current.status === "failed") {
+            throw __wfReviveError(current.error);
+          }
+          for (const [eventKey, event] of transaction.kv.list({
+            prefix: __wfEventPrefix(driver.generation),
+          })) {
+            if (event.type !== current.type) continue;
+            const value = {
+              payload: event.payload,
+              timestamp: new Date(event.timestampMs),
+              type: event.type,
+            };
+            // The delete and completed ledger record are one SQLite commit.
+            // A crash can therefore expose both or neither, so an
+            // acknowledged event cannot disappear between them.
+            transaction.kv.delete(eventKey);
+            /*__CELLD_TEST_WORKFLOW_EVENT_CONSUMED__*/
+            transaction.kv.put(key, {
+              kind: "event",
+              status: "completed",
+              value,
+              ordinal: current.ordinal,
+            });
+            return { value };
+          }
+        });
+        if (consumed !== undefined) return consumed;
+        return { block: record.deadline, kind: "event" };
+      });
+    },
+  };
+};
+
+const __WorkflowCell = (() => {
+  class StorageTransaction {
+    constructor(storage, transaction) {
+      this.kv = transaction.kv;
+      this._scope = storage._scope;
+    }
+    setAlarm(t) {
+      __alarm_set(this._scope, t instanceof Date ? t.getTime() : Number(t));
+    }
+    deleteAlarm() {
+      __alarm_delete(this._scope);
+    }
+  }
+  const transactionSync = (storage, callback) =>
+    storage.transactionSync((transaction) =>
+      callback(new StorageTransaction(storage, transaction))
+    );
+
+  // The adapter stays in this closure because Workflow needs synchronous
+  // alarm writes inside transactionSync(). The public async alarm API runs
+  // after that commit, while a global helper would let application code
+  // split metadata from its wake or invoke the raw operation after commit.
+  return class __WorkflowCell {
+  constructor(state) {
+    this._state = state;
+  }
+  async __wfCreate({ workflowName, instanceId, params, skipExisting = false }) {
+    const storage = this._state.storage;
+    if (params !== undefined) __wfCheckValue(params, "the workflow params");
+    const result = transactionSync(storage, (transaction) => {
+      const meta = transaction.kv.get("__wf.meta");
+      if (meta !== undefined && skipExisting) return { id: instanceId, created: false };
+      if (meta !== undefined && !__wfTerminal(meta.status)) {
+        throw __wfError(
+          `instance ${JSON.stringify(instanceId)} already exists with status ` +
+            JSON.stringify(meta.status),
+        );
+      }
+      if (meta !== undefined) {
+        for (const [key] of transaction.kv.list({
+          prefix: __wfLedgerPrefix(meta.generation),
+        })) {
+          transaction.kv.delete(key);
+        }
+      }
+      const generation = crypto.randomUUID();
+      transaction.kv.put("__wf.meta", {
+        workflowName,
+        instanceId,
+        params,
+        generation,
+        createdMs: Date.now(),
+        status: "queued",
+      });
+      // The metadata and alarm are one SQLite commit. A committed creation
+      // therefore always has the wake that can start or recover its drive.
+      transaction.setAlarm(Date.now());
+      /*__CELLD_TEST_WORKFLOW_META_CREATED__*/
+      return { id: instanceId, created: true };
+    });
+    return result;
+  }
+  async __wfStatus() {
+    const meta = await this._state.storage.get("__wf.meta");
+    // A cell exists on first address like any cell, so an absent ledger is
+    // the only honest "no such instance" signal. Inventing an instance here
+    // would turn every typo into an empty workflow.
+    if (meta === undefined) throw __wfError("instance does not exist");
+    const status = { status: meta.status, rollback: null };
+    if (meta.error !== undefined) status.error = meta.error;
+    if (meta.output !== undefined) status.output = meta.output;
+    return status;
+  }
+  async __wfPause() {
+    const storage = this._state.storage;
+    transactionSync(storage, (transaction) => {
+      const meta = transaction.kv.get("__wf.meta");
+      if (meta === undefined) throw __wfError("instance does not exist");
+      if (__wfTerminal(meta.status) || meta.status === "paused" ||
+          meta.status === "waitingForPause") return;
+      if (meta.status === "running") {
+        meta.status = "waitingForPause";
+        // A drive lost after this commit must re-enter and finish the pause.
+        transaction.setAlarm(Date.now());
+      } else {
+        meta.status = "paused";
+        meta.pausedMs = Date.now();
+        transaction.deleteAlarm();
+      }
+      transaction.kv.put("__wf.meta", meta);
+    });
+  }
+  async __wfResume() {
+    const storage = this._state.storage;
+    transactionSync(storage, (transaction) => {
+      const meta = transaction.kv.get("__wf.meta");
+      if (meta === undefined) throw __wfError("instance does not exist");
+      if (meta.status === "waitingForPause") {
+        meta.status = "running";
+        transaction.kv.put("__wf.meta", meta);
+        transaction.setAlarm(Date.now());
+        return;
+      }
+      if (meta.status !== "paused") {
+        throw __wfError(
+          `cannot resume an instance with status ${JSON.stringify(meta.status)}`,
+        );
+      }
+      const offset = Math.max(0, Date.now() - (meta.pausedMs ?? Date.now()));
+      for (const [key, record] of transaction.kv.list({
+        prefix: __wfLedgerPrefix(meta.generation) + "step.",
+      })) {
+        if (record.status === "retrying") record.nextAt += offset;
+        if (record.status === "sleeping" || record.status === "waiting") {
+          record.deadline += offset;
+        }
+        transaction.kv.put(key, record);
+      }
+      delete meta.pausedMs;
+      meta.status = "queued";
+      transaction.kv.put("__wf.meta", meta);
+      transaction.setAlarm(Date.now());
+    });
+  }
+  async __wfRestart(options) {
+    const checked = __wfRestartOptions(options);
+    const storage = this._state.storage;
+    transactionSync(storage, (transaction) => {
+      const meta = transaction.kv.get("__wf.meta");
+      if (meta === undefined) throw __wfError("instance does not exist");
+      const oldPrefix = __wfLedgerPrefix(meta.generation);
+      let targetOrdinal;
+      if (checked.from !== undefined) {
+        const expectedKind = checked.from.type === "waitForEvent"
+          ? "event"
+          : checked.from.type;
+        let occurrence = 0;
+        const history = [...transaction.kv.list({ prefix: oldPrefix + "step." })]
+          .filter(([, record]) => Number.isInteger(record.ordinal))
+          .sort((left, right) => left[1].ordinal - right[1].ordinal);
+        // The ledger key is `<prefix>step.<per-name-count>.<name>`. Derive
+        // the name from it because a record stores replay state, not identity.
+        for (const [key, record] of history) {
+          const marker = oldPrefix + "step.";
+          const suffix = key.slice(marker.length);
+          const dot = suffix.indexOf(".");
+          const name = dot < 0 ? "" : suffix.slice(dot + 1);
+          if (record.kind !== expectedKind || name !== checked.from.name) continue;
+          occurrence += 1;
+          if (occurrence === checked.from.count) {
+            targetOrdinal = record.ordinal;
+            break;
+          }
+        }
+        if (targetOrdinal === undefined) {
+          throw __wfError(
+            `restart() could not find ${checked.from.type} step ` +
+              `${JSON.stringify(checked.from.name)} occurrence ${checked.from.count}`,
+          );
+        }
+      }
+      const generation = crypto.randomUUID();
+      const newPrefix = __wfLedgerPrefix(generation);
+      if (targetOrdinal !== undefined) {
+        for (const [key, record] of transaction.kv.list({ prefix: oldPrefix + "step." })) {
+          if (Number.isInteger(record.ordinal) && record.ordinal < targetOrdinal) {
+            transaction.kv.put(newPrefix + key.slice(oldPrefix.length), record);
+          }
+        }
+      }
+      for (const [key] of transaction.kv.list({ prefix: oldPrefix })) {
+        transaction.kv.delete(key);
+      }
+      meta.generation = generation;
+      meta.status = "queued";
+      delete meta.pausedMs;
+      delete meta.output;
+      delete meta.error;
+      transaction.kv.put("__wf.meta", meta);
+      transaction.setAlarm(Date.now());
+    });
+  }
+  async __wfTerminate() {
+    const storage = this._state.storage;
+    transactionSync(storage, (transaction) => {
+      const meta = transaction.kv.get("__wf.meta");
+      if (meta === undefined) throw __wfError("instance does not exist");
+      if (__wfTerminal(meta.status)) {
+        throw __wfError(
+          `cannot terminate an instance with status ${JSON.stringify(meta.status)}`,
+        );
+      }
+      meta.status = "terminated";
+      transaction.kv.put("__wf.meta", meta);
+      transaction.deleteAlarm();
+      /*__CELLD_TEST_WORKFLOW_ALARM_DELETED__*/
+    });
+  }
+  async __wfSendEvent(options) {
+    const storage = this._state.storage;
+    // The binding validates first to avoid an unnecessary cell call. Repeat
+    // the check here because this RPC owns the durable event invariant: no
+    // current or future internal caller can bypass validation before storage.
+    const { type, payload } = __wfEventOptions(options);
+    transactionSync(storage, (transaction) => {
+      const meta = transaction.kv.get("__wf.meta");
+      if (meta === undefined) throw __wfError("instance does not exist");
+      if (__wfTerminal(meta.status)) {
+        throw __wfError(
+          `cannot send an event to an instance with status ${JSON.stringify(meta.status)}`,
+        );
+      }
+      const sequenceKey = __wfLedgerPrefix(meta.generation) + "eventSeq";
+      const sequence = transaction.kv.get(sequenceKey) ?? 0;
+      transaction.kv.put(sequenceKey, sequence + 1);
+      transaction.kv.put(__wfEventKey(meta.generation, sequence), {
+        type,
+        payload,
+        timestampMs: Date.now(),
+      });
+      // Allocation, the event body, and the nudge are one commit. Parallel
+      // writers cannot reuse a sequence and a crash cannot expose a partial
+      // acknowledged send.
+      if (meta.status !== "paused" && meta.status !== "waitingForPause") {
+        transaction.setAlarm(Date.now());
+      }
+    });
+  }
+  async alarm() {
+    const storage = this._state.storage;
+    // One drive at a time. A sendEvent nudge (setAlarm(now)) landing
+    // mid-fire replaces the firing alarm in the core, and the replacement
+    // can dispatch a second alarm() into this isolate while the first drive
+    // still awaits user code. Two concurrent replays would both see the
+    // same incomplete steps and double-execute their callbacks. The guard
+    // is isolate-local and that is sufficient: every drive for a cell runs
+    // in its owner's isolate, and a takeover starts a fresh isolate with no
+    // drive in flight. The nudge is not lost -- the in-flight drive folds
+    // `_wfNudge` into the minimum it re-arms, and if it suspended before
+    // seeing the flag, the re-arm below starts a fresh drive immediately.
+    // A failed drive is not re-raised here: the engine already retries the
+    // alarm that fired it.
+    if (this._wfDriving !== undefined) {
+      this._wfNudge = Date.now();
+      await this._wfDriving.catch(() => {});
+      if (this._wfNudge !== undefined) {
+        this._wfNudge = undefined;
+        const meta = await storage.get("__wf.meta");
+        if (
+          meta !== undefined && !__wfTerminal(meta.status) &&
+          meta.status !== "paused" && meta.status !== "waitingForPause"
+        ) {
+          await storage.setAlarm(Date.now());
+        }
+      }
+      return;
+    }
+    const meta = await storage.get("__wf.meta");
+    // A terminal instance's pending alarm can still fire; seeing the status
+    // and doing nothing is the whole terminate-race policy.
+    if (meta === undefined || __wfTerminal(meta.status)) {
+      await storage.deleteAlarm();
+      return;
+    }
+    if (meta.status === "paused") {
+      await storage.deleteAlarm();
+      return;
+    }
+    if (meta.status === "waitingForPause") {
+      transactionSync(storage, (transaction) => {
+        const current = transaction.kv.get("__wf.meta");
+        if (current === undefined || current.generation !== meta.generation ||
+            current.status !== "waitingForPause") return;
+        current.status = "paused";
+        current.pausedMs = Date.now();
+        transaction.kv.put("__wf.meta", current);
+        transaction.deleteAlarm();
+      });
+      return;
+    }
+    // The fired alarm stays armed while the drive runs. The engine consumes
+    // it only when this handler returns cleanly, and retries it when the
+    // handler fails -- that retry is the crash safety net. Deleting it here
+    // would commit the deletion durably mid-drive (durability is per SQLite
+    // commit, and replication ships frames per commit), so a SIGKILL before
+    // the suspend-time re-arm would strand a "running" instance with no
+    // alarm and no wake entry. The suspend path re-arms explicitly, and a
+    // terminal drive deletes.
+    const driving = this._drive(meta);
+    this._wfDriving = driving;
+    try {
+      await driving;
+    } finally {
+      this._wfDriving = undefined;
+    }
+  }
+  async _drive(meta) {
+    const storage = this._state.storage;
+    // The drive owns `status`, `output`, and `error`; every other piece of
+    // instance state belongs to the RPCs (sendEvent's sequence lives in its
+    // own key for the same reason). The gate is open at every await, so a
+    // terminate can land mid-drive: re-reading before each write, and
+    // writing nothing once the status is terminal, is what makes "terminate
+    // wins the race" true rather than asserted. Writing back the meta this
+    // drive entered with would resurrect a terminated instance as "waiting"
+    // and re-arm the alarm its terminate deleted.
+    const settle = (mutate) => transactionSync(storage, (transaction) => {
+      const current = transaction.kv.get("__wf.meta");
+      if (current === undefined || __wfTerminal(current.status) ||
+          current.generation !== meta.generation) return false;
+      mutate(current, transaction);
+      transaction.kv.put("__wf.meta", current);
+      return true;
+    });
+    const className = __cell.workflows[meta.workflowName];
+    const cls = className === undefined ? undefined : __cf.exports[className];
+    if (typeof cls !== "function" ||
+        typeof (cls.prototype && cls.prototype.run) !== "function") {
+      // Deploy cannot see inside the bundle, so a missing export fails
+      // here, loudly, with the class and the config key named.
+      settle((current, transaction) => {
+        current.status = "errored";
+        current.error = {
+          name: "Error",
+          message: className === undefined
+            ? `workflow ${JSON.stringify(meta.workflowName)} is not declared ` +
+              "in this deployment's `workflows`"
+            : `workflow class ${JSON.stringify(className)} is not a module ` +
+              "export with a run() method; export it and extend " +
+              "WorkflowEntrypoint",
+        };
+        transaction.deleteAlarm();
+        /*__CELLD_TEST_WORKFLOW_ALARM_DELETED__*/
+      });
+      return;
+    }
+    const driver = {
+      storage: undefined,
+      storageFailure: undefined,
+      generation: meta.generation,
+      ledgerPrefix: __wfLedgerPrefix(meta.generation),
+      counts: new Map(),
+      ordinal: 0,
+      running: 0,
+      blocked: [],
+      pauseRequested: false,
+      finished: false,
+      checkQueued: false,
+      stallTimer: undefined,
+      clearStall() {
+        if (this.stallTimer !== undefined) {
+          clearTimeout(this.stallTimer);
+          this.stallTimer = undefined;
+        }
+      },
+    };
+    driver.storage = __wfTrackStorageFailures(storage, driver);
+    const outcome = new Promise((resolve) => {
+      driver.finish = (result) => {
+        if (driver.finished) return;
+        driver.finished = true;
+        driver.clearStall();
+        resolve(result);
+      };
+    });
+    // Quiescence: when a step is blocked, no step callback is executing,
+    // and a macrotask has passed, nothing can progress, so the invocation
+    // suspends. The macrotask lets every microtask chain a completed step
+    // unblocked drain first; checking on the spot would suspend an instance
+    // whose next step is one `await` away from starting.
+    driver.check = () => {
+      if (driver.checkQueued || driver.finished) return;
+      driver.checkQueued = true;
+      setTimeout(() => {
+        driver.checkQueued = false;
+        if (driver.finished || driver.running !== 0) return;
+        if (driver.pauseRequested) {
+          driver.finish({ kind: "pause" });
+          return;
+        }
+        if (driver.blocked.length > 0) {
+          driver.finish({ kind: "suspend" });
+          return;
+        }
+        // No step runs, none is blocked, and run() has not settled: it
+        // awaits something that is not a step. Upstream permits that -- an
+        // un-stepped `await fetch()` between steps is legal, merely
+        // non-durable -- so this is not yet an error; but a promise that
+        // never settles would wedge the alarm handler in silence, with the
+        // instance "running" forever. A grace timer splits the two: if the
+        // same nothing-can-progress state still holds when it fires, the
+        // instance fails loudly. The timer is a plain in-isolate timeout,
+        // not a durable alarm, on purpose: an eviction or a restart replays
+        // run() from the top anyway, so losing the timer loses nothing --
+        // the replay re-enters the same stall and re-arms its own grace.
+        if (driver.stallTimer !== undefined) return;
+        driver.stallTimer = setTimeout(() => {
+          driver.stallTimer = undefined;
+          if (driver.finished || driver.running !== 0 || driver.blocked.length > 0) {
+            return;
+          }
+          driver.finish({
+            kind: "error",
+            error: __wfError(
+              "run() has been awaiting something that is not a step for " +
+                (__WF_STALL_GRACE_MS / 1000) + " seconds while no step is " +
+                "running or blocked; a replay cannot resume this wait, so " +
+                "wrap long async work in step.do",
+            ),
+          });
+        }, __WF_STALL_GRACE_MS);
+      }, 0);
+    };
+    if (
+      meta.status !== "running" &&
+      !(await settle((current) => {
+        current.status = "running";
+      }))
+    ) {
+      return;
+    }
+    const step = __wfMakeStep(driver);
+    const event = {
+      payload: meta.params,
+      timestamp: new Date(meta.createdMs),
+      instanceId: meta.instanceId,
+      workflowName: meta.workflowName,
+    };
+    // ExecutionContext-shaped, as the WorkflowEntrypoint constructor
+    // documents upstream.
+    const ctx = {
+      waitUntil: globalThis.__registerWaitUntil,
+      passThroughOnException() {},
+    };
+    (async () => new cls(ctx, __cell.env).run(event, step))().then(
+      (value) => driver.finish({ kind: "complete", value }),
+      (error) => driver.finish({ kind: "error", error }),
+    );
+    /*__CELLD_TEST_WORKFLOW_AFTER_RUN_STARTED__*/
+    let result = await outcome;
+    // The workflow can catch a rejected step promise, but it cannot turn an
+    // engine storage failure into a successful run. Preserve the alarm so
+    // the runtime retries over the last committed ledger prefix.
+    if (driver.storageFailure !== undefined) {
+      throw driver.storageFailure;
+    }
+    const currentMeta = await storage.get("__wf.meta");
+    if (
+      result.kind === "pause" ||
+      (currentMeta !== undefined &&
+        currentMeta.generation === meta.generation &&
+        currentMeta.status === "waitingForPause")
+    ) {
+      /*__CELLD_TEST_WORKFLOW_BEFORE_PAUSE_SETTLE__*/
+      settle((current, transaction) => {
+        // A resume can cancel waitingForPause after this drive selected its
+        // pause result. Preserve that newer running state and its alarm, or
+        // this stale settlement strands an acknowledged resume as paused.
+        if (current.status !== "waitingForPause") return;
+        current.status = "paused";
+        current.pausedMs = Date.now();
+        transaction.deleteAlarm();
+      });
+      return;
+    }
+    if (result.kind === "suspend") {
+      let at = Math.min(...driver.blocked.map((entry) => entry.at));
+      // A nudge that landed mid-drive must not wait out the pending
+      // deadline. It is visible in one of two places: getAlarm(), when the
+      // nudge re-armed and no second alarm dispatched yet, or `_wfNudge`,
+      // when a second alarm() already entered and parked on the drive
+      // guard -- its dispatch consumed the armed alarm, so getAlarm()
+      // alone would miss it.
+      const nudge = await storage.getAlarm();
+      if (nudge !== null) at = Math.min(at, nudge);
+      if (this._wfNudge !== undefined) {
+        at = Math.min(at, this._wfNudge);
+        this._wfNudge = undefined;
+      }
+      settle((current, transaction) => {
+        current.status = "waiting";
+        transaction.setAlarm(at);
+      });
+      // The explicit re-arm replaces the alarm that fired this drive.
+      // Durability is per SQLite commit, not per turn: a crash can persist
+      // any prefix of this invocation's ledger writes, and the unconsumed
+      // fired alarm is what re-drives the replay over whatever prefix
+      // survived. A terminated instance re-arms nothing; its leftover
+      // alarm fires once, sees the terminal status, and retires itself.
+      return;
+    }
+    if (result.kind === "complete") {
+      try {
+        if (result.value !== undefined) {
+          __wfCheckValue(result.value, "the run() return value");
+        }
+      } catch (error) {
+        result = { kind: "error", error };
+      }
+      if (result.kind === "complete") {
+        // Keep settlement outside the value-validation catch. A storage
+        // failure must escape the alarm handler so the engine retries the
+        // still-armed drive; converting it to a user error would consume the
+        // alarm and make a transient commit failure terminal.
+        settle((current, transaction) => {
+          current.status = "complete";
+          if (result.value !== undefined) current.output = result.value;
+          // A concurrent nudge may have re-armed mid-run. Settlement retires
+          // it in the same commit that makes the instance terminal.
+          transaction.deleteAlarm();
+          /*__CELLD_TEST_WORKFLOW_ALARM_DELETED__*/
+        });
+        return;
+      }
+    }
+    settle((current, transaction) => {
+      current.status = "errored";
+      current.error = __wfErrorRecord(result.error);
+      transaction.deleteAlarm();
+      /*__CELLD_TEST_WORKFLOW_ALARM_DELETED__*/
+    });
+  }
+  };
+})();
+__cell.classes.__Workflow = __WorkflowCell;
+// RPC on a stub needs `extends DurableObject` or the js_rpc flag. This class
+// is the runtime's own, so grant it here, as __D1Database does.
+__cell.doExports.__Workflow = true;
+
+class NonRetryableError extends Error {
+  constructor(message, name = "NonRetryableError") {
+    super(message);
+    this.name = name;
+  }
+}
+// Backing object for the `cloudflare:workflows` builtin module.
+globalThis.__cfWorkflows = { NonRetryableError };
+
+const __wfValidInstanceId = (id) =>
+  typeof id === "string" && id.length >= 1 && id.length <= 100 &&
+  __WF_NAME_RE.test(id);
+const __wfCreateOptions = (options, what, validateParams = true) => {
+  if (!__wfOwnObject(options)) {
+    throw __wfError(`${what} needs an object`);
+  }
+  // These are published options, not unknown extension fields. Reject them
+  // until their semantics exist so celld cannot silently promise retention or
+  // placement. The generated binding surfaces ignore other object fields.
+  if (options.retention !== undefined) {
+    throw __wfError(`${what} does not support option "retention"`);
+  }
+  if (options.locationHint !== undefined) {
+    throw __wfError(`${what} does not support option "locationHint"`);
+  }
+  const id = options.id === undefined ? crypto.randomUUID() : options.id;
+  if (!__wfValidInstanceId(id)) {
+    throw __wfError(
+      `invalid instance id ${JSON.stringify(id)}: use letters, digits, ` +
+        "\"-\" and \"_\" (not starting with \"-\"), at most 100 characters",
+    );
+  }
+  if (validateParams && options.params !== undefined) {
+    // The cell repeats this serialization check because it owns the durable
+    // create invariant. A single create rejects before it addresses the cell.
+    __wfCheckValue(options.params, "the workflow params");
+  }
+  return { id, params: options.params };
+};
+
+// Named so SDKs that sniff a binding by `constructor.name` recognise it.
+class WorkflowInstance {
+  constructor(workflowName, id) {
+    Object.defineProperty(this, "_workflowName", { value: workflowName });
+    this.id = id;
+  }
+  // Resolved per call rather than cached: a cell can move between calls.
+  get _stub() {
+    // The reserved class is script-scoped (`deploy::workflow_class`), because
+    // a workflow instance is: two co-hosted scripts must not share one entry
+    // in the deployment's flat class registry. `__cell.script` is injected
+    // before any binding runs, so this resolves at call time.
+    return __cell.makeNamespace("__Workflow." + __cell.script)
+      .getByName(this._workflowName + "/" + this.id);
+  }
+  async status() {
+    return await this._stub.__wfStatus();
+  }
+  async terminate(options) {
+    if (options && options.rollback) {
+      throw __wfError(
+        "terminate({rollback: true}) is not implemented in celld; step " +
+          "rollbackOptions are not implemented, so no handler could run",
+      );
+    }
+    await this._stub.__wfTerminate();
+  }
+  async sendEvent(options) {
+    await this._stub.__wfSendEvent(__wfEventOptions(options));
+  }
+  async pause() {
+    await this._stub.__wfPause();
+  }
+  async resume() {
+    await this._stub.__wfResume();
+  }
+  async restart(options) {
+    await this._stub.__wfRestart(__wfRestartOptions(options));
+  }
+  async delete() {
+    throw __wfError(
+      "delete() is not implemented in celld yet; the instance state stays in " +
+        "the cell until a delete surface exists",
+    );
+  }
+}
+
+class Workflow {
+  constructor(workflowName) {
+    Object.defineProperty(this, "_workflowName", { value: workflowName });
+  }
+  async _create(options, skipExisting) {
+    const { id, params } = options;
+    const instance = new WorkflowInstance(this._workflowName, id);
+    const result = await instance._stub.__wfCreate({
+      workflowName: this._workflowName,
+      instanceId: id,
+      params,
+      skipExisting,
+    });
+    return result.created ? instance : undefined;
+  }
+  async create(options = {}) {
+    return await this._create(__wfCreateOptions(options, "create()"), false);
+  }
+  async createBatch(batch) {
+    if (!Array.isArray(batch)) {
+      throw __wfError("createBatch() needs an array of create options");
+    }
+    if (batch.length > 100) {
+      throw __wfError(
+        `createBatch() accepts at most 100 instances, got ${batch.length}`,
+      );
+    }
+    if (batch.length === 0) {
+      throw __wfError("createBatch() needs at least one instance");
+    }
+    // Cloudflare rejects a structural error in any item before it creates the
+    // first instance, but it filters a params clone failure per item. Keep
+    // these two gates separate so a bad ID stays atomic while a clone failure
+    // does not suppress the valid items around it.
+    const optionsList = batch.map((options, index) =>
+      __wfCreateOptions(options, `createBatch() item ${index}`, false));
+    const creatable = [];
+    for (const options of optionsList) {
+      let encoded;
+      try {
+        if (options.params !== undefined) {
+          encoded = __wfEncodeValue(options.params, "the workflow params");
+        }
+      } catch {
+        continue;
+      }
+      if (encoded !== undefined) {
+        __wfCheckEncodedValue(encoded, "the workflow params");
+      }
+      creatable.push(options);
+    }
+    const created = [];
+    for (const options of creatable) {
+      const instance = await this._create(options, true);
+      if (instance !== undefined) created.push(instance);
+    }
+    return created;
+  }
+  async get(id) {
+    if (!__wfValidInstanceId(id)) {
+      throw __wfError(`invalid instance id ${JSON.stringify(id)}`);
+    }
+    const instance = new WorkflowInstance(this._workflowName, id);
+    // The cell exists on first address like any cell, but get() must not
+    // mint an instance for a typo: an id with no ledger rejects here.
+    await instance._stub.__wfStatus();
+    return instance;
+  }
+  async deleteBatch() {
+    throw __wfError("deleteBatch() is not implemented in celld yet");
+  }
+}
+
+globalThis.__makeWorkflow = (workflowName) => new Workflow(workflowName);
 // `cloudflare:workers` module surface. The DO base class sets ctx/env the
 // way `class X extends DurableObject` expects; env aliases the cell env.
 globalThis.__cf = {
@@ -4125,6 +8638,13 @@ globalThis.__cf = {
   },
   // Named entrypoint for `[[services]]` with `entrypoint = "Name"`.
   WorkerEntrypoint: class WorkerEntrypoint {
+    constructor(ctx, env) { this.ctx = ctx; this.env = env; }
+  },
+  // Base class for `workflows` classes. The reserved workflow cell
+  // instantiates a subclass on every replay with an ExecutionContext-shaped
+  // ctx -- never the cell's own DurableObjectState, which would hand user
+  // code the ledger that replays it.
+  WorkflowEntrypoint: class WorkflowEntrypoint {
     constructor(ctx, env) { this.ctx = ctx; this.env = env; }
   },
   // `new RpcStub(target)` wraps any local object or function in a
@@ -4582,21 +9102,61 @@ if (!globalThis.File) {
   }
 }
 if (!globalThis.FormData) {
+// Byte offsets the multipart scanner compares against. A part body is
+// arbitrary bytes, so every framing decision below is made on bytes.
+const __CR = 13, __LF = 10, __DASH = 45;
+const __bytesIndexOf = (haystack, needle, from) => {
+  const last = haystack.length - needle.length;
+  outer: for (let i = from; i <= last; i++) {
+    for (let j = 0; j < needle.length; j++)
+      if (haystack[i + j] !== needle[j]) continue outer;
+    return i;
+  }
+  return -1;
+};
+// A boundary delimiter is a delimiter only at the start of a line (RFC 2046
+// section 5.1.1). Searching for the bytes anywhere would let a binary part
+// that happens to contain `--<boundary>` split itself, which is a corrupt
+// upload rather than a parse error, so the caller never learns of it.
+const __delimiterIndex = (bytes, delimiter, from) => {
+  for (let at = from;;) {
+    const found = __bytesIndexOf(bytes, delimiter, at);
+    if (found < 0) return -1;
+    if (found === 0 || bytes[found - 1] === __LF) return found;
+    at = found + 1;
+  }
+};
+// A `Content-Disposition` parameter, anchored to the start of a parameter:
+// the parameter name must follow the header name or a `;`. An unanchored
+// pattern found the `name=` inside `filename=`, so a part whose header wrote
+// the filename first landed under the filename. The grammar does not
+// constrain the parameter order, and both orders occur in the wild. Hoisted
+// because the previous shape compiled a regex per parameter per part.
+const __CD_NAME =
+  /(?:^|;)\s*name\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;]*))/i;
+const __CD_FILENAME =
+  /(?:^|;)\s*filename\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;]*))/i;
 // Body -> FormData for multipart/form-data and
 // application/x-www-form-urlencoded. Kept out of the class so V8 only
 // pre-parses it; the body is compiled on first actual formData() call.
-globalThis.__parseFormData = (text, contentType) => {
+//
+// `bytes` is the undecoded body. A file part must reach `File` as the bytes
+// that arrived: decoding the body first and slicing part bodies out of the
+// string replaced every non-UTF-8 sequence with U+FFFD, and the re-encode in
+// the `Blob` constructor then wrote those replacement bytes into the file.
+globalThis.__parseFormData = (bytes, contentType) => {
   const ct = String(contentType || "");
   if (/^\s*application\/x-www-form-urlencoded/i.test(ct)) {
-    // The body has already been decoded as UTF-8, so a declared charset that
-    // is not UTF-8 cannot be honoured. Refuse rather than mis-decode.
+    // This form is decoded as UTF-8, so a declared charset that is not UTF-8
+    // cannot be honoured. Refuse rather than mis-decode.
     const charset = /;\s*charset\s*=\s*"?([^";]+)/i.exec(ct);
     if (charset && !/^utf-?8$/i.test(charset[1].trim()))
       throw new TypeError(
         `Unsupported charset "${charset[1].trim()}". FormData can only ` +
         "parse UTF-8 encoded bodies.");
     const form = new FormData();
-    for (const [key, value] of new URLSearchParams(text))
+    for (const [key, value] of new URLSearchParams(
+      new TextDecoder().decode(bytes)))
       form.append(key, value);
     return form;
   }
@@ -4612,12 +9172,13 @@ globalThis.__parseFormData = (text, contentType) => {
       "Content-Type header.");
   const boundary = (found[1] !== undefined ? found[1] : found[2]).trim();
   const form = new FormData();
-  const delimiter = "--" + boundary;
-  // Walk the delimiters rather than splitting on them, so that a truncated or
-  // corrupt body is refused instead of silently yielding the parts that
-  // happened to parse. The preamble before the first delimiter and the
-  // epilogue after the closing one are ignored.
-  let cursor = text.indexOf(delimiter);
+  const delimiter = new TextEncoder().encode("--" + boundary);
+  // Walk the delimiters rather than splitting on them, so that a body whose
+  // framing is truncated or corrupt is refused instead of silently yielding
+  // the parts that happened to parse. Only the framing is checked; a part's
+  // own bytes are carried through unexamined. The preamble before the first
+  // delimiter and the epilogue after the closing one are ignored.
+  let cursor = __delimiterIndex(bytes, delimiter, 0);
   if (cursor < 0)
     throw new TypeError(
       "No boundary delimiter was found in the multipart/form-data body.");
@@ -4625,29 +9186,53 @@ globalThis.__parseFormData = (text, contentType) => {
   for (;;) {
     // What follows a delimiter decides everything: "--" closes the body, a
     // line break opens another part, and anything else is malformed.
-    if (text.startsWith("--", cursor)) break;
-    const lineBreak = text.startsWith("\r\n", cursor)
+    if (bytes[cursor] === __DASH && bytes[cursor + 1] === __DASH) break;
+    const lineBreak = bytes[cursor] === __CR && bytes[cursor + 1] === __LF
       ? 2
-      : text.startsWith("\n", cursor) ? 1 : 0;
+      : bytes[cursor] === __LF ? 1 : 0;
     if (lineBreak === 0)
       throw new TypeError(
         "A boundary delimiter must be followed by CRLF, LF, or \"--\".");
     cursor += lineBreak;
-    const next = text.indexOf(delimiter, cursor);
+    const partStart = cursor;
+    const next = __delimiterIndex(bytes, delimiter, partStart);
     if (next < 0)
       throw new TypeError(
         "The multipart/form-data body ended without a closing boundary " +
         "delimiter.");
     // The line break before a delimiter belongs to the delimiter, not to the
     // part it terminates.
-    const chunk = text.slice(cursor, next).replace(/\r?\n$/, "");
+    let chunkEnd = next;
+    if (chunkEnd > partStart && bytes[chunkEnd - 1] === __LF) {
+      chunkEnd -= 1;
+      if (chunkEnd > partStart && bytes[chunkEnd - 1] === __CR) chunkEnd -= 1;
+    }
     cursor = next + delimiter.length;
-    const split = /\r?\n\r?\n/.exec(chunk);
-    if (!split)
+    // The headers end at the first blank line. Either line break can be CRLF
+    // or a bare LF, which accepted inputs can contain.
+    let headerEnd = -1, bodyStart = -1;
+    for (let i = partStart; i < chunkEnd; i++) {
+      const first = bytes[i] === __CR && bytes[i + 1] === __LF
+        ? 2
+        : bytes[i] === __LF ? 1 : 0;
+      if (first === 0) continue;
+      const after = i + first;
+      const second = bytes[after] === __CR && bytes[after + 1] === __LF
+        ? 2
+        : bytes[after] === __LF ? 1 : 0;
+      if (second === 0) continue;
+      headerEnd = i;
+      bodyStart = after + second;
+      break;
+    }
+    if (headerEnd < 0)
       throw new TypeError(
         "A FormData part's headers must be terminated by a blank line.");
-    const rawHeaders = chunk.slice(0, split.index);
-    const body = chunk.slice(split.index + split[0].length);
+    // Part headers are text. Decoding this slice as UTF-8 keeps a non-ASCII
+    // name or filename intact and cannot reach the part body.
+    const rawHeaders = new TextDecoder().decode(
+      bytes.subarray(partStart, headerEnd));
+    const body = bytes.subarray(bodyStart, chunkEnd);
     let disposition = null;
     let type = "";
     for (const line of rawHeaders.split(/\r?\n/)) {
@@ -4668,10 +9253,8 @@ globalThis.__parseFormData = (text, contentType) => {
         "Content-Disposition header for FormData part must have the " +
         "value \"form-data\", possibly followed by parameters. Got: " +
         "\"" + kind + "\"");
-    const param = (key) => {
-      const m = new RegExp(
-        key + "\\s*=\\s*(?:\"((?:[^\"\\\\]|\\\\.)*)\"|([^;]*))", "i",
-      ).exec(disposition);
+    const param = (pattern) => {
+      const m = pattern.exec(disposition);
       if (!m) return undefined;
       const raw = m[1] !== undefined ? m[1] : (m[2] || "").trim();
       if (/\\$/.test(raw.replace(/\\\\/g, "")))
@@ -4679,13 +9262,17 @@ globalThis.__parseFormData = (text, contentType) => {
           "Name or filename can't end with backslash");
       return raw.replace(/\\(.)/g, "$1");
     };
-    const name = param("name");
+    const name = param(__CD_NAME);
     if (name === undefined)
       throw new TypeError(
         "Content-Disposition header for FormData part must have a " +
         "name parameter.");
-    const filename = param("filename");
-    if (filename === undefined) form.append(name, body);
+    const filename = param(__CD_FILENAME);
+    // A part without a filename is an entry value, which the spec defines as a
+    // string, so this one part is decoded as UTF-8. A file part keeps its
+    // bytes.
+    if (filename === undefined)
+      form.append(name, new TextDecoder().decode(body));
     else
       form.append(
         name, new File([body], filename, { type: type || "" }));
@@ -4915,17 +9502,18 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
   }
   // The pump ends only when the socket closes, so it must NOT be registered
   // as waitUntil work: that would hold the request open for as long as the
-  // socket lives, and the region can only reclaim an abandoned socket by
-  // exiting. Its `__ws_next` ops still belong to the region and are driven
-  // while the request runs, then aborted with it.
+  // socket lives, and the host reclaims an abandoned socket only once the
+  // request has retired. Its `__ws_next` ops are driven while the request
+  // runs and normally resolve with the host's 1001 "request ended" close.
+  // They resolve as 1006 only if the sender disappears without a close frame.
   _startPump() {
     if (this._pumping) return;
     this._pumping = true;
     this._pump().catch(() => {});
   }
   // Drain the host queue for an isolate-polled socket. Each `__ws_next` is an
-  // ordinary async op, so the request's region owns it and aborts it if the
-  // request ends first — the socket is closed by the region on the way out.
+  // ordinary async op the request owns; a request that retires with the
+  // socket still open closes it, which ends this loop with a close frame.
   async _pump() {
     for (;;) {
       const frame = await __ws_next(this._id);
@@ -5283,15 +9871,16 @@ globalThis.__registerWaitUntil = (promise) => {
 // `props` are the per-stub props a loopback service stub carries
 // (ctx.props); `exports` is built once, on first access.
 const __defaultProps = {};
+const __entrypointContext = (props = __defaultProps) => ({
+  waitUntil: globalThis.__registerWaitUntil,
+  passThroughOnException() {},
+  abort: __ctxAbortCurrent,
+  props,
+  get exports() { return __ctxExports(); },
+});
 globalThis.__beginEvent = (props = __defaultProps) => {
   __event_begin();
-  return {
-    waitUntil: globalThis.__registerWaitUntil,
-    passThroughOnException() {},
-    abort: __ctxAbortCurrent,
-    props,
-    get exports() { return __ctxExports(); },
-  };
+  return __entrypointContext(props);
 };
 globalThis.__endEvent = () => __event_end();
 // fs stub that behaves like a no-filesystem env: reads throw ENOENT and
@@ -5362,7 +9951,30 @@ globalThis.__readResponse = (r) => {
       bodyStreamId: 0,
       headersJson: "[]",
       wsTargetJson: "null",
+      workerSocketId: 0,
     };
+  }
+  // Keep the network-error marker out of the HTTP response fields. If status
+  // zero reaches Rust as an ordinary response, the outer server can report
+  // only a generic invalid status instead of the Worker contract failure.
+  if (r.type === "error" || r.status === 0)
+    return { error: __ERROR_RESPONSE_MESSAGE };
+  let workerSocketId = 0;
+  let wsTarget = r._wsTarget || (r.webSocket && r.webSocket._target) || null;
+  if (r.status === 101 && r.webSocket && wsTarget === null) {
+    const server = r.webSocket._peer;
+    if (server && server._accepted) {
+      workerSocketId = server._id;
+      // Install the host queue before the pump asks for its first frame. The
+      // target marker makes sends use that queue instead of remaining in the
+      // pair's pre-upgrade buffer.
+      __ws_prepare_worker_handoff(workerSocketId);
+      server._target = { id: workerSocketId, scope: "" };
+      server._polled = true;
+      __sockets.set(workerSocketId, server);
+      server._startPump();
+      server._flushPending();
+    }
   }
   const bodyStreamId = r._bodyBytes === null
     ? typeof r.body?.__celldStreamId === "number" &&
@@ -5379,9 +9991,8 @@ globalThis.__readResponse = (r) => {
       bodyBytes: new Uint8Array(),
       bodyStreamId,
       headersJson: JSON.stringify(Array.from(r.headers)),
-      wsTargetJson: JSON.stringify(
-        r._wsTarget || (r.webSocket && r.webSocket._target) || null,
-      ),
+      wsTargetJson: JSON.stringify(wsTarget),
+      workerSocketId,
     };
   }
   const bytes = r._bodyBytes;
@@ -5390,8 +10001,7 @@ globalThis.__readResponse = (r) => {
     bodyBytes: bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes),
     bodyStreamId: 0,
     headersJson: JSON.stringify(Array.from(r.headers)),
-    wsTargetJson: JSON.stringify(
-      r._wsTarget || (r.webSocket && r.webSocket._target) || null,
-    ),
+    wsTargetJson: JSON.stringify(wsTarget),
+    workerSocketId,
   };
 };

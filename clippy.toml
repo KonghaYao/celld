@@ -1,20 +1,20 @@
-# The execution boundary must use celld::asyncrt. Modules which never execute
-# in the World carry an explicit lint allow and are listed in the S0 audit.
+# The execution boundary must use celld::asyncrt. Modules outside that boundary
+# carry an explicit lint allow.
 disallowed-methods = [
-  { path = "tokio::spawn", reason = "use celld::asyncrt::spawn inside the World boundary" },
-  { path = "tokio::runtime::Handle::spawn", reason = "use celld::asyncrt::spawn inside the World boundary" },
-  { path = "tokio::task::spawn_blocking", reason = "use celld::asyncrt::blocking inside the World boundary" },
-  { path = "tokio::runtime::Handle::spawn_blocking", reason = "use celld::asyncrt::blocking inside the World boundary" },
-  { path = "tokio::time::sleep", reason = "use celld::asyncrt::sleep inside the World boundary" },
-  { path = "tokio::time::sleep_until", reason = "use celld::asyncrt::sleep_until inside the World boundary" },
-  { path = "tokio::time::timeout", reason = "use celld::asyncrt::timeout inside the World boundary" },
-  { path = "tokio::time::timeout_at", reason = "use celld::asyncrt::timeout_at inside the World boundary" },
-  { path = "tokio::time::interval", reason = "use celld::asyncrt::interval inside the World boundary" },
-  { path = "tokio::time::interval_at", reason = "use celld::asyncrt::interval_at inside the World boundary" },
-  { path = "std::time::SystemTime::now", reason = "use the execution-domain wall clock inside the World boundary" },
-  { path = "std::time::Instant::now", reason = "use the execution-domain monotonic clock inside the World boundary" },
-  { path = "rand::random", reason = "use a labeled execution-domain RNG inside the World boundary" },
-  { path = "std::process::id", reason = "use the execution-domain process tag inside the World boundary" },
+  { path = "tokio::spawn", reason = "use celld::asyncrt::spawn inside the execution boundary" },
+  { path = "tokio::runtime::Handle::spawn", reason = "use celld::asyncrt::spawn inside the execution boundary" },
+  { path = "tokio::task::spawn_blocking", reason = "use celld::asyncrt::blocking inside the execution boundary" },
+  { path = "tokio::runtime::Handle::spawn_blocking", reason = "use celld::asyncrt::blocking inside the execution boundary" },
+  { path = "tokio::time::sleep", reason = "use celld::asyncrt::sleep inside the execution boundary" },
+  { path = "tokio::time::sleep_until", reason = "use celld::asyncrt::sleep_until inside the execution boundary" },
+  { path = "tokio::time::timeout", reason = "use celld::asyncrt::timeout inside the execution boundary" },
+  { path = "tokio::time::timeout_at", reason = "use celld::asyncrt::timeout_at inside the execution boundary" },
+  { path = "tokio::time::interval", reason = "use celld::asyncrt::interval inside the execution boundary" },
+  { path = "tokio::time::interval_at", reason = "use celld::asyncrt::interval_at inside the execution boundary" },
+  { path = "std::time::SystemTime::now", reason = "use the execution-domain wall clock inside the execution boundary" },
+  { path = "std::time::Instant::now", reason = "use the execution-domain monotonic clock inside the execution boundary" },
+  { path = "rand::random", reason = "use a labeled execution-domain RNG inside the execution boundary" },
+  { path = "std::process::id", reason = "use the execution-domain process tag inside the execution boundary" },
   { path = "std::fs::read", reason = "use the injected whole-node filesystem for celld node storage" },
   { path = "std::fs::read_to_string", reason = "use the injected whole-node filesystem for celld node storage" },
   { path = "std::fs::read_dir", reason = "use the injected whole-node filesystem for celld node storage" },
@@ -76,10 +76,15 @@ disallowed-methods = [
   { path = "tokio::fs::set_permissions", reason = "use the injected whole-node filesystem for celld node storage" },
 ]
 
+# The celld and celld-ltx packages forbid these macros, so no module can lower
+# this policy. Clippy resolves imported and aliased macro calls in every
+# target that Cargo compiles for these packages.
 disallowed-macros = [
-  { path = "tokio::select", reason = "use celld::asyncrt::select with a declared priority inside the World boundary" },
+  { path = "tokio::select", reason = "use celld::asyncrt::select! for fair polling or select_biased! with a site reason for source-order priority; production uses a process-seeded cyclic start, and simulation uses Domain-derived ordering" },
+  { path = "std::println", reason = "use celld::cli_output::Output for celld stdout data and note! for human-readable stderr messages" },
+  { path = "std::print", reason = "use celld::cli_output::Output for celld stdout data and note! for human-readable stderr messages" },
 ]
 
 disallowed-types = [
-  { path = "rand::rngs::OsRng", reason = "use a labeled execution-domain RNG inside the World boundary" },
+  { path = "rand::rngs::OsRng", reason = "use a labeled execution-domain RNG inside the execution boundary" },
 ]

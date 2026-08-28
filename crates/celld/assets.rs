@@ -1,12 +1,15 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-// Asset download and cache maintenance execute in the V8/process arm, which
-// the World replaces with scripted client and cell-host boundaries.
+// Asset download and cache maintenance execute outside the Actor execution
+// domain.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use crate::bucket::Bucket;
 use crate::js;
-use crate::protocol::{asset_blob_key, AssetEntry, AssetIndex, AssetManifestRef, RunWorkerFirst};
+use crate::protocol::{
+    asset_blob_key, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
+    RunWorkerFirst,
+};
 use anyhow::{anyhow, Context};
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -29,10 +32,59 @@ pub struct AssetResolver {
     inner: Arc<AssetResolverInner>,
 }
 
+/// Where a resolver can look for a NEWER deployment's asset index than the
+/// one this process booted with. During a rolling restart an upgraded node
+/// serves HTML whose content-hashed asset paths an un-restarted node has
+/// never heard of; the blobs are content-addressed and fleet-visible, so
+/// only the index is stale. denoland/celld#161.
+pub struct FallbackSource {
+    /// The pointer this deployment was loaded from (`deploy/current.json`,
+    /// or the script-scoped pointer for a service).
+    pub pointer_key: String,
+    /// The deployment prefix loaded at boot; a pointer naming another
+    /// prefix names a newer deployment.
+    pub boot_prefix: String,
+}
+
+/// The newest foreign index this resolver has adopted, plus the throttle
+/// that keeps a miss storm from becoming a pointer-GET storm. Guarded by a
+/// std mutex that is NEVER held across I/O: the refresh runs in a spawned
+/// task, so a degraded bucket cannot stall the miss path — before this
+/// rule, one slow pointer GET head-of-line-blocked every Worker-bound
+/// request whose path missed the index.
+/// What one refresh pass concluded about the pointer.
+enum Adoption {
+    /// The pointer names the booted deployment: any adoption is withdrawn.
+    Booted,
+    /// The pointer names the deployment already adopted.
+    Unchanged,
+    /// The pointer names a deployment this resolver now adopts. Boxed:
+    /// an index can be large, and the other variants carry nothing.
+    Newer {
+        prefix: String,
+        index: Box<AssetIndex>,
+    },
+}
+
+#[derive(Default)]
+struct FallbackState {
+    checked: Option<std::time::Instant>,
+    refreshing: bool,
+    prefix: Option<String>,
+    index: Option<Arc<AssetIndex>>,
+}
+
+/// How long a pointer observation stays fresh. A newer deployment's assets
+/// become servable within this bound after its pointer lands, which is far
+/// inside the window a rolling restart leaves a node un-upgraded.
+const FALLBACK_CHECK_MS: u64 = 5_000;
+
 struct AssetResolverInner {
     bucket: Bucket,
     index: AssetIndex,
     asset_only: bool,
+    fallback: Option<FallbackSource>,
+    fallback_state: std::sync::Mutex<FallbackState>,
     cache_root: PathBuf,
     cache_max_bytes: u64,
     download_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -88,6 +140,7 @@ impl AssetResolver {
         prefix: &str,
         reference: &AssetManifestRef,
         asset_only: bool,
+        fallback: Option<FallbackSource>,
     ) -> anyhow::Result<Self> {
         if reference.index != "assets.json" {
             return Err(anyhow!("unsupported asset index name: {}", reference.index));
@@ -120,6 +173,8 @@ impl AssetResolver {
                 bucket: bucket.clone(),
                 index,
                 asset_only,
+                fallback,
+                fallback_state: std::sync::Mutex::new(FallbackState::default()),
                 cache_root,
                 cache_max_bytes,
                 download_locks: Mutex::new(HashMap::new()),
@@ -219,7 +274,22 @@ impl AssetResolver {
             }
             break;
         }
-        match selected.unwrap_or_else(|| route(&self.inner.index, &path, include_not_found)) {
+        let routed = match selected {
+            Some(routed) => routed,
+            None => {
+                let mut routed = route(&self.inner.index, &path, false);
+                if matches!(routed, Route::Missing) {
+                    if let Some(fresh) = self.newer_deployment_route(&path) {
+                        routed = fresh;
+                    }
+                }
+                if matches!(routed, Route::Missing) && include_not_found {
+                    routed = not_found_route(&self.inner.index, &path);
+                }
+                routed
+            }
+        };
+        match routed {
             Route::Missing => Ok(None),
             Route::Redirect {
                 mut location,
@@ -332,7 +402,7 @@ impl AssetResolver {
                 body: b"Method not allowed".to_vec(),
                 stream: None,
                 headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
-                ws: None,
+                websocket: None,
                 write_position: None,
             });
         }
@@ -383,7 +453,7 @@ impl AssetResolver {
                     )
                 })
                 .collect(),
-            ws: None,
+            websocket: None,
             write_position: None,
         })
     }
@@ -426,6 +496,125 @@ impl AssetResolver {
             }
         }
         Ok(())
+    }
+
+    /// A route from a NEWER deployment's index, when the fleet pointer has
+    /// moved past the one this process booted with. Best-effort: every
+    /// failure keeps the booted behavior, so the fallback can make an asset
+    /// appear but never disappear. The lock never crosses I/O — the refresh
+    /// runs in a spawned task on the host runtime and the triggering miss
+    /// routes against the last adopted snapshot, so a degraded bucket
+    /// degrades only the fallback, never the miss path. One refresh per
+    /// `FALLBACK_CHECK_MS`, and the `refreshing` latch keeps a refresh that
+    /// outlives the interval from stacking a second one behind it
+    /// (denoland/celld#161).
+    fn newer_deployment_route(&self, path: &str) -> Option<Route> {
+        self.inner.fallback.as_ref()?;
+        let (snapshot, refresh_due) = {
+            let mut state = self.inner.fallback_state.lock().unwrap();
+            let due = !state.refreshing
+                && state.checked.is_none_or(|at| {
+                    at.elapsed() >= std::time::Duration::from_millis(FALLBACK_CHECK_MS)
+                });
+            if due {
+                state.refreshing = true;
+                state.checked = Some(std::time::Instant::now());
+            }
+            (state.index.clone(), due)
+        };
+        if refresh_due {
+            let resolver = self.clone();
+            crate::asyncrt::op_handle().spawn(async move {
+                resolver.refresh_fallback().await;
+            });
+        }
+        let index = snapshot?;
+        match route(&index, path, false) {
+            Route::Missing => None,
+            found => Some(found),
+        }
+    }
+
+    /// One refresh pass: read the pointer, adopt a newer deployment's
+    /// checksum-validated index, clear the adoption when the pointer moved
+    /// BACK to the booted deployment — a rollback must withdraw the rolled-
+    /// back assets, not pin them until restart.
+    async fn refresh_fallback(&self) {
+        let Some(source) = self.inner.fallback.as_ref() else {
+            return;
+        };
+        let adopted = self.inner.fallback_state.lock().unwrap().prefix.clone();
+        let outcome = self.adopt_newer_index(source, adopted.as_deref()).await;
+        let mut state = self.inner.fallback_state.lock().unwrap();
+        state.refreshing = false;
+        match outcome {
+            Ok(Adoption::Newer { prefix, index }) => {
+                state.prefix = Some(prefix);
+                state.index = Some(Arc::new(*index));
+            }
+            Ok(Adoption::Booted) => {
+                state.prefix = None;
+                state.index = None;
+            }
+            Ok(Adoption::Unchanged) => {}
+            Err(error) => {
+                tracing::warn!(%error, "asset version-skew fallback refresh failed");
+            }
+        }
+    }
+
+    /// Read the pointer and, when it names a deployment this resolver has
+    /// not adopted, load and validate that deployment's asset index with
+    /// the same gates the boot path applies.
+    async fn adopt_newer_index(
+        &self,
+        source: &FallbackSource,
+        adopted: Option<&str>,
+    ) -> anyhow::Result<Adoption> {
+        let bucket = &self.inner.bucket;
+        let (bytes, _) = bucket
+            .get(&source.pointer_key)
+            .await?
+            .with_context(|| format!("read {}", source.pointer_key))?;
+        let pointer: DeployPointer =
+            serde_json::from_slice(&bytes).context("decode deploy pointer")?;
+        if pointer.prefix == source.boot_prefix {
+            return Ok(Adoption::Booted);
+        }
+        if Some(pointer.prefix.as_str()) == adopted {
+            return Ok(Adoption::Unchanged);
+        }
+        let manifest_key = format!("{}/manifest.json", pointer.prefix);
+        let (bytes, _) = bucket
+            .get(&manifest_key)
+            .await?
+            .with_context(|| format!("read {manifest_key}"))?;
+        let manifest: Manifest =
+            serde_json::from_slice(&bytes).context("decode deployment manifest")?;
+        crate::protocol::validate_required_features(&manifest.required_features)?;
+        let Some(reference) = manifest.assets else {
+            // The newer deployment has no assets: adopt an empty index so
+            // the pointer is not re-fetched for every miss until it moves.
+            return Ok(Adoption::Newer {
+                prefix: pointer.prefix,
+                index: Box::default(),
+            });
+        };
+        let index_key = format!("{}/{}", pointer.prefix, reference.index);
+        let (bytes, _) = bucket
+            .get(&index_key)
+            .await?
+            .with_context(|| format!("read {index_key}"))?;
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        if sha256 != reference.sha256 {
+            return Err(anyhow!("fallback asset index checksum mismatch"));
+        }
+        let index: AssetIndex = serde_json::from_slice(&bytes).context("decode asset index")?;
+        validate_index(&index, &reference)?;
+        Ok(Adoption::Newer {
+            prefix: pointer.prefix,
+            index: Box::new(index),
+        })
     }
 
     fn navigation_prefers_asset_serving(&self, headers: &HeaderMap) -> bool {
@@ -857,6 +1046,15 @@ fn route(index: &AssetIndex, path: &str, include_not_found: bool) -> Route {
     if !include_not_found {
         return Route::Missing;
     }
+    not_found_route(index, path)
+}
+
+/// The `not_found_handling` tail of `route`, separated so the version-skew
+/// fallback can run between an exact miss and the not-found fabrication: a
+/// single-page application must serve a NEW deployment's hashed asset, not
+/// its own stale `/index.html`, when both are possible.
+fn not_found_route(index: &AssetIndex, path: &str) -> Route {
+    let entries = &index.entries;
     match index.config.not_found_handling.as_deref() {
         Some("single-page-application") => entries
             .get("/index.html")

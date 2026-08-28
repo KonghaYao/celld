@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-// Peer probing is a real-wire diagnostic outside the World.
+// Peer probing is a real-wire diagnostic outside the Actor execution domain.
 #![allow(clippy::disallowed_types)]
 
 //! Challenge-bound proof that a diagnostic reached the node named by a lease.
@@ -126,7 +126,7 @@ pub(crate) async fn probe(
         ));
     }
     let challenge = random_challenge();
-    let path = "/__celld/probe";
+    let path = "/peer/probe";
     let request = auth.sign(
         client.get(format!("http://{}{path}", node.addr)),
         "GET",

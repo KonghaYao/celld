@@ -21,17 +21,18 @@ pub struct PressureConfig {
     /// The ceiling on the memory the cells hold. This is the ordinary limit,
     /// and `CELLD_MAX_RSS_MB` sets it.
     pub high_bytes: Option<u64>,
-    /// An absolute ceiling on the resident set size: 95% of the machine.
+    /// An absolute ceiling on the cgroup charge, or process RSS when the
+    /// process has no readable cgroup: 95% of the available memory.
     ///
-    /// `high_bytes` applies to `Load::in_use_bytes`, which excludes the pages
-    /// the allocator keeps. That exclusion is what lets a node recover, but it
-    /// is not exact: the allocator also holds metadata and fragmentation
-    /// behind live allocations, and an eviction does not return those either.
-    /// A node could therefore keep admitting while its true resident set
-    /// climbed, and trade a wedge for a kill by the operating system.
+    /// `high_bytes` applies to allocator-adjusted RSS and to the active cgroup
+    /// working set after the same allocator adjustment. The adjustment lets a
+    /// node recover after a free, and the cgroup measurement includes active
+    /// kernel charges outside RSS. Neither measurement includes every charge
+    /// that the cgroup limit uses.
     ///
-    /// This is the floor under that trade. It reads the resident set size
-    /// directly, so nothing can hide from it.
+    /// This is the floor under that trade. A container reads
+    /// `memory.current`, so kernel charges outside process RSS cannot hide
+    /// from it.
     ///
     /// It is a fixed share of the machine and is never derived from
     /// `high_bytes`. A first attempt placed it "at least 125% of the ceiling",
@@ -60,11 +61,14 @@ pub struct Latches {
 ///
 /// The futility stop compares a sample with the one the last cut measured, so
 /// it has to know that the two samples are the same measurement. They are not
-/// interchangeable: eviction moves the in-use figure at once and may never move
-/// the resident set size at all.
+/// interchangeable: eviction moves the ordinary working-set figure at once and
+/// may never move the complete cgroup charge at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Metric {
+    /// The greater of allocator-adjusted RSS and the allocator-adjusted active
+    /// cgroup working set. An eviction can return this memory.
     InUse,
+    /// The complete cgroup charge, with process RSS as a host fallback.
     Rss,
 }
 
@@ -76,36 +80,69 @@ pub struct Load {
     pub resident_cells: usize,
     /// Reported to peers and operators, never decided on.
     pub rss_bytes: u64,
-    /// RSS minus the pages the allocator keeps but nothing uses. Shedding can
-    /// only return the memory a cell holds, so only this may hold the latch --
-    /// a classifier reading RSS never releases once jemalloc retains, however
-    /// many cells the node gives back.
+    /// RSS minus the pages the allocator keeps but nothing uses. This is the
+    /// ordinary pressure fallback when no cgroup working set is readable.
     pub in_use_bytes: u64,
+    /// The cgroup charge after inactive file pages from `memory.stat` are
+    /// removed. `None` outside a readable Linux memory cgroup.
+    pub cgroup_working_set_bytes: Option<u64>,
+    /// The complete `memory.current` charge. This is the number the cgroup
+    /// limit constrains, including charges that process RSS does not contain.
+    /// `None` outside a readable Linux memory cgroup.
+    pub cgroup_current_bytes: Option<u64>,
+}
+
+impl Load {
+    /// The ordinary pressure measurement. A cgroup working set contains active
+    /// kernel charges that process RSS omits. Subtract the same measured
+    /// allocator slack from it, or retained pages would recreate the admission
+    /// wedge through the cgroup path. The process measurement remains the floor
+    /// because cgroup and RSS accounting can differ for shared pages.
+    pub fn memory_bytes(self) -> u64 {
+        let allocator_slack = self.rss_bytes.saturating_sub(self.in_use_bytes);
+        let cgroup_in_use = self
+            .cgroup_working_set_bytes
+            .unwrap_or_default()
+            .saturating_sub(allocator_slack);
+        self.in_use_bytes.max(cgroup_in_use)
+    }
+
+    /// The hard pressure measurement. `memory.current` is authoritative when
+    /// present because the cgroup limit constrains it, not process RSS.
+    pub fn hard_bytes(self) -> u64 {
+        self.cgroup_current_bytes.unwrap_or(self.rss_bytes)
+    }
+
+    pub fn metric_bytes(self, metric: Metric) -> u64 {
+        match metric {
+            Metric::InUse => self.memory_bytes(),
+            Metric::Rss => self.hard_bytes(),
+        }
+    }
 }
 
 /// The latch engaged because the memory the cells hold crossed the ceiling.
 /// This is the ordinary case, and shedding relieves it.
 pub const SHED_MEMORY: &str = "memory";
 
-/// The latch engaged because the resident set size crossed the absolute cap.
-/// Shedding may not relieve this one, so it is named apart: an operator who
-/// sees it is looking at allocator retention that did not come back, and the
-/// node is close to a kill by the operating system.
+/// The latch engaged because the complete cgroup charge, or the RSS fallback,
+/// crossed the absolute cap. The string keeps its established telemetry name,
+/// but a Linux container decides it from `memory.current`.
 pub const SHED_RSS_HARD: &str = "rss-hard";
 
 impl PressureConfig {
     /// Build the watermarks from the machine and the operator's setting.
     ///
     /// The policy lives here, not at the edge, because it is arithmetic with a
-    /// correctness argument and it needs tests. The shell only supplies the two
-    /// facts it can read: how much memory the process may use, and what
+    /// correctness argument and requires explicit validation. The shell only
+    /// supplies the two facts it can read: how much memory the process can use, and what
     /// `CELLD_MAX_RSS_MB` says. `None` for the setting means the default, and
     /// `Some(0)` disables pressure shedding altogether.
     ///
     /// The absolute cap is 95% of the machine and is never derived from the
     /// ceiling. A cap derived from the ceiling either lands above the machine
     /// (so it never fires) or below the ceiling (so it fires first on every
-    /// sample and the classifier is reading the resident set size again). Both
+    /// sample and the classifier is reading the hard measurement again). Both
     /// have shipped in this file; neither is a floor.
     ///
     /// When the machine size is unknown, the cap falls back to 125% of an
@@ -141,8 +178,8 @@ impl PressureConfig {
 
     /// Does the ceiling sit at or above the absolute cap?
     ///
-    /// Then the cap is the effective limit and the node decides on its resident
-    /// set size, not on the memory the cells hold. That is the operator's
+    /// Then the cap is the effective limit and the node decides on its complete
+    /// cgroup charge or RSS fallback. That is the operator's
     /// choice -- they asked for a ceiling above the safety floor -- but it
     /// gives up the recovery property of this module, so the shell reports it.
     pub fn ceiling_above_cap(self) -> bool {
@@ -168,8 +205,8 @@ impl PressureConfig {
             ceiling.is_some_and(|c| sample >= c || (latched && sample > Self::low_watermark(c)))
         };
         let latches = Latches {
-            memory: over(self.high_bytes, s.in_use_bytes, was.memory),
-            rss_hard: over(self.rss_hard_bytes, s.rss_bytes, was.rss_hard),
+            memory: over(self.high_bytes, s.memory_bytes(), was.memory),
+            rss_hard: over(self.rss_hard_bytes, s.hard_bytes(), was.rss_hard),
         };
         let reason = if latches.rss_hard {
             Some(SHED_RSS_HARD)
@@ -190,6 +227,18 @@ impl PressureConfig {
     /// stops above the line it could have reached or never stops at all.
     fn low_watermark(ceiling: u64) -> u64 {
         ceiling.saturating_mul(4) / 5
+    }
+
+    /// Whether the sample leaves the reserve below every configured low
+    /// watermark. A rollout uses this stricter state instead of `!pressured`:
+    /// a node can be below the high watermark without enough room to absorb a
+    /// donor. A disabled ceiling imposes no headroom condition.
+    pub fn has_headroom(self, sample: Load) -> bool {
+        let below = |ceiling: Option<u64>, bytes: u64| {
+            ceiling.is_none_or(|ceiling| bytes <= Self::low_watermark(ceiling))
+        };
+        below(self.high_bytes, sample.memory_bytes())
+            && below(self.rss_hard_bytes, sample.hard_bytes())
     }
 
     /// Where the walk down against `metric` has to get the sample to.

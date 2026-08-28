@@ -1,16 +1,13 @@
-#![warn(
-    clippy::disallowed_macros,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+#![warn(clippy::disallowed_methods, clippy::disallowed_types)]
 
-//! `celld-ltx` — embeddable streaming replication of a SQLite database to
-//! object storage, with point-in-time restore and object-storage lease fencing.
+//! `celld-ltx` provides embeddable streaming replication for a SQLite database.
+//! It captures WAL data as LTX segments, reads and writes replica storage,
+//! restores databases, compacts levels, and reads bundle objects.
 //!
-//! A from-scratch Rust reimplementation of **Litestream v0.5** (pinned
-//! `v0.5.11`). The public surface includes `Db`, `Replica`, and `restore`.
+//! The original replication behavior is a from-scratch Rust reimplementation
+//! of Litestream v0.5.11. The block format follows LTX v0.5.2.
 //!
-//! # Core position/identity helpers  (T4)
+//! # Core position and identity helpers
 //!
 //! Ported from litestream@v0.5.11 litestream.go:18-203 and
 //! ltx@v0.5.2 ltx.go:66-145.
@@ -29,6 +26,19 @@ pub mod replica;
 pub mod replica_compactor;
 pub mod replica_url;
 pub mod wal;
+
+/// The unstable implementation API supports external verification tools.
+///
+/// This module has no compatibility guarantee.
+#[doc(hidden)]
+pub mod internal {
+    pub use crate::db::internal as db;
+    pub use crate::lz4_block::internal as lz4_block;
+    pub use crate::replica::internal as replica;
+
+    #[cfg(feature = "s3")]
+    pub use crate::client::object_store::internal as object_store;
+}
 
 // ── Crate-root re-exports — the ergonomic public surface ────────────────
 //
@@ -284,7 +294,7 @@ pub fn parse_pos(s: &str) -> Result<Pos> {
     }
     let txid = parse_txid(&s[..16])
         .map_err(|_| Error::Other(format!("invalid position txid: {:?}", &s[..16]).into()))?;
-    // DECISION: We validate that byte 16 is '/' (the separator) even though
+    // Validate that byte 16 is '/' (the separator) even though
     // Go's ParsePos (ltx@v0.5.1 ltx.go:80-99) blindly slices s[:16] and s[17:]
     // without checking the separator byte, so Go would accept e.g.
     // "0000000000000001X8000000000000001".  We keep the stricter check because:
@@ -370,7 +380,7 @@ pub fn wal_checksum(big_endian: bool, s0: u32, s1: u32, b: &[u8]) -> (u32, u32) 
 // naive `format!("{}/ltx", root)` skips this cleaning, so a root carrying a
 // trailing slash (e.g. an S3 prefix `"backups/"`) would yield a DIFFERENT
 // object key than the real binary (`"backups//ltx"` vs `"backups/ltx"`),
-// breaking the differential oracle.  We port `Clean`/`Join` byte-for-byte.
+// breaking byte compatibility. We port `Clean`/`Join` byte-for-byte.
 
 /// Lexically cleans a slash-separated path.
 ///
@@ -386,7 +396,7 @@ pub fn wal_checksum(big_endian: bool, s0: u32, s1: u32, b: &[u8]) -> (u32, u32) 
 /// The returned path ends in a slash only if it is the root `"/"`.  An empty
 /// input returns `"."`.
 ///
-/// `pub(crate)` so `replica_url::clean_replica_url_path` (T3) can reuse Go's
+/// `pub(crate)` so `replica_url::clean_replica_url_path` can reuse Go's
 /// `path.Clean` semantics rather than reimplementing them.
 pub(crate) fn path_clean(path: &str) -> String {
     if path.is_empty() {

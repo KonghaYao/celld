@@ -2,6 +2,8 @@
   "name": "rpc",
   "main": "index.js",
   "compatibility_date": "2026-01-01",
-  "durable_objects": { "bindings": [{ "name": "ACCOUNT", "class_name": "Account" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Account"] }]
+  "durable_objects": {
+    "bindings": [{ "name": "COUNTER", "class_name": "Counter" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter"] }]
 }

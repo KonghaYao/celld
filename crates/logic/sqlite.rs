@@ -6,7 +6,7 @@
 
 /// SQLite primary result codes that mean the ENGINE failed (not just one
 /// statement) — stable values from the SQLite C API. Production asserts these
-/// match `rusqlite::ffi::*`, so any drift is caught in debug/test builds.
+/// match `rusqlite::ffi::*`, so debug builds catch any drift.
 pub const SQLITE_NOMEM: i32 = 7;
 pub const SQLITE_INTERRUPT: i32 = 9;
 pub const SQLITE_IOERR: i32 = 10;

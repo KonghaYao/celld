@@ -3,13 +3,12 @@
 // This module owns the ambient production primitives which the boundary lint
 // prohibits elsewhere.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
-#![warn(clippy::disallowed_macros)]
 
 //! The production execution facade for celld.
 //!
 //! This module delegates tasks and timers to Tokio and obtains nondeterministic
-//! process values from the host. The private conformance build replaces this
-//! module with its deterministic execution backend.
+//! process values from the host. A cfg-gated build can replace this module
+//! with another execution backend.
 
 use crate::host_services::HostServices;
 use rand::{CryptoRng, RngCore};
@@ -24,6 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static PROCESS_DOMAIN: OnceLock<ProductionDomain> = OnceLock::new();
 static FALLBACK_SERVICES: OnceLock<Arc<HostServices>> = OnceLock::new();
+static SELECT_STATE: OnceLock<AtomicU64> = OnceLock::new();
 
 thread_local! {
     static SPAWNS: RefCell<Vec<(u64, OpFuture)>> = const { RefCell::new(Vec::new()) };
@@ -157,9 +157,33 @@ pub fn mono_ms() -> u64 {
     current_domain().started_at.elapsed().as_millis() as u64
 }
 
+/// Return monotonic process time in microseconds for timing instrumentation.
+pub fn mono_us() -> u64 {
+    current_domain().started_at.elapsed().as_micros() as u64
+}
+
 pub fn rng(consumer: &'static str) -> rng::Stream {
     let _ = consumer;
     rng::Stream::production()
+}
+
+fn mix_select(mut value: u64) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+/// Return the first branch index for one unbiased select poll.
+pub fn select_start(branches: u32) -> u32 {
+    debug_assert!(branches > 0);
+    // A select can run before the process installs its Tokio handle. Keep its
+    // process-wide state separate, so branch ordering cannot capture a
+    // short-lived runtime that another operation later tries to use.
+    let state = SELECT_STATE
+        .get_or_init(|| AtomicU64::new(rand::rngs::OsRng.next_u64()))
+        .fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
+        .wrapping_add(0x9e37_79b9_7f4a_7c15);
+    (mix_select(state) % u64::from(branches)) as u32
 }
 
 pub fn process_tag() -> u64 {
@@ -323,6 +347,7 @@ pub fn drain_spawns() -> Vec<(u64, OpFuture)> {
 }
 
 pub use crate::__celld_domain_select as select;
+pub use crate::__celld_domain_select_biased as select_biased;
 
 pub mod rng {
     use super::*;

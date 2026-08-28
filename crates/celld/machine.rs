@@ -1,7 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-#![warn(clippy::disallowed_macros)]
-
 //! What the process can learn about where it is running.
 //!
 //! Two kinds of fact, both read once at startup or sampled on a timer:
@@ -74,19 +72,8 @@ pub fn ownership_on_evict_from_environment() -> anyhow::Result<OwnershipOnEvict>
 #[cfg(target_os = "linux")]
 #[allow(clippy::disallowed_methods)] // cgroup and `/proc` files describe the host.
 fn total_memory_bytes() -> Option<u64> {
-    for path in [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ] {
-        if let Ok(raw) = std::fs::read_to_string(path) {
-            if let Ok(limit) = raw.trim().parse::<u64>() {
-                // cgroup v1 reports "no limit" as a huge page-rounded
-                // number; anything at or above 1 PiB means unlimited.
-                if limit < (1 << 50) {
-                    return Some(limit);
-                }
-            }
-        }
+    if let Some(limit) = crate::memory::cgroup_limit_bytes() {
+        return Some(limit);
     }
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     let kb = meminfo
@@ -124,8 +111,8 @@ pub fn pressure_config_from_environment() -> anyhow::Result<celld_logic::pressur
     // Residency is a hard cap (`CELLD_MAX_RESIDENT_CELLS` -> `Config::max_resident`),
     // enforced at admission -- not a pressure watermark, so it is not built here.
     // Memory shedding is on by default: a node that runs into its memory ceiling
-    // must give cells back, not be killed. The arithmetic lives in the core,
-    // where it is tested; the shell supplies only the two facts it can read.
+    // must give cells back, not be killed. The arithmetic lives in the core;
+    // the shell supplies only the two facts it can read.
     let config = celld_logic::pressure::PressureConfig::from_limits(
         total_memory_bytes(),
         crate::env_vars::optional::<u64>("CELLD_MAX_RSS_MB")?,
@@ -135,8 +122,7 @@ pub fn pressure_config_from_environment() -> anyhow::Result<celld_logic::pressur
             high_bytes = config.high_bytes,
             rss_hard_bytes = config.rss_hard_bytes,
             "CELLD_MAX_RSS_MB is at or above the absolute cap, so the node \
-             decides on its resident set size and cannot recover from allocator \
-             retention alone"
+             decides on its complete cgroup charge or RSS fallback"
         );
     }
     Ok(config)

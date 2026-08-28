@@ -1,7 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-#![warn(clippy::disallowed_macros)]
-
 //! Process services that an engine incarnation can observe.
 //!
 //! Production installs one service set. A deterministic domain installs one
@@ -9,42 +7,7 @@
 //! host measurements.
 
 use crate::ownership_store::LiveLoad;
-#[cfg(all(test, celld_internal_tests))]
-use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, OnceLock};
-
-/// Test-only faults planted in production adapter transitions. Each value is
-/// scoped to one simulation domain, so parallel corpus tests cannot arm one
-/// another's teeth.
-#[cfg(all(test, celld_internal_tests))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum EngineSabotage {
-    SuppressResetStop,
-    CoverTicketEarly,
-    MisreportGatePosition,
-    RestoreSupersededEpoch,
-    FreshCreateOverwrites,
-    DropCompactionInput,
-    HideDirtyCell,
-    DropTimerArm,
-    IgnoreTookOver,
-    SkipArmTimeWakePut,
-    IgnoreAlarmConsumeOnRestore,
-    SuppressReleasingDecrement,
-    SkipBucketProofOwnershipRead,
-    SkipTakeoverInterlock,
-    SkipBundleCreditRecordRead,
-    SkipObserveLogEpoch,
-    ClearShipInFlightEarly,
-    DeleteUncoveredBundle,
-    CollectOpenFragment,
-    GracefulSealUsesCreditedCoverage,
-    AcceptAppendPastSeal,
-    FilterRecoveryBundlesByRecordEpoch,
-    SealAmnesiacWithoutLossRecord,
-    SkipActivationFenceCas,
-    SkipAlarmWriteGate,
-}
 
 /// One resource observation used by the pressure path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -52,11 +15,13 @@ pub struct HostMetricsSample {
     pub cpu_percent_x100: u64,
     pub rss_bytes: u64,
     pub in_use_bytes: u64,
+    pub cgroup_working_set_bytes: Option<u64>,
+    pub cgroup_current_bytes: Option<u64>,
 }
 
 enum MetricsBackend {
     Production(Mutex<ProcessLoadSampler>),
-    #[cfg(all(test, celld_internal_tests))]
+    #[cfg(celld_internal_tests)]
     Scripted(Mutex<HostMetricsSample>),
 }
 
@@ -66,8 +31,6 @@ pub struct HostServices {
     wake_entry: crate::js::WakeEntryService,
     websockets: crate::js::WebSocketService,
     metrics: MetricsBackend,
-    #[cfg(all(test, celld_internal_tests))]
-    sabotages: Mutex<BTreeSet<EngineSabotage>>,
 }
 
 impl HostServices {
@@ -77,19 +40,16 @@ impl HostServices {
             wake_entry: crate::js::WakeEntryService::default(),
             websockets: crate::js::WebSocketService::default(),
             metrics: MetricsBackend::Production(Mutex::new(ProcessLoadSampler::default())),
-            #[cfg(all(test, celld_internal_tests))]
-            sabotages: Mutex::new(BTreeSet::new()),
         }
     }
 
-    #[cfg(all(test, celld_internal_tests))]
+    #[cfg(celld_internal_tests)]
     pub fn scripted() -> Self {
         Self {
             node_load: OnceLock::new(),
             wake_entry: crate::js::WakeEntryService::default(),
             websockets: crate::js::WebSocketService::default(),
             metrics: MetricsBackend::Scripted(Mutex::new(HostMetricsSample::default())),
-            sabotages: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -118,29 +78,21 @@ impl HostServices {
                     cpu_percent_x100: sampler.sample_cpu_percent_x100(),
                     rss_bytes: memory.rss_bytes,
                     in_use_bytes: memory.in_use_bytes,
+                    cgroup_working_set_bytes: memory.cgroup_working_set_bytes,
+                    cgroup_current_bytes: memory.cgroup_current_bytes,
                 }
             }
-            #[cfg(all(test, celld_internal_tests))]
+            #[cfg(celld_internal_tests)]
             MetricsBackend::Scripted(sample) => *sample.lock().unwrap(),
         }
     }
 
-    #[cfg(all(test, celld_internal_tests))]
+    #[cfg(celld_internal_tests)]
     pub fn set_scripted_metrics(&self, sample: HostMetricsSample) {
         let MetricsBackend::Scripted(current) = &self.metrics else {
             panic!("scripted metrics require a simulation HostServices instance");
         };
         *current.lock().unwrap() = sample;
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub fn arm_sabotage(&self, sabotage: EngineSabotage) {
-        self.sabotages.lock().unwrap().insert(sabotage);
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn sabotage_active(&self, sabotage: EngineSabotage) -> bool {
-        self.sabotages.lock().unwrap().contains(&sabotage)
     }
 }
 

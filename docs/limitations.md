@@ -1,55 +1,48 @@
 # Limitations
 
-The boundaries of the current alpha:
+celld is an alpha. The current release has these operational limits. See
+[Cloudflare compatibility](cloudflare-compat.md) for the supported services,
+APIs, and Wrangler configuration.
 
-- A fleet runs one application deployment. There is no multi-tenant
-  scheduler, no account service, or managed ingress.
-- celld requires an S3-compatible bucket, a Google Cloud Storage bucket,
-  or an Azure Blob Storage container, also on a laptop. There is no local
-  filesystem mode, so local development needs a real bucket or a local
-  store that provides conditional writes (see [ownership and
-  fencing](fencing.md)).
-- The peer HTTP protocol does not terminate TLS. Run the fleet on a
-  private network or an encrypted overlay, and terminate public TLS in an
-  ingress proxy.
-- The fleet bucket is the administrative authority, so give its
-  credentials a narrow scope; celld does not make shared object-store
-  credentials safe.
-- The bucket credentials come from the `AWS_*` environment or from
-  explicit managed credentials, which includes instance metadata and web
-  identity tokens. celld does not read `~/.aws` profiles or SSO logins.
-  A `gs://` bucket authenticates with Google Application Default
-  Credentials or with a service account key from the `GOOGLE_*`
-  environment; S3 static credentials do not apply to it. An `az://`
-  bucket authenticates with a storage account key, a managed identity, or
-  a workload identity on the public Azure cloud. celld requires exactly one
-  credential family, and it refuses every recognized Azure configuration
-  variable outside those families. It ignores an `AZURE_*` name that
-  `object_store` 0.11.2 does not recognize.
-- An `az://` bucket reads a managed identity from the Azure instance
-  metadata service, which an Azure VM and an AKS node supply. celld does
-  not read the `IDENTITY_ENDPOINT` variable, so a managed identity on
-  Azure App Service or Azure Container Apps does not work. Use a workload
-  identity or a storage account key on those two platforms.
-- The [Cloudflare compatibility](cloudflare-compat.md) page shows what
-  celld runs of the Workers platform: the available APIs, the deploy
-  contract, and what is out of scope (KV, R2, `wrangler.toml`, routes).
-  An unknown key or API causes a loud failure; a silent gap is a bug.
-- Each node can be the WebSocket ingress for each cell through the signed
-  peer tunnel, but the test coverage for close codes and reconnections
-  across nodes is thinner than for one node. If latency is important,
-  send the traffic of a cell to its owner node.
-- An outbound Durable Object WebSocket keeps its cell resident, and the
-  connection does not continue when the cell moves to a different node:
-  keep the connection intent in storage, and connect again after the
-  activation. (A Worker's outbound socket stops with its request, the
-  same as on Cloudflare.) A node limits how much residency the outbound
-  sockets can hold.
-- Windows is not available, and Intel Macs get no prebuilt binaries; a
-  build from source works.
-- celld has no central placement controller, so it does not rebalance the
-  fleet when a node joins. Normal traffic places an unowned or released cell
-  on a node with capacity.
-- Updates are manual: the installer keeps immutable releases behind one
-  `current` pointer, so a previous SHA is the rollback. There is no
-  automatic update agent.
+## Fleets
+
+- A fleet runs one application. celld has no account service, multi-tenant
+  scheduler, or managed ingress.
+- A fleet stores its durable state in an S3-compatible bucket, a Google Cloud
+  Storage bucket, or an Azure Blob Storage container. The `celld dev` command
+  instead uses a local SQLite object store. A regular node or an operator
+  subcommand cannot select this local backend.
+- A node does not rebalance the existing cells when it joins a fleet. Traffic
+  assigns an unowned or released cell to a node with capacity.
+
+## Networking and security
+
+- celld does not terminate TLS. Terminate public TLS at an ingress proxy, and
+  put the internal listener on a private network or an encrypted overlay.
+- Peer traffic crosses the internal network as plaintext HTTP. The fleet HMAC
+  authenticates tunnel establishment and control requests, and it does not
+  encrypt application data on the wire. The network layer must provide the
+  confidentiality.
+- The fleet bucket controls the fleet. Give its credentials access to one fleet
+  only. See [Security](security.md).
+
+## Object storage credentials
+
+- celld supports different credential methods for each object storage provider.
+  See [Configure object storage](README.md#configure-object-storage) for the
+  available methods and their precedence.
+- Azure identity support is limited to the public Azure cloud. A managed
+  identity from Azure App Service or Azure Container Apps does not work. Use a
+  workload identity or a storage account key on these platforms.
+
+## WebSockets
+
+- An outbound Durable Object WebSocket keeps its cell resident. The connection
+  closes if the cell moves to another node, so the application must store the
+  connection intent and reconnect.
+- A node limits the cells and outbound WebSockets that can remain resident.
+
+## Platforms and updates
+
+- The installer supplies binaries for Linux x86-64, Linux ARM64, and Apple
+  Silicon. Windows is not supported.

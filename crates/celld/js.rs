@@ -1,12 +1,9 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-// The raw V8 adapter and its child modules remain outside the World. The
-// Actor-reachable wake and WebSocket state is injected through HostServices.
-#![allow(
-    clippy::disallowed_macros,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+// The raw V8 adapter and its child modules remain outside the Actor execution
+// domain. The Actor-reachable wake and WebSocket state is injected through
+// HostServices.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 //! The JS engine: rusty_v8 directly. One isolate per cell.
 //!
@@ -19,12 +16,13 @@
 use crate::asyncrt;
 use crate::storage;
 use anyhow::{anyhow, Context as _, Result};
+use base64::Engine as _;
 use futures_util::StreamExt as _;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use v8::{ValueDeserializerHelper, ValueSerializerHelper};
 
@@ -97,7 +95,9 @@ pub struct DoCallReq {
     pub name: Option<String>,
     pub url: String,
     pub method: String,
-    pub body: Vec<u8>,
+    pub body: RequestBody,
+    /// Owns a streamed body while the call waits for routing or admission.
+    pub body_guard: RequestBodyGuard,
     pub headers: Vec<(String, String)>,
     pub reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
     /// Where this call sits in its caller's order for this cell.
@@ -155,7 +155,8 @@ pub struct CallOrder {
 /// and a third call can be delivered ahead of a first that is still in
 /// flight. Rare, since it needs a call to fail between two that do not, and
 /// silent, since every call involved still gets an answer.
-struct Place(Option<Box<tokio::sync::oneshot::Receiver<Place>>>);
+#[doc(hidden)]
+pub struct Place(Option<Box<tokio::sync::oneshot::Receiver<Place>>>);
 
 impl CallOrder {
     /// Wait for every call before this one to be delivered.
@@ -202,14 +203,16 @@ impl Drop for CallOrder {
 
 /// One caller's chains, one per cell it has called.
 #[derive(Default)]
-struct CallChains {
+#[doc(hidden)]
+pub struct CallChains {
     next_seq: u64,
-    tails: HashMap<String, (u64, tokio::sync::oneshot::Receiver<Place>)>,
+    pub tails: HashMap<String, (u64, tokio::sync::oneshot::Receiver<Place>)>,
 }
 
 /// Take this call's place in its caller's chain for `cell`. Synchronous, so
 /// the places are taken in the order the script made the calls.
-fn enter_call_order(caller: Arc<IoContext>, cell: &str) -> CallOrder {
+#[doc(hidden)]
+pub fn enter_call_order(caller: Arc<IoContext>, cell: &str) -> CallOrder {
     let (release, next) = tokio::sync::oneshot::channel();
     let (seq, ahead) = {
         let mut chains = caller.call_chains.lock().unwrap();
@@ -231,13 +234,18 @@ fn enter_call_order(caller: Arc<IoContext>, cell: &str) -> CallOrder {
     }
 }
 
-/// An output-gate request for the co-hosted (same-isolate) Durable Object fast
-/// path. That path runs a resident DO's `fetch` inline, bypassing
-/// `dispatch_do_call` where the gate lives; the inline handler samples the
-/// cell's committed-write position and asks the actor whether the response can
-/// leave. `position` is present for a write and absent for a read.
+/// A ticket asking the actor whether an outbound effect may leave the process.
+///
+/// Every in-handler channel takes one: `fetch`, a service binding, a call to
+/// another cell, and a frame on a socket the isolate opened. `position` is
+/// present when the running event wrote through it, absent when the event only
+/// read and the effect must trail whatever the cell already has outstanding.
 pub struct GateReq {
     pub scope: String,
+    /// Which way the effect this ticket holds would leave the process. The
+    /// core stores it and hands it back, so the shell can route the release
+    /// to the adapter holding the effect.
+    pub channel: celld_logic::Channel,
     pub position: Option<u64>,
     pub reply: tokio::sync::oneshot::Sender<Result<(), celld_logic::RequestError>>,
 }
@@ -253,10 +261,16 @@ pub struct SvcCallReq {
     /// Fires when the caller's request signal aborts, so the router stops
     /// waiting on the target instead of leaving the call outstanding.
     pub cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// The application generation of the calling isolate. The target is
+    /// resolved in that generation's service graph, so a caller built for
+    /// one deployment never reaches a target from another.
+    pub generation: crate::generation::GenerationId,
     pub script: String,
     pub url: String,
     pub method: String,
-    pub body: Vec<u8>,
+    pub body: RequestBody,
+    /// Owns a streamed body until the target installs its request context.
+    pub body_guard: RequestBodyGuard,
     pub headers: Vec<(String, String)>,
     pub reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
 }
@@ -266,6 +280,8 @@ static SVC_CALL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<SvcCallReq>> = O
 /// index loaded for that Worker; unlike ingress this never falls back into the
 /// Worker and therefore cannot recurse.
 pub struct AssetCallReq {
+    /// The calling isolate's application generation; see `SvcCallReq`.
+    pub generation: crate::generation::GenerationId,
     pub script: String,
     pub url: String,
     pub method: String,
@@ -277,6 +293,8 @@ static ASSET_CALL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<AssetCallReq>>
 /// An RPC call on a named `WorkerEntrypoint` of another script. Arguments and
 /// the result cross as V8 structured-clone bytes.
 pub struct SvcRpcReq {
+    /// The calling isolate's application generation; see `SvcCallReq`.
+    pub generation: crate::generation::GenerationId,
     pub script: String,
     pub entrypoint: String,
     pub method: String,
@@ -284,11 +302,53 @@ pub struct SvcRpcReq {
     pub reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
 }
 static SVC_RPC_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<SvcRpcReq>> = OnceLock::new();
+
+/// The persisted identity a consumer settlement must match for one message.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct QueueLeaseRef {
+    pub message_id: String,
+    pub seq: i64,
+    pub generation: u64,
+}
+
+/// A durable broker batch released through its output gate.
+pub struct QueueDispatchReq {
+    pub scope: String,
+    /// The dispatching queue cell's application generation; see
+    /// `SvcCallReq`.
+    pub generation: crate::generation::GenerationId,
+    pub script: String,
+    pub lease_id: String,
+    pub leases: Vec<QueueLeaseRef>,
+    pub batch: QueueBatch,
+}
+static QUEUE_DISPATCH_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<QueueDispatchReq>> =
+    OnceLock::new();
+/// The fleet bucket used by KV values that are too large for a namespace cell.
+///
+/// The landed R2 binding established the safe pattern: a cloneable bucket
+/// handle can live beside the asynchronous ops, so independent requests do not
+/// queue behind one task that awaits every object-store operation in order.
+static KV_BLOB_STORE: OnceLock<crate::bucket::Bucket> = OnceLock::new();
+
+pub fn set_kv_blob_store(store: crate::bucket::Bucket) {
+    let _ = KV_BLOB_STORE.set(store);
+}
+
+fn kv_blob_store() -> std::result::Result<&'static crate::bucket::Bucket, String> {
+    KV_BLOB_STORE
+        .get()
+        .ok_or_else(|| "KV large values need a fleet bucket".to_string())
+}
+
 pub fn set_svc_rpc_tx(tx: tokio::sync::mpsc::UnboundedSender<SvcRpcReq>) {
     let _ = SVC_RPC_TX.set(tx);
 }
 pub fn set_svc_call_tx(tx: tokio::sync::mpsc::UnboundedSender<SvcCallReq>) {
     let _ = SVC_CALL_TX.set(tx);
+}
+pub fn set_queue_dispatch_tx(tx: tokio::sync::mpsc::UnboundedSender<QueueDispatchReq>) {
+    let _ = QUEUE_DISPATCH_TX.set(tx);
 }
 pub fn set_asset_call_tx(tx: tokio::sync::mpsc::UnboundedSender<AssetCallReq>) {
     let _ = ASSET_CALL_TX.set(tx);
@@ -308,9 +368,10 @@ pub fn submit_do_call(call: DoCallReq) -> bool {
 /// The arm-time wake-entry gate, output-gate style (matching Durable
 /// Objects): `setAlarm()` resolves optimistically on the committed local
 /// write — it never yields the cell's event scheduling to remote I/O — and
-/// the cell's response edge is withheld until every pending wake-entry PUT
-/// has landed. Invariant: an arm the caller has OBSERVED acknowledged
-/// (received the response) is covered by a durable entry.
+/// the cell's response edge is withheld until every wake-entry PUT that this
+/// event registered before its response boundary has landed. Invariant: an
+/// arm the caller has OBSERVED acknowledged (received the response) is
+/// covered by a durable entry.
 pub struct ArmGate {
     pub bucket: crate::bucket::Bucket,
     pub flusher: Arc<crate::wake::WakeFlusher>,
@@ -321,8 +382,15 @@ type ArmGateRx = tokio::sync::oneshot::Receiver<Result<(), String>>;
 #[derive(Default)]
 pub(crate) struct WakeEntryService {
     gate: OnceLock<ArmGate>,
-    pending: Mutex<HashMap<String, Vec<ArmGateRx>>>,
+    #[cfg(celld_internal_tests)]
+    test_pending: Mutex<HashMap<String, Vec<ArmGateRx>>>,
+    #[cfg(celld_internal_tests)]
+    scripted: Mutex<std::collections::VecDeque<ArmGateRx>>,
+    #[cfg(celld_internal_tests)]
+    drop_next_gated_reply_task: AtomicBool,
 }
+
+pub use r2_ops::set_r2_store;
 
 pub fn set_arm_gate(gate: ArmGate) {
     let _ = asyncrt::services().wake_entry().gate.set(gate);
@@ -339,8 +407,7 @@ pub fn wake_entry_tracked(cell: &str) -> bool {
 
 /// Drop this node's belief about `cell`'s wake entry — the cell fenced or
 /// resolved to a remote owner, so the entry is no longer ours to manage.
-/// Defined since the wake audit and now actually called (it was dead code,
-/// which meant a node that lost a cell kept believing in its entry).
+/// A node that loses a cell must also forget its wake entry.
 pub fn forget_wake_entry(cell: &str) {
     let services = asyncrt::services();
     if let Some(gate) = services.wake_entry().gate.get() {
@@ -376,35 +443,33 @@ pub async fn reconcile_wake_entry(cell: &str, next_alarm_ms: i64, consume_durabl
 }
 
 /// A committed alarm tightened the durable wake bound: launch the entry PUT
-/// and register it against the cell's output gate. No-op when the bound
-/// already covers it or no gate is configured (unit tests).
-fn spawn_arm_gate(cell: &str, at_ms: i64) {
-    #[cfg(all(test, celld_internal_tests))]
-    if asyncrt::sabotage_active(crate::host_services::EngineSabotage::SkipArmTimeWakePut) {
-        return;
+/// and register it against the current event's output gate. No-op when the
+/// bound already covers it or no gate is configured.
+fn spawn_arm_gate(cell: &str, at_ms: i64, context: Option<Arc<IoContext>>) {
+    #[cfg(celld_internal_tests)]
+    {
+        let services = asyncrt::services();
+        if let Some(rx) = services.wake_entry().scripted.lock().unwrap().pop_front() {
+            register_arm_gate_with_current_event(rx, context);
+            return;
+        };
     }
+    if let Some(rx) = launch_arm_gate(cell, at_ms) {
+        register_arm_gate_with_current_event(rx, context);
+    }
+}
+
+/// Launch the durable PUT and return the response edge that observes it.
+/// Registration is separate because production binds the receiver to a V8
+/// event, while the private S1 driver binds it to its simulated request.
+fn launch_arm_gate(cell: &str, at_ms: i64) -> Option<ArmGateRx> {
     let services = asyncrt::services();
-    let Some(gate) = services.wake_entry().gate.get() else {
-        return;
-    };
+    let gate = services.wake_entry().gate.get()?;
     let Some(celld_logic::wake::Op::Put { key, due_ms }) = gate.flusher.arm_op(cell, at_ms) else {
-        return;
+        return None;
     };
     let cell_ = cell.to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    {
-        let mut pending = services.wake_entry().pending.lock().unwrap();
-        let gates = pending.entry(cell_.clone()).or_default();
-        // Arms with no response edge to drain them (alarm handlers,
-        // WebSocket events) must not accumulate: drop already-settled gates.
-        gates.retain_mut(|gate| {
-            matches!(
-                gate.try_recv(),
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-            )
-        });
-        gates.push(rx);
-    }
     asyncrt::spawn(async move {
         let gate = services.wake_entry().gate.get().unwrap();
         // A delete of this exact key may already be on the wire — the tracked
@@ -424,29 +489,99 @@ fn spawn_arm_gate(cell: &str, at_ms: i64) {
         let _ = tx.send(result);
     })
     .detach();
+    Some(rx)
 }
 
-#[cfg(all(test, celld_internal_tests))]
+fn register_arm_gate_with_current_event(gate: ArmGateRx, context: Option<Arc<IoContext>>) {
+    let Some(context) = context else {
+        drop(gate);
+        return;
+    };
+    if let Err(gate) = context.register_arm_gate(gate) {
+        // The response boundary sealed this context. The PUT itself
+        // continues, but its receiver cannot migrate into a later event's
+        // reply batch.
+        drop(gate);
+    }
+}
+
+#[cfg(celld_internal_tests)]
+fn register_test_pending_arm_gate(cell: &str, gate: ArmGateRx) {
+    let services = asyncrt::services();
+    let mut pending = services.wake_entry().test_pending.lock().unwrap();
+    let gates = pending.entry(cell.to_string()).or_default();
+    gates.retain_mut(|gate| {
+        matches!(
+            gate.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        )
+    });
+    gates.push(gate);
+}
+
+#[cfg(celld_internal_tests)]
 pub(crate) fn spawn_arm_gate_for_test(cell: &str, at_ms: i64) {
-    spawn_arm_gate(cell, at_ms);
+    let services = asyncrt::services();
+    if let Some(gate) = services.wake_entry().scripted.lock().unwrap().pop_front() {
+        match installed_context() {
+            Some(context) => register_arm_gate_with_current_event(gate, Some(context)),
+            None => {
+                // The deterministic S1 driver calls the storage seam without a
+                // JavaScript request. Keep that private compatibility path out of
+                // production and separate from a sealed event.
+                register_test_pending_arm_gate(cell, gate);
+            }
+        }
+        return;
+    }
+    let Some(gate) = launch_arm_gate(cell, at_ms) else {
+        return;
+    };
+    match installed_context() {
+        Some(context) => register_arm_gate_with_current_event(gate, Some(context)),
+        None => register_test_pending_arm_gate(cell, gate),
+    }
 }
 
-/// Await the cell's pending wake-entry PUTs — the output-gate drain a
-/// response edge performs before releasing its reply. An error means an arm
-/// the response would acknowledge is not durably covered; the caller must
-/// fail the response rather than lie (the flusher retries the entry).
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn pause_next_arm_gate_for_test() -> tokio::sync::oneshot::Sender<Result<(), String>> {
+    let (resume, paused) = tokio::sync::oneshot::channel();
+    asyncrt::services()
+        .wake_entry()
+        .scripted
+        .lock()
+        .unwrap()
+        .push_back(paused);
+    resume
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn next_arm_gate_is_paused_for_test() -> bool {
+    !asyncrt::services()
+        .wake_entry()
+        .scripted
+        .lock()
+        .unwrap()
+        .is_empty()
+}
+
+/// Drain the compatibility wake-entry PUT gates for a simulated S1 cell.
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
 pub async fn drain_arm_gates(cell: &str) -> Result<(), String> {
     let services = asyncrt::services();
-    let gates = services.wake_entry().pending.lock().unwrap().remove(cell);
-    let Some(gates) = gates else { return Ok(()) };
-    for gate in gates {
-        match gate.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(error),
-            Err(_) => return Err("wake-entry gate task dropped".into()),
-        }
-    }
-    Ok(())
+    let gates = services
+        .wake_entry()
+        .test_pending
+        .lock()
+        .unwrap()
+        .remove(cell);
+    let Some(gates) = gates else {
+        return Ok(());
+    };
+    await_arm_gates(gates).await
 }
 
 pub type RequestId = u128;
@@ -476,7 +611,8 @@ fn do_call_cancels(
     DO_CALL_CANCELS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-fn next_do_request_id() -> RequestId {
+#[doc(hidden)]
+pub fn next_do_request_id() -> RequestId {
     let prefix = *DO_REQUEST_PROCESS_PREFIX.get_or_init(|| {
         let mut bytes = [0; 8];
         getrandom::fill(&mut bytes).expect("OS random source unavailable");
@@ -492,6 +628,30 @@ pub fn request_id_string(request_id: RequestId) -> String {
 
 pub fn parse_request_id(value: &str) -> Option<RequestId> {
     u128::from_str_radix(value, 16).ok()
+}
+
+/// Publish `request_id` on a pending call's promise as the token the JS
+/// harness hands back to `__do_call_cancel`.
+///
+/// The only writer of `__celldCancelId`, and the counterpart of
+/// [`parse_request_id`]. Each cancellable op used to spell the property name
+/// and the encoding out for itself, and `op_svc_call_impl` wrote decimal while
+/// `op_do_call_cancel` reads hexadecimal. Every decimal digit is also a
+/// hexadecimal digit, so the parse succeeded on a different number, the
+/// registry lookup missed, and the cancel was dropped with no error — a
+/// service-binding abort rejected the caller and left the target running. One
+/// writer paired with one parser removes the chance to disagree.
+fn attach_cancel_id(
+    scope: &mut v8::PinScope,
+    promise: v8::Local<v8::Value>,
+    request_id: RequestId,
+) {
+    let Some(object) = promise.to_object(scope) else {
+        return;
+    };
+    let key = v8::String::new(scope, "__celldCancelId").unwrap();
+    let value = v8::String::new(scope, &request_id_string(request_id)).unwrap();
+    object.set(scope, key.into(), value.into());
 }
 
 struct DoCallCancelGuard(Option<RequestId>);
@@ -520,11 +680,11 @@ impl Drop for DoCallCancelGuard {
 }
 
 /// An RPC payload crossing the host boundary. JS stubs marshal by V8
-/// structured clone (`V8`); the legacy cross-node JSON envelope and the test
-/// harness use `Json`. `__dispatchRpc` answers in the flavor it was asked in.
+/// structured clone (`V8`), and legacy callers use the JSON envelope (`Json`).
+/// `__dispatchRpc` answers in the flavor it was asked in.
 pub enum RpcData {
     Json(String),
-    V8(Vec<u8>),
+    V8(bytes::Bytes),
 }
 
 /// A native Durable Object RPC call (`stub.someMethod(...args)`).
@@ -583,6 +743,77 @@ pub fn set_outbound_ws_tx(tx: tokio::sync::mpsc::UnboundedSender<OutboundWsReq>)
     let _ = OUTBOUND_WS_TX.set(tx);
 }
 
+#[cfg(celld_internal_tests)]
+/// An outbound connector scoped to the current internal-test JS thread.
+///
+/// The production connector is process-wide. Installing a test sender there
+/// captures requests from unrelated suites, and those suites have no receiver
+/// that can answer them. The thread-local sender follows the current-thread V8
+/// harnesses, while this handle owns its receiver and removes the sender when
+/// the case ends.
+#[doc(hidden)]
+pub struct TestOutboundWsConnector {
+    requests: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<OutboundWsReq>>,
+    /// A scoped connector must drop on the thread where it installed its sender.
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(celld_internal_tests)]
+impl TestOutboundWsConnector {
+    #[doc(hidden)]
+    pub fn requests(
+        &self,
+    ) -> &tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<OutboundWsReq>> {
+        &self.requests
+    }
+}
+
+#[cfg(celld_internal_tests)]
+thread_local! {
+    static TEST_OUTBOUND_WS_TX: RefCell<Option<tokio::sync::mpsc::UnboundedSender<OutboundWsReq>>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(celld_internal_tests)]
+impl Drop for TestOutboundWsConnector {
+    fn drop(&mut self) {
+        TEST_OUTBOUND_WS_TX.with(|slot| {
+            assert!(
+                slot.borrow_mut().take().is_some(),
+                "test outbound WebSocket connector was not installed",
+            );
+        });
+    }
+}
+
+#[cfg(celld_internal_tests)]
+/// Install the internal-test connector for the current JS thread.
+#[doc(hidden)]
+pub fn install_outbound_ws_connector_for_test() -> TestOutboundWsConnector {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    TEST_OUTBOUND_WS_TX.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        assert!(
+            slot.is_none(),
+            "test outbound WebSocket connector is already installed"
+        );
+        *slot = Some(tx);
+    });
+    TestOutboundWsConnector {
+        requests: tokio::sync::Mutex::new(rx),
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+/// Select the scoped internal-test connector before the production connector.
+fn outbound_ws_tx() -> Option<tokio::sync::mpsc::UnboundedSender<OutboundWsReq>> {
+    #[cfg(celld_internal_tests)]
+    if let Some(tx) = TEST_OUTBOUND_WS_TX.with(|slot| slot.borrow().clone()) {
+        return Some(tx);
+    }
+    OUTBOUND_WS_TX.get().cloned()
+}
+
 static NEXT_TIMER_ID: AtomicU64 = AtomicU64::new(1);
 static TIMER_CANCELS: OnceLock<std::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<()>>>> =
     OnceLock::new();
@@ -597,6 +828,7 @@ static NEXT_HTTP_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 /// this marker. The value stays distinctive, so a reader that does compare
 /// the value cannot match a plausible body.
 const HTTP_STREAM_DONE: &str = "__celld_http_stream_end__";
+const HTTP_STREAM_STALE_AFTER: Duration = Duration::from_secs(60);
 enum HttpStreamSource {
     Response(reqwest::Response),
     Receiver(tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>),
@@ -606,6 +838,9 @@ struct HttpStreamEntry {
     created: Instant,
     source: Option<HttpStreamSource>,
     cancelled: tokio::sync::watch::Sender<bool>,
+    /// Request contexts that can still read this source. A dispatch guard can
+    /// reclaim the entry only while this is zero.
+    owners: usize,
 }
 static HTTP_STREAMS: OnceLock<std::sync::Mutex<HashMap<u64, HttpStreamEntry>>> = OnceLock::new();
 fn http_streams() -> &'static std::sync::Mutex<HashMap<u64, HttpStreamEntry>> {
@@ -614,15 +849,58 @@ fn http_streams() -> &'static std::sync::Mutex<HashMap<u64, HttpStreamEntry>> {
 fn register_http_stream(stream_id: u64, source: HttpStreamSource) {
     let (cancelled, _) = tokio::sync::watch::channel(false);
     let mut streams = http_streams().lock().unwrap();
-    streams.retain(|_, stream| stream.created.elapsed() < Duration::from_secs(60));
+    streams.retain(|_, stream| {
+        stream.owners > 0 || stream.created.elapsed() < HTTP_STREAM_STALE_AFTER
+    });
     streams.insert(
         stream_id,
         HttpStreamEntry {
             created: Instant::now(),
             source: Some(source),
             cancelled,
+            owners: 0,
         },
     );
+}
+
+fn claim_http_stream(stream_id: u64) -> bool {
+    let mut streams = http_streams().lock().unwrap();
+    let Some(stream) = streams.get_mut(&stream_id) else {
+        return false;
+    };
+    stream.owners = stream.owners.saturating_add(1);
+    true
+}
+
+fn release_http_stream(stream_id: u64) {
+    let mut streams = http_streams().lock().unwrap();
+    let remove = streams.get_mut(&stream_id).is_some_and(|stream| {
+        stream.owners = stream.owners.saturating_sub(1);
+        stream.owners == 0
+    });
+    if remove {
+        streams.remove(&stream_id);
+    }
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn make_http_stream_stale_for_test(stream_id: u64) {
+    if let Some(stream) = http_streams().lock().unwrap().get_mut(&stream_id) {
+        stream.created -= HTTP_STREAM_STALE_AFTER;
+    }
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn http_stream_exists_for_test(stream_id: u64) -> bool {
+    http_streams().lock().unwrap().contains_key(&stream_id)
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn remove_http_stream_for_test(stream_id: u64) {
+    http_streams().lock().unwrap().remove(&stream_id);
 }
 struct ResponseStreamWriter {
     created: Instant,
@@ -642,12 +920,11 @@ pub type HttpChunkStream =
 pub struct WsTarget {
     pub id: u64,
     pub scope: String,
+    /// A parked tunneled 101 on the calling node (`peer_tunnel::splice`).
+    /// The id is meaningful only in the process that parked it, but it must
+    /// survive the isolate round trip, so it serializes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_node: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_addr: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_epoch: Option<u64>,
+    pub tunnel: Option<u64>,
 }
 
 /// Encode a host response for the JS side. A text body crosses as a
@@ -661,7 +938,11 @@ fn encode_http_response(mut response: HttpResponse, ws_target: bool) -> String {
         "headers": response.headers,
     });
     if ws_target {
-        obj["wsTarget"] = serde_json::json!(response.ws);
+        let target = match response.websocket.as_ref() {
+            Some(HttpResponseWebSocket::Cell(target)) => Some(target),
+            _ => None,
+        };
+        obj["wsTarget"] = serde_json::json!(target);
     }
     if let Some(stream) = response.stream.take() {
         let stream_id = NEXT_HTTP_STREAM_ID.fetch_add(1, Ordering::Relaxed);
@@ -676,13 +957,19 @@ fn encode_http_response(mut response: HttpResponse, ws_target: bool) -> String {
     obj.to_string()
 }
 
+pub enum HttpResponseWebSocket {
+    Cell(WsTarget),
+    Worker(websocket::WorkerWebSocket),
+}
+
 pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
     /// A response body forwarded without materializing it in memory.
     pub stream: Option<HttpChunkStream>,
     pub headers: Vec<(String, String)>,
-    pub ws: Option<WsTarget>,
+    /// The one WebSocket target that owns this response, if it is an upgrade.
+    pub websocket: Option<HttpResponseWebSocket>,
     /// The cell's committed-write position after the handler ran, for a local
     /// Durable Object request. The shell gates the response on durability when
     /// this advanced past the cell's last seen position. `None` for responses
@@ -690,18 +977,89 @@ pub struct HttpResponse {
     pub write_position: Option<u64>,
 }
 
+/// The encoding that the queue producer selected for one message body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueContentType {
+    Text,
+    Bytes,
+    Json,
+    V8,
+}
+
+impl QueueContentType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Bytes => "bytes",
+            Self::Json => "json",
+            Self::V8 => "v8",
+        }
+    }
+}
+
+/// One message handed from a queue cell to a consumer isolate.
+pub struct QueueMessage {
+    pub id: String,
+    pub timestamp_ms: i64,
+    pub body: Vec<u8>,
+    pub content_type: QueueContentType,
+    pub attempts: u16,
+}
+
+/// The queue state observed when a cell leases a batch.
+pub struct QueueMetrics {
+    pub backlog_count: f64,
+    pub backlog_bytes: f64,
+    pub oldest_message_timestamp_ms: Option<i64>,
+}
+
+/// One leased batch handed to the stateless isolate pool.
+pub struct QueueBatch {
+    pub queue: String,
+    pub messages: Vec<QueueMessage>,
+    pub metrics: QueueMetrics,
+}
+
+/// The batch-wide retry decision made by a queue handler.
+#[derive(Debug, Eq, PartialEq)]
+pub struct QueueRetryBatch {
+    pub retry: bool,
+    pub delay_seconds: Option<i32>,
+}
+
+/// An explicit retry decision made for one message.
+#[derive(Debug, Eq, PartialEq)]
+pub struct QueueRetryMessage {
+    pub msg_id: String,
+    pub delay_seconds: Option<i32>,
+}
+
+/// How the queue handler itself completed. Infrastructure failures still use
+/// the outer `Result`, so a handler exception can preserve earlier acks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueOutcome {
+    Ok,
+    Exception,
+}
+
+/// The handler outcome and the settlement instructions it made before return.
+#[derive(Debug, Eq, PartialEq)]
+pub struct QueueDispatchResult {
+    pub outcome: QueueOutcome,
+    pub error: Option<String>,
+    pub ack_all: bool,
+    pub retry_batch: QueueRetryBatch,
+    pub explicit_acks: Vec<String>,
+    pub retry_messages: Vec<QueueRetryMessage>,
+}
+
 /// Which alarm a dispatch runs, and who owns its bookkeeping.
 pub enum AlarmDispatch {
-    /// Claim whatever is due now, and record the outcome. Production only
-    /// ever asks for this.
+    /// Claim whatever is due now, and record the outcome.
     Due,
-    /// Claim whatever is armed, however far ahead its deadline. Test-only:
-    /// the corpus asserts on retry accounting without waiting out real
-    /// deadlines.
+    #[cfg(celld_internal_tests)]
     Armed,
-    /// The caller has already claimed it. Dispatch with this retry count and
-    /// leave the bookkeeping to them. Test-only, so the corpus can assert on
-    /// the claim and the handler separately.
+    #[cfg(celld_internal_tests)]
     Claimed(i64),
 }
 
@@ -719,7 +1077,7 @@ pub enum CellJob {
         name: Option<String>,
         url: String,
         method: String,
-        body: Vec<u8>,
+        body: RequestBody,
         headers: Vec<(String, String)>,
         reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
         /// Where this call sits in its caller's order for this cell, if it
@@ -765,7 +1123,39 @@ pub enum CellJob {
         /// same way now, in `InFlight::answer_settled`.
         reply: tokio::sync::oneshot::Sender<Result<(Option<i64>, Option<u64>)>>,
     },
+    #[cfg(celld_internal_tests)]
+    SyncErrorForTest {
+        scope: String,
+        gate: ArmGateRx,
+        socket_id: Option<u64>,
+        terminate: bool,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
 }
+
+/// A cell event that the runtime refuses before application code starts.
+///
+/// The type survives the Rust RPC path. Its display text also survives the V8
+/// promise boundary, so the public ingress can restore the HTTP overload
+/// contract after a Worker forwards the refusal.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct CellOverloaded;
+
+/// The V8 promise boundary preserves only an error string. Use an opaque
+/// marker so application text cannot accidentally restore an HTTP overload
+/// response, and keep the producer and ingress checks on one value.
+#[doc(hidden)]
+pub const CELL_OVERLOAD_ERROR_MARKER: &str =
+    "celld-internal-cell-overload-7ec38c64-12d7-4ddc-9e77-b63f9dc14130";
+
+impl std::fmt::Display for CellOverloaded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(CELL_OVERLOAD_ERROR_MARKER)
+    }
+}
+
+impl std::error::Error for CellOverloaded {}
 
 impl CellJob {
     /// The cell this event addresses, which is also the realm it runs in.
@@ -777,7 +1167,26 @@ impl CellJob {
             | CellJob::WsMessage { scope, .. }
             | CellJob::WsClosed { scope, .. }
             | CellJob::Alarm { scope, .. } => scope,
+            #[cfg(celld_internal_tests)]
+            CellJob::SyncErrorForTest { scope, .. } => scope,
         }
+    }
+
+    /// The client request that can cancel this event, when it is a fetch.
+    pub(crate) fn request_id(&self) -> Option<RequestId> {
+        match self {
+            CellJob::Fetch { request_id, .. } => *request_id,
+            _ => None,
+        }
+    }
+
+    /// Queue sends use native RPC, so the method is the narrow seam where the
+    /// owner can bound producer events without limiting an ordinary Durable
+    /// Object RPC or a Queue alarm and settlement.
+    pub(crate) fn is_queue_producer(&self) -> bool {
+        matches!(self, CellJob::Rpc { scope, method, .. }
+            if scope.split_once(':').is_some_and(|(class, _)|
+                class == crate::deploy::QUEUE_CLASS) && method == "__queueSend")
     }
 
     /// This event's place in its caller's order, taken out so the drive can
@@ -798,6 +1207,8 @@ impl CellJob {
             CellJob::WsMessage { reply, .. } => drop(reply.send(Err(error))),
             CellJob::WsClosed { reply, .. } => drop(reply.send(Err(error))),
             CellJob::Alarm { reply, .. } => drop(reply.send(Err(error))),
+            #[cfg(celld_internal_tests)]
+            CellJob::SyncErrorForTest { reply, .. } => drop(reply.send(Err(error))),
         }
     }
 }
@@ -811,28 +1222,11 @@ thread_local! {
     static DO_ID_KEYS: RefCell<HashMap<String, [u8; 32]>> = RefCell::new(HashMap::new());
 }
 
-mod websocket;
+#[doc(hidden)]
+pub mod websocket;
 pub(crate) use websocket::WebSocketService;
 pub use websocket::*;
-use websocket::{ws_capture_begin, ws_capture_take};
-
-/// Held for the duration of one cell event; pops on every exit path.
-pub struct EgressGateScope;
-
-impl Drop for EgressGateScope {
-    fn drop(&mut self) {
-        current_context().egress.lock().unwrap().pop();
-    }
-}
-
-pub fn egress_gate_enter(cell: &str, position: Option<u64>) -> EgressGateScope {
-    current_context()
-        .egress
-        .lock()
-        .unwrap()
-        .push((cell.to_string(), position.unwrap_or(0)));
-    EgressGateScope
-}
+use websocket::{ws_capture_begin, ws_capture_take, ws_close_request_sockets};
 
 /// What an outbound effect must trail before it leaves the process.
 ///
@@ -847,11 +1241,11 @@ enum EgressGate {
     /// its egress reveals nothing that can still be lost and leaves directly.
     NoCell,
     /// This event wrote through the position. The effect waits for that write.
-    Wrote(String, u64),
+    Wrote(String, celld_logic::Channel, u64),
     /// A read-only output. It reveals whatever the cell holds, so it trails
     /// the newest write barrier still open on the cell. Only the core knows
     /// which writes are outstanding, so this asks rather than guesses.
-    ReadOnly(String),
+    ReadOnly(String, celld_logic::Channel),
 }
 
 impl EgressGate {
@@ -861,29 +1255,39 @@ impl EgressGate {
     fn is_gated(&self) -> bool {
         !matches!(self, EgressGate::NoCell)
     }
+
+    /// The cell whose event raised the effect. The host derives this from the
+    /// active event, so JavaScript cannot claim another cell's authority.
+    fn cell_scope(&self) -> Option<&str> {
+        match self {
+            EgressGate::NoCell => None,
+            EgressGate::Wrote(cell, ..) | EgressGate::ReadOnly(cell, ..) => Some(cell),
+        }
+    }
 }
 
 /// Sample what the running handler's outbound effects must trail. Answers for
 /// every active cell event, including a read whose core lookup can settle
 /// immediately.
-fn egress_gate_request() -> EgressGate {
+fn egress_gate_request(channel: celld_logic::Channel) -> EgressGate {
     let context = current_context();
     let stack = context.egress.lock().unwrap();
     let Some((cell, before)) = stack.last() else {
         return EgressGate::NoCell;
     };
     match storage::write_position(cell).filter(|position| position > before) {
-        Some(position) => EgressGate::Wrote(cell.clone(), position),
+        Some(position) => EgressGate::Wrote(cell.clone(), channel, position),
         // A read-only output in a process that configured no output gate has
         // nothing to trail. Such a process cannot acknowledge a write either
-        // -- `op_gate_write` refuses one for want of the same channel -- so no
-        // committed-but-unproven write exists for a read to reveal. Answer as
+        // -- `await_egress_gate` fails a write closed for want of the same
+        // channel -- so no committed-but-unproven write exists for a read to
+        // reveal. Answer as
         // if no cell event were running, which keeps the effect on the direct,
         // synchronous path it has always taken; a WebSocket frame in
         // particular must not join a deferred queue whose flush needs a gate
         // to release it. A write still takes a ticket and still fails closed.
         None if GATE_TX.get().is_none() => EgressGate::NoCell,
-        None => EgressGate::ReadOnly(cell.clone()),
+        None => EgressGate::ReadOnly(cell.clone(), channel),
     }
 }
 
@@ -898,10 +1302,10 @@ fn egress_gate_request() -> EgressGate {
 /// cell has no barrier open, so an ordinary read pays one actor hop and no
 /// replica write.
 async fn await_egress_gate(gate: EgressGate) -> std::result::Result<(), String> {
-    let (cell, position) = match gate {
+    let (cell, channel, position) = match gate {
         EgressGate::NoCell => return Ok(()),
-        EgressGate::Wrote(cell, position) => (cell, Some(position)),
-        EgressGate::ReadOnly(cell) => (cell, None),
+        EgressGate::Wrote(cell, channel, position) => (cell, channel, Some(position)),
+        EgressGate::ReadOnly(cell, channel) => (cell, channel, None),
     };
     let (tx, receive) = tokio::sync::oneshot::channel();
     let sent = GATE_TX
@@ -909,6 +1313,7 @@ async fn await_egress_gate(gate: EgressGate) -> std::result::Result<(), String> 
         .map(|gate| {
             gate.send(GateReq {
                 scope: cell,
+                channel,
                 position,
                 reply: tx,
             })
@@ -971,7 +1376,7 @@ static GATE_WAITERS: OnceLock<Mutex<HashMap<String, Vec<GateWake>>>> = OnceLock:
 
 /// Events waiting for a cell's input gate to open, in arrival order.
 ///
-/// Step 6 deleted this queue, correctly at the time: an event the gate
+/// An earlier implementation deleted this queue because an event the gate
 /// refused stayed on the cell's job channel until a later delivery point
 /// took it, so the channel *was* the queue and a second one could disagree
 /// with it. Drives have no channel, so a refused event needs somewhere to
@@ -1094,10 +1499,50 @@ fn resolve_res(tc: &mut v8::PinScope, id: u64, res: Result<asyncrt::OpOut, Strin
 
 /// Move `bytes` into a `Uint8Array` without copying.
 fn bytes_value<'s>(scope: &mut v8::PinScope<'s, '_>, bytes: Vec<u8>) -> v8::Local<'s, v8::Value> {
+    #[cfg(celld_internal_tests)]
+    let input = bytes.as_ptr() as usize;
     let len = bytes.len();
     let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
     let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
+    #[cfg(celld_internal_tests)]
+    record_bytes_value_allocation_for_test(
+        input,
+        buffer
+            .get_backing_store()
+            .data()
+            .map(|data| data.as_ptr() as usize),
+    );
     v8::Uint8Array::new(scope, buffer, 0, len).unwrap().into()
+}
+
+#[cfg(celld_internal_tests)]
+static BYTES_VALUE_ALLOCATION_PROBE: Mutex<Option<(usize, Option<usize>)>> = Mutex::new(None);
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn capture_bytes_value_allocation_for_test(expected: *const u8) {
+    *BYTES_VALUE_ALLOCATION_PROBE.lock().unwrap() = Some((expected as usize, None));
+}
+
+#[cfg(celld_internal_tests)]
+fn record_bytes_value_allocation_for_test(input: usize, output: Option<usize>) {
+    let mut probe = BYTES_VALUE_ALLOCATION_PROBE.lock().unwrap();
+    if probe
+        .as_ref()
+        .is_some_and(|(expected, _)| *expected == input)
+    {
+        *probe = Some((input, output));
+    }
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn take_bytes_value_allocation_for_test() -> Option<usize> {
+    BYTES_VALUE_ALLOCATION_PROBE
+        .lock()
+        .unwrap()
+        .take()
+        .and_then(|(_, output)| output)
 }
 
 pub fn handler_budget() -> Duration {
@@ -1132,8 +1577,15 @@ pub fn abort_request(request_id: RequestId) {
     }
 }
 
-fn clear_request_cancellation(request_id: RequestId) {
+pub(crate) fn clear_request_cancellation(request_id: RequestId) {
     let _ = take_pending_abort(request_id);
+    cancelled_requests().lock().unwrap().remove(&request_id);
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn clear_request_cancellation_for_test(request_id: RequestId) {
+    clear_request_cancellation(request_id);
 }
 
 fn take_pending_abort(request_id: RequestId) -> bool {
@@ -1164,13 +1616,7 @@ fn resolved_promise<'s>(
 }
 
 fn abort_incoming_request(tc: &mut v8::PinScope, request_id: RequestId) -> Result<bool> {
-    let global = tc.get_current_context().global(tc);
-    let key = v8::String::new(tc, "__abortIncomingRequest").unwrap();
-    let function: v8::Local<v8::Function> = global
-        .get(tc, key.into())
-        .ok_or_else(|| anyhow!("no __abortIncomingRequest"))?
-        .try_into()
-        .map_err(|_| anyhow!("__abortIncomingRequest is not a function"))?;
+    let function = event_hook(tc, |hooks| &hooks.abort_incoming_request)?;
     let request_id = v8::String::new(tc, &request_id_string(request_id)).unwrap();
     let recv = v8::undefined(tc).into();
     let result = function
@@ -1208,17 +1654,26 @@ fn reject_reason(tc: &mut v8::PinScope, p: v8::Local<v8::Promise>) -> String {
 pub struct Engine;
 impl Engine {
     pub fn init() {
-        // No `v8::icu::set_common_data_78` call: the rusty_v8 152 prebuilt
-        // statically links the complete ICU data (full locale tables and
-        // regex property-of-strings, e.g. /\p{RGI_Emoji}/v — verified
-        // empirically), so overriding it with an embedded icudtl.dat only
-        // duplicated 10.8 MB in the binary. A test pins that coverage, so a
-        // future v8 bump that reduces the builtin data fails rather than
-        // silently narrowing it; the fix would be to re-embed rusty_v8's
-        // `third_party/icu/common/icudtl.dat`, 16-byte-aligned.
-        let platform = v8::new_default_platform(0, false).make_shared();
-        v8::V8::initialize_platform(platform);
-        v8::V8::initialize();
+        // V8 is process-global, so the guard belongs to the initializer. A
+        // guard at each caller allowed two callers to each initialize V8 once,
+        // which poisoned the global state when both ran.
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            #[cfg(celld_internal_tests)]
+            v8::V8::set_flags_from_string("--expose-gc");
+            // No `v8::icu::set_common_data_78` call: the rusty_v8 152 prebuilt
+            // statically links the complete ICU data (full locale tables and
+            // regex property-of-strings, e.g. /\p{RGI_Emoji}/v — verified
+            // empirically), so overriding it with an embedded icudtl.dat only
+            // duplicated 10.8 MB in the binary. The required coverage is
+            // explicit, so a future v8 bump that reduces the builtin data
+            // fails rather than silently narrowing it; the fix would be to
+            // re-embed rusty_v8's `third_party/icu/common/icudtl.dat`,
+            // 16-byte-aligned.
+            let platform = v8::new_default_platform(0, false).make_shared();
+            v8::V8::initialize_platform(platform);
+            v8::V8::initialize();
+        });
     }
 }
 
@@ -1242,6 +1697,9 @@ pub struct Compat {
     /// a binary message arrives as a `Blob`, per the WHATWG default. Without
     /// it celld keeps the historical `"arraybuffer"`.
     pub websocket_standard_binary_type: bool,
+    /// Queue bodies default to JSON on compatibility dates after 2024-03-18;
+    /// older deployments retain the V8 structured-clone default.
+    pub queue_json_messages: bool,
 }
 
 /// A non-main module the worker's main module may import, tagged by how the
@@ -1259,15 +1717,52 @@ pub enum ModuleSource {
     Wasm(bytes::Bytes),
 }
 
+/// A Workflow binding keeps the three names distinct across deployment
+/// loading, environment construction, and runtime class injection.
+pub struct WorkflowBinding {
+    pub environment: String,
+    pub workflow: String,
+    pub class: String,
+}
+
+/// One Queue producer binding in a Worker environment.
+#[derive(Clone)]
+pub struct QueueBinding {
+    pub environment: String,
+    pub queue: String,
+    pub delivery_delay: u32,
+}
+
+/// One queue's push consumer after the owning script has been resolved.
+#[derive(Clone)]
+pub struct QueueConsumerRegistration {
+    pub script: String,
+    pub config: crate::protocol::QueueConsumerConfig,
+}
+
 pub struct WorkerConfig {
     src: String,
     pub script_name: String,
     do_classes: Vec<String>,
     bindings: Vec<(String, String)>,
-    r2_bindings: Vec<String>,
+    /// `r2_buckets`: (environment name, bucket name). The bucket name is
+    /// the key space the binding owns inside the fleet bucket; see [[r2]].
+    r2_bindings: Vec<(String, String)>,
     /// `d1_databases`: (environment name, stable database identity). The
     /// identity addresses the cell that holds the database; see [[d1]].
     d1_bindings: Vec<(String, String)>,
+    /// `kv_namespaces`: (environment name, namespace identity). The identity is
+    /// the config's `id` verbatim, and it addresses the namespace's cells; see
+    /// [[kv]].
+    kv_bindings: Vec<(String, String)>,
+    queue_bindings: Vec<QueueBinding>,
+    queue_consumers: Vec<QueueConsumerRegistration>,
+    /// This script declared a consumer in its own manifest. The deployment-
+    /// wide catalog later replaces `queue_consumers` in every isolate, so the
+    /// catalog cannot answer whether this particular default export can omit
+    /// `fetch` and provide only `queue`.
+    declares_queue_consumer: bool,
+    workflow_bindings: Vec<WorkflowBinding>,
     ai_binding: Option<String>,
     vars: Vec<(String, String)>,
     node: String,
@@ -1289,6 +1784,35 @@ pub struct WorkerConfig {
     /// `triggers.crons` from the deployment. Empty for a loaded worker and for
     /// any script without cron triggers.
     pub crons: Vec<String>,
+    /// The application generation this configuration belongs to. Every
+    /// isolate built from it carries the value as a slot, so its host calls
+    /// resolve against the deployment graph it was built with.
+    pub generation: crate::generation::GenerationId,
+    /// The external (`node:*`/`cloudflare:*`) imports of `src`.
+    ///
+    /// The scan walks the whole bundle, which an esbuild artifact makes
+    /// megabytes, and its answer depends only on `src` — a field nothing
+    /// mutates after construction. It used to run inside `load_config`,
+    /// so a deployment paid it again on every cell wake and on every
+    /// stateless pool thread. One `Arc<WorkerConfig>` backs all of those
+    /// isolates, so scanning here pays it once instead.
+    main_imports: modules::ExternalImports,
+    /// The same scan for each `ModuleSource::EsModule` sibling, in the order
+    /// `es_module_sources` yields them. Read through
+    /// [`WorkerConfig::es_modules`], which hands a module and its scan out
+    /// together so no caller can pair a module with another module's scan.
+    module_imports: Vec<modules::ExternalImports>,
+}
+
+/// The `ModuleSource::EsModule` siblings of a worker, as (name, source).
+///
+/// The single definition of that order: `WorkerConfig::new` scans in it and
+/// `WorkerConfig::es_modules` zips against it, so the two cannot disagree.
+fn es_module_sources(modules: &[(String, ModuleSource)]) -> impl Iterator<Item = (&str, &str)> {
+    modules.iter().filter_map(|(name, source)| match source {
+        ModuleSource::EsModule(source) => Some((name.as_str(), source.as_str())),
+        _ => None,
+    })
 }
 
 pub struct WorkerConfigOptions {
@@ -1296,8 +1820,12 @@ pub struct WorkerConfigOptions {
     pub script_name: String,
     pub do_classes: Vec<String>,
     pub bindings: Vec<(String, String)>,
-    pub r2_bindings: Vec<String>,
+    pub r2_bindings: Vec<(String, String)>,
     pub d1_bindings: Vec<(String, String)>,
+    pub kv_bindings: Vec<(String, String)>,
+    pub queue_bindings: Vec<QueueBinding>,
+    pub queue_consumers: Vec<crate::protocol::QueueConsumerConfig>,
+    pub workflow_bindings: Vec<WorkflowBinding>,
     pub ai_binding: Option<String>,
     pub vars: Vec<(String, String)>,
     pub node: String,
@@ -1314,12 +1842,28 @@ impl WorkerConfig {
             bindings,
             r2_bindings,
             d1_bindings,
+            kv_bindings,
+            queue_bindings,
+            queue_consumers,
+            workflow_bindings,
             ai_binding,
             vars,
             node,
             modules,
             compat,
         } = options;
+        let main_imports = modules::scan_external_imports(&src);
+        let module_imports = es_module_sources(&modules)
+            .map(|(_name, source)| modules::scan_external_imports(source))
+            .collect();
+        let declares_queue_consumer = !queue_consumers.is_empty();
+        let queue_consumers = queue_consumers
+            .into_iter()
+            .map(|config| QueueConsumerRegistration {
+                script: script_name.clone(),
+                config,
+            })
+            .collect();
         Self {
             src,
             script_name,
@@ -1327,6 +1871,11 @@ impl WorkerConfig {
             bindings,
             r2_bindings,
             d1_bindings,
+            kv_bindings,
+            queue_bindings,
+            queue_consumers,
+            declares_queue_consumer,
+            workflow_bindings,
             ai_binding,
             vars,
             node,
@@ -1338,7 +1887,38 @@ impl WorkerConfig {
             egress: EgressPolicy::Allow,
             loader_env: None,
             crons: Vec::new(),
+            generation: 0,
+            main_imports,
+            module_imports,
         }
+    }
+
+    /// Stamp this Worker with the application generation it serves.
+    pub fn with_generation(mut self, generation: crate::generation::GenerationId) -> Self {
+        self.generation = generation;
+        self
+    }
+
+    pub fn with_queue_consumers(mut self, consumers: Vec<QueueConsumerRegistration>) -> Self {
+        self.queue_consumers = consumers;
+        self
+    }
+
+    /// Every `ModuleSource::EsModule` sibling with its name, its source and
+    /// its scanned external imports.
+    fn es_modules(&self) -> impl Iterator<Item = (&str, &str, &modules::ExternalImports)> {
+        // `zip` would truncate silently if the two ever disagreed, and a
+        // truncated scan means a sibling links against a stub missing its
+        // names. Both are filled from `es_module_sources` in `new`, so a
+        // disagreement is a bug in a future mutator, not a reachable state.
+        debug_assert_eq!(
+            es_module_sources(&self.modules).count(),
+            self.module_imports.len(),
+            "an ES sibling lost its scanned imports",
+        );
+        es_module_sources(&self.modules)
+            .zip(&self.module_imports)
+            .map(|((name, source), imports)| (name, source, imports))
     }
 
     /// Give this Worker the deployment's cron trigger expressions.
@@ -1377,6 +1957,16 @@ impl WorkerConfig {
     }
 }
 
+/// The storage authority installed when a cell enters an isolate.
+///
+/// The path and epoch form one value because opening either one without the
+/// other would let later asynchronous work use the wrong ownership epoch.
+#[doc(hidden)]
+pub struct CellStorage<'a> {
+    pub path: &'a str,
+    pub epoch: u64,
+}
+
 pub struct Worker {
     inner: Option<WorkerIsolate>,
 }
@@ -1402,6 +1992,10 @@ pub struct WorkerIsolate {
     realm: Realm,
     original_heap_limit: usize,
     compat: Compat,
+    /// Identity used to reclaim every dynamic Worker this isolate created.
+    /// Named Worker Loader identity lives in this isolate's JavaScript heap,
+    /// so no child can remain charged to the registry after its owner is gone.
+    loader_owner: LoaderOwner,
     /// The storage of the cells this isolate hosts.
     ///
     /// It lives here, and not in a thread-local, because a driven cell's
@@ -1541,10 +2135,9 @@ struct HeapLimitState {
     /// the current one.
     limit: usize,
     last_gc_nudge: Mutex<Option<Instant>>,
-    /// Test-only: a real heap over the admission share is unreachable from a
-    /// test, and the condemnation flag cannot stand in for it because
-    /// recovery clears that one at the next turn.
-    #[cfg(all(test, celld_internal_tests))]
+    /// An explicit admission refusal cannot use the condemnation flag because
+    /// recovery clears that flag at the next turn.
+    #[cfg(celld_internal_tests)]
     forced_admission_refusal: AtomicBool,
 }
 
@@ -1567,12 +2160,12 @@ impl HeapLimitState {
     }
 }
 
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 fn admission_refusal_forced(state: &HeapLimitState) -> bool {
     state.forced_admission_refusal.load(Ordering::Relaxed)
 }
 
-#[cfg(not(all(test, celld_internal_tests)))]
+#[cfg(not(celld_internal_tests))]
 fn admission_refusal_forced(_state: &HeapLimitState) -> bool {
     false
 }
@@ -1596,7 +2189,68 @@ struct ActorRuntimeState {
     promises: std::sync::Mutex<PromiseMap>,
     termination: std::sync::Mutex<Option<ExecutionTermination>>,
     pending_puts: std::sync::Mutex<PendingPuts>,
+    io_contexts: std::sync::Mutex<HashMap<u64, Weak<IoContext>>>,
+    next_io_context_id: AtomicU64,
     egress: EgressPolicy,
+    event_hooks: OnceLock<EventHooks>,
+}
+
+/// The harness functions the host calls on the boundary of every cell event.
+///
+/// `harness.js` installs `__beginEvent`, `__endEvent` and
+/// `__abortIncomingRequest` on the global once per isolate and never replaces
+/// them. Reading each one back by name per event cost a fresh `v8::String`
+/// plus a lookup on the global object for a result that cannot change;
+/// holding the functions removes the string and the lookup together.
+///
+/// The three are resolved together on purpose. A partial resolution would
+/// leave one hook still reached by name, so `install_harness` builds all three
+/// or the isolate fails to load, and no caller has to remember which of them
+/// is cached.
+///
+/// A `v8::Global` is only valid in the isolate that created it, which is why
+/// this hangs off `ActorRuntimeState` — an isolate slot — and not off a
+/// process-wide `static`. `ModuleRegistry` documents the same constraint.
+struct EventHooks {
+    begin_event: v8::Global<v8::Function>,
+    end_event: v8::Global<v8::Function>,
+    abort_incoming_request: v8::Global<v8::Function>,
+}
+
+/// One cached hook, opened into `scope`.
+///
+/// `pick` names the hook rather than a getter per hook, so the three call
+/// sites stay one line each.
+fn event_hook<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    pick: fn(&EventHooks) -> &v8::Global<v8::Function>,
+) -> Result<v8::Local<'s, v8::Function>> {
+    let state = actor_runtime_state(scope);
+    let hooks = state
+        .event_hooks
+        .get()
+        .ok_or_else(|| anyhow!("event hooks are not installed"))?;
+    Ok(v8::Local::new(scope, pick(hooks)))
+}
+
+impl ActorRuntimeState {
+    fn allocate_io_context_id(&self) -> u64 {
+        self.next_io_context_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .unwrap_or_else(|_| panic!("the isolate exhausted its IoContext ids"))
+            + 1
+    }
+
+    fn io_context(&self, id: u64) -> Option<Arc<IoContext>> {
+        let mut contexts = self.io_contexts.lock().unwrap();
+        let context = contexts.get(&id)?.upgrade();
+        if context.is_none() {
+            contexts.remove(&id);
+        }
+        context
+    }
 }
 
 struct ExecutionTermination {
@@ -1643,7 +2297,7 @@ fn compile_fn<'s>(
 fn cell_registry_has(scope: &mut v8::PinScope, registry: &str, name: &str) -> Result<bool> {
     let context = scope.get_current_context();
     let global = context.global(scope);
-    let cell_key = v8::String::new(scope, "__cell").unwrap();
+    let cell_key = static_key(scope, &v8_strings::CELL);
     let registry_key = v8::String::new(scope, registry).unwrap();
     let registry_obj = global
         .get(scope, cell_key.into())
@@ -1718,9 +2372,17 @@ fn v8_heap_limit_bytes() -> usize {
 
 impl Drop for WorkerIsolate {
     fn drop(&mut self) {
+        // Detach children while their IDs are still attributable to this
+        // parent, but do not drop their V8 isolates while this one is entered.
+        // In-flight child calls hold their own receiver clones and finish
+        // normally; this removes only the registry's ownership reference.
+        let loaded_children = take_loader_owner(self.loader_owner);
         let limit = self.original_heap_limit;
-        let (mut locker, _cells) = self.lock();
-        locker.remove_near_heap_limit_callback(near_heap_limit, limit);
+        {
+            let (mut locker, _cells) = self.lock();
+            locker.remove_near_heap_limit_callback(near_heap_limit, limit);
+        }
+        drop(loaded_children);
     }
 }
 
@@ -1738,6 +2400,7 @@ impl Drop for WorkerIsolate {
 pub enum Answer {
     Fetch(tokio::sync::oneshot::Sender<Result<HttpResponse>>),
     Rpc(tokio::sync::oneshot::Sender<Result<Vec<u8>>>),
+    Queue(tokio::sync::oneshot::Sender<Result<QueueDispatchResult>>),
     /// A DO method call, which answers a value rather than a response.
     CellRpc(tokio::sync::oneshot::Sender<Result<RpcOutcome>>),
     /// A `webSocketMessage`, which answers the frames the output gate held
@@ -1753,15 +2416,241 @@ pub enum Answer {
 impl Answer {
     /// Send an error, whichever shape the caller is waiting for.
     fn fail(self, error: anyhow::Error) {
+        let _ = self.fail_with_arm_gates(error, Vec::new());
+    }
+
+    fn fail_with_arm_gates(
+        self,
+        error: anyhow::Error,
+        gates: Vec<ArmGateRx>,
+    ) -> Option<GatedReplyRx> {
         match self {
-            Answer::Fetch(reply) => drop(reply.send(Err(error))),
-            Answer::Rpc(reply) => drop(reply.send(Err(error))),
-            Answer::CellRpc(reply) => drop(reply.send(Err(error))),
-            Answer::WsMessage(reply) => drop(reply.send(Err(error))),
-            Answer::Ack(reply) => drop(reply.send(Err(error))),
-            Answer::Alarm(reply) => drop(reply.send(Err(error))),
+            Answer::Fetch(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
+            Answer::Rpc(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
+            Answer::Queue(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
+            Answer::CellRpc(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
+            Answer::WsMessage(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
+            Answer::Ack(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
+            Answer::Alarm(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
         }
     }
+}
+
+async fn await_arm_gates(gates: Vec<ArmGateRx>) -> Result<(), String> {
+    let mut first_failure = None;
+    for gate in gates {
+        let failure = match gate.await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(_) => Some("wake-entry gate task dropped".into()),
+        };
+        if first_failure.is_none() {
+            first_failure = failure;
+        }
+    }
+    match first_failure {
+        Some(failure) => Err(failure),
+        None => Ok(()),
+    }
+}
+
+fn send_answer_after_arm_gates<T: Send + 'static>(
+    mut reply: tokio::sync::oneshot::Sender<Result<T>>,
+    value: Result<T>,
+    gates: Vec<ArmGateRx>,
+) -> Option<GatedReplyRx> {
+    if gates.is_empty() {
+        drop(reply.send(value));
+        return None;
+    }
+    let (completed, completion) = tokio::sync::oneshot::channel();
+    let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
+    #[cfg(celld_internal_tests)]
+    let drop_task = asyncrt::services()
+        .wake_entry()
+        .drop_next_gated_reply_task
+        .swap(false, Ordering::AcqRel);
+    asyncrt::spawn(async move {
+        #[cfg(celld_internal_tests)]
+        if drop_task {
+            return;
+        }
+        enum GateWait {
+            Completed(Result<(), String>),
+            CallerClosed,
+            Cancelled,
+            DriverDropped,
+        }
+        let gate_wait = {
+            let mut waiting = Box::pin(await_arm_gates(gates));
+            let result = asyncrt::select_biased! {
+                "a completed gate aggregate wins a tie with caller cancellation";
+                result = &mut waiting => GateWait::Completed(result),
+                cancellation = async {
+                    asyncrt::select_biased! {
+                        "a closed caller wins a tie with an explicit cancellation signal";
+                        _ = reply.closed() => GateWait::CallerClosed,
+                        cancelled = &mut cancelled => match cancelled {
+                            Ok(()) => GateWait::Cancelled,
+                            Err(_) => GateWait::DriverDropped,
+                        },
+                    }
+                } => cancellation,
+            };
+            // On either cancellation path this drops every unobserved gate
+            // receiver before the completion becomes visible to the driver.
+            drop(waiting);
+            result
+        };
+        let value = match gate_wait {
+            GateWait::Completed(gate_result) => match (value, gate_result) {
+                (value, Ok(())) => value,
+                (Ok(_), Err(error)) => Err(anyhow!("wake-entry gate: {error}")),
+                (Err(primary), Err(error)) => {
+                    tracing::error!(
+                        event = "wake_entry_gate_failed_after_handler_error",
+                        handler_error = %primary,
+                        gate_error = %error,
+                    );
+                    Err(primary.context(format!("wake-entry gate also failed: {error}")))
+                }
+            },
+            GateWait::CallerClosed => {
+                let failure = value
+                    .as_ref()
+                    .err()
+                    .map(|error| crate::telemetry::cap_error(format!("{error:#}")));
+                drop(value);
+                let _ = completed.send(GatedReplyCompletion::CallerClosed { failure });
+                return;
+            }
+            // The driver observed a request cancellation after the handler
+            // fixed its reply. Do not enter JavaScript again: the handler is
+            // already over. A successful answer becomes a disconnect error,
+            // while an existing handler error remains the primary failure.
+            GateWait::Cancelled => match value {
+                Ok(_) => Err(anyhow!("The client has disconnected")),
+                Err(primary) => Err(primary),
+            },
+            // Dropping the driver drops both halves of its completion handle.
+            // Release every detached resource, but do not let an abandoned
+            // driver manufacture a reply that nothing owns any longer.
+            GateWait::DriverDropped => {
+                drop(value);
+                return;
+            }
+        };
+        let failure = value
+            .as_ref()
+            .err()
+            .map(|error| crate::telemetry::cap_error(format!("{error:#}")));
+        let completion = match reply.send(value) {
+            Ok(()) => GatedReplyCompletion::Sent { failure },
+            Err(value) => {
+                drop(value);
+                GatedReplyCompletion::CallerClosed { failure }
+            }
+        };
+        let _ = completed.send(completion);
+    })
+    .detach();
+    Some(GatedReplyRx {
+        completion,
+        cancel: Some(cancel),
+    })
+}
+
+pub(crate) enum GatedReplyCompletion {
+    /// The final reply value is now visible to the receiver.
+    Sent { failure: Option<String> },
+    /// The receiver disappeared, so no reply remains to deliver.
+    CallerClosed { failure: Option<String> },
+}
+
+pub(crate) struct GatedReplyRx {
+    completion: tokio::sync::oneshot::Receiver<GatedReplyCompletion>,
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl GatedReplyRx {
+    /// Stop waiting on event gates after a request cancellation. The detached
+    /// task owns the reply value and gate receivers, so it performs their
+    /// ordered cleanup and reports completion back to the driver.
+    pub(crate) fn cancel(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
+impl std::future::Future for GatedReplyRx {
+    type Output = Result<GatedReplyCompletion, tokio::sync::oneshot::error::RecvError>;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().completion).poll(context)
+    }
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub async fn await_arm_gates_for_test(
+    gates: Vec<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+) -> Result<(), String> {
+    await_arm_gates(gates).await
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub enum GatedReplyCompletionForTest {
+    Sent { failure: Option<String> },
+    CallerClosed { failure: Option<String> },
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub struct GatedReplyForTest(GatedReplyRx);
+
+#[cfg(celld_internal_tests)]
+impl std::future::Future for GatedReplyForTest {
+    type Output = Result<GatedReplyCompletionForTest, tokio::sync::oneshot::error::RecvError>;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().0).poll(context).map(|result| {
+            result.map(|completion| match completion {
+                GatedReplyCompletion::Sent { failure } => {
+                    GatedReplyCompletionForTest::Sent { failure }
+                }
+                GatedReplyCompletion::CallerClosed { failure } => {
+                    GatedReplyCompletionForTest::CallerClosed { failure }
+                }
+            })
+        })
+    }
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn send_answer_after_arm_gates_for_test<T: Send + 'static>(
+    reply: tokio::sync::oneshot::Sender<Result<T>>,
+    value: Result<T>,
+    gates: Vec<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+) -> Option<GatedReplyForTest> {
+    send_answer_after_arm_gates(reply, value, gates).map(GatedReplyForTest)
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn drop_next_gated_reply_task_for_test() {
+    asyncrt::services()
+        .wake_entry()
+        .drop_next_gated_reply_task
+        .store(true, Ordering::Release);
 }
 
 pub struct InFlight {
@@ -1784,6 +2673,7 @@ pub struct InFlight {
     request_id: Option<RequestId>,
     active_request_id: Option<RequestId>,
     reply: Option<Answer>,
+    gated_reply: Option<GatedReplyRx>,
     /// `waitUntil` work still running after the response was sent. The
     /// request stays in flight until it settles, as the single-request loop
     /// keeps driving it.
@@ -1798,9 +2688,9 @@ pub struct InFlight {
     /// is off or the trace was not sampled. Installed into the isolate's
     /// CPED slot for every turn, so promise continuations carry it.
     trace: Option<crate::telemetry::TraceIds>,
-    /// Why a handler that did not finish failed, captured for the span's
-    /// `error` so a query sees the reason, not only that it failed. Set
-    /// only when a trace is sampled.
+    /// Why the event failed, captured for the span's `error` so a query sees
+    /// the reason, not only that it failed. This also records an output-gate
+    /// failure after a successful handler.
     failure: Option<String>,
     /// The isolate this entry's ops belong to, so `abandon` can drop their
     /// resolvers without a scope to reach the isolate through.
@@ -1831,37 +2721,52 @@ impl InFlight {
             if self.trace.is_some() {
                 self.failure = Some(crate::telemetry::cap_error(error.to_string()));
             }
-            reply.fail(anyhow!(error));
+            self.gated_reply =
+                reply.fail_with_arm_gates(anyhow!(error), self.context.take_arm_gates());
             return;
         }
-        self.background = match reply {
+        let (background, gated_reply) = match reply {
             Answer::Fetch(reply) => {
                 let read = read_response(tc, value).map(|mut response| {
                     response.write_position = self.write_delta();
                     response
                 });
-                send_and_end(tc, reply, read)
+                send_and_end(tc, &self.context, reply, read)
             }
             Answer::Rpc(reply) => {
                 let read =
                     view_bytes(value).ok_or_else(|| anyhow!("entrypoint RPC answered non-bytes"));
-                send_and_end(tc, reply, read)
+                send_and_end(tc, &self.context, reply, read)
+            }
+            Answer::Queue(reply) => {
+                let read = read_queue_result(tc, value);
+                if let Ok(result) = &read {
+                    if result.outcome == QueueOutcome::Exception && self.trace.is_some() {
+                        self.failure = Some(crate::telemetry::cap_error(
+                            result
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "queue handler rejected".to_string()),
+                        ));
+                    }
+                }
+                send_and_end(tc, &self.context, reply, read)
             }
             Answer::CellRpc(reply) => {
                 let outcome = RpcOutcome {
                     data: rpc_data_ret(tc, value),
                     write_position: self.write_delta(),
                 };
-                send_and_end(tc, reply, Ok(outcome))
+                send_and_end(tc, &self.context, reply, Ok(outcome))
             }
             Answer::WsMessage(reply) => {
                 let dispatch = WsDispatch {
                     frames: ws_capture_take(),
                     write_position: self.write_delta(),
                 };
-                send_and_end(tc, reply, Ok(dispatch))
+                send_and_end(tc, &self.context, reply, Ok(dispatch))
             }
-            Answer::Ack(reply) => send_and_end(tc, reply, Ok(())),
+            Answer::Ack(reply) => send_and_end(tc, &self.context, reply, Ok(())),
             Answer::Alarm(reply) => {
                 // The handler ran and returned, so close the claim as a
                 // success. This is the only path that does: every other
@@ -1880,9 +2785,11 @@ impl InFlight {
                     .as_deref()
                     .map(storage::get_alarm)
                     .unwrap_or(None);
-                send_and_end(tc, reply, Ok((alarm, self.write_delta())))
+                send_and_end(tc, &self.context, reply, Ok((alarm, self.write_delta())))
             }
         };
+        self.background = background;
+        self.gated_reply = gated_reply;
     }
 
     /// The write position to gate this answer on: `None` unless the handler
@@ -1896,17 +2803,20 @@ impl InFlight {
 
     /// Fail whichever shape is waiting, without knowing which.
     ///
-    /// An alarm that fails here failed for a reason that is not the
-    /// handler's — a budget overrun, a disconnect — so it does not count
-    /// against the retry limit. A handler that threw is recorded by
-    /// `settle`, which knows that it did, before it reaches this.
+    /// This must not touch cell storage: a budget overrun and a stuck
+    /// handler are found on the driving task, between turns, where the
+    /// storage thread-local is null — settling the alarm claim here
+    /// panicked the node (denoland/celld#170). The claim stays put, and
+    /// the drive loop's `owes_alarm` turn records it as not counting
+    /// against the retry limit, because a failure here is not the
+    /// handler's. A handler that threw is recorded by `settle`, which
+    /// knows that it did, before it reaches this.
     fn fail(&mut self, error: anyhow::Error) {
         if let Some(reply) = self.reply.take() {
-            self.settle_alarm(false, false);
             if self.trace.is_some() {
                 self.failure = Some(crate::telemetry::cap_error(error.to_string()));
             }
-            reply.fail(error);
+            self.gated_reply = reply.fail_with_arm_gates(error, self.context.take_arm_gates());
         }
     }
 
@@ -1935,10 +2845,86 @@ impl InFlight {
 
     /// Done when the response has been sent and nothing is left running.
     pub fn finished(&self) -> bool {
-        self.reply.is_none() && self.background.is_none() && self.ops.is_empty()
+        self.retired() && self.ops.is_empty()
     }
 
-    /// Why the handler failed, when a sampled trace captured it.
+    /// The gate waiter that still owns this event's reply, if any.
+    pub(crate) fn gated_reply(&mut self) -> Option<&mut GatedReplyRx> {
+        self.gated_reply.as_mut()
+    }
+
+    #[cfg(celld_internal_tests)]
+    #[doc(hidden)]
+    pub fn has_gated_reply_for_test(&self) -> bool {
+        self.gated_reply.is_some()
+    }
+
+    #[cfg(celld_internal_tests)]
+    #[doc(hidden)]
+    pub async fn finish_gated_reply_for_test(&mut self) -> bool {
+        let Some(gated_reply) = self.gated_reply.as_mut() else {
+            return false;
+        };
+        let completion = gated_reply.await;
+        self.finish_gated_reply(completion);
+        true
+    }
+
+    /// Ask the detached gate owner to release every event gate and finish the
+    /// reply edge. The driver waits for its completion before it retires the
+    /// event, so response resources cannot outlive that cleanup.
+    pub(crate) fn cancel_gated_reply(&mut self) {
+        if let Some(gated_reply) = &mut self.gated_reply {
+            gated_reply.cancel();
+        }
+    }
+
+    /// Retire a gate waiter after it sent the reply or observed caller-close.
+    ///
+    /// This method also closes request sockets when the completion makes the
+    /// entry retire. `finish_turn` cannot do that earlier because the reply
+    /// value can still own response resources while the gate is pending.
+    pub(crate) fn finish_gated_reply(
+        &mut self,
+        completion: Result<GatedReplyCompletion, tokio::sync::oneshot::error::RecvError>,
+    ) {
+        self.gated_reply = None;
+        if self.trace.is_some() {
+            match completion {
+                Ok(GatedReplyCompletion::Sent {
+                    failure: Some(failure),
+                })
+                | Ok(GatedReplyCompletion::CallerClosed {
+                    failure: Some(failure),
+                }) => self.failure = Some(failure),
+                Ok(GatedReplyCompletion::Sent { failure: None }) => {}
+                Ok(GatedReplyCompletion::CallerClosed { failure: None }) => {
+                    if self.failure.is_none() {
+                        self.failure = Some("The client has disconnected".to_string());
+                    }
+                }
+                Err(_) => {
+                    if self.failure.is_none() {
+                        self.failure = Some("wake-entry reply gate task dropped".to_string());
+                    }
+                }
+            }
+        }
+        if self.retired() {
+            self.context.close_sockets();
+        }
+    }
+
+    /// The request has answered and its `waitUntil` work has settled.
+    ///
+    /// An isolate-polled WebSocket can still own an op after this point. The
+    /// request closes that socket when it retires, so the op can finish and
+    /// the request can leave the drive loop.
+    fn retired(&self) -> bool {
+        self.reply.is_none() && self.gated_reply.is_none() && self.background.is_none()
+    }
+
+    /// Why the event failed, when a sampled trace captured it.
     pub fn failure(&self) -> Option<&str> {
         self.failure.as_deref()
     }
@@ -1970,7 +2956,15 @@ impl InFlight {
 
     /// Has the client been answered? `waitUntil` work can still be running.
     pub fn answered(&self) -> bool {
-        self.reply.is_none()
+        self.reply.is_none() && self.gated_reply.is_none()
+    }
+
+    /// Whether a native operation can still resume JavaScript for this event.
+    ///
+    /// A detached reply gate is host work. It cannot keep handler operations
+    /// alive after the handler ends, but explicit `waitUntil` work can.
+    pub(crate) fn keeps_native_ops(&self) -> bool {
+        self.reply.is_some() || self.background.is_some()
     }
 
     /// Whether a client can still disconnect from this request. A request
@@ -2001,32 +2995,51 @@ impl InFlight {
     }
 }
 
-/// The CPED slot carries two riders in one immutable record: the
+/// The CPED slot carries three riders in one immutable record: the
 /// harness's async-context frame (`__als_get`/`__als_set` — ALS and
-/// request-context confinement) and telemetry's trace context. Each
-/// write builds a fresh two-element array preserving the other rider,
-/// so V8's per-reaction snapshots restore both atomically and neither
-/// feature can stomp the other — the collision the trace-join test
-/// caught when telemetry first took the whole slot.
+/// request-context confinement), telemetry's trace context, and the native
+/// `IoContext` token. Each write builds a fresh three-element array preserving
+/// the other riders, so V8's per-reaction snapshots restore them atomically.
+/// Telemetry once took the whole slot and exposed this collision.
 ///
-/// The empty state stays *empty*: when both riders are absent the slot
-/// is undefined, which V8 fast-paths, and "off is structural" holds.
+/// When all three riders are absent, the slot stays undefined and V8 can use
+/// its empty-state fast path. Stateless code can retain that path. A cell
+/// event intentionally installs the native token even when telemetry is off.
 fn cped_parts<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-) -> (v8::Local<'s, v8::Value>, v8::Local<'s, v8::Value>) {
+) -> (
+    v8::Local<'s, v8::Value>,
+    v8::Local<'s, v8::Value>,
+    v8::Local<'s, v8::Value>,
+) {
     let data = scope.get_continuation_preserved_embedder_data();
     if let Ok(record) = v8::Local::<v8::Array>::try_from(data) {
+        if record.length() == 3 {
+            let undefined = v8::undefined(scope).into();
+            return (
+                record.get_index(scope, 0).unwrap_or(undefined),
+                record.get_index(scope, 1).unwrap_or(undefined),
+                record.get_index(scope, 2).unwrap_or(undefined),
+            );
+        }
+        // Accept snapshots created by the former two-rider layout. They can
+        // still be live while an isolate upgrades across this code boundary.
         if record.length() == 2 {
             let undefined = v8::undefined(scope).into();
             return (
                 record.get_index(scope, 0).unwrap_or(undefined),
                 record.get_index(scope, 1).unwrap_or(undefined),
+                undefined,
             );
         }
     }
     // Any non-record value is a bare frame from before this scheme, or
     // the empty slot.
-    (data, v8::undefined(scope).into())
+    (
+        data,
+        v8::undefined(scope).into(),
+        v8::undefined(scope).into(),
+    )
 }
 
 fn cped_frame<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Value> {
@@ -2037,15 +3050,25 @@ fn cped_trace<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Value> 
     cped_parts(scope).1
 }
 
-fn set_cped(scope: &mut v8::PinScope, frame: v8::Local<v8::Value>, trace: v8::Local<v8::Value>) {
-    if frame.is_undefined() && trace.is_undefined() {
+fn cped_io_context<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Value> {
+    cped_parts(scope).2
+}
+
+fn set_cped(
+    scope: &mut v8::PinScope,
+    frame: v8::Local<v8::Value>,
+    trace: v8::Local<v8::Value>,
+    io_context: v8::Local<v8::Value>,
+) {
+    if frame.is_undefined() && trace.is_undefined() && io_context.is_undefined() {
         let undefined = v8::undefined(scope).into();
         scope.set_continuation_preserved_embedder_data(undefined);
         return;
     }
-    let record = v8::Array::new(scope, 2);
+    let record = v8::Array::new(scope, 3);
     record.set_index(scope, 0, frame);
     record.set_index(scope, 1, trace);
+    record.set_index(scope, 2, io_context);
     scope.set_continuation_preserved_embedder_data(record.into());
 }
 
@@ -2060,12 +3083,11 @@ fn set_cped(scope: &mut v8::PinScope, frame: v8::Local<v8::Value>, trace: v8::Lo
 /// ArrayBuffer, fresh per turn — cheap at sampled rates, and nothing
 /// outlives V8's own snapshots.
 ///
-/// Returns the previous slot value *only when something was installed*;
-/// the caller restores it before releasing the isolate. An untraced
-/// turn touches CPED not at all — every traced turn restores what it
-/// found, so the ambient slot between turns is always empty, and "off
-/// is structural" stays true at the V8 boundary too (the -13% the
-/// always-read version cost at 1% sampling was measured, not guessed).
+/// Returns the previous slot value *only when a trace was installed*; the
+/// caller restores it before releasing the isolate. An untraced turn does not
+/// install the trace rider. A cell event separately installs its `IoContext`
+/// token, so V8 can attribute a continuation that runs during another event's
+/// checkpoint.
 fn install_trace<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     trace: Option<&crate::telemetry::TraceIds>,
@@ -2082,7 +3104,8 @@ fn install_trace<'s>(
         std::ptr::copy_nonoverlapping(ids.span_id.as_ptr(), bytes.add(16), 8);
     }
     let frame = cped_frame(scope);
-    set_cped(scope, frame, buffer.into());
+    let io_context = cped_io_context(scope);
+    set_cped(scope, frame, buffer.into(), io_context);
     Some(previous)
 }
 
@@ -2090,6 +3113,36 @@ fn restore_trace(scope: &mut v8::PinScope, previous: Option<v8::Local<v8::Value>
     if let Some(previous) = previous {
         scope.set_continuation_preserved_embedder_data(previous);
     }
+}
+
+/// Install the current cell event's native context in CPED. V8 restores this
+/// token for each reaction, including a reaction that runs during another
+/// event's microtask checkpoint.
+fn install_io_context<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    context: &IoContext,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let (id, _) = context.continuation.as_ref()?;
+    let previous = scope.get_continuation_preserved_embedder_data();
+    let frame = cped_frame(scope);
+    let trace = cped_trace(scope);
+    let token: v8::Local<v8::Value> = v8::BigInt::new_from_u64(scope, *id).into();
+    set_cped(scope, frame, trace, token);
+    Some(previous)
+}
+
+fn restore_io_context(scope: &mut v8::PinScope, previous: Option<v8::Local<v8::Value>>) {
+    if let Some(previous) = previous {
+        scope.set_continuation_preserved_embedder_data(previous);
+    }
+}
+
+fn current_reaction_io_context(scope: &mut v8::PinScope) -> Option<Arc<IoContext>> {
+    let token = v8::Local::<v8::BigInt>::try_from(cped_io_context(scope)).ok()?;
+    let (id, lossless) = token.u64_value();
+    lossless
+        .then(|| actor_runtime_state(scope).io_context(id))
+        .flatten()
 }
 
 /// The trace context current at this exact point of JS execution, read
@@ -2181,10 +3234,12 @@ impl Worker {
         let tc = std::pin::pin!(v8::TryCatch::new(cs));
         let tc = &mut tc.init();
 
+        let previous_io_context = install_io_context(tc, &entry.context);
         let previous = install_trace(tc, entry.trace.as_ref());
         cancel(tc, entry);
         let ops = finish_turn(tc, entry);
         restore_trace(tc, previous);
+        restore_io_context(tc, previous_io_context);
         ops
     }
 
@@ -2207,11 +3262,13 @@ impl Worker {
         let tc = std::pin::pin!(v8::TryCatch::new(cs));
         let tc = &mut tc.init();
 
+        let previous_io_context = install_io_context(tc, &entry.context);
         let previous = install_trace(tc, entry.trace.as_ref());
         deliver(tc, entry, op, res);
         cancelled(tc, entry);
         let ops = finish_turn(tc, entry);
         restore_trace(tc, previous);
+        restore_io_context(tc, previous_io_context);
         ops
     }
 }
@@ -2232,6 +3289,19 @@ impl Worker {
 /// Draining before step 2 is the bug that made a streaming handler answer
 /// with nothing outstanding and conclude it was waiting on nothing.
 /// The checkpoint before adoption is what makes response-body pumps visible.
+///
+/// Step 5 exists because `finished()` also waits for the op set to empty,
+/// and an isolate-polled WebSocket keeps one op outstanding for as long as
+/// the socket lives. The drive loop therefore never reached its own exit for
+/// such a request: it parked on `ops.next()` forever, holding the request's
+/// affiliation and its context, so nothing that runs *after* the loop could
+/// ever close the socket. Closing at the moment the request retires is what
+/// lets the pump's op resolve, which is what lets the loop finish.
+///
+/// "Retired" is deliberately not "answered": a streaming response body is a
+/// pump `send_and_end` registers with `waitUntil`, so the client is still
+/// being served while `background` is set, and a socket the handler opened
+/// stays open for as long as that body is still going out.
 fn finish_turn(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
     settle(tc, entry);
     tc.perform_microtask_checkpoint();
@@ -2246,6 +3316,10 @@ fn finish_turn(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
         return Vec::new();
     }
     settle(tc, entry);
+    // 5. **close the request's sockets** — see above.
+    if entry.retired() {
+        entry.context.close_sockets();
+    }
     adopt(entry)
 }
 
@@ -2294,6 +3368,9 @@ fn begin<'s>(
             args,
             reply,
         } => return begin_entrypoint_rpc(tc, &entrypoint, &method, args, reply),
+        crate::WorkerJob::Queue { batch, reply, .. } => {
+            return begin_queue(tc, batch, reply);
+        }
         job => job,
     };
     let crate::WorkerJob::Fetch {
@@ -2308,10 +3385,12 @@ fn begin<'s>(
     else {
         return Begun::Nothing;
     };
-
     let context = IoContext::new();
+    if let Some(stream_id) = body.stream_id() {
+        context.own_body_stream(stream_id);
+    }
     let guard = CurrentGuard::enter(context.clone());
-    let started = start_fetch(tc, fetch, &url, &method, &body, &headers, request_id);
+    let started = start_fetch(tc, fetch, &url, &method, body, &headers, request_id);
     let promise = match started {
         Ok(Started::Running(ret, active)) => match ret.try_cast::<v8::Promise>() {
             Ok(promise) => Ok((promise, active)),
@@ -2335,6 +3414,7 @@ fn begin<'s>(
                 request_id,
                 active_request_id,
                 reply: Some(Answer::Fetch(reply)),
+                gated_reply: None,
                 background: None,
                 ops: std::collections::HashSet::new(),
                 alarm: None,
@@ -2389,6 +3469,7 @@ fn begin_entrypoint_rpc(
             Err(_) => resolved_promise(tc, ret),
         }
     })();
+    let event_started = Instant::now();
     match started {
         Ok(promise) => {
             tc.perform_microtask_checkpoint();
@@ -2401,6 +3482,237 @@ fn begin_entrypoint_rpc(
                 request_id: None,
                 active_request_id: None,
                 reply: Some(Answer::Rpc(reply)),
+                gated_reply: None,
+                background: None,
+                ops: std::collections::HashSet::new(),
+                alarm: None,
+                started: event_started,
+                trace: None,
+                failure: None,
+            };
+            drop(guard);
+            Begun::Running(Box::new(entry))
+        }
+        Err(error) => {
+            let _ = end_event_context(tc);
+            drop(guard);
+            let _ = reply.send(Err(error));
+            Begun::Nothing
+        }
+    }
+}
+
+fn queue_property<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    name: &str,
+) -> Result<v8::Local<'s, v8::Value>> {
+    let key = v8::String::new(scope, name).unwrap();
+    object
+        .get(scope, key.into())
+        .ok_or_else(|| anyhow!("queue result has no {name}"))
+}
+
+fn queue_bool<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    name: &str,
+) -> Result<bool> {
+    let value = queue_property(scope, object, name)?;
+    anyhow::ensure!(value.is_boolean(), "queue result {name} is not a boolean");
+    Ok(value.boolean_value(scope))
+}
+
+fn queue_delay<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Result<Option<i32>> {
+    let value = queue_property(scope, object, "delaySeconds")?;
+    if value.is_undefined() {
+        return Ok(None);
+    }
+    value
+        .int32_value(scope)
+        .map(Some)
+        .ok_or_else(|| anyhow!("queue retry delaySeconds is not a 32-bit integer"))
+}
+
+fn queue_string_array<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    name: &str,
+) -> Result<Vec<String>> {
+    let value = queue_property(scope, object, name)?;
+    let array: v8::Local<v8::Array> = value
+        .try_into()
+        .map_err(|_| anyhow!("queue result {name} is not an array"))?;
+    (0..array.length())
+        .map(|index| {
+            let value = array
+                .get_index(scope, index)
+                .ok_or_else(|| anyhow!("queue result {name}[{index}] is missing"))?;
+            anyhow::ensure!(
+                value.is_string(),
+                "queue result {name}[{index}] is not a string"
+            );
+            Ok(value.to_rust_string_lossy(scope))
+        })
+        .collect()
+}
+
+fn read_queue_result<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+) -> Result<QueueDispatchResult> {
+    let object: v8::Local<v8::Object> = value
+        .try_into()
+        .map_err(|_| anyhow!("queue handler answered a non-object"))?;
+    let outcome = queue_property(scope, object, "outcome")?;
+    anyhow::ensure!(outcome.is_string(), "queue result outcome is not a string");
+    let outcome = match outcome.to_rust_string_lossy(scope).as_str() {
+        "ok" => QueueOutcome::Ok,
+        "exception" => QueueOutcome::Exception,
+        outcome => return Err(anyhow!("unknown queue result outcome {outcome}")),
+    };
+    let error = queue_property(scope, object, "error")?;
+    let error = if error.is_undefined() {
+        None
+    } else {
+        anyhow::ensure!(error.is_string(), "queue result error is not a string");
+        Some(error.to_rust_string_lossy(scope))
+    };
+    let retry_batch: v8::Local<v8::Object> = queue_property(scope, object, "retryBatch")?
+        .try_into()
+        .map_err(|_| anyhow!("queue result retryBatch is not an object"))?;
+    let retries = queue_property(scope, object, "retryMessages")?;
+    let retries: v8::Local<v8::Array> = retries
+        .try_into()
+        .map_err(|_| anyhow!("queue result retryMessages is not an array"))?;
+    let mut retry_messages = Vec::with_capacity(retries.length() as usize);
+    for index in 0..retries.length() {
+        let retry: v8::Local<v8::Object> = retries
+            .get_index(scope, index)
+            .ok_or_else(|| anyhow!("queue result retryMessages[{index}] is missing"))?
+            .try_into()
+            .map_err(|_| anyhow!("queue result retryMessages[{index}] is not an object"))?;
+        let msg_id = queue_property(scope, retry, "msgId")?;
+        anyhow::ensure!(
+            msg_id.is_string(),
+            "queue result retryMessages[{index}].msgId is not a string"
+        );
+        retry_messages.push(QueueRetryMessage {
+            msg_id: msg_id.to_rust_string_lossy(scope),
+            delay_seconds: queue_delay(scope, retry)?,
+        });
+    }
+    Ok(QueueDispatchResult {
+        outcome,
+        error,
+        ack_all: queue_bool(scope, object, "ackAll")?,
+        retry_batch: QueueRetryBatch {
+            retry: queue_bool(scope, retry_batch, "retry")?,
+            delay_seconds: queue_delay(scope, retry_batch)?,
+        },
+        explicit_acks: queue_string_array(scope, object, "explicitAcks")?,
+        retry_messages,
+    })
+}
+
+fn set_queue_property<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    name: &str,
+    value: v8::Local<'s, v8::Value>,
+) -> Result<()> {
+    let key = v8::String::new(scope, name).unwrap();
+    anyhow::ensure!(
+        object.create_data_property(scope, key.into(), value) == Some(true),
+        "could not construct queue batch field {name}"
+    );
+    Ok(())
+}
+
+fn queue_batch_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    batch: QueueBatch,
+) -> Result<v8::Local<'s, v8::Value>> {
+    let QueueBatch {
+        queue,
+        messages,
+        metrics,
+    } = batch;
+    let mut message_values = Vec::with_capacity(messages.len());
+    for message in messages {
+        let object = v8::Object::new(scope);
+        let id = v8::String::new(scope, &message.id).unwrap();
+        set_queue_property(scope, object, "id", id.into())?;
+        let timestamp = v8::Number::new(scope, message.timestamp_ms as f64);
+        set_queue_property(scope, object, "timestamp", timestamp.into())?;
+        let body = bytes_value(scope, message.body);
+        set_queue_property(scope, object, "body", body)?;
+        let content_type = v8::String::new(scope, message.content_type.as_str()).unwrap();
+        set_queue_property(scope, object, "contentType", content_type.into())?;
+        let attempts = v8::Integer::new_from_unsigned(scope, u32::from(message.attempts));
+        set_queue_property(scope, object, "attempts", attempts.into())?;
+        message_values.push(object.into());
+    }
+
+    let metrics_value = v8::Object::new(scope);
+    let count = v8::Number::new(scope, metrics.backlog_count);
+    set_queue_property(scope, metrics_value, "backlogCount", count.into())?;
+    let bytes = v8::Number::new(scope, metrics.backlog_bytes);
+    set_queue_property(scope, metrics_value, "backlogBytes", bytes.into())?;
+    let oldest = match metrics.oldest_message_timestamp_ms {
+        Some(timestamp) => v8::Number::new(scope, timestamp as f64).into(),
+        None => v8::undefined(scope).into(),
+    };
+    set_queue_property(scope, metrics_value, "oldestMessageTimestamp", oldest)?;
+
+    let value = v8::Object::new(scope);
+    let queue = v8::String::new(scope, &queue).unwrap();
+    set_queue_property(scope, value, "queue", queue.into())?;
+    let messages = v8::Array::new_with_elements(scope, &message_values);
+    set_queue_property(scope, value, "messages", messages.into())?;
+    set_queue_property(scope, value, "metrics", metrics_value.into())?;
+    Ok(value.into())
+}
+
+/// Start a queue consumer's first turn. The batch body bytes move directly
+/// into V8, and only the small settlement record crosses back out.
+fn begin_queue(
+    tc: &mut v8::PinScope,
+    batch: QueueBatch,
+    reply: tokio::sync::oneshot::Sender<Result<QueueDispatchResult>>,
+) -> Begun {
+    let context = IoContext::new();
+    let guard = CurrentGuard::enter(context.clone());
+    let started = (|| {
+        let dispatch = dispatcher(tc, "__dispatchEntrypointQueue")?;
+        let batch = queue_batch_value(tc, batch)?;
+        let entrypoint = v8::String::new(tc, "default").unwrap();
+        let recv = v8::undefined(tc).into();
+        begin_event_context(tc)?;
+        let ret = dispatch
+            .call(tc, recv, &[entrypoint.into(), batch])
+            .ok_or_else(|| anyhow!("queue dispatch threw"))?;
+        match ret.try_cast::<v8::Promise>() {
+            Ok(promise) => Ok(promise),
+            Err(_) => resolved_promise(tc, ret),
+        }
+    })();
+    match started {
+        Ok(promise) => {
+            tc.perform_microtask_checkpoint();
+            let entry = InFlight {
+                runtime_state: actor_runtime_state(tc),
+                promise: v8::Global::new(tc, promise),
+                context,
+                scope: None,
+                writes_before: None,
+                request_id: None,
+                active_request_id: None,
+                reply: Some(Answer::Queue(reply)),
+                gated_reply: None,
                 background: None,
                 ops: std::collections::HashSet::new(),
                 alarm: None,
@@ -2424,14 +3736,14 @@ fn begin_entrypoint_rpc(
 fn rpc_data_value<'s>(scope: &mut v8::PinScope<'s, '_>, data: RpcData) -> v8::Local<'s, v8::Value> {
     match data {
         RpcData::Json(json) => v8::String::new(scope, &json).unwrap().into(),
-        RpcData::V8(bytes) => bytes_value(scope, bytes),
+        RpcData::V8(bytes) => bytes_value(scope, bytes.into()),
     }
 }
 
 /// The inverse: `__dispatchRpc` answers in the flavor it was asked in.
 fn rpc_data_ret(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> RpcData {
     match view_bytes(ret) {
-        Some(bytes) => RpcData::V8(bytes),
+        Some(bytes) => RpcData::V8(bytes.into()),
         None => RpcData::Json(ret.to_rust_string_lossy(scope)),
     }
 }
@@ -2451,12 +3763,19 @@ fn unix_now_ms() -> i64 {
 /// shape and on the error path too.
 fn send_and_end<T>(
     tc: &mut v8::PinScope,
+    context: &IoContext,
     reply: tokio::sync::oneshot::Sender<Result<T>>,
     value: Result<T>,
-) -> Option<v8::Global<v8::Promise>> {
+) -> (Option<v8::Global<v8::Promise>>, Option<GatedReplyRx>)
+where
+    T: Send + 'static,
+{
     let background = end_event_context(tc).ok().flatten();
-    let _ = reply.send(value);
-    background.map(|promise| v8::Global::new(tc, promise))
+    let gated_reply = send_answer_after_arm_gates(reply, value, context.take_arm_gates());
+    (
+        background.map(|promise| v8::Global::new(tc, promise)),
+        gated_reply,
+    )
 }
 
 /// A committed-write position only counts when the handler advanced it; celld's
@@ -2498,11 +3817,17 @@ fn start_cell_event<'s>(
     scope: &str,
     answer: Answer,
     request_id: Option<RequestId>,
+    body_stream_id: Option<u64>,
     capture_frames: bool,
     call: impl FnOnce(&mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>>,
 ) -> Begun {
-    let context = IoContext::new();
+    let runtime_state = actor_runtime_state(tc);
+    let context = IoContext::tracked(&runtime_state);
+    if let Some(stream_id) = body_stream_id {
+        context.own_body_stream(stream_id);
+    }
     let guard = CurrentGuard::enter(context.clone());
+    let previous_io_context = install_io_context(tc, &context);
     // Sampled before the handler runs so the output gate can tell a write
     // this event made from celld's own activation writes.
     let writes_before = storage::write_position(scope);
@@ -2516,6 +3841,7 @@ fn start_cell_event<'s>(
     if capture_frames {
         ws_capture_begin();
     }
+    let event_started = Instant::now();
     let started = (|| {
         begin_event_context(tc)?;
         let ret = call(tc)?;
@@ -2528,7 +3854,7 @@ fn start_cell_event<'s>(
         Ok(promise) => {
             tc.perform_microtask_checkpoint();
             let entry = InFlight {
-                runtime_state: actor_runtime_state(tc),
+                runtime_state: runtime_state.clone(),
                 promise: v8::Global::new(tc, promise),
                 context,
                 scope: Some(scope.to_string()),
@@ -2539,21 +3865,56 @@ fn start_cell_event<'s>(
                 // aborts by the job's own id.
                 active_request_id: None,
                 reply: Some(answer),
+                gated_reply: None,
                 background: None,
                 ops: std::collections::HashSet::new(),
                 alarm: None,
-                started: Instant::now(),
+                started: event_started,
                 trace: None,
                 failure: None,
             };
+            restore_io_context(tc, previous_io_context);
             drop(guard);
             Begun::Running(Box::new(entry))
         }
         Err(error) => {
-            let _ = end_event_context(tc);
+            // A V8 termination has a concrete stored cause. The dispatcher
+            // wrapper can only report that its call returned no value, so do
+            // not replace process.exit or actor-abort with that generic seam.
+            let error = take_execution_termination(tc).unwrap_or(error);
+            let background = end_event_context(tc)
+                .ok()
+                .flatten()
+                .map(|promise| v8::Global::new(tc, promise));
+            let failure = crate::telemetry::cap_error(format!("{error:#}"));
+            let gated_reply = answer.fail_with_arm_gates(error, context.take_arm_gates());
+            let begun = if gated_reply.is_none() && background.is_none() {
+                Begun::Nothing
+            } else {
+                let undefined = v8::undefined(tc).into();
+                let promise = resolved_promise(tc, undefined)
+                    .expect("a finishing cell event can create a resolved promise");
+                Begun::Running(Box::new(InFlight {
+                    runtime_state,
+                    promise: v8::Global::new(tc, promise),
+                    context,
+                    scope: Some(scope.to_string()),
+                    writes_before,
+                    request_id,
+                    active_request_id: None,
+                    reply: None,
+                    gated_reply,
+                    background,
+                    ops: std::collections::HashSet::new(),
+                    alarm: None,
+                    started: event_started,
+                    trace: None,
+                    failure: Some(failure),
+                }))
+            };
+            restore_io_context(tc, previous_io_context);
             drop(guard);
-            answer.fail(error);
-            Begun::Nothing
+            begun
         }
     }
 }
@@ -2596,25 +3957,47 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob) -> Begun {
                 let _ = reply.send(Err(error));
                 return Begun::Nothing;
             }
-            start_cell_event(tc, &scope, Answer::Fetch(reply), request_id, false, |tc| {
-                let f = dispatcher(tc, "__dispatchTo")?;
-                let arguments = [
-                    v8::String::new(tc, &scope).unwrap().into(),
-                    v8::String::new(tc, &url).unwrap().into(),
-                    v8::String::new(tc, &method).unwrap().into(),
-                    bytes_value(tc, body),
-                    v8::String::new(tc, &serde_json::to_string(&headers)?)
-                        .unwrap()
-                        .into(),
-                    match request_id {
-                        Some(id) => v8::String::new(tc, &request_id_string(id)).unwrap().into(),
-                        None => v8::null(tc).into(),
-                    },
-                ];
-                let recv = v8::undefined(tc).into();
-                f.call(tc, recv, &arguments)
-                    .ok_or_else(|| anyhow!("dispatchTo threw"))
-            })
+            let body_stream_id = body.stream_id();
+            start_cell_event(
+                tc,
+                &scope,
+                Answer::Fetch(reply),
+                request_id,
+                body_stream_id,
+                false,
+                |tc| {
+                    let f = dispatcher(tc, "__dispatchTo")?;
+                    // A held body crosses as its bytes; a streamed body crosses as
+                    // its host stream id, so the handler reads it in parts instead
+                    // of the routing seam collecting it first.
+                    let (body_value, stream_id) = match body {
+                        RequestBody::Bytes(bytes) => {
+                            (bytes_value(tc, bytes.into()), v8::null(tc).into())
+                        }
+                        RequestBody::Stream(id) => (
+                            v8::undefined(tc).into(),
+                            v8::Number::new(tc, id as f64).into(),
+                        ),
+                    };
+                    let arguments = [
+                        v8::String::new(tc, &scope).unwrap().into(),
+                        v8::String::new(tc, &url).unwrap().into(),
+                        v8::String::new(tc, &method).unwrap().into(),
+                        body_value,
+                        v8::String::new(tc, &serde_json::to_string(&headers)?)
+                            .unwrap()
+                            .into(),
+                        match request_id {
+                            Some(id) => v8::String::new(tc, &request_id_string(id)).unwrap().into(),
+                            None => v8::null(tc).into(),
+                        },
+                        stream_id,
+                    ];
+                    let recv = v8::undefined(tc).into();
+                    f.call(tc, recv, &arguments)
+                        .ok_or_else(|| anyhow!("dispatchTo threw"))
+                },
+            )
         }
         CellJob::Rpc {
             scope,
@@ -2627,24 +4010,32 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob) -> Begun {
                 let _ = reply.send(Err(error));
                 return Begun::Nothing;
             }
-            start_cell_event(tc, &scope, Answer::CellRpc(reply), None, false, |tc| {
-                let f = dispatcher(tc, "__dispatchRpc")?;
-                let arguments = [
-                    v8::String::new(tc, &scope).unwrap().into(),
-                    v8::String::new(tc, &method).unwrap().into(),
-                    rpc_data_value(tc, args),
-                ];
-                let recv = v8::undefined(tc).into();
-                f.call(tc, recv, &arguments)
-                    .ok_or_else(|| anyhow!("dispatchRpc threw"))
-            })
+            start_cell_event(
+                tc,
+                &scope,
+                Answer::CellRpc(reply),
+                None,
+                None,
+                false,
+                |tc| {
+                    let f = dispatcher(tc, "__dispatchRpc")?;
+                    let arguments = [
+                        v8::String::new(tc, &scope).unwrap().into(),
+                        v8::String::new(tc, &method).unwrap().into(),
+                        rpc_data_value(tc, args),
+                    ];
+                    let recv = v8::undefined(tc).into();
+                    f.call(tc, recv, &arguments)
+                        .ok_or_else(|| anyhow!("dispatchRpc threw"))
+                },
+            )
         }
         CellJob::WsOpen {
             scope,
             ws_id,
             protocol,
             reply,
-        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, false, |tc| {
+        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, |tc| {
             let f = dispatcher(tc, "__wsOpen")?;
             let arguments = [
                 v8::String::new(tc, &scope).unwrap().into(),
@@ -2660,21 +4051,29 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob) -> Begun {
             ws_id,
             data,
             reply,
-        } => start_cell_event(tc, &scope, Answer::WsMessage(reply), None, true, |tc| {
-            let (name, data) = match data {
-                WsIn::Text(text) => ("__wsMessage", v8::String::new(tc, &text).unwrap().into()),
-                WsIn::Binary(bytes) => ("__wsBinary", bytes_value(tc, bytes)),
-            };
-            let f = dispatcher(tc, name)?;
-            let arguments = [
-                v8::String::new(tc, &scope).unwrap().into(),
-                v8::Number::new(tc, ws_id as f64).into(),
-                data,
-            ];
-            let recv = v8::undefined(tc).into();
-            f.call(tc, recv, &arguments)
-                .ok_or_else(|| anyhow!("WebSocket message dispatch threw"))
-        }),
+        } => start_cell_event(
+            tc,
+            &scope,
+            Answer::WsMessage(reply),
+            None,
+            None,
+            true,
+            |tc| {
+                let (name, data) = match data {
+                    WsIn::Text(text) => ("__wsMessage", v8::String::new(tc, &text).unwrap().into()),
+                    WsIn::Binary(bytes) => ("__wsBinary", bytes_value(tc, bytes)),
+                };
+                let f = dispatcher(tc, name)?;
+                let arguments = [
+                    v8::String::new(tc, &scope).unwrap().into(),
+                    v8::Number::new(tc, ws_id as f64).into(),
+                    data,
+                ];
+                let recv = v8::undefined(tc).into();
+                f.call(tc, recv, &arguments)
+                    .ok_or_else(|| anyhow!("WebSocket message dispatch threw"))
+            },
+        ),
         CellJob::WsClosed {
             scope,
             ws_id,
@@ -2682,7 +4081,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob) -> Begun {
             reason,
             was_clean,
             reply,
-        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, false, |tc| {
+        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, |tc| {
             let f = dispatcher(tc, "__wsClosed")?;
             let arguments = [
                 v8::String::new(tc, &scope).unwrap().into(),
@@ -2701,6 +4100,31 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob) -> Begun {
             claim,
             reply,
         } => begin_alarm(tc, &scope, scheduled_ms, claim, reply),
+        #[cfg(celld_internal_tests)]
+        CellJob::SyncErrorForTest {
+            scope,
+            gate,
+            socket_id,
+            terminate,
+            reply,
+        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, |tc| {
+            register_arm_gate_with_current_event(gate, installed_context());
+            if let Some(socket_id) = socket_id {
+                current_context().sockets.lock().unwrap().push(socket_id);
+            }
+            if terminate {
+                let state = actor_runtime_state(tc);
+                *state.termination.lock().expect("termination lock poisoned") =
+                    Some(ExecutionTermination {
+                        error: "synchronous V8 termination sentinel".to_string(),
+                        actor_scope: None,
+                    });
+                tc.terminate_execution();
+                Err(anyhow!("generic synchronous dispatch failure"))
+            } else {
+                Err(anyhow!("synchronous cell dispatch sentinel"))
+            }
+        }),
     }
 }
 
@@ -2721,6 +4145,7 @@ fn begin_alarm(
         let _ = reply.send(Err(anyhow!("alarm dispatched before its deadline")));
         return Begun::Nothing;
     }
+    #[cfg(celld_internal_tests)]
     if let AlarmDispatch::Claimed(retry) = claim {
         let Some(scheduled_at) = storage::active_alarm_scheduled_time(scope) else {
             let _ = reply.send(Err(anyhow!("alarm dispatched without a claim")));
@@ -2729,8 +4154,11 @@ fn begin_alarm(
         return fire_alarm_handler(tc, scope, scheduled_at, retry, None, reply);
     }
     let due_by = match claim {
+        #[cfg(celld_internal_tests)]
         AlarmDispatch::Armed => i64::MAX,
-        _ => now,
+        AlarmDispatch::Due => now,
+        #[cfg(celld_internal_tests)]
+        AlarmDispatch::Claimed(_) => unreachable!("claimed alarms return above"),
     };
     let Some((scheduled_at, retry)) = storage::due_alarm_entry(scope, due_by) else {
         // Nothing is due: another dispatch already ran it, or the handler
@@ -2759,7 +4187,7 @@ fn fire_alarm_handler(
     claim: Option<AlarmClaim>,
     reply: tokio::sync::oneshot::Sender<Result<(Option<i64>, Option<u64>)>>,
 ) -> Begun {
-    let begun = start_cell_event(tc, scope, Answer::Alarm(reply), None, false, |tc| {
+    let begun = start_cell_event(tc, scope, Answer::Alarm(reply), None, None, false, |tc| {
         let f = dispatcher(tc, "__fireAlarm")?;
         let arguments = [
             v8::String::new(tc, scope).unwrap().into(),
@@ -2901,13 +4329,13 @@ fn start_fetch<'s>(
     fetch: v8::Local<'s, v8::Function>,
     url: &str,
     method: &str,
-    body: &RequestBody,
+    body: RequestBody,
     headers: &[(String, String)],
     request_id: Option<RequestId>,
 ) -> Result<Started<'s>> {
     let req = match request_id {
         Some(_) => make_incoming_request(tc, url, method, body, headers),
-        None => make_request(tc, url, method, body.bytes(), headers),
+        None => make_request(tc, url, method, body, headers),
     }?;
     let env = harness_env(tc)?;
     let recv = v8::undefined(tc).into();
@@ -2961,19 +4389,14 @@ impl Worker {
     /// `fetch`. `do_classes` come from the manifest; `bindings` maps a binding
     /// name to a DO class name (from wrangler metadata).
     ///
-    /// The runtime builds a `WorkerConfig` directly; this helper is
-    /// test-only.
-    #[cfg(test)]
-    pub fn load(options: WorkerConfigOptions, owned: &[String]) -> Result<Worker> {
-        let config = Arc::new(WorkerConfig::new(options));
-        Self::load_config(config, owned)
+    /// The runtime builds a `WorkerConfig` directly. This cfg-gated helper
+    /// constructs the same value from individual options.
+    #[cfg(celld_internal_tests)]
+    pub fn load(options: WorkerConfigOptions) -> Result<Worker> {
+        Self::load_config(Arc::new(WorkerConfig::new(options)))
     }
 
-    pub fn load_config(config: Arc<WorkerConfig>, owned: &[String]) -> Result<Worker> {
-        Self::load_config_owned(config, Arc::from(owned.to_vec()))
-    }
-
-    fn load_config_owned(config: Arc<WorkerConfig>, owned: Arc<[String]>) -> Result<Worker> {
+    pub fn load_config(config: Arc<WorkerConfig>) -> Result<Worker> {
         let src = config.src.as_str();
         let script_name = config.script_name.as_str();
         let do_classes = config.do_classes.as_slice();
@@ -2988,7 +4411,7 @@ impl Worker {
             excessively_exceeded: AtomicBool::new(false),
             limit: original_heap_limit,
             last_gc_nudge: Mutex::new(None),
-            #[cfg(all(test, celld_internal_tests))]
+            #[cfg(celld_internal_tests)]
             forced_admission_refusal: AtomicBool::new(false),
         });
         let runtime_state = Arc::new(ActorRuntimeState {
@@ -2996,11 +4419,14 @@ impl Worker {
             egress: config.egress,
             ..Default::default()
         });
+        let loader_owner = LoaderOwner::fresh();
         let heap_limit_state_ptr =
             Arc::as_ptr(&heap_limit_state) as *mut HeapLimitState as *mut std::ffi::c_void;
         isolate.set_slot(heap_limit_state);
         isolate.set_slot(runtime_state.clone());
         isolate.set_slot(Arc::new(ModuleRegistry::default()));
+        isolate.set_slot(loader_owner);
+        isolate.set_slot(crate::generation::GenerationTag(config.generation));
         isolate.add_near_heap_limit_callback(near_heap_limit, heap_limit_state_ptr);
         let (context, fetch) = {
             v8::scope!(let hs, &mut isolate);
@@ -3022,9 +4448,9 @@ impl Worker {
                 Some(m) => m,
                 None => return Err(anyhow!("compile: {}", exc!(scope))),
             };
-            register_stubs(scope, src, &config.modules); // cloudflare:*/node:* + text modules
+            register_stubs(scope, &config); // cloudflare:*/node:* + text modules
             register_wasm_modules(scope, &config.modules);
-            register_loader_modules(scope, &config.modules);
+            register_loader_modules(scope, &config);
             module
                 .instantiate_module(scope, resolve_external)
                 .ok_or_else(|| anyhow!("instantiate: {}", exc!(scope)))?;
@@ -3070,7 +4496,7 @@ impl Worker {
                 // export. It is in `do_classes` so that it gets a namespace
                 // key; reading it off the module namespace would find
                 // `undefined` and overwrite the harness's registration.
-                if cn == crate::deploy::D1_CLASS {
+                if crate::deploy::is_reserved_class(cn) {
                     continue;
                 }
                 let key = v8::String::new(scope, cn).unwrap();
@@ -3081,12 +4507,16 @@ impl Worker {
             }
             inject_namespace_keys(scope, script_name, do_classes)?;
             inject_crons(scope, &config.crons)?;
+            inject_workflows(scope, script_name, &config.workflow_bindings)?;
+            inject_kv_limits(scope)?;
+            inject_queue_config(scope, &config)?;
             populate_cf_exports(scope, ns, do_classes)?;
             register_entrypoints(scope, ns)?;
+            validate_workflow_classes(scope, ns, &config.workflow_bindings)?;
             // build env from bindings and stash it in the harness
             build_env(scope, &config)?;
             // tell the harness which cells are local (route the rest cross-node)
-            inject_routing(scope, owned.as_ref(), node)?;
+            inject_routing(scope, node)?;
 
             // entry fetch
             let dk = v8::String::new(scope, "default").unwrap();
@@ -3101,9 +4531,30 @@ impl Worker {
                 .ok_or_else(|| anyhow!("no fetch"))?;
             let default_is_entrypoint =
                 default.is_function() && cell_registry_has(scope, "entrypoints", "default")?;
+            let class_fetch = default_is_entrypoint
+                && default
+                    .get(scope, v8::String::new(scope, "prototype").unwrap().into())
+                    .and_then(|prototype| prototype.to_object(scope))
+                    .and_then(|prototype| prototype.get(scope, fk.into()))
+                    .is_some_and(|handler| handler.is_function());
+            let qk = v8::String::new(scope, "queue").unwrap();
+            let own_queue = default
+                .get(scope, qk.into())
+                .is_some_and(|handler| handler.is_function());
+            let class_queue = default_is_entrypoint
+                && default
+                    .get(scope, v8::String::new(scope, "prototype").unwrap().into())
+                    .and_then(|prototype| prototype.to_object(scope))
+                    .and_then(|prototype| prototype.get(scope, qk.into()))
+                    .is_some_and(|handler| handler.is_function());
+            let has_queue_handler = own_queue || class_queue;
+            anyhow::ensure!(
+                !config.declares_queue_consumer || has_queue_handler,
+                "queue consumer has no queue handler"
+            );
             let f: v8::Local<v8::Function> = if fetch_value.is_function() {
                 fetch_value.try_into().expect("function casts to Function")
-            } else if default_is_entrypoint {
+            } else if default_is_entrypoint && class_fetch {
                 // A class-based default entrypoint (extends WorkerEntrypoint)
                 // keeps fetch on the prototype, so route through the
                 // harness's cached instance like a named entrypoint. Only a
@@ -3118,6 +4569,22 @@ impl Worker {
                     "the default export is a Durable Object class; export a fetch \
                      handler or a WorkerEntrypoint class as the default"
                 ));
+            } else if config.declares_queue_consumer {
+                // A push-consumer Worker needs no HTTP handler. Keep the
+                // stateless pool's fetch slot total, but fail closed if this
+                // deployment becomes the fleet's HTTP entry point. Test the
+                // prototype above before the entrypoint fallback below: a
+                // queue-only class is still a registered entrypoint, but
+                // routing fetch through it throws instead of returning 404.
+                compile_fn(scope, "() => new Response('Not found', { status: 404 })")?
+            } else if default_is_entrypoint {
+                // Preserve an RPC-only default entrypoint. Its HTTP path
+                // reports the harness's specific missing-fetch error, while
+                // its named methods remain callable through RPC.
+                compile_fn(
+                    scope,
+                    "(req) => globalThis.__dispatchEntrypointFetch('default', req)",
+                )?
             } else {
                 return Err(anyhow!("fetch not fn"));
             };
@@ -3125,7 +4592,7 @@ impl Worker {
             // Lets a self-targeted service binding invoke the handler in
             // this isolate instead of crossing to a pool thread.
             {
-                let cell_key = v8::String::new(scope, "__cell").unwrap();
+                let cell_key = static_key(scope, &v8_strings::CELL);
                 if let Some(cell) = context
                     .global(scope)
                     .get(scope, cell_key.into())
@@ -3172,7 +4639,7 @@ impl Worker {
                 // migrates between threads and is dropped on whichever one
                 // holds the lock last. This isolate carries exactly:
                 //
-                // - three slots, whose types the assertion below pins as
+                // - four slots, whose types the assertion below pins as
                 //   `Send + Sync`;
                 // - `near_heap_limit`, a bare fn pointer whose only captured
                 //   state is a raw pointer into the `HeapLimitState` above;
@@ -3193,6 +4660,7 @@ impl Worker {
                 realm: Realm { context, fetch },
                 original_heap_limit,
                 compat,
+                loader_owner,
                 cells: storage::Cells::default(),
             }),
         })
@@ -3201,25 +4669,19 @@ impl Worker {
     /// Restore an idFromName() actor's human-readable identity before its
     /// constructor runs. The host calls this on activation and before a named
     /// request is dispatched.
-    /// Record whether this isolate hosts `cell`, so the harness can dispatch
-    /// to it in-isolate instead of going back out through the host.
+    /// Take a cell into this isolate or give it back.
     ///
-    /// Baked in at load time until cells shared isolates, when an isolate
-    /// served exactly one cell for its whole life and the list could not
-    /// change. Now a cell arrives at an isolate that already exists, so the
-    /// list has to move with placement.
+    /// Taking it opens the cell's SQLite -- which the isolate owns, not the
+    /// caller -- and restores the persisted id name. Giving it back releases
+    /// what the isolate holds for the residency and closes the database, so
+    /// state cannot span two epochs.
     ///
-    /// Getting this wrong is not symmetric. A cell missing from the list
-    /// still works: the dispatch goes out to the host, which routes it
-    /// straight back here, costing a round trip. A cell wrongly *in* the
-    /// list is a cell this isolate would try to serve without hosting it, so
-    /// the shell sets it when it takes a residency and clears it when the
-    /// residency ends.
+    /// Dispatch does not depend on this: every cell call goes out through the
+    /// host whichever isolate hosts the target.
     pub fn own_cell(
         &mut self,
         cell: &str,
-        db_path: Option<&str>,
-        owned: bool,
+        storage: Option<CellStorage<'_>>,
     ) -> Result<Option<i64>> {
         let compat = self.inner.as_ref().expect("live worker isolate").compat;
         let (mut locker, _cells) = self.lock();
@@ -3228,7 +4690,7 @@ impl Worker {
         let context = realm.context;
         let cs = &mut v8::ContextScope::new(hs, context);
         let tc = std::pin::pin!(v8::TryCatch::new(cs));
-        adopt_cell(&mut tc.init(), cell, db_path, owned, compat)
+        adopt_cell(&mut tc.init(), cell, storage, compat)
     }
 
     /// Drain the alarm moves the last turn committed in this isolate.
@@ -3282,7 +4744,9 @@ impl Worker {
         let out = match begin_cell(tc, job) {
             Begun::Running(mut entry) => {
                 entry.trace = trace;
+                let previous_io_context = install_io_context(tc, &entry.context);
                 let ops = finish_turn(tc, &mut entry);
+                restore_io_context(tc, previous_io_context);
                 (Some(*entry), ops)
             }
             Begun::Threw(answer) => {
@@ -3314,9 +4778,11 @@ impl Worker {
         let tc = std::pin::pin!(v8::TryCatch::new(cs));
         let tc = &mut tc.init();
 
+        let previous_io_context = install_io_context(tc, &entry.context);
         let previous = install_trace(tc, entry.trace.as_ref());
         let ops = finish_turn(tc, entry);
         restore_trace(tc, previous);
+        restore_io_context(tc, previous_io_context);
         ops
     }
 
@@ -3361,6 +4827,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__ws_send_binary" => websocket::op_ws_send_binary,
         "__ws_close" => websocket::op_ws_close,
         "__ws_alloc" => websocket::op_ws_alloc,
+        "__ws_prepare_worker_handoff" => websocket::op_ws_prepare_worker_handoff,
         "__ws_accept" => websocket::op_ws_accept,
         "__ws_accept_regular" => websocket::op_ws_accept_regular,
         "__ws_list" => websocket::op_ws_list,
@@ -3374,7 +4841,6 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__ws_upgrade" => websocket::op_ws_upgrade,
         "__storage_get" => storage_ops::op_storage_get,
         "__storage_get_many" => storage_ops::op_storage_get_many,
-        "__sql_exec" => storage_ops::op_sql_exec,
         "__sql_ingest" => storage_ops::op_sql_ingest,
         "__sql_cursor_start" => storage_ops::op_sql_cursor_start,
         "__sql_cursor_next" => storage_ops::op_sql_cursor_next,
@@ -3393,6 +4859,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__storage_cancel_pending_puts" => storage_ops::op_storage_cancel_pending_puts,
         "__actor_abort" => op_actor_abort,
         "__cron_plan" => op_cron_plan,
+        "__kv_blob" => op_kv_blob,
         "__process_exit" => op_process_exit,
         "__storage_delete" => storage_ops::op_storage_delete,
         "__storage_delete_many" => storage_ops::op_storage_delete_many,
@@ -3418,11 +4885,11 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__loader_rpc" => op_loader_rpc,
         "__loader_drop" => op_loader_drop,
         "__do_call" => op_do_call,
-        "__writePosition" => op_write_position,
-        "__gateWrite" => op_gate_write,
         "__svc_call" => op_svc_call,
         "__svc_call_cancellable" => op_svc_call_cancellable,
         "__svc_rpc" => op_svc_rpc,
+        "__queue_dispatch" => op_queue_dispatch,
+        "__queue_policy" => op_queue_policy,
         "__do_call_cancellable" => op_do_call_cancellable,
         "__do_call_cancel" => op_do_call_cancel,
         "__do_id" => op_do_id,
@@ -3430,6 +4897,19 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__sc_encode" => storage_ops::op_sc_encode,
         "__sc_decode" => storage_ops::op_sc_decode,
         "__op_fetch" => op_fetch,
+        "__r2_head" => r2_ops::op_r2_head,
+        "__r2_get" => r2_ops::op_r2_get,
+        "__r2_put" => r2_ops::op_r2_put,
+        "__r2_put_begin" => r2_ops::op_r2_put_begin,
+        "__r2_put_chunk" => r2_ops::op_r2_put_chunk,
+        "__r2_put_end" => r2_ops::op_r2_put_end,
+        "__r2_delete" => r2_ops::op_r2_delete,
+        "__r2_list" => r2_ops::op_r2_list,
+        "__r2_mp_begin" => r2_ops::op_r2_mp_begin,
+        "__r2_mp_resume" => r2_ops::op_r2_mp_resume,
+        "__r2_mp_part" => r2_ops::op_r2_mp_part,
+        "__r2_mp_complete" => r2_ops::op_r2_mp_complete,
+        "__r2_mp_abort" => r2_ops::op_r2_mp_abort,
         "__asset_fetch" => op_asset_fetch,
         "__http_stream_read" => op_http_stream_read,
         "__http_stream_cancel" => op_http_stream_cancel,
@@ -3472,7 +4952,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__zlib_stream_end" => zlib::op_zlib_stream_end,
         "__zlib_stream_drop" => zlib::op_zlib_stream_drop,
     }
-    #[cfg(all(test, celld_internal_tests))]
+    #[cfg(celld_internal_tests)]
     ops! { scope, global,
         "__test_gc" => op_test_gc,
         "__loader_count" => op_loader_count,
@@ -3481,6 +4961,14 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__test_force_heap_admission_refusal" =>
             op_test_force_heap_admission_refusal,
         "__test_heap_share" => op_test_heap_share,
+        "__test_external_memory" => op_test_external_memory,
+        "__test_workflow_event_consumed" => op_test_workflow_event_consumed,
+        "__test_workflow_meta_created" => op_test_workflow_meta_created,
+        "__test_workflow_alarm_deleted" => op_test_workflow_alarm_deleted,
+        "__test_queue_dlq_accepted" => op_test_queue_dlq_accepted,
+        "__test_queue_metrics_materialized" => op_test_queue_metrics_materialized,
+        "__test_queue_rearm_bounded" => op_test_queue_rearm_bounded,
+        "__test_queue_lease_lookup_plan" => op_test_queue_lease_lookup_plan,
         "__sql_set_max_page_count_for_test" =>
             storage_ops::op_sql_set_max_page_count_for_test,
         "__sql_set_write_fault_for_test" => storage_ops::op_sql_set_write_fault_for_test,
@@ -3492,6 +4980,154 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
     }
 }
 
+/// `__kv_blob(requestJson, bytes?)` -> Promise<string | Uint8Array>.
+///
+/// One op for the whole large-value path, following `__d1_run` rather than
+/// exposing get, put and sweep as three. A put copies one typed view into Rust,
+/// and a successful get resolves directly to a `Uint8Array`. JSON arrays would
+/// turn a valid 25 MiB value into millions of heap objects and crash the
+/// isolate before the bucket I/O began.
+///
+/// JSON remains the control envelope for an absent get and a swept count. The
+/// cell scope is host-derived, so JavaScript cannot read or collect another
+/// namespace's objects by changing the request.
+fn op_kv_blob(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let request = args.get(0).to_rust_string_lossy(scope);
+    let value = view_bytes(args.get(1));
+    // Bucket I/O is egress, so it waits on the same gate a service call does
+    // rather than escaping the shed the node applies under pressure.
+    let gate = egress_gate_request(celld_logic::Channel::Service);
+    // Blob authority follows the storage installed for this exact cell
+    // activation. Capturing it before enqueue prevents a later ownership
+    // lookup from lending a deposed collector the new owner's epoch.
+    let authority = gate
+        .cell_scope()
+        .and_then(|cell| storage::activation_epoch(cell).map(|epoch| (cell.to_string(), epoch)));
+    let id = asyncrt::enqueue(async move {
+        let (cell, activation_epoch) =
+            authority.ok_or_else(|| "KV blob I/O requires active cell storage".to_string())?;
+        let request: serde_json::Value =
+            serde_json::from_str(&request).map_err(|error| format!("invalid request: {error}"))?;
+        let field = |name: &str| -> std::result::Result<String, String> {
+            request
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| format!("request has no {name}"))
+        };
+        let mode = field("mode")?;
+        await_egress_gate(gate).await?;
+        let reply = match mode.as_str() {
+            "prepare" => {
+                let digest = field("digest")?;
+                let reference = celld_logic::kv::BlobRef::v2(activation_epoch, &digest)
+                    .map_err(|error| error.to_string())?
+                    .encode();
+                serde_json::json!({ "reference": reference })
+            }
+            "get" => {
+                let reference = field("reference")?;
+                let reference = celld_logic::kv::BlobRef::parse(&reference)
+                    .map_err(|error| error.to_string())?;
+                if !reference.readable_by(activation_epoch) {
+                    return Err("a KV row references a later ownership epoch".to_string());
+                }
+                let key = reference.object_key(&cell);
+                match kv_blob_store()?
+                    .get(&key)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    Some((bytes, _etag)) => {
+                        return Ok(asyncrt::OpOut::Bytes(bytes.to_vec()));
+                    }
+                    None => serde_json::json!({ "found": false }),
+                }
+            }
+            "put" => {
+                let bytes = value.ok_or_else(|| "request has no byte view".to_string())?;
+                let reference = field("reference")?;
+                let reference = celld_logic::kv::BlobRef::parse(&reference)
+                    .map_err(|error| error.to_string())?;
+                if !reference.writable_by(activation_epoch) {
+                    return Err("a new KV blob must use the active ownership epoch".to_string());
+                }
+                let key = reference.object_key(&cell);
+                kv_blob_store()?
+                    .put(&key, bytes)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                serde_json::json!({ "ok": true })
+            }
+            "sweep" => {
+                let values = request
+                    .get("live")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| "request has no live blob reference list".to_string())?;
+                let mut live = HashSet::new();
+                for value in values {
+                    let reference = value.as_str().ok_or_else(|| {
+                        "the live blob reference list contains a non-string".to_string()
+                    })?;
+                    let reference = celld_logic::kv::BlobRef::parse(reference)
+                        .map_err(|error| error.to_string())?;
+                    if !reference.readable_by(activation_epoch) {
+                        return Err(
+                            "the live blob reference list contains a later epoch".to_string()
+                        );
+                    }
+                    if matches!(reference, celld_logic::kv::BlobRef::V2 { .. }) {
+                        live.insert(reference.encode());
+                    }
+                }
+                // Mark and sweep, and the model says why it is not a refcount:
+                // a crash between the blob write and the row commit leaves
+                // bytes no count ever counted. The caller includes its pending
+                // references because this end only needs "do not delete these".
+                // Legacy blobs live outside this prefix and remain retained as
+                // the safe migration cost.
+                let prefix = celld_logic::kv::BlobRef::v2_object_prefix(&cell);
+                let listed = kv_blob_store()?
+                    .list(&prefix)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                // Validate the complete listing before issuing one delete. A
+                // malformed key must fail closed instead of turning a parsing
+                // error into partial collection.
+                let mut doomed = Vec::new();
+                for object in listed {
+                    let key = object.location.as_ref().to_string();
+                    let suffix = key.strip_prefix(&prefix).ok_or_else(|| {
+                        "the KV blob listing returned a key outside its prefix".to_string()
+                    })?;
+                    let reference = celld_logic::kv::BlobRef::parse_object_suffix(suffix)
+                        .map_err(|error| error.to_string())?;
+                    if reference.collectable_by(activation_epoch)
+                        && !live.contains(&reference.encode())
+                    {
+                        doomed.push(key);
+                    }
+                }
+                let gone = kv_blob_store()?.delete_many(&doomed).await;
+                if gone.len() != doomed.len() {
+                    return Err(format!(
+                        "{} blob(s) refused deletion",
+                        doomed.len().saturating_sub(gone.len())
+                    ));
+                }
+                serde_json::json!({ "removed": gone.len() })
+            }
+            other => return Err(format!("unknown mode {other}")),
+        };
+        Ok(asyncrt::OpOut::Str(reply.to_string()))
+    });
+    rv.set(promise_for(scope, id));
+}
+
 /// Create a JS promise for an async op `id` and return it to JS.
 fn promise_for<'s>(scope: &mut v8::PinScope<'s, '_>, id: u64) -> v8::Local<'s, v8::Value> {
     let resolver = v8::PromiseResolver::new(scope).unwrap();
@@ -3500,11 +5136,383 @@ fn promise_for<'s>(scope: &mut v8::PinScope<'s, '_>, id: u64) -> v8::Local<'s, v
     promise.into()
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueDispatchEnvelope {
+    lease_id: String,
+    leases: Vec<QueueLeaseRef>,
+    messages: Vec<QueueWireMessage>,
+    metrics: QueueWireMetrics,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueWireMessage {
+    id: String,
+    timestamp_ms: i64,
+    body_base64: String,
+    content_type: String,
+    attempts: u16,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueWireMetrics {
+    backlog_count: f64,
+    backlog_bytes: f64,
+    oldest_message_timestamp_ms: Option<i64>,
+}
+
+/// `__queue_dispatch(script, queue, envelopeJson)` persists no state itself.
+/// The Queue cell has already installed each lease; this op gates that write,
+/// then hands the batch to the host and returns. Settlement comes back as a
+/// new call to the broker, so the alarm event does not spend the consumer's
+/// admission or handler budget and several leases can run concurrently.
+fn op_queue_dispatch(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let script = args.get(0).to_rust_string_lossy(scope);
+    let queue = args.get(1).to_rust_string_lossy(scope);
+    let envelope: QueueDispatchEnvelope =
+        match serde_json::from_str(&args.get(2).to_rust_string_lossy(scope)) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                return loader_throw(scope, &format!("invalid Queue dispatch envelope: {error}"))
+            }
+        };
+    let gate = egress_gate_request(celld_logic::Channel::Queue);
+    let cell = gate.cell_scope().map(str::to_string);
+    let mut messages = Vec::with_capacity(envelope.messages.len());
+    for message in envelope.messages {
+        let content_type = match message.content_type.as_str() {
+            "text" => QueueContentType::Text,
+            "bytes" => QueueContentType::Bytes,
+            "json" => QueueContentType::Json,
+            "v8" => QueueContentType::V8,
+            other => return loader_throw(scope, &format!("invalid Queue content type {other:?}")),
+        };
+        let body = match base64::engine::general_purpose::STANDARD.decode(&message.body_base64) {
+            Ok(body) => body,
+            Err(error) => {
+                return loader_throw(scope, &format!("invalid Queue message body: {error}"))
+            }
+        };
+        messages.push(QueueMessage {
+            id: message.id,
+            timestamp_ms: message.timestamp_ms,
+            body,
+            content_type,
+            attempts: message.attempts,
+        });
+    }
+    if messages.len() != envelope.leases.len()
+        || messages
+            .iter()
+            .zip(&envelope.leases)
+            .any(|(message, lease)| message.id != lease.message_id)
+    {
+        return loader_throw(
+            scope,
+            "a Queue dispatch must carry one matching lease per message",
+        );
+    }
+    let request = QueueDispatchReq {
+        generation: current_generation(scope),
+        scope: cell.unwrap_or_default(),
+        script,
+        lease_id: envelope.lease_id,
+        leases: envelope.leases,
+        batch: QueueBatch {
+            queue,
+            messages,
+            metrics: QueueMetrics {
+                backlog_count: envelope.metrics.backlog_count,
+                backlog_bytes: envelope.metrics.backlog_bytes,
+                oldest_message_timestamp_ms: envelope.metrics.oldest_message_timestamp_ms,
+            },
+        },
+    };
+    let id = asyncrt::enqueue(async move {
+        if request.scope.is_empty() {
+            return Err("Queue dispatch requires a cell event".to_string());
+        }
+        gated_channel_send(
+            gate,
+            &QUEUE_DISPATCH_TX,
+            request,
+            "no Queue dispatch channel",
+        )
+        .await?;
+        Ok(asyncrt::OpOut::Str(String::new()))
+    });
+    rv.set(promise_for(scope, id));
+}
+
+/// One synchronous boundary for Queue policy owned by `celld-logic`.
+///
+/// The JavaScript cell owns SQL and presentation. It sends row facts here so
+/// alarm selection, concurrency admission, generation advancement, settlement
+/// fencing, purge classification, retry precedence, and exhaustion have one
+/// production implementation rather than a tested Rust copy beside a different
+/// shipped JavaScript copy.
+fn op_queue_policy(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let request: serde_json::Value =
+        match serde_json::from_str(&args.get(0).to_rust_string_lossy(scope)) {
+            Ok(request) => request,
+            Err(error) => {
+                return loader_throw(scope, &format!("invalid Queue policy input: {error}"))
+            }
+        };
+    let integer = |object: &serde_json::Value, name: &str| -> Result<i64> {
+        object
+            .get(name)
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| anyhow!("Queue policy input has no integer {name}"))
+    };
+    let optional_integer = |object: &serde_json::Value, name: &str| -> Result<Option<i64>> {
+        match object.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(value) => value
+                .as_i64()
+                .map(Some)
+                .ok_or_else(|| anyhow!("Queue policy input {name} is not an integer")),
+        }
+    };
+    let result = (|| -> Result<serde_json::Value> {
+        match request.get("op").and_then(serde_json::Value::as_str) {
+            Some("rearm") => Ok(serde_json::json!(celld_logic::queue::rearm(
+                integer(&request, "now")?,
+                optional_integer(&request, "batchDeadline")?,
+                optional_integer(&request, "earliestVisible")?,
+                optional_integer(&request, "earliestLeaseExpiry")?,
+                optional_integer(&request, "nextSweep")?,
+            ))),
+            Some("capacity") => {
+                let active = usize::try_from(integer(&request, "active")?)
+                    .map_err(|_| anyhow!("Queue active concurrency is out of range"))?;
+                let maximum = u16::try_from(integer(&request, "maximum")?)
+                    .map_err(|_| anyhow!("Queue max concurrency is out of range"))?;
+                Ok(serde_json::json!(celld_logic::queue::can_install_lease(
+                    active, maximum,
+                )))
+            }
+            Some("retries") => {
+                let now = integer(&request, "now")?;
+                let entries = request
+                    .get("entries")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| anyhow!("Queue retry policy has no entries"))?;
+                let mut results = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let seconds = |name: &str| -> Result<Option<u32>> {
+                        optional_integer(entry, name)?
+                            .map(|value| {
+                                u32::try_from(value)
+                                    .map_err(|_| anyhow!("Queue retry {name} is out of range"))
+                            })
+                            .transpose()
+                    };
+                    let attempt = u16::try_from(integer(entry, "attempt")?)
+                        .map_err(|_| anyhow!("Queue retry attempt is out of range"))?;
+                    let max_retries = u16::try_from(integer(entry, "maxRetries")?)
+                        .map_err(|_| anyhow!("Queue maxRetries is out of range"))?;
+                    results.push(serde_json::json!({
+                        "at": celld_logic::queue::retry_at(
+                            now,
+                            seconds("explicitSeconds")?,
+                            seconds("configuredSeconds")?,
+                        ),
+                        "exhausted": celld_logic::queue::exhausted(attempt, max_retries),
+                    }));
+                }
+                Ok(serde_json::Value::Array(results))
+            }
+            Some("expiry") => {
+                let now = integer(&request, "now")?;
+                let entries = request
+                    .get("entries")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| anyhow!("Queue expiry policy has no entries"))?;
+                let mut results = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let prior_failures = u16::try_from(integer(entry, "priorFailures")?)
+                        .map_err(|_| anyhow!("Queue priorFailures is out of range"))?;
+                    let max_retries = u16::try_from(integer(entry, "maxRetries")?)
+                        .map_err(|_| anyhow!("Queue maxRetries is out of range"))?;
+                    let configured = optional_integer(entry, "configuredSeconds")?
+                        .map(|value| {
+                            u32::try_from(value)
+                                .map_err(|_| anyhow!("Queue retry delay is out of range"))
+                        })
+                        .transpose()?;
+                    let purge = entry
+                        .get("purgeOnSettle")
+                        .and_then(serde_json::Value::as_bool)
+                        .ok_or_else(|| anyhow!("Queue expiry has no purgeOnSettle"))?;
+                    let expired = celld_logic::queue::expire_lease(
+                        now,
+                        prior_failures,
+                        max_retries,
+                        configured,
+                        purge,
+                    );
+                    let action = match expired.action {
+                        celld_logic::queue::ExpiredLeaseAction::RetryAt(at) => {
+                            serde_json::json!({ "kind": "retry", "at": at })
+                        }
+                        celld_logic::queue::ExpiredLeaseAction::Exhausted => {
+                            serde_json::json!({ "kind": "exhausted" })
+                        }
+                        celld_logic::queue::ExpiredLeaseAction::DeletePurged => {
+                            serde_json::json!({ "kind": "delete-purged" })
+                        }
+                    };
+                    results.push(serde_json::json!({
+                        "attempt": expired.attempt,
+                        "action": action,
+                    }));
+                }
+                Ok(serde_json::Value::Array(results))
+            }
+            Some("batch") => {
+                let now = integer(&request, "now")?;
+                let max_batch_size = usize::try_from(integer(&request, "maxBatchSize")?)
+                    .map_err(|_| anyhow!("Queue maxBatchSize is out of range"))?;
+                let rows = request
+                    .get("rows")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| anyhow!("Queue batch policy has no rows"))?;
+                let rows = rows
+                    .iter()
+                    .map(|row| {
+                        let generation = row
+                            .get("leaseGeneration")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| anyhow!("Queue row has no leaseGeneration"))?
+                            .parse::<u64>()
+                            .context("Queue leaseGeneration is invalid")?;
+                        Ok(celld_logic::queue::BatchRow {
+                            seq: integer(row, "seq")?,
+                            visible_at: integer(row, "visibleAt")?,
+                            lease_generation: generation,
+                            leased_until: optional_integer(row, "leasedUntil")?,
+                            purge_on_settle: row
+                                .get("purgeOnSettle")
+                                .and_then(serde_json::Value::as_bool)
+                                .ok_or_else(|| anyhow!("Queue row has no purgeOnSettle"))?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let plan = celld_logic::queue::batch_plan(now, &rows, max_batch_size)?;
+                Ok(serde_json::json!({
+                    "leases": plan.leases.into_iter().map(|lease| serde_json::json!({
+                        "seq": lease.seq,
+                        "generation": lease.generation.to_string(),
+                        "reclaimed": lease.reclaimed,
+                    })).collect::<Vec<_>>(),
+                    "deletePurged": plan.delete_purged,
+                }))
+            }
+            Some("settlement") => {
+                #[cfg(celld_internal_tests)]
+                QUEUE_SETTLEMENT_POLICY_OBSERVED.with(|observed| observed.set(true));
+
+                let members = |name: &str| -> Result<Vec<celld_logic::queue::LeaseMember<'_>>> {
+                    request
+                        .get(name)
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| anyhow!("Queue settlement policy has no {name}"))?
+                        .iter()
+                        .map(|member| {
+                            let string = |field: &str| -> Result<&str> {
+                                member
+                                    .get(field)
+                                    .and_then(serde_json::Value::as_str)
+                                    .ok_or_else(|| {
+                                        anyhow!("Queue settlement member has no {field}")
+                                    })
+                            };
+                            Ok(celld_logic::queue::LeaseMember {
+                                seq: string("seq")?
+                                    .parse::<i64>()
+                                    .context("Queue settlement sequence is invalid")?,
+                                message_id: string("messageId")?,
+                                generation: string("generation")?
+                                    .parse::<u64>()
+                                    .context("Queue settlement generation is invalid")?,
+                            })
+                        })
+                        .collect()
+                };
+                let current = members("current")?;
+                let submitted = members("submitted")?;
+                Ok(serde_json::json!(celld_logic::queue::settlement_matches(
+                    &current, &submitted,
+                )))
+            }
+            Some("purge") => {
+                let now = integer(&request, "now")?;
+                let rows = request
+                    .get("rows")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| anyhow!("Queue purge policy has no rows"))?
+                    .iter()
+                    .map(|row| {
+                        Ok(celld_logic::queue::PurgeRow {
+                            seq: row
+                                .get("seq")
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or_else(|| anyhow!("Queue purge row has no sequence"))?
+                                .parse::<i64>()
+                                .context("Queue purge sequence is invalid")?,
+                            lease_id_present: row
+                                .get("leaseIdPresent")
+                                .and_then(serde_json::Value::as_bool)
+                                .ok_or_else(|| anyhow!("Queue purge row has no lease state"))?,
+                            leased_until: optional_integer(row, "leasedUntil")?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let plan = celld_logic::queue::purge_plan(now, &rows);
+                Ok(serde_json::json!({
+                    "delete": plan.delete.into_iter().map(|seq| seq.to_string()).collect::<Vec<_>>(),
+                    "markForSettle": plan.mark_for_settle.into_iter().map(|seq| seq.to_string()).collect::<Vec<_>>(),
+                }))
+            }
+            Some(other) => Err(anyhow!("unknown Queue policy operation {other:?}")),
+            None => Err(anyhow!("Queue policy input has no op")),
+        }
+    })();
+    match result {
+        Ok(value) => {
+            let value = v8::String::new(scope, &value.to_string()).unwrap();
+            rv.set(value.into());
+        }
+        Err(error) => loader_throw(scope, &error.to_string()),
+    }
+}
+
 /// Async cross-node dispatch: hand the fetch to the tokio proxy task and await
 /// its reply off-thread — the JS thread is never blocked. Resolves to a JSON
 /// `{status, body, headers}` string the harness turns back into a Response.
 /// `__svc_rpc(script, entrypoint, method, argsSc)` -> Promise<Uint8Array>;
 /// arguments and result are V8 structured-clone bytes.
+/// The application generation the calling isolate was built for, from the
+/// slot `load_config` installs. Zero for an isolate built outside any
+/// generation, which the runtime resolves as the current one.
+fn current_generation(scope: &mut v8::PinScope) -> crate::generation::GenerationId {
+    scope
+        .get_slot::<crate::generation::GenerationTag>()
+        .map(|tag| tag.0)
+        .unwrap_or(0)
+}
+
 fn op_svc_rpc(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -3515,8 +5523,9 @@ fn op_svc_rpc(
     let method = args.get(2).to_rust_string_lossy(scope);
     let call_args = view_bytes(args.get(3)).unwrap_or_default();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let gate = egress_gate_request();
+    let gate = egress_gate_request(celld_logic::Channel::Service);
     let request = SvcRpcReq {
+        generation: current_generation(scope),
         script,
         entrypoint,
         method,
@@ -3562,12 +5571,43 @@ fn op_svc_call_impl(
     let script = args.get(0).to_rust_string_lossy(scope);
     let url = args.get(1).to_rust_string_lossy(scope);
     let method = args.get(2).to_rust_string_lossy(scope);
-    let body = view_bytes(args.get(3)).unwrap_or_default();
-    let headers =
-        serde_json::from_str(&args.get(4).to_rust_string_lossy(scope)).unwrap_or_default();
+    let stream_arg = args.get(5);
+    let body = if stream_arg.is_number() {
+        RequestBody::Stream(stream_arg.number_value(scope).unwrap_or(0.0) as u64)
+    } else {
+        let Some(bytes) = view_bytes(args.get(3)) else {
+            return loader_throw(
+                scope,
+                "service binding: the request body is not a typed array",
+            );
+        };
+        RequestBody::Bytes(bytes.into())
+    };
+    let headers: Vec<(String, String)> =
+        match serde_json::from_str(&args.get(4).to_rust_string_lossy(scope)) {
+            Ok(headers) => headers,
+            Err(error) => {
+                return loader_throw(
+                    scope,
+                    &format!(
+                        "service binding: the request headers are not a name/value list: {error}"
+                    ),
+                )
+            }
+        };
+    let body_guard = match body.stream_id() {
+        Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
+            Some(guard) => guard,
+            None => return loader_throw(scope, "service binding: the body stream is not owned"),
+        },
+        None => RequestBodyGuard::of(&body),
+    };
     let (tx, rx) = tokio::sync::oneshot::channel();
-    // Shares the Durable Object cancel registry, so `__do_call_cancel` works
-    // unchanged for a service call.
+    // Shares the Durable Object cancel registry and the id encoding
+    // `attach_cancel_id` writes, so `__do_call_cancel` works unchanged for a
+    // service call. Only a cancellable call registers: a caller with no
+    // AbortSignal has nothing that can cancel it, and the router already ends
+    // the call when the reply sender drops.
     let (request_id, cancel, cancel_guard) = if cancellable {
         let request_id = next_do_request_id();
         let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
@@ -3583,13 +5623,15 @@ fn op_svc_call_impl(
     } else {
         (None, None, None)
     };
-    let gate = egress_gate_request();
+    let gate = egress_gate_request(celld_logic::Channel::Service);
     let request = SvcCallReq {
         cancel,
+        generation: current_generation(scope),
         script,
         url,
         method,
         body,
+        body_guard,
         headers,
         reply: tx,
     };
@@ -3608,11 +5650,7 @@ fn op_svc_call_impl(
     });
     let promise = promise_for(scope, id);
     if let Some(request_id) = request_id {
-        if let Some(object) = promise.to_object(scope) {
-            let key = v8::String::new(scope, "__celldCancelId").unwrap();
-            let value = v8::String::new(scope, &request_id.to_string()).unwrap();
-            object.set(scope, key.into(), value.into());
-        }
+        attach_cancel_id(scope, promise, request_id);
     }
     rv.set(promise);
 }
@@ -3634,12 +5672,43 @@ enum LoaderState {
     Failed(Arc<str>),
 }
 
-type LoaderRegistry = HashMap<u64, tokio::sync::watch::Receiver<LoaderState>>;
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct LoaderOwner(u64);
+
+impl LoaderOwner {
+    fn fresh() -> Self {
+        Self(LOADER_NEXT_OWNER.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+#[doc(hidden)]
+pub struct LoaderEntry {
+    owner: LoaderOwner,
+    state: tokio::sync::watch::Receiver<LoaderState>,
+}
+
+type LoaderRegistry = HashMap<u64, LoaderEntry>;
 static LOADER_REGISTRY: OnceLock<std::sync::Mutex<LoaderRegistry>> = OnceLock::new();
 static LOADER_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static LOADER_NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
-fn loader_registry() -> &'static std::sync::Mutex<LoaderRegistry> {
+#[doc(hidden)]
+pub fn loader_registry() -> &'static std::sync::Mutex<LoaderRegistry> {
     LOADER_REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Remove the registry references for every child of `owner`. The caller
+/// chooses when to drop the returned states, because they can own V8 isolates
+/// and no other isolate can be entered on that thread at destruction time.
+fn take_loader_owner(owner: LoaderOwner) -> Vec<tokio::sync::watch::Receiver<LoaderState>> {
+    let mut registry = loader_registry().lock().unwrap();
+    let ids: Vec<u64> = registry
+        .iter()
+        .filter_map(|(id, entry)| (entry.owner == owner).then_some(*id))
+        .collect();
+    ids.into_iter()
+        .filter_map(|id| registry.remove(&id).map(|entry| entry.state))
+        .collect()
 }
 
 fn loader_throw(scope: &mut v8::PinScope, message: &str) {
@@ -3793,6 +5862,9 @@ fn op_loader_load(
             );
         }
     };
+    let owner = *scope
+        .get_slot::<LoaderOwner>()
+        .expect("Worker isolate has a Loader owner");
     // Bound live loaded workers so a runaway agent loop cannot exhaust
     // isolates. Evicted workers (dropped stubs) free their slot.
     let max = crate::env_vars::positive_or("CELLD_MAX_LOADED_WORKERS", 256)
@@ -3821,6 +5893,10 @@ fn op_loader_load(
             // A loaded worker reaches D1 only if its parent injects a stub;
             // ambient bindings are exactly what Code Mode withholds.
             d1_bindings: Vec::new(),
+            kv_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
+            workflow_bindings: Vec::new(),
             ai_binding: None,
             vars: Vec::new(),
             node: String::new(),
@@ -3835,16 +5911,18 @@ fn op_loader_load(
         Err(error) => return loader_throw(scope, &format!("worker loader: {error}")),
     };
     let (loaded, state) = tokio::sync::watch::channel(LoaderState::Loading);
-    loader_registry().lock().unwrap().insert(id, state);
+    loader_registry()
+        .lock()
+        .unwrap()
+        .insert(id, LoaderEntry { owner, state });
     handle.spawn(async move {
-        let state =
-            match tokio::task::spawn_blocking(move || Worker::load_config(config, &[])).await {
-                Ok(Ok(worker)) => LoaderState::Ready(crate::pool::Slot::standalone(worker)),
-                Ok(Err(error)) => LoaderState::Failed(Arc::from(format!("{error}"))),
-                Err(error) => LoaderState::Failed(Arc::from(format!(
-                    "worker loader: load task failed: {error}"
-                ))),
-            };
+        let state = match tokio::task::spawn_blocking(move || Worker::load_config(config)).await {
+            Ok(Ok(worker)) => LoaderState::Ready(crate::pool::Slot::standalone(worker)),
+            Ok(Err(error)) => LoaderState::Failed(Arc::from(format!("{error}"))),
+            Err(error) => LoaderState::Failed(Arc::from(format!(
+                "worker loader: load task failed: {error}"
+            ))),
+        };
         loaded.send_replace(state);
     });
     rv.set(v8::Number::new(scope, id as f64).into());
@@ -3860,10 +5938,42 @@ fn op_loader_fetch(
     let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let url = args.get(1).to_rust_string_lossy(scope);
     let method = args.get(2).to_rust_string_lossy(scope);
-    let body = view_bytes(args.get(3)).unwrap_or_default();
-    let headers =
-        serde_json::from_str(&args.get(4).to_rust_string_lossy(scope)).unwrap_or_default();
-    let loaded = loader_registry().lock().unwrap().get(&id).cloned();
+    let stream_arg = args.get(5);
+    let body = if stream_arg.is_number() {
+        RequestBody::Stream(stream_arg.number_value(scope).unwrap_or(0.0) as u64)
+    } else {
+        let Some(bytes) = view_bytes(args.get(3)) else {
+            return loader_throw(
+                scope,
+                "worker loader: the request body is not a typed array",
+            );
+        };
+        RequestBody::Bytes(bytes.into())
+    };
+    let headers: Vec<(String, String)> =
+        match serde_json::from_str(&args.get(4).to_rust_string_lossy(scope)) {
+            Ok(headers) => headers,
+            Err(error) => {
+                return loader_throw(
+                    scope,
+                    &format!(
+                        "worker loader: the request headers are not a name/value list: {error}"
+                    ),
+                )
+            }
+        };
+    let mut body_guard = match body.stream_id() {
+        Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
+            Some(guard) => guard,
+            None => return loader_throw(scope, "worker loader: the body stream is not owned"),
+        },
+        None => RequestBodyGuard::of(&body),
+    };
+    let loaded = loader_registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|entry| entry.state.clone());
     let async_id = asyncrt::enqueue(async move {
         let state = loaded.ok_or_else(|| "worker loader: unknown worker".to_string())?;
         let slot = loaded_worker_slot(state).await?;
@@ -3872,14 +5982,23 @@ fn op_loader_fetch(
             queued_at: Instant::now(),
             url,
             method,
-            body: body.into(),
+            body,
             headers,
-            request_id: None,
+            // A loaded Worker receives an incoming request like a service
+            // target does. The id selects the stream-aware construction path
+            // and gives an abandoned request a lifecycle owner.
+            request_id: Some(next_request_id()),
             reply,
         };
         let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
         match receive.await {
-            Ok(Ok(response)) => Ok(encode_http_response(response, false)),
+            Ok(Ok(response)) => {
+                // The response proves that the loaded Worker installed its
+                // request context. That context owns an unread body tail
+                // through its waitUntil work.
+                body_guard.disarm();
+                Ok(encode_http_response(response, false))
+            }
             Ok(Err(error)) => Err(format!("{error}")),
             Err(_) => match driving.await {
                 Err(error) => Err(format!("loaded worker task died: {error}")),
@@ -3888,6 +6007,36 @@ fn op_loader_fetch(
         }
     });
     rv.set(promise_for(scope, async_id));
+}
+
+/// Reclaims a streamed request body if a host dispatch fails before the
+/// target installs a request context. A successful dispatch disarms this
+/// fallback because the target context then owns the unread tail.
+pub struct RequestBodyGuard(Option<u64>);
+
+impl RequestBodyGuard {
+    pub fn of(body: &RequestBody) -> Self {
+        let stream_id = body.stream_id().filter(|id| claim_http_stream(*id));
+        Self(stream_id)
+    }
+
+    fn transferred(stream_id: u64) -> Self {
+        Self(Some(stream_id))
+    }
+
+    pub fn disarm(&mut self) {
+        if let Some(stream_id) = self.0.take() {
+            release_http_stream(stream_id);
+        }
+    }
+}
+
+impl Drop for RequestBodyGuard {
+    fn drop(&mut self) {
+        if let Some(stream_id) = self.0.take() {
+            release_http_stream(stream_id);
+        }
+    }
 }
 
 /// `__loader_rpc(id, entrypoint, method, argsSc)` -> Promise<Uint8Array>. The
@@ -3902,7 +6051,11 @@ fn op_loader_rpc(
     let entrypoint = args.get(1).to_rust_string_lossy(scope);
     let method = args.get(2).to_rust_string_lossy(scope);
     let call_args = view_bytes(args.get(3)).unwrap_or_default();
-    let loaded = loader_registry().lock().unwrap().get(&id).cloned();
+    let loaded = loader_registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|entry| entry.state.clone());
     let async_id = asyncrt::enqueue(async move {
         let state = loaded.ok_or_else(|| "worker loader: unknown worker".to_string())?;
         let slot = loaded_worker_slot(state).await?;
@@ -3935,71 +6088,14 @@ fn op_loader_drop(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    if let Some(state) = loader_registry().lock().unwrap().remove(&id) {
+    if let Some(entry) = loader_registry().lock().unwrap().remove(&id) {
         // This op runs while the parent isolate is entered. The load state can
         // own the loaded isolate, and V8 forbids dropping one isolate while a
         // different isolate is entered on the same thread. Hand the final
         // reference to the host scheduler so destruction happens after this
         // turn has left V8.
-        asyncrt::op_handle().spawn(async move { drop(state) });
+        asyncrt::op_handle().spawn(async move { drop(entry.state) });
     }
-}
-
-/// `__writePosition(scope)` -> the cell's committed-write position (a number),
-/// or `null` when the scope has no open connection. The co-hosted DO fast path
-/// samples this around an inline `fetch` to tell a write from a read.
-fn op_write_position(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    match storage::write_position(&cell) {
-        Some(position) => rv.set(v8::Number::new(scope, position as f64).into()),
-        None => rv.set(v8::null(scope).into()),
-    }
-}
-
-/// `__gateWrite(scope, positionOrNull)` -> a promise that resolves once every
-/// write the response can reveal is durable. A null position identifies a
-/// read-only response, which trails any barrier already open for the cell.
-fn op_gate_write(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
-    let cell = args.get(0).to_rust_string_lossy(scope);
-    let value = args.get(1);
-    let position = (!value.is_null_or_undefined())
-        .then(|| value.to_integer(scope).map(|n| n.value() as u64))
-        .flatten();
-    let read_only = position.is_none();
-    let (tx, receive) = tokio::sync::oneshot::channel();
-    let sent = GATE_TX
-        .get()
-        .map(|gate| {
-            gate.send(GateReq {
-                scope: cell,
-                position,
-                reply: tx,
-            })
-            .is_ok()
-        })
-        .unwrap_or(false);
-    let id = asyncrt::enqueue(async move {
-        if !sent {
-            if read_only {
-                return Ok(String::new());
-            }
-            return Err("no output-gate channel".into());
-        }
-        match receive.await {
-            Ok(Ok(())) => Ok(String::new()),
-            Ok(Err(error)) => Err(format!("{error:?}")),
-            Err(_) => Err("output gate dropped".into()),
-        }
-    });
-    rv.set(promise_for(scope, id));
 }
 
 fn op_do_call(
@@ -4029,9 +6125,40 @@ fn op_do_call_impl(
     let name = (!name_value.is_null_or_undefined()).then(|| name_value.to_rust_string_lossy(scope));
     let url = args.get(2).to_rust_string_lossy(scope);
     let method = args.get(3).to_rust_string_lossy(scope);
-    let body = view_bytes(args.get(4)).unwrap_or_default();
-    let headers =
-        serde_json::from_str(&args.get(5).to_rust_string_lossy(scope)).unwrap_or_default();
+    // arg 4 is the held bytes; arg 6, when a number, is a host stream id for a
+    // body that must not be collected here (a large or unbounded upload). The
+    // owning cell reads that stream directly; only a cross-node hop collects it.
+    let stream_arg = args.get(6);
+    let body = if stream_arg.is_number() {
+        RequestBody::Stream(stream_arg.number_value(scope).unwrap_or(0.0) as u64)
+    } else {
+        let Some(bytes) = view_bytes(args.get(4)) else {
+            return loader_throw(
+                scope,
+                "durable object: the request body is not a typed array",
+            );
+        };
+        RequestBody::Bytes(bytes.into())
+    };
+    let headers: Vec<(String, String)> =
+        match serde_json::from_str(&args.get(5).to_rust_string_lossy(scope)) {
+            Ok(headers) => headers,
+            Err(error) => {
+                return loader_throw(
+                    scope,
+                    &format!(
+                        "durable object: the request headers are not a name/value list: {error}"
+                    ),
+                )
+            }
+        };
+    let body_guard = match body.stream_id() {
+        Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
+            Some(guard) => guard,
+            None => return loader_throw(scope, "durable object: the body stream is not owned"),
+        },
+        None => RequestBodyGuard::of(&body),
+    };
     let (tx, rx) = tokio::sync::oneshot::channel();
     // Taken here and nowhere later: this is the last point that still runs
     // in the order the script made the calls.
@@ -4046,7 +6173,7 @@ fn op_do_call_impl(
         .unwrap()
         .insert(request_id, cancel_sender);
     let mut cancel_guard = DoCallCancelGuard::new(request_id);
-    let gate = egress_gate_request();
+    let gate = egress_gate_request(celld_logic::Channel::CellRpc);
     let request = DoCallReq {
         request_id: Some(request_id),
         cancel: Some(cancel),
@@ -4056,6 +6183,7 @@ fn op_do_call_impl(
         url,
         method,
         body,
+        body_guard,
         headers,
         reply: tx,
         order,
@@ -4073,11 +6201,7 @@ fn op_do_call_impl(
     });
     let p = promise_for(scope, id);
     if cancellable {
-        if let Some(promise) = p.to_object(scope) {
-            let key = v8::String::new(scope, "__celldCancelId").unwrap();
-            let request_id = v8::String::new(scope, &request_id_string(request_id)).unwrap();
-            promise.set(scope, key.into(), request_id.into());
-        }
+        attach_cancel_id(scope, p, request_id);
     }
     rv.set(p);
 }
@@ -4107,9 +6231,9 @@ fn op_rpc_call(
     let name_value = args.get(1);
     let name = (!name_value.is_null_or_undefined()).then(|| name_value.to_rust_string_lossy(scope));
     let method = args.get(2).to_rust_string_lossy(scope);
-    let args = RpcData::V8(view_bytes(args.get(3)).unwrap_or_default());
+    let args = RpcData::V8(view_bytes(args.get(3)).unwrap_or_default().into());
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let gate = egress_gate_request();
+    let gate = egress_gate_request(celld_logic::Channel::CellRpc);
     let request = RpcCallReq {
         scope: cell,
         name,
@@ -4120,7 +6244,7 @@ fn op_rpc_call(
     let id = asyncrt::enqueue(async move {
         gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await?;
         match rx.await {
-            Ok(Ok(RpcData::V8(bytes))) => Ok(bytes),
+            Ok(Ok(RpcData::V8(bytes))) => Ok(Vec::<u8>::from(bytes)),
             Ok(Ok(RpcData::Json(_))) => Err("RPC answered JSON to a structured-clone call".into()),
             Ok(Err(e)) => Err(format!("{e}")),
             Err(e) => Err(format!("RPC proxy dropped: {e}")),
@@ -4131,7 +6255,7 @@ fn op_rpc_call(
 }
 
 /// Outbound `fetch` — the op behind the harness's `fetch()`. Resolves to a JSON
-/// `{status, body, headers}` string. Streaming is a later layer.
+/// `{status, body, headers}` string.
 fn op_fetch(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -4149,15 +6273,46 @@ fn op_fetch(
     }
     let method = args.get(0).to_rust_string_lossy(scope);
     let url = args.get(1).to_rust_string_lossy(scope);
-    let b = args.get(2);
-    let body: Option<Vec<u8>> = if b.is_undefined() || b.is_null() {
+    // A body is a typed array, as it is for `__svc_call`, `__do_call` and
+    // `__loader_fetch`. `None` and an empty body are different requests — one
+    // carries no `Content-Length` — so the absent case stays distinct.
+    let body_arg = args.get(2);
+    let stream_arg = args.get(5);
+    let body: Option<RequestBody> = if body_arg.is_undefined() || body_arg.is_null() {
         None
+    } else if stream_arg.is_number() {
+        Some(RequestBody::Stream(
+            stream_arg.number_value(scope).unwrap_or(0.0) as u64,
+        ))
     } else {
-        serde_json::from_str(&b.to_rust_string_lossy(scope)).ok()
+        match view_bytes(body_arg) {
+            Some(bytes) => Some(RequestBody::Bytes(bytes.into())),
+            // Answering an unreadable argument with `None` sent the request
+            // with no body at all: the peer saw something the Worker never
+            // asked for, and nothing threw and nothing was logged.
+            None => return loader_throw(scope, "fetch: the request body is not a typed array"),
+        }
     };
-    let mut headers: Vec<(String, String)> =
-        serde_json::from_str(&args.get(3).to_rust_string_lossy(scope)).unwrap_or_default();
+    let raw_headers = args.get(3).to_rust_string_lossy(scope);
+    let mut headers: Vec<(String, String)> = match serde_json::from_str(&raw_headers) {
+        Ok(headers) => headers,
+        // Same failure as the body: dropping the headers silently sent an
+        // unauthenticated, unrouted request in place of the real one.
+        Err(error) => {
+            return loader_throw(
+                scope,
+                &format!("fetch: the request headers are not a name/value list: {error}"),
+            )
+        }
+    };
     let redirect = args.get(4).to_rust_string_lossy(scope);
+    let mut body_guard = match body.as_ref().and_then(RequestBody::stream_id) {
+        Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
+            Some(guard) => guard,
+            None => return loader_throw(scope, "fetch: the body stream is not owned"),
+        },
+        None => RequestBodyGuard(None),
+    };
     let client = if redirect == "manual" {
         HTTP_MANUAL.with(|client| client.clone())
     } else {
@@ -4183,7 +6338,7 @@ fn op_fetch(
     // third party that has acted on a write celld then loses cannot be told to
     // un-act. That covers a write this handler made and a value it only read,
     // because the third party cannot tell the two apart.
-    let gate = egress_gate_request();
+    let gate = egress_gate_request(celld_logic::Channel::Fetch);
     let id = asyncrt::enqueue(async move {
         let span_started = trace.as_ref().map(|_| crate::telemetry::now_unix_us());
         let mut span = trace.as_ref().zip(child).map(|(parent, child)| {
@@ -4215,11 +6370,37 @@ fn op_fetch(
         let mut rb = client
             .request(m, &url)
             .timeout(std::time::Duration::from_secs(fetch_timeout));
+        // reqwest omits Content-Length for an empty Vec, which collapses the
+        // wire representation of `Some([])` into the representation of
+        // `None`. Install the zero length here unless the Worker supplied a
+        // framing header, so the body distinction survives the HTTP client.
+        let empty_body_needs_length = body
+            .as_ref()
+            .is_some_and(|body| matches!(body, RequestBody::Bytes(bytes) if bytes.is_empty()))
+            && !headers.iter().any(|(name, _)| {
+                name.eq_ignore_ascii_case("content-length")
+                    || name.eq_ignore_ascii_case("transfer-encoding")
+            });
         for (name, value) in headers {
             rb = rb.header(name, value);
         }
-        if let Some(b) = body {
-            rb = rb.body(b);
+        if let Some(body) = body {
+            rb = match body {
+                RequestBody::Bytes(bytes) => rb.body(bytes),
+                RequestBody::Stream(stream_id) => match take_body_stream(stream_id) {
+                    Ok(stream) => {
+                        body_guard.disarm();
+                        rb.body(reqwest::Body::wrap_stream(stream))
+                    }
+                    Err(error) => {
+                        finish(false, None, Some(error.clone()));
+                        return Err(error);
+                    }
+                },
+            };
+        }
+        if empty_body_needs_length {
+            rb = rb.header(reqwest::header::CONTENT_LENGTH, 0);
         }
         match rb.send().await {
             Ok(resp) => {
@@ -4261,11 +6442,21 @@ fn op_asset_fetch(
     let method = args.get(1).to_rust_string_lossy(scope);
     let url = args.get(2).to_rust_string_lossy(scope);
     let headers: Vec<(String, String)> =
-        serde_json::from_str(&args.get(3).to_rust_string_lossy(scope)).unwrap_or_default();
+        match serde_json::from_str(&args.get(3).to_rust_string_lossy(scope)) {
+            Ok(headers) => headers,
+            Err(error) => {
+                return loader_throw(
+                    scope,
+                    &format!("assets: the request headers are not a name/value list: {error}"),
+                )
+            }
+        };
+    let generation = current_generation(scope);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let sent = ASSET_CALL_TX.get().is_some_and(|sender| {
         sender
             .send(AssetCallReq {
+                generation,
                 script,
                 url,
                 method,
@@ -4285,6 +6476,20 @@ fn op_asset_fetch(
         }
     });
     rv.set(promise_for(scope, id));
+}
+
+/// Take exclusive ownership of a registered request source.
+///
+/// The returned stream removes the registry hop, so its eventual consumer
+/// supplies the backpressure and dropping that consumer cancels the source.
+pub fn take_body_stream(stream_id: u64) -> Result<HttpChunkStream, String> {
+    match http_streams().lock().unwrap().remove(&stream_id) {
+        Some(entry) => entry
+            .source
+            .map(http_chunk_stream)
+            .ok_or_else(|| format!("body stream {stream_id} source is checked out")),
+        None => Err(format!("body stream {stream_id} is not registered")),
+    }
 }
 
 async fn next_http_stream_chunk(source: &mut HttpStreamSource) -> Result<Option<Vec<u8>>, String> {
@@ -4371,7 +6576,7 @@ fn op_http_stream_read(
         let Some((mut source, mut cancelled)) = source else {
             return Ok(asyncrt::OpOut::Str(HTTP_STREAM_DONE.into()));
         };
-        let next = tokio::select! {
+        let next = crate::asyncrt::select! {
             result = next_http_stream_chunk(&mut source) => Some(result),
             _ = cancelled.changed() => None,
         };
@@ -4415,6 +6620,7 @@ fn op_http_stream_tee(
         return;
     };
     let ids = tee_http_stream(source);
+    current_context().replace_body_stream(stream_id, ids);
     let json = serde_json::to_string(&ids).unwrap();
     rv.set(v8::String::new(scope, &json).unwrap().into());
 }
@@ -4506,8 +6712,8 @@ fn op_response_stream_closed(
         .unzip();
     let id = asyncrt::enqueue(async move {
         let cancelled = match (writer, finished.as_mut()) {
-            (Some(writer), Some(finished)) => tokio::select! {
-                biased;
+            (Some(writer), Some(finished)) => crate::asyncrt::select_biased! {
+                "stream completion wins a tie so a completed response is not reported as cancelled";
                 result = finished.changed() => result.is_err(),
                 _ = writer.closed() => true,
             },
@@ -4542,10 +6748,6 @@ fn op_response_stream_close(
     rv.set(promise_for(scope, id));
 }
 
-pub fn reqwest_response_stream(response: reqwest::Response) -> HttpChunkStream {
-    http_chunk_stream(HttpStreamSource::Response(response))
-}
-
 /// Hand a request body to the isolate as a stream rather than as bytes.
 /// The returned id names the stream for `__http_stream_read`, so the
 /// Worker pulls each chunk off the socket as it asks for it and the host
@@ -4563,7 +6765,7 @@ pub fn register_body_stream(stream: HttpChunkStream) -> u64 {
 /// not need. A large body, or a body of unknown length, crosses as a
 /// stream id. The peak cost of that body is one chunk, not its length.
 pub enum RequestBody {
-    Bytes(Vec<u8>),
+    Bytes(bytes::Bytes),
     Stream(u64),
 }
 
@@ -4575,11 +6777,25 @@ impl RequestBody {
             Self::Stream(_) => &[],
         }
     }
+
+    pub fn stream_id(&self) -> Option<u64> {
+        match self {
+            Self::Bytes(_) => None,
+            Self::Stream(id) => Some(*id),
+        }
+    }
+
+    fn into_held_bytes(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Bytes(bytes) => Some(bytes.into()),
+            Self::Stream(_) => None,
+        }
+    }
 }
 
 impl From<Vec<u8>> for RequestBody {
     fn from(bytes: Vec<u8>) -> Self {
-        Self::Bytes(bytes)
+        Self::Bytes(bytes.into())
     }
 }
 
@@ -4594,7 +6810,7 @@ fn op_timer(
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
     timer_cancels().lock().unwrap().insert(timer_id, cancel_tx);
     let id = asyncrt::enqueue(async move {
-        tokio::select! {
+        crate::asyncrt::select! {
             _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {}
             _ = &mut cancel_rx => {}
         }
@@ -4622,7 +6838,7 @@ fn op_gate_acquire(
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
     let event = NEXT_GATE_EVENT.fetch_add(1, Ordering::Relaxed);
-    // Taken under the gates lock so the test and the take are one step: a
+    // Taken under the gates lock so the observation and the take are one step: a
     // release landing between them would leave this block queued behind a
     // gate that is already open.
     let taken = cell_gates()
@@ -4826,11 +7042,46 @@ fn durable_object_id_for_name(namespace_key: &str, name: &str) -> [u8; 32] {
 /// Workers can bind, and a Worker rename must not rename that database.
 const D1_NAMESPACE_KEY: &str = "cells:v1:d1:__D1Database";
 
+/// The same, for a KV namespace, and for the same reason: several Workers can
+/// bind one namespace, and they must reach one set of cells.
+///
+/// Written out rather than derived from the class name, because these two
+/// strings are addresses. A scheme that computed them would be free to change,
+/// and changing one renames every cell it ever addressed.
+const KV_NAMESPACE_KEY: &str = "cells:v1:kv:__KvNamespace";
+
+/// The fleet-wide namespace for Queue broker cells. The queue name is the
+/// durable resource identity, so a producer and a consumer in different
+/// scripts must derive the same cell id.
+const QUEUE_NAMESPACE_KEY: &str = "cells:v1:queue:__Queue";
+
+/// A shared reserved class addresses one set of cells for the whole fleet; every
+/// other class, reserved or not, is scoped to the script that exports it.
+///
+/// The question is asked once, through `deploy::is_shared_reserved_class`, and
+/// not as a chain of `==` against class names. A reserved class declared shared
+/// there and script-scoped here would silently give each script its own copy of
+/// a resource the configuration says they share -- which is what happened to KV
+/// between its manifest landing and this line being written.
+fn shared_namespace_key(class_name: &str) -> Option<&'static str> {
+    match class_name {
+        crate::deploy::D1_CLASS => Some(D1_NAMESPACE_KEY),
+        crate::deploy::KV_CLASS => Some(KV_NAMESPACE_KEY),
+        crate::deploy::QUEUE_CLASS => Some(QUEUE_NAMESPACE_KEY),
+        _ => {
+            debug_assert!(
+                !crate::deploy::is_shared_reserved_class(class_name),
+                "a shared reserved class needs a fleet-wide namespace key: {class_name}"
+            );
+            None
+        }
+    }
+}
+
 pub(crate) fn namespace_key(script_name: &str, class_name: &str) -> String {
-    if class_name == crate::deploy::D1_CLASS {
-        D1_NAMESPACE_KEY.to_string()
-    } else {
-        format!("cells:v1:{}:{script_name}:{class_name}", script_name.len())
+    match shared_namespace_key(class_name) {
+        Some(shared) => shared.to_string(),
+        None => format!("cells:v1:{}:{script_name}:{class_name}", script_name.len()),
     }
 }
 
@@ -4841,6 +7092,46 @@ pub(crate) fn namespace_key(script_name: &str, class_name: &str) -> String {
 pub fn d1_cell_scope(database_identity: &str) -> String {
     let id = durable_object_id_for_name(D1_NAMESPACE_KEY, database_identity);
     format!("{}:{}", crate::deploy::D1_CLASS, durable_object_id_hex(&id))
+}
+
+/// The cell scope one shard of a KV namespace lives at, for a caller outside
+/// any isolate. `celld kv` addresses a namespace over the operator route, and
+/// this derives what `getByName` derives in the harness -- from the same key,
+/// the same name, and the same HMAC.
+///
+/// The name comes from `celld_logic::kv::cell_name`, which is also what the
+/// binding is handed at `build_env`. Neither side formats it, because a
+/// formatting disagreement here does not fail: it silently addresses a second,
+/// empty namespace.
+pub fn kv_cell_scope(namespace_id: &str, shard: u32) -> String {
+    let name = celld_logic::kv::cell_name(namespace_id, shard);
+    let id = durable_object_id_for_name(KV_NAMESPACE_KEY, &name);
+    format!("{}:{}", crate::deploy::KV_CLASS, durable_object_id_hex(&id))
+}
+
+/// The Queue broker scope for callers outside a Worker isolate.
+pub fn queue_cell_scope(queue: &str) -> String {
+    let name = celld_logic::queue::cell_name(queue);
+    let id = durable_object_id_for_name(QUEUE_NAMESPACE_KEY, name);
+    format!(
+        "{}:{}",
+        crate::deploy::QUEUE_CLASS,
+        durable_object_id_hex(&id)
+    )
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn workflow_cell_scope_for_test(
+    script_name: &str,
+    workflow_name: &str,
+    instance_id: &str,
+) -> String {
+    let class = crate::deploy::workflow_class(script_name);
+    let namespace = namespace_key(script_name, &class);
+    let name = format!("{workflow_name}/{instance_id}");
+    let id = durable_object_id_for_name(&namespace, &name);
+    format!("{class}:{}", durable_object_id_hex(&id))
 }
 
 fn durable_object_id_hex(bytes: &[u8; 32]) -> String {
@@ -4886,7 +7177,7 @@ fn register_actor_name(
     };
     let context = scope.get_current_context();
     let global = context.global(scope);
-    let cell_key = v8::String::new(scope, "__cell").unwrap();
+    let cell_key = static_key(scope, &v8_strings::CELL);
     let cell = global
         .get(scope, cell_key.into())
         .and_then(|value| value.to_object(scope))
@@ -5137,7 +7428,7 @@ fn op_heap_over_admission_share(
     };
     rv.set(v8::Boolean::new(scope, over).into());
 }
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 fn op_test_set_heap_limit_excessively_exceeded(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -5149,7 +7440,7 @@ fn op_test_set_heap_limit_excessively_exceeded(
             .store(args.get(0).boolean_value(scope), Ordering::Relaxed);
     }
 }
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 fn op_test_force_heap_admission_refusal(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -5161,7 +7452,7 @@ fn op_test_force_heap_admission_refusal(
             .store(args.get(0).boolean_value(scope), Ordering::Relaxed);
     }
 }
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 fn op_test_gc(
     scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
@@ -5169,6 +7460,219 @@ fn op_test_gc(
 ) {
     scope.request_garbage_collection_for_testing(v8::GarbageCollectionType::Full);
 }
+
+#[cfg(celld_internal_tests)]
+thread_local! {
+    static FAIL_NEXT_WORKFLOW_EVENT_CONSUMPTION: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    static FAIL_NEXT_WORKFLOW_META_CREATION: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    static FAIL_NEXT_WORKFLOW_ALARM_DELETION: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    static FAIL_NEXT_QUEUE_DLQ_ACCEPT: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    static QUEUE_DLQ_ACCEPT_CALLS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static QUEUE_METRICS_MATERIALIZED: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    static QUEUE_REARM_OBSERVED: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    static QUEUE_REARM_POSITIVE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    static QUEUE_REARM_BOUND_VIOLATED: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    static QUEUE_SETTLEMENT_POLICY_OBSERVED: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    static QUEUE_LEASE_LOOKUP_PLANS: std::cell::RefCell<Vec<String>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn fail_next_workflow_event_consumption_for_test() {
+    FAIL_NEXT_WORKFLOW_EVENT_CONSUMPTION.with(|fail| fail.set(true));
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn fail_next_workflow_meta_creation_for_test() {
+    FAIL_NEXT_WORKFLOW_META_CREATION.with(|fail| fail.set(true));
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn fail_next_workflow_alarm_deletion_for_test() {
+    FAIL_NEXT_WORKFLOW_ALARM_DELETION.with(|fail| fail.set(true));
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn fail_next_queue_dlq_accept_for_test() {
+    FAIL_NEXT_QUEUE_DLQ_ACCEPT.with(|fail| fail.set(true));
+}
+
+#[cfg(celld_internal_tests)]
+pub fn reset_queue_dlq_accept_calls_for_test() {
+    QUEUE_DLQ_ACCEPT_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn queue_dlq_accept_calls_for_test() -> usize {
+    QUEUE_DLQ_ACCEPT_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(celld_internal_tests)]
+pub fn reset_queue_hot_path_observations_for_test() {
+    QUEUE_METRICS_MATERIALIZED.with(|observed| observed.set(false));
+    QUEUE_REARM_OBSERVED.with(|observed| observed.set(false));
+    QUEUE_REARM_POSITIVE.with(|observed| observed.set(false));
+    QUEUE_REARM_BOUND_VIOLATED.with(|violated| violated.set(false));
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn queue_hot_path_observations_for_test() -> (bool, bool, bool) {
+    let materialized = QUEUE_METRICS_MATERIALIZED.with(std::cell::Cell::get);
+    let bounded = QUEUE_REARM_OBSERVED.with(std::cell::Cell::get)
+        && QUEUE_REARM_POSITIVE.with(std::cell::Cell::get)
+        && !QUEUE_REARM_BOUND_VIOLATED.with(std::cell::Cell::get);
+    let violated = QUEUE_REARM_BOUND_VIOLATED.with(std::cell::Cell::get);
+    (materialized, bounded, violated)
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn reset_queue_lease_lookup_plans_for_test() {
+    QUEUE_LEASE_LOOKUP_PLANS.with(|plans| plans.borrow_mut().clear());
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn queue_lease_lookup_plans_for_test() -> Vec<String> {
+    QUEUE_LEASE_LOOKUP_PLANS.with(|plans| plans.borrow().clone())
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn reset_queue_settlement_policy_observation_for_test() {
+    QUEUE_SETTLEMENT_POLICY_OBSERVED.with(|observed| observed.set(false));
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn queue_settlement_policy_observed_for_test() -> bool {
+    QUEUE_SETTLEMENT_POLICY_OBSERVED.with(std::cell::Cell::get)
+}
+
+#[cfg(celld_internal_tests)]
+fn op_test_workflow_event_consumed(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let fail = FAIL_NEXT_WORKFLOW_EVENT_CONSUMPTION.with(|fail| fail.replace(false));
+    if fail {
+        throw_storage_error(
+            scope,
+            "workflow event consumption",
+            "injected failure after workflow event delete",
+        );
+    }
+}
+
+#[cfg(celld_internal_tests)]
+fn op_test_workflow_meta_created(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let fail = FAIL_NEXT_WORKFLOW_META_CREATION.with(|fail| fail.replace(false));
+    if fail {
+        throw_storage_error(
+            scope,
+            "workflow creation",
+            "injected failure after workflow metadata write",
+        );
+    }
+}
+
+#[cfg(celld_internal_tests)]
+fn op_test_workflow_alarm_deleted(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let fail = FAIL_NEXT_WORKFLOW_ALARM_DELETION.with(|fail| fail.replace(false));
+    if fail {
+        throw_storage_error(
+            scope,
+            "workflow alarm deletion",
+            "injected failure after workflow alarm delete",
+        );
+    }
+}
+
+#[cfg(celld_internal_tests)]
+fn op_test_queue_dlq_accepted(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    QUEUE_DLQ_ACCEPT_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let fail = FAIL_NEXT_QUEUE_DLQ_ACCEPT.with(|fail| fail.replace(false));
+    if fail {
+        throw_storage_error(
+            scope,
+            "Queue DLQ transfer",
+            "injected failure after the target accepted the message",
+        );
+    }
+}
+
+#[cfg(celld_internal_tests)]
+fn op_test_queue_metrics_materialized(
+    _scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    QUEUE_METRICS_MATERIALIZED.with(|observed| observed.set(true));
+}
+
+#[cfg(celld_internal_tests)]
+fn op_test_queue_lease_lookup_plan(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let plan = args.get(0).to_rust_string_lossy(scope);
+    QUEUE_LEASE_LOOKUP_PLANS.with(|plans| plans.borrow_mut().push(plan));
+}
+
+#[cfg(celld_internal_tests)]
+fn op_test_queue_rearm_bounded(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    QUEUE_REARM_OBSERVED.with(|observed| observed.set(true));
+    QUEUE_REARM_POSITIVE.with(|observed| observed.set(observed.get() || args.get(1).is_true()));
+    if !args.get(0).boolean_value(scope) {
+        QUEUE_REARM_BOUND_VIOLATED.with(|violated| violated.set(true));
+    }
+}
+mod r2_ops;
 mod storage_ops;
 use storage_ops::{actor_runtime_state, throw_storage_error};
 
@@ -5202,20 +7706,49 @@ fn op_url_parse(
         }
     };
     let o = v8::Object::new(scope);
-    let set = |k: &str, v: &str| {
-        let key = v8::String::new(scope, k).unwrap();
+    // The nine keys are fixed, so they come from the constant table rather
+    // than from nine fresh `v8::String`s per `new URL(...)`.
+    //
+    // A set can still fail — a throwing setter on `Object.prototype` reaches
+    // this plain object — and a URL record missing a component is worse than
+    // no record at all, so the first refusal stops the build.
+    let port = u.port().map(|p| p.to_string()).unwrap_or_default();
+    let fields: [(&'static v8::OneByteConst, &str); 9] = [
+        (&v8_strings::URL_PROTOCOL, u.scheme()),
+        (&v8_strings::URL_USERNAME, u.username()),
+        (&v8_strings::URL_PASSWORD, u.password().unwrap_or("")),
+        (&v8_strings::URL_HOST, u.host_str().unwrap_or("")),
+        (&v8_strings::URL_PORT, &port),
+        (&v8_strings::URL_PATHNAME, u.path()),
+        (&v8_strings::URL_SEARCH, u.query().unwrap_or("")),
+        (&v8_strings::URL_HASH, u.fragment().unwrap_or("")),
+        (&v8_strings::URL_HREF, u.as_str()),
+    ];
+    for (k, v) in fields {
+        let key = static_key(scope, k);
         let val = v8::String::new(scope, v).unwrap();
-        o.set(scope, key.into(), val.into());
-    };
-    set("protocol", u.scheme());
-    set("username", u.username());
-    set("password", u.password().unwrap_or(""));
-    set("host", u.host_str().unwrap_or(""));
-    set("port", &u.port().map(|p| p.to_string()).unwrap_or_default());
-    set("pathname", u.path());
-    set("search", u.query().unwrap_or(""));
-    set("hash", u.fragment().unwrap_or(""));
-    set("href", u.as_str());
+        match o.set(scope, key.into(), val.into()) {
+            Some(true) => {}
+            // The setter threw. Its exception is already pending, and it names
+            // the real cause, so it propagates unchanged. Throwing a generic
+            // TypeError here would overwrite it and hide that cause.
+            None => return,
+            // A refusal that does not throw — a non-writable inherited data
+            // property, in sloppy mode — leaves no pending exception, so this
+            // path has to raise one of its own.
+            Some(false) => {
+                let name = key.to_rust_string_lossy(scope);
+                let msg = v8::String::new(
+                    scope,
+                    &format!("Invalid URL: the {name} property of the URL record was refused"),
+                )
+                .unwrap();
+                let exc = v8::Exception::type_error(scope, msg);
+                scope.throw_exception(exc);
+                return;
+            }
+        }
+    }
     rv.set(o.into());
 }
 
@@ -5316,6 +7849,14 @@ fn op_atob(
     let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
     match base64::engine::general_purpose::STANDARD.decode(cleaned) {
         Ok(bytes) => {
+            // The public `atob()` wrapper omits this argument and keeps the
+            // required binary-string result. The KV operator protocol asks
+            // for a typed view, so a 25 MiB value does not become 25 million
+            // JavaScript numbers before the cell can store it.
+            if args.get(1).boolean_value(scope) {
+                rv.set(bytes_value(scope, bytes));
+                return;
+            }
             // atob returns a binary string (latin1)
             let s: String = bytes.iter().map(|&b| b as char).collect();
             rv.set(v8::String::new(scope, &s).unwrap().into());
@@ -5333,9 +7874,22 @@ fn op_atob(
 // node:async_hooks prelude calls these. The value is V8's
 // continuation-preserved embedder data — the primitive Workerd's
 // AsyncContextFrame rides — which V8 itself captures and restores
-// around every promise reaction. No promise hooks are installed, and an
-// isolate that never touches AsyncLocalStorage never sets the value, so
-// a bundle that does not import async_hooks pays nothing per promise.
+// around every promise reaction. No promise hooks are installed. A stateless
+// isolate that never touches AsyncLocalStorage leaves the frame absent; a cell
+// event still carries the separate native context token described below.
+
+#[derive(Default)]
+struct IoEventFrame {
+    wait_until: Vec<v8::Global<v8::Promise>>,
+    arm_gates: Vec<ArmGateRx>,
+}
+
+#[derive(Default)]
+struct IoEventState {
+    frames: Vec<IoEventFrame>,
+    ended_arm_gates: Vec<ArmGateRx>,
+    arm_gates_sealed: bool,
+}
 
 /// The per-request context: everything a request owns while it is in flight.
 ///
@@ -5357,34 +7911,43 @@ fn op_atob(
 /// **It is `Send + Sync`, and that is load-bearing.** Under D1 a request is
 /// a tokio task that suspends between turns and can resume on any worker, so
 /// the context it carries has to cross threads with it. `Rc` and `RefCell`
-/// would forbid that, and the alternative — parking every live context in a
-/// map inside the isolate, keyed by request id — rebuilds the very
-/// demultiplexing table (`idmap`) that deleting the pump exists to remove.
-/// So the interiors are `Mutex` instead. The locks are uncontended by
-/// construction, because only the isolate's holder can reach a context, and
-/// they are taken about twice per request.
+/// would forbid that. The isolate keeps one narrow weak lookup from a CPED
+/// continuation token to this context, because a reaction can run during a
+/// different event's checkpoint. That lookup owns no context, operation, or
+/// resolver, and `IoContext::drop` removes it. It therefore attributes the
+/// running reaction without rebuilding the pump's lifetime-owning `idmap`.
+/// The interiors are `Mutex`; only the isolate's holder reaches them.
 pub struct IoContext {
+    /// A per-isolate identity captured by V8 with each promise reaction.
+    /// The registry holds only a `Weak`, so a continuation cannot extend the
+    /// request lifetime after its `InFlight` owner retires.
+    continuation: Option<(u64, Weak<ActorRuntimeState>)>,
     /// This caller's delivery order for each cell it has called. See
     /// `CallOrder` — it is here rather than in a process-wide map because
     /// nothing outside this caller ever reads it.
-    call_chains: Mutex<CallChains>,
+    pub call_chains: Mutex<CallChains>,
     /// Event frames, innermost last. A frame collects the `waitUntil`
     /// promises registered while it is the innermost one.
     ///
     /// Nesting is per-request and strictly LIFO — a service-binding
     /// dispatch, an RPC entry, or a DO construction pushes its own frame so
     /// its `waitUntil` binds to that dispatch, matching workerd.
-    events: Mutex<Vec<Vec<v8::Global<v8::Promise>>>>,
-    /// Isolate-polled sockets opened by each nested run loop of this
-    /// request, innermost last. `asyncrt` aborts a region's pending ops when
-    /// it exits; these are host-side resources abort cannot reach, so the
-    /// region closes them itself.
-    sockets: Mutex<Vec<Vec<u64>>>,
-    /// Sockets opened before any run loop exists. A handler runs
-    /// synchronously to its first await before its loop is entered, so a
-    /// socket built at the top of a handler has no frame yet; the loop
-    /// adopts these when it starts.
-    pending_sockets: Mutex<Vec<u64>>,
+    events: Mutex<IoEventState>,
+    /// Isolate-polled sockets this request opened. Dropping the request's
+    /// pending ops aborts everything the isolate is waiting on, but a socket
+    /// is a host-side resource that abort cannot reach: its connector task
+    /// exits only when the isolate stops reading. So the request closes its
+    /// own sockets, and [`IoContext::drop`] is what makes that unforgettable.
+    ///
+    /// Flat rather than a stack. Only sockets that belong to no cell land
+    /// here, and one `IoContext` is one request, so there is nothing to nest:
+    /// a service-binding dispatch or a Durable Object call gets a context of
+    /// its own rather than a frame inside this one.
+    sockets: Mutex<Vec<u64>>,
+    /// Host-backed request bodies this handler owns. A subrequest transfers
+    /// an id out before its target takes ownership, so only one request can
+    /// reclaim an unread tail.
+    body_streams: Mutex<std::collections::HashSet<u64>>,
     /// Output-gate capture. While a `webSocketMessage` runs, the frames it
     /// sends are collected here instead of reaching the wire, so the shell
     /// can hold them until the message's write is durable. A stack, so a
@@ -5405,36 +7968,232 @@ pub struct IoContext {
 }
 
 impl IoContext {
-    fn new() -> Arc<Self> {
+    #[allow(clippy::new_ret_no_self, clippy::new_without_default)]
+    #[doc(hidden)]
+    pub fn new() -> Arc<Self> {
         Arc::new(Self {
+            continuation: None,
             call_chains: Mutex::new(CallChains::default()),
-            events: Mutex::new(Vec::new()),
+            events: Mutex::new(IoEventState::default()),
             sockets: Mutex::new(Vec::new()),
-            pending_sockets: Mutex::new(Vec::new()),
+            body_streams: Mutex::new(std::collections::HashSet::new()),
             ws_capture: Mutex::new(Vec::new()),
             egress: Mutex::new(Vec::new()),
         })
     }
 
+    fn tracked(runtime_state: &Arc<ActorRuntimeState>) -> Arc<Self> {
+        let id = runtime_state.allocate_io_context_id();
+        let context = Arc::new(Self {
+            continuation: Some((id, Arc::downgrade(runtime_state))),
+            call_chains: Mutex::new(CallChains::default()),
+            events: Mutex::new(IoEventState::default()),
+            sockets: Mutex::new(Vec::new()),
+            body_streams: Mutex::new(std::collections::HashSet::new()),
+            ws_capture: Mutex::new(Vec::new()),
+            egress: Mutex::new(Vec::new()),
+        });
+        runtime_state
+            .io_contexts
+            .lock()
+            .unwrap()
+            .insert(id, Arc::downgrade(&context));
+        context
+    }
+
     fn begin_event(&self) {
-        self.events.lock().unwrap().push(Vec::new());
+        self.events
+            .lock()
+            .unwrap()
+            .frames
+            .push(IoEventFrame::default());
     }
 
     /// Pop the innermost frame and hand back what it collected. `None` when
     /// there is no frame, which is a script calling `waitUntil` outside any
     /// event; the harness turns that into workerd's global-scope error.
     fn end_event(&self) -> Option<Vec<v8::Global<v8::Promise>>> {
-        self.events.lock().unwrap().pop()
+        let mut events = self.events.lock().unwrap();
+        let mut frame = events.frames.pop()?;
+        if events.arm_gates_sealed {
+            drop(frame.arm_gates);
+        } else if let Some(parent) = events.frames.last_mut() {
+            parent.arm_gates.append(&mut frame.arm_gates);
+        } else {
+            events.ended_arm_gates.append(&mut frame.arm_gates);
+        }
+        Some(frame.wait_until)
     }
 
     fn register_wait_until(&self, promise: v8::Global<v8::Promise>) {
-        if let Some(frame) = self.events.lock().unwrap().last_mut() {
-            frame.push(promise);
+        if let Some(frame) = self.events.lock().unwrap().frames.last_mut() {
+            frame.wait_until.push(promise);
         }
     }
 
+    fn register_arm_gate(&self, gate: ArmGateRx) -> Result<(), ArmGateRx> {
+        let mut events = self.events.lock().unwrap();
+        if events.arm_gates_sealed {
+            return Err(gate);
+        }
+        if let Some(frame) = events.frames.last_mut() {
+            frame.arm_gates.push(gate);
+        } else {
+            // `op_event_end` pops the final frame before `Promise.allSettled`
+            // can invoke a user-defined `then`. A gate created during that
+            // call still belongs to this event until `take_arm_gates` seals
+            // the response boundary.
+            events.ended_arm_gates.push(gate);
+        }
+        Ok(())
+    }
+
+    /// Take every response gate that this event owns.
+    ///
+    /// The normal path takes gates moved out by `end_event`. Active frames
+    /// cover failures that cannot run JavaScript again, such as a timeout or
+    /// an isolate termination.
+    fn take_arm_gates(&self) -> Vec<ArmGateRx> {
+        let mut events = self.events.lock().unwrap();
+        if events.arm_gates_sealed {
+            return Vec::new();
+        }
+        events.arm_gates_sealed = true;
+        let mut gates = std::mem::take(&mut events.ended_arm_gates);
+        for frame in &mut events.frames {
+            gates.append(&mut frame.arm_gates);
+        }
+        gates
+    }
+
     fn depth(&self) -> usize {
-        self.events.lock().unwrap().len()
+        self.events.lock().unwrap().frames.len()
+    }
+
+    /// Close every isolate-polled socket this request opened.
+    ///
+    /// Draining makes the operation idempotent. The drive loop calls it when
+    /// the request retires, and `drop` covers every earlier failure path.
+    fn close_sockets(&self) {
+        let opened = self.sockets.lock().unwrap().drain(..).collect();
+        ws_close_request_sockets(opened);
+    }
+
+    #[doc(hidden)]
+    pub fn own_body_stream(&self, stream_id: u64) {
+        let mut owned = self.body_streams.lock().unwrap();
+        if owned.insert(stream_id) && !claim_http_stream(stream_id) {
+            owned.remove(&stream_id);
+        }
+    }
+
+    fn transfer_body_stream(&self, stream_id: u64) -> Option<RequestBodyGuard> {
+        if self.body_streams.lock().unwrap().remove(&stream_id) {
+            // Move the existing registry claim into the guard. There is no
+            // unowned interval in which the age sweep can delete the source.
+            Some(RequestBodyGuard::transferred(stream_id))
+        } else {
+            None
+        }
+    }
+
+    /// Replace one request-owned source with the two sources created by a
+    /// native tee. Response streams are not request-owned, so they keep the
+    /// registry's ordinary unowned lifecycle.
+    fn replace_body_stream(&self, stream_id: u64, branches: (u64, u64)) {
+        let mut owned = self.body_streams.lock().unwrap();
+        if !owned.remove(&stream_id) {
+            return;
+        }
+        for branch in [branches.0, branches.1] {
+            if claim_http_stream(branch) {
+                owned.insert(branch);
+            }
+        }
+    }
+
+    #[cfg(celld_internal_tests)]
+    #[doc(hidden)]
+    pub fn begin_event_for_test(&self) {
+        self.begin_event();
+    }
+
+    #[cfg(celld_internal_tests)]
+    #[doc(hidden)]
+    pub fn end_event_for_test(&self) -> Option<()> {
+        self.end_event().map(drop)
+    }
+
+    #[cfg(celld_internal_tests)]
+    #[doc(hidden)]
+    pub fn register_arm_gate_for_test(
+        &self,
+        gate: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    ) -> Result<(), tokio::sync::oneshot::Receiver<Result<(), String>>> {
+        self.register_arm_gate(gate)
+    }
+
+    #[cfg(celld_internal_tests)]
+    #[doc(hidden)]
+    pub fn take_arm_gates_for_test(
+        &self,
+    ) -> Vec<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+        self.take_arm_gates()
+    }
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+#[derive(Default)]
+pub struct IoContextRegistryForTest(Arc<ActorRuntimeState>);
+
+#[cfg(celld_internal_tests)]
+impl IoContextRegistryForTest {
+    #[doc(hidden)]
+    pub fn track(&self) -> (u64, Arc<IoContext>) {
+        let context = IoContext::tracked(&self.0);
+        let id = context
+            .continuation
+            .as_ref()
+            .map(|(id, _)| *id)
+            .expect("a tracked IoContext has a continuation id");
+        (id, context)
+    }
+
+    #[doc(hidden)]
+    pub fn resolves_to(&self, id: u64, expected: &Arc<IoContext>) -> bool {
+        self.0
+            .io_context(id)
+            .is_some_and(|context| Arc::ptr_eq(&context, expected))
+    }
+
+    #[doc(hidden)]
+    pub fn contains(&self, id: u64) -> bool {
+        self.0.io_contexts.lock().unwrap().contains_key(&id)
+    }
+
+    #[doc(hidden)]
+    pub fn is_empty(&self) -> bool {
+        self.0.io_contexts.lock().unwrap().is_empty()
+    }
+}
+
+/// A Worker socket lives and dies with its request, exactly as it does on
+/// Cloudflare. Closing it here rather than at each of the drive loops' exits
+/// is the difference between a rule every exit path has to remember and one
+/// it cannot get wrong: a request that times out, that is abandoned as stuck,
+/// or whose client disconnects drops its context on a path of its own.
+impl Drop for IoContext {
+    fn drop(&mut self) {
+        self.close_sockets();
+        for stream_id in self.body_streams.get_mut().unwrap().drain() {
+            release_http_stream(stream_id);
+        }
+        if let Some((id, runtime_state)) = &self.continuation {
+            if let Some(runtime_state) = runtime_state.upgrade() {
+                runtime_state.io_contexts.lock().unwrap().remove(id);
+            }
+        }
     }
 }
 
@@ -5447,6 +8206,7 @@ const _: fn() = || {
     assert_send_sync::<HeapLimitState>();
     assert_send_sync::<ActorRuntimeState>();
     assert_send_sync::<ModuleRegistry>();
+    assert_send_sync::<LoaderOwner>();
 };
 
 /// A request must be able to carry its own context across a suspension. A
@@ -5497,6 +8257,11 @@ fn current_context() -> Arc<IoContext> {
         let mut current = current.borrow_mut();
         current.get_or_insert_with(IoContext::new).clone()
     })
+}
+
+#[cfg(celld_internal_tests)]
+fn installed_context() -> Option<Arc<IoContext>> {
+    CURRENT.with(|current| current.borrow().clone())
 }
 
 fn op_event_begin(
@@ -5592,7 +8357,8 @@ fn op_als_set(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let trace = cped_trace(scope);
-    set_cped(scope, args.get(0), trace);
+    let io_context = cped_io_context(scope);
+    set_cped(scope, args.get(0), trace, io_context);
 }
 
 // node:util prelude calls these; registration is the sole per-isolate cost.
@@ -5718,9 +8484,11 @@ fn op_alarm_set(
     match storage::set_alarm(&s, at) {
         Err(error) => throw_storage_error(scope, "setAlarm", error),
         // Committed immediately: register the wake-entry PUT against the
-        // cell's output gate. Inside an explicit transaction (`Ok(None)`)
+        // current event's output gate. Inside an explicit transaction (`Ok(None)`)
         // the gate registers at that transaction's commit instead.
-        Ok(Some(committed)) if committed >= 0 => spawn_arm_gate(&s, committed),
+        Ok(Some(committed)) if committed >= 0 => {
+            spawn_arm_gate(&s, committed, current_reaction_io_context(scope))
+        }
         Ok(_) => {}
     }
 }
@@ -5837,8 +8605,16 @@ fn op_btoa(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     use base64::Engine;
-    let input = args.get(0).to_rust_string_lossy(scope);
-    let bytes: Vec<u8> = input.chars().map(|c| c as u8).collect();
+    // The public `btoa()` wrapper always supplies a string. The KV operator
+    // protocol supplies a typed view directly, which avoids constructing a
+    // second 25 MiB binary string only to encode it here.
+    let bytes = view_bytes(args.get(0)).unwrap_or_else(|| {
+        args.get(0)
+            .to_rust_string_lossy(scope)
+            .chars()
+            .map(|c| c as u8)
+            .collect()
+    });
     let s = base64::engine::general_purpose::STANDARD.encode(bytes);
     rv.set(v8::String::new(scope, &s).unwrap().into());
 }
@@ -6043,19 +8819,23 @@ fn op_text_decoder_free(
 
 // ---- the JS harness: Web API + the DO object model ----
 
-mod bootstrap;
-mod modules;
+#[doc(hidden)]
+pub mod bootstrap;
+pub mod modules;
+mod v8_strings;
 use bootstrap::{
     adopt_cell, begin_event_context, build_env, end_event_context, harness_env,
-    inject_compatibility_flags, inject_crons, inject_namespace_keys, inject_routing,
-    inject_storage_compatibility, install_harness, install_prelude, populate_cf_exports,
-    register_class, register_entrypoints,
+    inject_compatibility_flags, inject_crons, inject_kv_limits, inject_namespace_keys,
+    inject_queue_config, inject_routing, inject_storage_compatibility, inject_workflows,
+    install_harness, install_prelude, populate_cf_exports, register_class, register_entrypoints,
+    validate_workflow_classes,
 };
 use modules::{
     compile_module, host_import_module_dynamically, install_lazy_globals, op_builtin_module,
     register_loader_modules, register_stubs, register_wasm_modules, resolve_external,
     ModuleRegistry,
 };
+use v8_strings::key as static_key;
 /// Like `make_request`, but marks the request as incoming. Its signal is
 /// registered only if the handler actually suspends, preserving the
 /// synchronous request path.
@@ -6063,7 +8843,7 @@ fn make_incoming_request<'s>(
     tc: &mut v8::PinScope<'s, '_>,
     url: &str,
     method: &str,
-    body: &RequestBody,
+    body: RequestBody,
     headers: &[(String, String)],
 ) -> Result<v8::Local<'s, v8::Value>> {
     let global = tc.get_current_context().global(tc);
@@ -6082,11 +8862,15 @@ fn make_incoming_request<'s>(
     .unwrap();
     // A streamed body passes its id, and the harness builds the body
     // stream around that id. A held body passes the bytes.
-    let (body, stream_id) = match body {
-        RequestBody::Bytes(bytes) => (bytes_value(tc, bytes.clone()), v8::undefined(tc).into()),
-        RequestBody::Stream(id) => (
+    let stream_id = body.stream_id();
+    let (body, stream_id) = match stream_id {
+        None => (
+            bytes_value(tc, body.into_held_bytes().unwrap()),
             v8::undefined(tc).into(),
-            v8::Number::new(tc, *id as f64).into(),
+        ),
+        Some(id) => (
+            v8::undefined(tc).into(),
+            v8::Number::new(tc, id as f64).into(),
         ),
     };
     let recv = v8::undefined(tc).into();
@@ -6136,7 +8920,7 @@ fn make_request<'s>(
     tc: &mut v8::PinScope<'s, '_>,
     url: &str,
     method: &str,
-    body: &[u8],
+    body: RequestBody,
     headers: &[(String, String)],
 ) -> Result<v8::Local<'s, v8::Value>> {
     let g = tc.get_current_context().global(tc);
@@ -6144,7 +8928,8 @@ fn make_request<'s>(
     let f: v8::Local<v8::Function> = g.get(tc, k.into()).unwrap().try_into().unwrap();
     let u = v8::String::new(tc, url).unwrap();
     let m = v8::String::new(tc, method).unwrap();
-    let b = bytes_value(tc, body.to_vec());
+    let bytes = body.into_held_bytes().unwrap_or_default();
+    let b = bytes_value(tc, bytes);
     let h = v8::String::new(tc, &serde_json::to_string(headers)?).unwrap();
     let recv = v8::undefined(tc).into();
     f.call(tc, recv, &[u.into(), m.into(), b, h.into()])
@@ -6171,11 +8956,16 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
         return Err(anyhow!("__readResponse returned a promise"));
     }
     let out = out.to_object(scope).ok_or_else(|| anyhow!("not object"))?;
+    let ek = v8::String::new(scope, "error").unwrap();
+    if let Some(error) = out.get(scope, ek.into()).filter(|value| value.is_string()) {
+        return Err(anyhow!(error.to_rust_string_lossy(scope)));
+    }
     let sk = v8::String::new(scope, "status").unwrap();
     let bk = v8::String::new(scope, "bodyBytes").unwrap();
     let tk = v8::String::new(scope, "bodyStreamId").unwrap();
     let hk = v8::String::new(scope, "headersJson").unwrap();
     let wk = v8::String::new(scope, "wsTargetJson").unwrap();
+    let worker_wk = v8::String::new(scope, "workerSocketId").unwrap();
     let status = out
         .get(scope, sk.into())
         .and_then(|v| v.uint32_value(scope))
@@ -6220,43 +9010,43 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
         .map(|v| v.to_rust_string_lossy(scope))
         .unwrap_or_else(|| "null".into());
     let ws = serde_json::from_str(&ws_json).ok();
+    let worker_id = out
+        .get(scope, worker_wk.into())
+        .and_then(|value| value.integer_value(scope))
+        .unwrap_or(0)
+        .max(0) as u64;
+    let worker_ws = if worker_id == 0 {
+        None
+    } else {
+        Some(
+            websocket::transfer_worker_websocket_handoff(worker_id)
+                .ok_or_else(|| anyhow!("Worker WebSocket {worker_id} has no frame handoff"))?,
+        )
+    };
     if status == 101 {
         tracing::info!(%ws_json, has_target = ws.is_some(), "JS WebSocket response");
     }
+    let websocket = match (ws, worker_ws) {
+        (Some(target), None) => Some(HttpResponseWebSocket::Cell(target)),
+        (None, Some(worker)) => Some(HttpResponseWebSocket::Worker(worker)),
+        (None, None) => None,
+        (Some(_), Some(_)) => return Err(anyhow!("Worker response has two WebSocket targets")),
+    };
     Ok(HttpResponse {
         status,
         body,
         stream,
         headers,
-        ws,
+        websocket,
         write_position: None,
     })
 }
 
-#[cfg(all(test, celld_internal_tests))]
-fn init_engine_for_tests() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        v8::V8::set_flags_from_string("--expose-gc");
-        Engine::init();
-    });
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn init_engine_for_tests() {
+    Engine::init();
 }
 
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 include!(env!("CELLD_INTERNAL_JS_OBSERVERS"));
-
-/// Externally injected Web-platform tests.
-#[cfg(all(test, celld_internal_tests))]
-pub(crate) mod conformance_runtime_tests {
-    include!(env!("CELLD_CONFORMANCE_JS_RUNTIME_TESTS"));
-}
-
-#[cfg(all(test, celld_internal_tests))]
-mod conformance_web_platform_tests {
-    include!(env!("CELLD_CONFORMANCE_WEB_PLATFORM_TESTS"));
-}
-
-#[cfg(all(test, celld_internal_tests))]
-mod call_order_private {
-    include!(env!("CELLD_CONFORMANCE_CALL_ORDER_TESTS"));
-}

@@ -1,7 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-#![warn(clippy::disallowed_macros)]
-
 //! The engine's single object-store client: the `object_store` crate
 //! `celld-ltx` already links, bound to one bucket. Replaces aws-sdk-s3.
 //! No call site streamed a body, so everything is in-memory `Bytes`.
@@ -28,6 +26,7 @@
 use anyhow::anyhow;
 use anyhow::Context;
 use bytes::Bytes;
+use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::aws::S3ConditionalPut;
@@ -35,15 +34,20 @@ use object_store::azure::authority_hosts;
 use object_store::azure::AzureConfigKey;
 use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
+use object_store::list::PaginatedListOptions;
+use object_store::list::PaginatedListStore;
 use object_store::path::Path;
 use object_store::Attribute;
 use object_store::Attributes;
 use object_store::ClientOptions;
 use object_store::Error;
 use object_store::GetOptions;
+use object_store::GetRange;
+use object_store::MultipartUpload;
 use object_store::ObjectMeta;
 use object_store::ObjectStore;
 use object_store::PutMode;
+use object_store::PutMultipartOptions;
 use object_store::PutOptions;
 use object_store::PutPayload;
 use object_store::RetryConfig;
@@ -68,10 +72,12 @@ pub struct StaticCredentials {
 /// applies If-None-Match and If-Match to the etag, exactly as S3 does,
 /// so the two share [`Self::token`] and [`Self::update`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StorageBackend {
+#[doc(hidden)]
+pub enum StorageBackend {
     S3,
     Gcs,
     Azure,
+    Local,
 }
 
 impl StorageBackend {
@@ -80,6 +86,7 @@ impl StorageBackend {
             StorageBackend::S3 => "s3",
             StorageBackend::Gcs => "gs",
             StorageBackend::Azure => "az",
+            StorageBackend::Local => "dev",
         }
     }
 
@@ -87,9 +94,10 @@ impl StorageBackend {
     /// per dialect. A response without one cannot be fenced against, so a
     /// missing or empty token is an error — never an empty string a later
     /// conditional write would send as a real precondition.
-    fn token(self, e_tag: Option<String>, version: Option<String>) -> anyhow::Result<String> {
+    #[doc(hidden)]
+    pub fn token(self, e_tag: Option<String>, version: Option<String>) -> anyhow::Result<String> {
         let (token, header) = match self {
-            StorageBackend::S3 | StorageBackend::Azure => (e_tag, "ETag"),
+            StorageBackend::S3 | StorageBackend::Azure | StorageBackend::Local => (e_tag, "ETag"),
             StorageBackend::Gcs => (version, "x-goog-generation"),
         };
         match token {
@@ -101,9 +109,10 @@ impl StorageBackend {
     }
 
     /// The precondition a conditional update sends for a held token.
-    fn update(self, token: &str) -> UpdateVersion {
+    #[doc(hidden)]
+    pub fn update(self, token: &str) -> UpdateVersion {
         match self {
-            StorageBackend::S3 | StorageBackend::Azure => UpdateVersion {
+            StorageBackend::S3 | StorageBackend::Azure | StorageBackend::Local => UpdateVersion {
                 e_tag: Some(token.to_string()),
                 version: None,
             },
@@ -120,7 +129,9 @@ impl StorageBackend {
     /// wrong place.
     fn precondition(self) -> &'static str {
         match self {
-            StorageBackend::S3 | StorageBackend::Azure => "If-Match / If-None-Match",
+            StorageBackend::S3 | StorageBackend::Azure | StorageBackend::Local => {
+                "If-Match / If-None-Match"
+            }
             StorageBackend::Gcs => "x-goog-if-generation-match",
         }
     }
@@ -131,13 +142,22 @@ impl StorageBackend {
 /// instance also isolates its traffic.
 #[derive(Clone)]
 pub struct Bucket {
-    store: Arc<dyn ObjectStore>,
+    pub store: Arc<dyn ObjectStore>,
+    /// The same client as `store`, reached through the paginated listing
+    /// trait. `ObjectStore::list_with_delimiter` drains every continuation
+    /// page into one buffer before it returns, so it cannot answer "the
+    /// first N" without paying for all of them. `PaginatedListStore` takes
+    /// a page size and returns a resumption token, which is what bounds a
+    /// listing's cost rather than only its output. It is a separate trait,
+    /// so the concrete client has to be kept here as it is built —
+    /// `Arc<dyn ObjectStore>` cannot be widened to it later.
+    paginated: Arc<dyn PaginatedListStore>,
     /// Conditional writes only, built with retries OFF: a retried CAS put
     /// can land on the first attempt's own token change and report a clean
     /// 412 — converting "may have committed" into a false rejection. The
     /// ambiguity must surface as `Err` so the caller reconciles.
-    cas_store: Arc<dyn ObjectStore>,
-    backend: StorageBackend,
+    pub cas_store: Arc<dyn ObjectStore>,
+    pub backend: StorageBackend,
     /// Bucket name, for messages — the store is already bound to it.
     pub name: String,
     /// Empty, or a slash-terminated key prefix every operation is scoped
@@ -146,11 +166,21 @@ pub struct Bucket {
     pub prefix: String,
 }
 
+/// One page of [`Bucket::common_prefixes_page`].
+pub struct CommonPrefixPage {
+    /// The children this page listed, in the store's key order.
+    pub prefixes: Vec<String>,
+    /// Present exactly when the store truncated the page, so a caller
+    /// learns that more children exist without a second request.
+    pub page_token: Option<String>,
+}
+
 /// Whether a conditional write reached a provider-enforced conflict.
 /// Azure reports a failed `If-None-Match` as `Precondition`, while some
 /// stores report the same create conflict as `AlreadyExists`. Both are a
 /// clean lost race. Every other error remains ambiguous.
-fn is_clean_cas_rejection(error: &Error) -> bool {
+#[doc(hidden)]
+pub fn is_clean_cas_rejection(error: &Error) -> bool {
     matches!(
         error,
         Error::Precondition { .. } | Error::AlreadyExists { .. }
@@ -167,7 +197,8 @@ fn is_clean_cas_rejection(error: &Error) -> bool {
 /// from `AZURE_STORAGE_ACCOUNT_NAME`. The second path segment is the key
 /// prefix on all three schemes, so the account cannot live there without
 /// making `az://` parse differently from the other two.
-fn split_spec(spec: &str) -> (StorageBackend, &str, String) {
+#[doc(hidden)]
+pub fn split_spec(spec: &str) -> (StorageBackend, &str, String) {
     let (backend, spec) = match (spec.strip_prefix("gs://"), spec.strip_prefix("az://")) {
         (Some(rest), _) => (StorageBackend::Gcs, rest),
         (_, Some(rest)) => (StorageBackend::Azure, rest),
@@ -182,10 +213,252 @@ fn split_spec(spec: &str) -> (StorageBackend, &str, String) {
     )
 }
 
+/// The S3 endpoint the environment supplies when no explicit one was
+/// given: the AWS SDK's standard `AWS_ENDPOINT_URL`, then the older
+/// `AWS_ENDPOINT` — the same variables `AmazonS3Builder::from_env`
+/// injects into the client. Resolved here so the path-style decision and
+/// the client always agree about whether an endpoint is in play.
+#[doc(hidden)]
+pub fn resolve_env_endpoint() -> Option<String> {
+    ["AWS_ENDPOINT_URL", "AWS_ENDPOINT"]
+        .iter()
+        .find_map(|var| std::env::var(var).ok().filter(|value| !value.is_empty()))
+}
+
+/// The byte range a `get` asked for. R2 spells a range four ways and so
+/// does `object_store`, so the request reaches the backend as the caller
+/// wrote it rather than widened to a whole-object read.
+#[derive(Clone, Copy)]
+pub enum BlobRange {
+    /// The whole object.
+    Whole,
+    /// `offset` onwards, to the end of the object.
+    From(u64),
+    /// `length` bytes starting at `offset`.
+    Bounded { offset: u64, length: u64 },
+    /// The last `length` bytes.
+    Suffix(u64),
+}
+
+/// R2's `onlyIf`, split by who can answer it. The etag halves ride down
+/// to the store as If-Match / If-None-Match, so no concurrent write slips
+/// between the check and the read. The upload-time halves are checked
+/// here: R2 compares milliseconds and an HTTP date carries only seconds,
+/// so If-Modified-Since would answer a different question for every
+/// object written in the same second as the bound.
+#[derive(Default, Clone)]
+pub struct BlobConditions {
+    pub if_match: Option<String>,
+    pub if_none_match: Option<String>,
+    pub uploaded_before_ms: Option<i64>,
+    pub uploaded_after_ms: Option<i64>,
+}
+
+impl BlobConditions {
+    /// Whether an etag satisfies the halves the store checks. Used on the
+    /// write path, which evaluates the whole condition itself against a
+    /// head rather than sending it, because a write's precondition has to
+    /// be paired with the CAS token of the very version it inspected.
+    fn etag_met(&self, etag: Option<&str>) -> bool {
+        let matches = |list: &str| match list.trim() {
+            "*" => etag.is_some(),
+            list => list
+                .split(',')
+                .any(|candidate| etag_eq(candidate, etag.unwrap_or_default())),
+        };
+        self.if_match.as_deref().is_none_or(&matches)
+            && !self.if_none_match.as_deref().is_some_and(&matches)
+    }
+
+    /// Whether an upload time satisfies the halves this module checks.
+    fn time_met(&self, uploaded_ms: i64) -> bool {
+        self.uploaded_before_ms
+            .is_none_or(|before| uploaded_ms < before)
+            && self
+                .uploaded_after_ms
+                .is_none_or(|after| uploaded_ms > after)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.if_match.is_none()
+            && self.if_none_match.is_none()
+            && self.uploaded_before_ms.is_none()
+            && self.uploaded_after_ms.is_none()
+    }
+}
+
+/// Etag comparison, weak-marker and quote insensitive. R2 hands a Worker
+/// the unquoted etag and takes either spelling back.
+fn etag_eq(left: &str, right: &str) -> bool {
+    let bare = |value: &str| {
+        value
+            .trim()
+            .trim_start_matches("W/")
+            .trim_matches('"')
+            .to_string()
+    };
+    bare(left) == bare(right)
+}
+
+/// The HTTP headers and the user metadata an object carries. The five
+/// headers are the ones every backend stores as headers, and are R2's
+/// `httpMetadata` minus `cacheExpiry`, which no backend has a header for.
+/// `metadata` is the backend's user metadata, kept under its own
+/// `x-amz-meta-` / `x-goog-meta-` / `x-ms-meta-` prefix; what an R2
+/// binding puts in there is the binding's business, not this module's.
+#[derive(Default, Clone)]
+pub struct BlobAttributes {
+    pub content_type: Option<String>,
+    pub content_language: Option<String>,
+    pub content_disposition: Option<String>,
+    pub content_encoding: Option<String>,
+    pub cache_control: Option<String>,
+    pub metadata: Vec<(String, String)>,
+}
+
+impl BlobAttributes {
+    /// The headers and user metadata on a response. Every other attribute
+    /// `object_store` parses is a transport detail, not the object's.
+    fn read(attributes: &Attributes) -> Self {
+        let value = |attribute: &Attribute| {
+            attributes
+                .get(attribute)
+                .map(|value| value.as_ref().to_string())
+        };
+        Self {
+            content_type: value(&Attribute::ContentType),
+            content_language: value(&Attribute::ContentLanguage),
+            content_disposition: value(&Attribute::ContentDisposition),
+            content_encoding: value(&Attribute::ContentEncoding),
+            cache_control: value(&Attribute::CacheControl),
+            metadata: user_metadata(attributes),
+        }
+    }
+
+    /// The same, as the store's write-side attribute set.
+    fn write(&self) -> Attributes {
+        let mut attributes = Attributes::new();
+        let mut set = |attribute: Attribute, value: &Option<String>| {
+            if let Some(value) = value {
+                attributes.insert(attribute, value.clone().into());
+            }
+        };
+        set(Attribute::ContentType, &self.content_type);
+        set(Attribute::ContentLanguage, &self.content_language);
+        set(Attribute::ContentDisposition, &self.content_disposition);
+        set(Attribute::ContentEncoding, &self.content_encoding);
+        set(Attribute::CacheControl, &self.cache_control);
+        for (name, value) in &self.metadata {
+            attributes.insert(
+                Attribute::Metadata(Cow::Owned(name.clone())),
+                value.clone().into(),
+            );
+        }
+        attributes
+    }
+}
+
+/// What every answer about an object knows, whatever asked for it.
+pub struct BlobMeta {
+    pub size: u64,
+    pub etag: Option<String>,
+    /// The backend's version id, where the bucket has versioning on.
+    pub version: Option<String>,
+    /// The conditional-write token for exactly this version, in the
+    /// backend's dialect — the etag on S3 and Azure, the generation on
+    /// GCS. A conditional write pairs the check it made on this metadata
+    /// with the token, so a racing write cannot land in between.
+    pub cas: Option<String>,
+    pub uploaded_ms: i64,
+    pub attributes: BlobAttributes,
+}
+
+/// A blob a `get` answered, with its body still on the wire.
+pub struct Blob {
+    pub meta: BlobMeta,
+    /// The slice of the object this response carries, `(offset, length)`.
+    /// A bounded read that runs past the end is clamped by the store, so
+    /// this is what was served rather than what was asked for.
+    pub range: (u64, u64),
+    pub body: BoxStream<'static, Result<Vec<u8>, String>>,
+}
+
+/// What a conditional read found.
+pub enum BlobRead {
+    /// No such key.
+    Missing,
+    /// The key is there and the condition refused it. R2 answers the
+    /// object's metadata with no body, so the caller sees what it has.
+    Unmet(BlobMeta),
+    Hit(Blob),
+}
+
+/// One object in a listing page.
+pub struct BlobEntry {
+    pub key: String,
+    pub size: u64,
+    pub etag: Option<String>,
+    pub version: Option<String>,
+    pub uploaded_ms: i64,
+}
+
+/// One page of a listing.
+pub struct BlobPage {
+    pub objects: Vec<BlobEntry>,
+    /// The keys a delimiter rolled up, in key order and deduplicated.
+    pub prefixes: Vec<String>,
+    pub truncated: bool,
+    /// The last key this page consumed, whether it was listed or rolled
+    /// up. The next page resumes strictly after it, which is what R2's
+    /// opaque cursor does.
+    pub cursor: Option<String>,
+}
+
+/// The user metadata on a response, as name/value pairs. `object_store`
+/// parses the backend's `x-amz-meta-` / `x-goog-meta-` / `x-ms-meta-`
+/// headers into `Attribute::Metadata`; every other attribute is a standard
+/// HTTP header and not part of R2's `customMetadata`.
+fn user_metadata(attributes: &Attributes) -> Vec<(String, String)> {
+    attributes
+        .iter()
+        .filter_map(|(attribute, value)| match attribute {
+            Attribute::Metadata(name) => {
+                Some((name.as_ref().to_string(), value.as_ref().to_string()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The paginated listing an injected store cannot serve.
+///
+/// A test build constructs a bucket over plain injected stores, and a
+/// paginated listing serves an operator command rather than a node
+/// decision, so no injected store reaches one. Refusing is louder than an
+/// empty page, which a caller would read as a fleet that holds no cells.
+#[cfg(celld_internal_tests)]
+#[derive(Debug)]
+struct UnpaginatedStore;
+
+#[cfg(celld_internal_tests)]
+#[async_trait::async_trait]
+impl PaginatedListStore for UnpaginatedStore {
+    async fn list_paginated(
+        &self,
+        _prefix: Option<&str>,
+        _options: PaginatedListOptions,
+    ) -> object_store::Result<object_store::list::PaginatedListResult> {
+        Err(object_store::Error::NotSupported {
+            source: "an injected store serves no paginated listing".into(),
+        })
+    }
+}
+
 impl Bucket {
     /// Builds a bucket over injected ordinary and conditional-write stores.
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn with_stores(
+    #[cfg(celld_internal_tests)]
+    #[doc(hidden)]
+    pub fn with_stores(
         store: Arc<dyn ObjectStore>,
         cas_store: Arc<dyn ObjectStore>,
         backend: StorageBackend,
@@ -194,6 +467,7 @@ impl Bucket {
     ) -> Self {
         Self {
             store,
+            paginated: Arc::new(UnpaginatedStore),
             cas_store,
             backend,
             name,
@@ -225,6 +499,10 @@ impl Bucket {
         credentials: Option<StaticCredentials>,
         app: Option<&str>,
     ) -> anyhow::Result<Bucket> {
+        anyhow::ensure!(
+            !bucket.starts_with("dev://"),
+            "dev:// storage is internal to `celld dev` and is not a fleet bucket"
+        );
         Self::open_with_sources(
             bucket,
             endpoint,
@@ -235,11 +513,27 @@ impl Bucket {
         )
     }
 
+    /// Open the machine-local development store. Only the `celld dev`
+    /// supervisor and its child node receive this constructor; fleet flags
+    /// continue to resolve exclusively through the cloud backend parser.
+    pub(crate) fn open_dev(database: &std::path::Path) -> anyhow::Result<Bucket> {
+        let store = Arc::new(crate::local_store::LocalStore::open(database)?);
+        Ok(Bucket {
+            store: store.clone(),
+            paginated: store.clone(),
+            cas_store: store,
+            backend: StorageBackend::Local,
+            name: database.display().to_string(),
+            prefix: String::new(),
+        })
+    }
+
     /// The body of [`Self::open`], taking the cloud configuration instead
     /// of deriving it from the `GOOGLE_*` and `AZURE_*` environments. A
     /// caller that passes explicit sources is independent of that
     /// environment.
-    fn open_with_sources(
+    #[doc(hidden)]
+    pub fn open_with_sources(
         bucket: &str,
         endpoint: Option<&str>,
         region: &str,
@@ -284,15 +578,30 @@ impl Bucket {
             retry_timeout: Duration::from_secs(30),
             ..RetryConfig::default()
         };
-        let (store, cas_store): (Arc<dyn ObjectStore>, Arc<dyn ObjectStore>) = match backend {
+        let (store, paginated, cas_store): (
+            Arc<dyn ObjectStore>,
+            Arc<dyn PaginatedListStore>,
+            Arc<dyn ObjectStore>,
+        ) = match backend {
             StorageBackend::S3 => {
+                // An endpoint can also arrive through the environment:
+                // `AmazonS3Builder::from_env` reads the AWS SDK's standard
+                // AWS_ENDPOINT_URL / AWS_ENDPOINT into the client. The
+                // path-style decision below must see that endpoint too —
+                // an env-supplied endpoint with virtual-hosted-style
+                // requests half-configures the client, and against an
+                // S3-compatible store every operation then fails with a
+                // NoSuchBucket that names the key prefix, pointing well
+                // away from the cause. An explicit argument (--endpoint /
+                // S3_ENDPOINT, resolved by the caller) still wins.
+                let endpoint = endpoint.map(str::to_string).or_else(resolve_env_endpoint);
                 let mut builder = AmazonS3Builder::from_env()
                     .with_bucket_name(bucket)
                     .with_region(region)
                     .with_conditional_put(S3ConditionalPut::ETagMatch)
                     .with_retry(retry)
                     .with_client_options(options);
-                if let Some(endpoint) = endpoint {
+                if let Some(endpoint) = endpoint.as_deref() {
                     // Path-style against explicit S3-compatible endpoints, exactly
                     // as the aws client's force_path_style(endpoint.is_some()).
                     builder = builder
@@ -310,8 +619,10 @@ impl Bucket {
                     }
                 }
                 let cas_builder = builder.clone().with_retry(cas_retry);
+                let client = Arc::new(builder.build().context("build s3 client")?);
                 (
-                    Arc::new(builder.build().context("build s3 client")?),
+                    client.clone(),
+                    client,
                     Arc::new(cas_builder.build().context("build s3 cas client")?),
                 )
             }
@@ -338,8 +649,10 @@ impl Bucket {
                     .with_retry(retry)
                     .with_client_options(options);
                 let cas_builder = builder.clone().with_retry(cas_retry);
+                let client = Arc::new(builder.build().context("build gcs client")?);
                 (
-                    Arc::new(builder.build().context("build gcs client")?),
+                    client.clone(),
+                    client,
                     Arc::new(cas_builder.build().context("build gcs cas client")?),
                 )
             }
@@ -365,14 +678,20 @@ impl Bucket {
                     .with_retry(retry)
                     .with_client_options(options);
                 let cas_builder = builder.clone().with_retry(cas_retry);
+                let client = Arc::new(builder.build().context("build azure client")?);
                 (
-                    Arc::new(builder.build().context("build azure client")?),
+                    client.clone(),
+                    client,
                     Arc::new(cas_builder.build().context("build azure cas client")?),
                 )
+            }
+            StorageBackend::Local => {
+                unreachable!("the local development store has its own constructor")
             }
         };
         Ok(Bucket {
             store,
+            paginated,
             cas_store,
             backend,
             name: bucket.to_string(),
@@ -388,7 +707,8 @@ impl Bucket {
 
     /// The dialect this bucket speaks, for choosing the matching
     /// replication store.
-    pub(crate) fn backend(&self) -> StorageBackend {
+    #[doc(hidden)]
+    pub fn backend(&self) -> StorageBackend {
         self.backend
     }
 
@@ -433,7 +753,7 @@ impl Bucket {
                     .backend
                     .token(meta.e_tag, meta.version)
                     .with_context(|| format!("head {}://{}/{key}", self.scheme(), self.name))?;
-                Ok(Some((meta.size as u64, token)))
+                Ok(Some((meta.size, token)))
             }
             Err(Error::NotFound { .. }) => Ok(None),
             Err(error) => {
@@ -474,7 +794,7 @@ impl Bucket {
                     .attributes
                     .get(&Attribute::Metadata(name.to_string().into()))
                     .map(|value| value.as_ref().to_string());
-                Ok(Some((result.meta.size as u64, value)))
+                Ok(Some((result.meta.size, value)))
             }
             Err(Error::NotFound { .. }) => Ok(None),
             Err(error) => {
@@ -525,15 +845,6 @@ impl Bucket {
         let mode = match token {
             None => PutMode::Create,
             Some(token) => PutMode::Update(self.backend.update(token)),
-        };
-        #[cfg(all(test, celld_internal_tests))]
-        let mode = if token.is_none()
-            && crate::asyncrt::sabotage_active(
-                crate::host_services::EngineSabotage::FreshCreateOverwrites,
-            ) {
-            PutMode::Overwrite
-        } else {
-            mode
         };
         match self
             .cas_store
@@ -644,8 +955,66 @@ impl Bucket {
         }
     }
 
+    /// One page of the immediate child "directories" under `prefix/`.
+    ///
+    /// `start_after` resumes from a child a previous page returned, and
+    /// `page_token` continues the same walk. Pass one or the other: a
+    /// token is exact and works on every backend, while `start_after`
+    /// survives between separate processes, so an operator can resume a
+    /// listing by name.
+    ///
+    /// The store compares `start_after` against object keys, not against
+    /// children, and every key below `prefix/child/` sorts after that
+    /// prefix itself. So the page that resumes a walk repeats the child it
+    /// resumed from, and the caller drops it. The reverse error would skip
+    /// a cell, so the boundary is deliberately inclusive.
+    pub async fn common_prefixes_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page_token: Option<String>,
+        max_keys: usize,
+    ) -> anyhow::Result<CommonPrefixPage> {
+        // `PaginatedListStore` does not append the delimiter the way
+        // `ObjectStore::list_with_delimiter` does, so the prefix carries it.
+        let path = self.key(&format!("{}/", prefix.trim_end_matches('/')));
+        if start_after.is_some() && self.backend == StorageBackend::Azure {
+            anyhow::bail!(
+                "az:// cannot resume a listing by name, because Azure listing has no \
+                 start-after; drop --after and list the whole container"
+            );
+        }
+        let result = self
+            .paginated
+            .list_paginated(
+                Some(path.as_str()),
+                PaginatedListOptions {
+                    offset: start_after.map(|child| self.key(&format!("{child}/"))),
+                    delimiter: Some(std::borrow::Cow::Borrowed("/")),
+                    max_keys: Some(max_keys),
+                    page_token,
+                    ..PaginatedListOptions::default()
+                },
+            )
+            .await
+            .with_context(|| format!("list {}://{}/{path}", self.scheme(), self.name))?;
+        Ok(CommonPrefixPage {
+            prefixes: result
+                .result
+                .common_prefixes
+                .into_iter()
+                .map(|child| self.unkey(child.as_ref()).to_string())
+                .collect(),
+            page_token: result.page_token,
+        })
+    }
+
     /// Immediate child "directories" under `prefix/` (delimiter listing),
     /// as full prefixes with the trailing slash stripped.
+    ///
+    /// Every page is drained into one buffer, so the cost is the whole
+    /// listing. A caller that only needs a bounded answer must use
+    /// [`Self::common_prefixes_page`] instead.
     pub async fn common_prefixes(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
         let path = Path::from(self.key(prefix.trim_end_matches('/')));
         let result = self
@@ -658,6 +1027,316 @@ impl Bucket {
             .into_iter()
             .map(|p| self.unkey(p.as_ref()).to_string())
             .collect())
+    }
+
+    // ---- R2 binding primitives ------------------------------------------
+    //
+    // An `r2_buckets` binding is served out of the fleet bucket under the
+    // reserved `r2/<bucket_name>/` prefix, so a Worker's blobs share the
+    // durability and the credentials of everything else celld stores and
+    // need no second bucket. These are the only operations that reach past
+    // the in-memory `Bytes` contract the rest of this module keeps: a blob
+    // is a Worker's payload and can be far larger than a fleet object, so
+    // it is read as a stream and a large write goes through multipart.
+
+    /// Everything about an object except its bytes, or `None` when the key
+    /// does not exist. This is R2's `head`, and the read half of every
+    /// conditional write.
+    pub async fn head_blob(&self, key: &str) -> anyhow::Result<Option<BlobMeta>> {
+        let key = self.key(key);
+        let options = GetOptions {
+            head: true,
+            ..GetOptions::default()
+        };
+        match self
+            .store
+            .get_opts(&Path::from(key.as_str()), options)
+            .await
+        {
+            Ok(result) => Ok(Some(self.blob_meta(&result.meta, &result.attributes))),
+            Err(Error::NotFound { .. }) => Ok(None),
+            Err(error) => {
+                Err(anyhow!(error).context(format!("head {}://{}/{key}", self.scheme(), self.name)))
+            }
+        }
+    }
+
+    /// One blob a `get` answered, with its body still on the wire.
+    pub async fn get_blob(
+        &self,
+        key: &str,
+        range: BlobRange,
+        conditions: &BlobConditions,
+    ) -> anyhow::Result<BlobRead> {
+        let scoped = self.key(key);
+        let options = GetOptions {
+            range: match range {
+                BlobRange::Whole => None,
+                BlobRange::From(offset) => Some(GetRange::Offset(offset)),
+                BlobRange::Bounded { offset, length } => {
+                    Some(GetRange::Bounded(offset..offset.saturating_add(length)))
+                }
+                BlobRange::Suffix(length) => Some(GetRange::Suffix(length)),
+            },
+            if_match: conditions.if_match.clone(),
+            if_none_match: conditions.if_none_match.clone(),
+            ..GetOptions::default()
+        };
+        let result = match self
+            .store
+            .get_opts(&Path::from(scoped.as_str()), options)
+            .await
+        {
+            Ok(result) => result,
+            // Only an absent key is a miss. A range that overshoots the end
+            // of the object is served short, as R2 serves it; a range that
+            // *starts* past the end is a 416, and it stays an error rather
+            // than being turned into a miss, because that is what R2 does
+            // with one too.
+            Err(Error::NotFound { .. }) => return Ok(BlobRead::Missing),
+            // The store says only that the condition failed. R2 answers a
+            // refused `onlyIf` with the object itself, minus the body, so
+            // one more head fills in what the caller is entitled to see.
+            Err(Error::Precondition { .. } | Error::NotModified { .. }) => {
+                return Ok(match self.head_blob(key).await? {
+                    Some(meta) => BlobRead::Unmet(meta),
+                    None => BlobRead::Missing,
+                })
+            }
+            Err(error) => {
+                return Err(anyhow!(error).context(format!(
+                    "read {}://{}/{scoped}",
+                    self.scheme(),
+                    self.name
+                )))
+            }
+        };
+        let meta = self.blob_meta(&result.meta, &result.attributes);
+        // The upload-time half of `onlyIf` is answered here, against the
+        // millisecond the object carries. The body is dropped unread.
+        if !conditions.time_met(meta.uploaded_ms) {
+            return Ok(BlobRead::Unmet(meta));
+        }
+        // `range` is the slice this response actually carries, which is
+        // what the caller reads; a bounded request past the end is clamped
+        // here rather than by the store.
+        let served = result.range.clone();
+        let label = format!("read body {}://{}/{scoped}", self.scheme(), self.name);
+        let body = result
+            .into_stream()
+            .map(move |chunk| match chunk {
+                Ok(bytes) => Ok(bytes.to_vec()),
+                Err(error) => Err(format!("{label}: {error}")),
+            })
+            .boxed();
+        Ok(BlobRead::Hit(Blob {
+            meta,
+            range: (served.start, served.end.saturating_sub(served.start)),
+            body,
+        }))
+    }
+
+    /// A plain (non-multipart) write, carrying R2's `httpMetadata` and
+    /// `customMetadata`.
+    ///
+    /// `conditions` is R2's `onlyIf`, and is answered by reading the
+    /// object first and pairing the verdict with that version's CAS token:
+    /// the check and the write then apply to the same version, and a racing
+    /// write between them is refused rather than overwritten. `Ok(None)` is
+    /// a refused precondition — R2 reports one as a `null` return, not a
+    /// throw — and every other failure stays an error.
+    pub async fn put_blob(
+        &self,
+        key: &str,
+        body: PutPayload,
+        attributes: &BlobAttributes,
+        conditions: &BlobConditions,
+    ) -> anyhow::Result<Option<BlobMeta>> {
+        let size = body.content_length() as u64;
+        let mode = match conditions.is_empty() {
+            true => PutMode::Overwrite,
+            false => match self.head_blob(key).await? {
+                Some(current) => {
+                    if !conditions.etag_met(current.etag.as_deref())
+                        || !conditions.time_met(current.uploaded_ms)
+                    {
+                        return Ok(None);
+                    }
+                    let Some(cas) = current.cas else {
+                        return Err(anyhow!(
+                            "conditional R2 write of {}://{}/{key} cannot be fenced: \
+                             the store answered no version token",
+                            self.scheme(),
+                            self.name
+                        ));
+                    };
+                    PutMode::Update(self.backend.update(&cas))
+                }
+                // Nothing there: only a condition that an absent object can
+                // satisfy may write, and it writes as a create so that a
+                // racing create loses.
+                None => match conditions.etag_met(None) {
+                    true => PutMode::Create,
+                    false => return Ok(None),
+                },
+            },
+        };
+        let conditional = !matches!(mode, PutMode::Overwrite);
+        let store = match conditional {
+            true => &self.cas_store,
+            false => &self.store,
+        };
+        let scoped = self.key(key);
+        let options = PutOptions {
+            mode,
+            attributes: attributes.write(),
+            ..PutOptions::default()
+        };
+        match store
+            .put_opts(&Path::from(scoped.as_str()), body, options)
+            .await
+        {
+            Ok(result) => Ok(Some(BlobMeta {
+                size,
+                cas: self
+                    .backend
+                    .token(result.e_tag.clone(), result.version.clone())
+                    .ok(),
+                etag: result.e_tag,
+                version: result.version,
+                uploaded_ms: crate::asyncrt::wall_ms(),
+                attributes: attributes.clone(),
+            })),
+            // A racing write took the version this one checked. The
+            // caller's precondition is no longer true, which is the answer
+            // R2 would have given had the race gone the other way.
+            Err(error) if conditional && is_clean_cas_rejection(&error) => Ok(None),
+            Err(error) => Err(anyhow!(error).context(format!(
+                "write {}://{}/{scoped}",
+                self.scheme(),
+                self.name
+            ))),
+        }
+    }
+
+    /// One listing page: every object whose full key starts with `prefix`,
+    /// in key order, resuming strictly after `after`. `limit` bounds the
+    /// page, counting a rolled-up prefix as R2 counts one — against the
+    /// same limit as an object.
+    ///
+    /// `prefix` is a raw string prefix, as R2's is, not the directory
+    /// prefix the rest of this module lists by: the store is asked for the
+    /// enclosing directory and the tail is matched here.
+    ///
+    /// `delimiter` is R2's: the run of a key between the end of `prefix`
+    /// and the delimiter's first occurrence after it stands in for every
+    /// key sharing it, and those keys are not listed individually.
+    pub async fn list_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+        delimiter: Option<&str>,
+    ) -> anyhow::Result<BlobPage> {
+        let directory = prefix.rsplit_once('/').map_or("", |(head, _)| head);
+        let path = Path::from(self.key(directory).as_str());
+        let mut stream = match after {
+            Some(after) => self
+                .store
+                .list_with_offset(Some(&path), &Path::from(self.key(after).as_str())),
+            None => self.store.list(Some(&path)),
+        };
+        let delimiter = delimiter.filter(|delimiter| !delimiter.is_empty());
+        let mut page = BlobPage {
+            objects: Vec::with_capacity(limit.min(1024)),
+            prefixes: Vec::new(),
+            truncated: false,
+            cursor: None,
+        };
+        // The rolled-up prefixes seen so far. A listing is in key order, so
+        // a run of keys under one prefix is contiguous and only the newest
+        // prefix can repeat — but a delimiter is any string, not only `/`,
+        // so `prefix` can be re-entered later and the set is kept whole.
+        // Ordered, because nothing in the engine may hold state a replay
+        // would walk in a different order.
+        let mut rolled = std::collections::BTreeSet::new();
+        while let Some(meta) = stream.next().await {
+            let meta =
+                meta.with_context(|| format!("list {}://{}/{path}", self.scheme(), self.name))?;
+            let key = self.unkey(meta.location.as_ref());
+            if !key.starts_with(prefix) {
+                continue;
+            }
+            let group = delimiter.and_then(|delimiter| {
+                key[prefix.len()..]
+                    .find(delimiter)
+                    .map(|at| key[..prefix.len() + at + delimiter.len()].to_string())
+            });
+            // A prefix already rolled up costs nothing and does not end the
+            // page: it is the same entry the caller has already been given.
+            if let Some(group) = &group {
+                if rolled.contains(group) {
+                    page.cursor = Some(key.to_string());
+                    continue;
+                }
+            }
+            if page.objects.len() + page.prefixes.len() == limit {
+                page.truncated = true;
+                break;
+            }
+            match group {
+                Some(group) => {
+                    rolled.insert(group.clone());
+                    page.prefixes.push(group);
+                }
+                None => page.objects.push(BlobEntry {
+                    key: key.to_string(),
+                    size: meta.size,
+                    etag: meta.e_tag,
+                    version: meta.version,
+                    uploaded_ms: meta.last_modified.timestamp_millis(),
+                }),
+            }
+            page.cursor = Some(key.to_string());
+        }
+        if !page.truncated {
+            page.cursor = None;
+        }
+        Ok(page)
+    }
+
+    /// Open a multipart upload carrying R2's `httpMetadata` and
+    /// `customMetadata`. The parts and the completion ride on the returned
+    /// handle.
+    pub async fn begin_multipart(
+        &self,
+        key: &str,
+        attributes: &BlobAttributes,
+    ) -> anyhow::Result<Box<dyn MultipartUpload>> {
+        let key = self.key(key);
+        let options = PutMultipartOptions {
+            attributes: attributes.write(),
+            ..PutMultipartOptions::default()
+        };
+        self.store
+            .put_multipart_opts(&Path::from(key.as_str()), options)
+            .await
+            .with_context(|| format!("begin multipart {}://{}/{key}", self.scheme(), self.name))
+    }
+
+    /// One object's metadata, in the shape every R2 answer carries.
+    fn blob_meta(&self, meta: &ObjectMeta, attributes: &Attributes) -> BlobMeta {
+        BlobMeta {
+            size: meta.size,
+            etag: meta.e_tag.clone(),
+            version: meta.version.clone(),
+            cas: self
+                .backend
+                .token(meta.e_tag.clone(), meta.version.clone())
+                .ok(),
+            uploaded_ms: meta.last_modified.timestamp_millis(),
+            attributes: BlobAttributes::read(attributes),
+        }
     }
 
     /// The head_bucket replacement: prove the bucket is reachable and the
@@ -805,13 +1484,15 @@ pub(crate) enum CasVerdict {
 /// (OAuth via Application Default Credentials or the `GOOGLE_*` env),
 /// with the same bounded retry policy the S3 replica lane uses. Replica
 /// writes are plain puts, so retries stay on.
-pub(crate) fn gcs_replica_store(bucket: &str) -> anyhow::Result<Arc<dyn ObjectStore>> {
+#[doc(hidden)]
+pub fn gcs_replica_store(bucket: &str) -> anyhow::Result<Arc<dyn ObjectStore>> {
     gcs_replica_store_with_builder(GoogleCloudStorageBuilder::from_env(), bucket)
 }
 
 /// The body of [`gcs_replica_store`], taking the base builder for the same
 /// reason [`Bucket::open_with_sources`] does.
-fn gcs_replica_store_with_builder(
+#[doc(hidden)]
+pub fn gcs_replica_store_with_builder(
     builder: GoogleCloudStorageBuilder,
     bucket: &str,
 ) -> anyhow::Result<Arc<dyn ObjectStore>> {
@@ -828,13 +1509,15 @@ fn gcs_replica_store_with_builder(
 /// and connection pool, authenticated like [`Bucket::open`]'s az:// path,
 /// with the same bounded retry policy the S3 replica lane uses. Replica
 /// writes are plain puts, so retries stay on.
-pub(crate) fn azure_replica_store(container: &str) -> anyhow::Result<Arc<dyn ObjectStore>> {
+#[doc(hidden)]
+pub fn azure_replica_store(container: &str) -> anyhow::Result<Arc<dyn ObjectStore>> {
     azure_replica_store_with_env(&AzureEnv::from_process(), container)
 }
 
 /// The body of [`azure_replica_store`], taking the environment for the
 /// same reason [`Bucket::open_with_sources`] does.
-fn azure_replica_store_with_env(
+#[doc(hidden)]
+pub fn azure_replica_store_with_env(
     env: &AzureEnv,
     container: &str,
 ) -> anyhow::Result<Arc<dyn ObjectStore>> {
@@ -849,11 +1532,12 @@ fn azure_replica_store_with_env(
 /// The `AZURE_*` variables an `az://` bucket can inspect. celld captures
 /// them instead of letting `MicrosoftAzureBuilder::from_env` read the
 /// process environment, because the fleet client must decide which
-/// recognized settings it honors, and a test must be able to supply a
-/// set of its own. Names that `AzureConfigKey` does not parse are inert
+/// recognized settings it honors, and a caller can supply an explicit set.
+/// Names that `AzureConfigKey` does not parse are inert
 /// and stay ignored, as they are in `from_env`.
 #[derive(Clone, Default)]
-pub(crate) struct AzureEnv {
+#[doc(hidden)]
+pub struct AzureEnv {
     variables: Vec<(String, String)>,
 }
 
@@ -863,7 +1547,8 @@ impl AzureEnv {
         AzureEnv::from_pairs(std::env::vars().filter(|(name, _)| name.starts_with("AZURE_")))
     }
 
-    fn from_pairs<K, V>(pairs: impl IntoIterator<Item = (K, V)>) -> AzureEnv
+    #[doc(hidden)]
+    pub fn from_pairs<K, V>(pairs: impl IntoIterator<Item = (K, V)>) -> AzureEnv
     where
         K: Into<String>,
         V: Into<String>,
@@ -882,9 +1567,10 @@ impl AzureEnv {
 /// environment: the GCS builder, and the `AZURE_*` variables. Bundled so
 /// the seam that makes construction environment-independent stays one
 /// parameter as backends are added.
-pub(crate) struct CloudSources {
-    gcs: GoogleCloudStorageBuilder,
-    azure: AzureEnv,
+#[doc(hidden)]
+pub struct CloudSources {
+    pub gcs: GoogleCloudStorageBuilder,
+    pub azure: AzureEnv,
 }
 
 impl CloudSources {
@@ -1090,14 +1776,14 @@ pub fn is_unauthorized(error: &anyhow::Error) -> bool {
         ) {
             return true;
         }
-        // The list path wraps HTTP errors as Generic; the status only
-        // survives in the retry error's message.
+        // The S3 list path wraps its private retry error as Generic, so the
+        // status survives only in Display. object_store 0.11 used `status
+        // 403`, and 0.12 uses the canonical HTTP phrase below. A revoked
+        // managed credential must keep the same operator-visible state.
         let text = cause.to_string();
-        text.contains("status 403") || text.contains("status 401")
+        text.contains("status 403")
+            || text.contains("status 401")
+            || text.contains("status code: 403 Forbidden")
+            || text.contains("status code: 401 Unauthorized")
     })
-}
-
-#[cfg(all(test, celld_internal_tests))]
-mod conformance_bucket_tests {
-    include!(env!("CELLD_CONFORMANCE_BUCKET_TESTS"));
 }

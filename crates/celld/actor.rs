@@ -2,9 +2,6 @@
 
 //! The serial lifecycle executor and its shell-side request drivers.
 
-#![warn(clippy::disallowed_macros)]
-
-use crate::assets::AssetResolver;
 use crate::js::{HttpResponse, WsOut};
 use crate::machine::{
     ownership_on_evict_from_environment, pressure_config_from_environment,
@@ -15,22 +12,29 @@ use crate::peer_auth::{self, PeerAuth};
 use crate::runtime::{CellHost, RuntimeManager};
 use anyhow::Context as _;
 use celld_logic::{
-    on_event, CasGuard, CasOutcome, Config, Effect, Event, Failure, LeaseCasOutcome,
-    NodeLeaseRecord, NodeLeaseSpec, OpId, OwnerRecord, OwnershipOnEvict, Phase, RequestError,
-    Route, State, StopCause, Timer, WebSocketKind, WorkerRoute,
+    on_event, AdoptedCell, CapacityPeer, CasGuard, CasOutcome, Channel, Config, Effect, Event,
+    Failure, LeaseCasOutcome, NodeLeaseRecord, NodeLeaseSpec, OpId, OwnerRecord, OwnershipOnEvict,
+    Phase, RequestError, Route, State, StopCause, Timer, WebSocketKind, WorkerRoute,
 };
 use futures_util::stream::FuturesUnordered;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio_util::time::{delay_queue, DelayQueue};
 
 mod production;
 
 const DEFAULT_OPERATION_DEADLINE_MS: u64 = 15_000;
+
+/// The shell's deadline for one actor operation. Queue leases include this
+/// exact budget for their settlement call, so the actor and broker must read
+/// one accessor rather than duplicate the environment default.
+pub(crate) fn operation_deadline_ms() -> anyhow::Result<u64> {
+    crate::env_vars::positive_or("CELLD_OPERATION_DEADLINE_MS", DEFAULT_OPERATION_DEADLINE_MS)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TimerSlot {
@@ -331,6 +335,14 @@ pub enum Message {
     /// request shell has already stopped admission; this closes wake and
     /// service paths that do not pass through the HTTP gate.
     BeginPreserve,
+    /// The node adopted a new application generation. Resident cells on an
+    /// older one move to it at a safe point, or by force after `max_age_ms`;
+    /// cells of an eager class move at once.
+    GenerationChanged {
+        generation: crate::generation::GenerationId,
+        max_age_ms: u64,
+        eager_classes: Vec<String>,
+    },
     /// Graceful shutdown: release every owned cell's record so peers take
     /// over immediately. The release writes run as effects inside the
     /// shutdown drain window, and the drain waits for them to complete —
@@ -348,6 +360,14 @@ pub enum Message {
         request: u64,
         cell: String,
         capacity_handoff: bool,
+        /// Present only for the signed shutdown-handoff endpoint. The actor
+        /// settles this channel as soon as the ownership CAS is authoritative;
+        /// the ordinary route reply remains pending until it is cancelled.
+        handoff_accept: Option<HandoffAcceptWaiter>,
+        /// An event from this exact registered WebSocket can finish on a
+        /// quiescing resident. Ordinary requests carry no identity and wait
+        /// for the successor route.
+        websocket: Option<u64>,
         reply: oneshot::Sender<Result<Routed, RequestError>>,
     },
     /// A caller disappeared before routing finished. The request identity is
@@ -368,10 +388,13 @@ pub enum Message {
         alarm_at_ms: Option<i64>,
         alarm_covered: bool,
     },
-    /// A local response is ready. A write opens a durability barrier, and a
-    /// read trails the newest barrier already open on its cell.
-    GateWrite {
+    /// An outbound effect is ready to leave on `channel`. A write opens a
+    /// durability barrier, and a read trails the newest barrier already open on
+    /// its cell. The channel rides along so the release can be routed back to
+    /// whichever adapter is holding the effect.
+    Output {
         request: u64,
+        channel: Channel,
         position: Option<u64>,
         reply: oneshot::Sender<Result<(), RequestError>>,
     },
@@ -415,13 +438,17 @@ pub enum Message {
         reply: oneshot::Sender<()>,
     },
     Snapshot {
-        reply: oneshot::Sender<String>,
+        reply: oneshot::Sender<(String, Vec<celld_logic::DrainPin>, SwapCensus)>,
     },
     Health {
         reply: oneshot::Sender<bool>,
     },
     Presence {
         reply: oneshot::Sender<celld_logic::PresenceSnapshot>,
+    },
+    ResidentEpoch {
+        cell: String,
+        reply: oneshot::Sender<Option<u64>>,
     },
 }
 
@@ -440,20 +467,104 @@ pub struct Routed {
     pub route: Route,
 }
 
+/// A test-only receipt for three request-path outcomes. `AppHandle::request`
+/// deliberately maps both channel failures to `NodeFenced`, so its public
+/// result cannot identify which asynchronous seam failed.
+#[cfg(all(test, celld_internal_tests))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RequestPathReceiptForTest {
+    SubmissionFailure {
+        request: u64,
+    },
+    ReplyChannelClosed {
+        request: u64,
+    },
+    Returned {
+        allocated_request: u64,
+        result: Result<(u64, Route), RequestError>,
+    },
+}
+
+/// A test-only receipt for three output-gate outcomes. The public gate maps
+/// both channel failures to `NodeFenced`, so its result cannot identify which
+/// asynchronous seam failed.
+#[cfg(all(test, celld_internal_tests))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OutputGateReceiptForTest {
+    SubmissionFailure {
+        request: u64,
+    },
+    ReplyChannelClosed {
+        request: u64,
+    },
+    Returned {
+        request: u64,
+        result: Result<(), RequestError>,
+    },
+}
+
+enum RequestPathOutcome {
+    SubmissionFailure,
+    ReplyChannelClosed,
+    Returned(Result<Routed, RequestError>),
+}
+
+enum OutputGateOutcome {
+    SubmissionFailure,
+    ReplyChannelClosed,
+    Returned(Result<(), RequestError>),
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct DrainStatus {
     pub occupied: usize,
     pub activating: usize,
+    /// Resident cells reserved for shutdown handoff. New requests wait for
+    /// their successor routes while admitted work finishes.
+    pub quiescing: usize,
     pub evicting: usize,
     /// Ownership releases still in flight. A handoff drain waits for zero:
     /// a released cell leaves `occupied` before its record write commits,
     /// so exiting on occupancy alone can abort the write mid-flight and
     /// leave a record the successor waits out the node lease for.
     pub releasing: usize,
+    /// Released cells waiting for a successor's ownership acknowledgement.
+    /// These hold the shutdown pacing permits.
+    pub adopting: usize,
+    /// Monotonic ownership acknowledgements. A progressing handoff can
+    /// take longer than one stall interval when the node owns many cells.
+    pub handed_off: u64,
 }
 
-// Read only by the orphaned `worker_route`; removed with the landing-cell
-// machinery in the DO-dispatch refactor ([[designs/do-fast-path]]).
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HandoffRequest {
+    pub cell: String,
+    pub released_epoch: u64,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HandoffResponse {
+    pub node: String,
+    pub addr: String,
+    pub epoch: u64,
+    pub peer_protocol: u16,
+    /// Whether the successor adopted the cell. It repeats what the status code
+    /// reports, and the donor accepts the reply only when the two agree: `200`
+    /// with `true` is an adoption, and `409` with `false` names the current
+    /// owner for the donor to contact instead. Every other pairing is refused,
+    /// so a disagreement between the two cannot be read as a handoff.
+    pub published: bool,
+}
+
+pub struct HandoffAcceptWaiter {
+    released_epoch: u64,
+    reply: oneshot::Sender<AdoptedCell>,
+}
+
+// Read only by the orphaned `worker_route`, and removed with the rest of the
+// landing-cell machinery when that goes.
 #[allow(dead_code)]
 pub struct WorkerRouted {
     pub request: u64,
@@ -541,15 +652,252 @@ impl Drop for IngressAbortGuard {
     }
 }
 
+/// One public HTTP request admitted before shutdown closed the gate. Peer
+/// requests do not hold this guard because the handoff must keep serving them.
+pub struct PublicRequestGuard {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for PublicRequestGuard {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct DrainPinRegistry(Arc<std::sync::Mutex<DrainPinState>>);
+
+#[derive(Default)]
+struct DrainPinState {
+    pins: BTreeMap<u64, DrainPinTrace>,
+    requests: HashMap<crate::js::RequestId, u64>,
+}
+
+struct DrainPinTrace {
+    request_id: Option<crate::js::RequestId>,
+    origin: &'static str,
+    started_mono_ms: u64,
+    phase: &'static str,
+    response_headers_sent: bool,
+    response_body_active: bool,
+    durable_txid: Option<u64>,
+    output_gate_result: &'static str,
+    ack_point: &'static str,
+    cancellation_state: &'static str,
+    cancel: watch::Sender<bool>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DrainPinView {
+    cell: String,
+    core_request_id: Option<u64>,
+    request_id: Option<String>,
+    origin: &'static str,
+    age_ms: u64,
+    phase: &'static str,
+    response_headers_sent: bool,
+    response_body_active: bool,
+    durable_txid: Option<u64>,
+    output_gate_result: &'static str,
+    ack_point: &'static str,
+    active_request_count: usize,
+    output_gate_count: usize,
+    cancellation_state: &'static str,
+    regular_websocket_count: usize,
+    outbound_websocket_count: usize,
+}
+
+impl DrainPinRegistry {
+    fn begin(
+        &self,
+        core_request: u64,
+        request_id: Option<crate::js::RequestId>,
+        origin: &'static str,
+    ) -> watch::Receiver<bool> {
+        let (cancel, receive) = watch::channel(false);
+        let mut state = self.0.lock().unwrap();
+        state.pins.insert(
+            core_request,
+            DrainPinTrace {
+                request_id,
+                origin,
+                started_mono_ms: crate::asyncrt::mono_ms(),
+                phase: "handler",
+                response_headers_sent: false,
+                response_body_active: false,
+                durable_txid: None,
+                output_gate_result: "not_applicable",
+                ack_point: "not_acknowledged",
+                cancellation_state: "not_cancelled",
+                cancel,
+            },
+        );
+        if let Some(request_id) = request_id {
+            state.requests.insert(request_id, core_request);
+        }
+        receive
+    }
+
+    fn update(
+        &self,
+        core_request: u64,
+        phase: &'static str,
+        response_headers_sent: bool,
+        response_body_active: bool,
+    ) {
+        if let Some(pin) = self.0.lock().unwrap().pins.get_mut(&core_request) {
+            pin.phase = phase;
+            pin.response_headers_sent = response_headers_sent;
+            pin.response_body_active = response_body_active;
+            if response_headers_sent {
+                pin.ack_point = "response_headers_sent";
+            }
+        }
+    }
+
+    fn gate_started(&self, core_request: u64, durable_txid: u64) {
+        if let Some(pin) = self.0.lock().unwrap().pins.get_mut(&core_request) {
+            pin.durable_txid = Some(durable_txid);
+            pin.output_gate_result = "pending";
+        }
+    }
+
+    fn gate_finished(&self, core_request: u64, proven: bool) {
+        if let Some(pin) = self.0.lock().unwrap().pins.get_mut(&core_request) {
+            pin.output_gate_result = if proven { "proven" } else { "failed" };
+        }
+    }
+
+    pub fn cancel_request(
+        &self,
+        request_id: crate::js::RequestId,
+        cancellation_state: &'static str,
+    ) -> Option<&'static str> {
+        let mut state = self.0.lock().unwrap();
+        let core_request = state.requests.get(&request_id).copied()?;
+        let pin = state.pins.get_mut(&core_request)?;
+        pin.cancellation_state = cancellation_state;
+        let _ = pin.cancel.send(true);
+        Some(pin.phase)
+    }
+
+    fn cancel_core_request(
+        &self,
+        core_request: u64,
+        cancellation_state: &'static str,
+    ) -> Option<(Option<crate::js::RequestId>, &'static str)> {
+        let mut state = self.0.lock().unwrap();
+        let pin = state.pins.get_mut(&core_request)?;
+        pin.cancellation_state = cancellation_state;
+        let _ = pin.cancel.send(true);
+        Some((pin.request_id, pin.phase))
+    }
+
+    fn finish(&self, core_request: u64) -> Option<DrainPinTrace> {
+        let mut state = self.0.lock().unwrap();
+        let pin = state.pins.remove(&core_request)?;
+        if let Some(request_id) = pin.request_id {
+            state.requests.remove(&request_id);
+        }
+        Some(pin)
+    }
+
+    fn snapshot(&self, pins: Vec<celld_logic::DrainPin>) -> Vec<DrainPinView> {
+        let state = self.0.lock().unwrap();
+        pins.into_iter()
+            .map(|pin| {
+                let trace = pin.request.and_then(|request| state.pins.get(&request));
+                DrainPinView {
+                    cell: pin.cell,
+                    core_request_id: pin.request,
+                    request_id: trace
+                        .and_then(|trace| trace.request_id)
+                        .map(crate::js::request_id_string),
+                    origin: trace.map_or("unknown", |trace| trace.origin),
+                    age_ms: trace.map_or(0, |trace| {
+                        crate::asyncrt::mono_ms().saturating_sub(trace.started_mono_ms)
+                    }),
+                    phase: trace.map_or("unknown", |trace| trace.phase),
+                    response_headers_sent: trace.is_some_and(|trace| trace.response_headers_sent),
+                    response_body_active: trace.is_some_and(|trace| trace.response_body_active),
+                    durable_txid: trace.and_then(|trace| trace.durable_txid),
+                    output_gate_result: trace.map_or("unknown", |trace| trace.output_gate_result),
+                    ack_point: trace.map_or("unknown", |trace| trace.ack_point),
+                    active_request_count: pin.active_request_count,
+                    output_gate_count: pin.output_gate_count,
+                    cancellation_state: trace.map_or("unknown", |trace| trace.cancellation_state),
+                    regular_websocket_count: pin.regular_websocket_count,
+                    outbound_websocket_count: pin.outbound_websocket_count,
+                }
+            })
+            .collect()
+    }
+}
+
 pub struct ActivityGuard {
     tx: mpsc::UnboundedSender<Message>,
     request: u64,
     runtime: Option<RuntimeManager>,
     cell: String,
+    drain_pins: DrainPinRegistry,
+    cancellation: watch::Receiver<bool>,
+}
+
+impl ActivityGuard {
+    pub fn set_phase(
+        &self,
+        phase: &'static str,
+        response_headers_sent: bool,
+        response_body_active: bool,
+    ) {
+        self.drain_pins.update(
+            self.request,
+            phase,
+            response_headers_sent,
+            response_body_active,
+        );
+    }
+
+    pub fn cancellation(&self) -> watch::Receiver<bool> {
+        self.cancellation.clone()
+    }
+
+    pub fn gate_started(&self, durable_txid: u64) {
+        self.drain_pins.gate_started(self.request, durable_txid);
+    }
+
+    pub fn gate_finished(&self, proven: bool) {
+        self.drain_pins.gate_finished(self.request, proven);
+    }
 }
 
 impl Drop for ActivityGuard {
     fn drop(&mut self) {
+        if let Some(pin) = self.drain_pins.finish(self.request) {
+            if let Some(request_id) = pin
+                .request_id
+                .filter(|_| tracing::enabled!(target: "timing", tracing::Level::DEBUG))
+            {
+                tracing::debug!(
+                    target: "timing",
+                    event = "cell_request_lifecycle",
+                    core_request_id = self.request,
+                    request_id = %crate::js::request_id_string(request_id),
+                    scope = %self.cell,
+                    origin = pin.origin,
+                    age_ms = crate::asyncrt::mono_ms().saturating_sub(pin.started_mono_ms),
+                    phase = pin.phase,
+                    response_headers_sent = pin.response_headers_sent,
+                    response_body_active = pin.response_body_active,
+                    durable_txid = pin.durable_txid,
+                    output_gate_result = pin.output_gate_result,
+                    ack_point = pin.ack_point,
+                    cancellation_state = pin.cancellation_state,
+                    "cell request lifetime ended"
+                );
+            }
+        }
         // Read and send under the registry lock (`with_alarm`), so this
         // report cannot carry an alarm older than one the reporter already
         // sent — a stale fold arriving later would unarm the core and
@@ -681,6 +1029,46 @@ impl CellRouteTiming {
     }
 }
 
+/// Report a cell's runtime stopped, but only once the host has actually let
+/// the cell go.
+///
+/// A stop that failed can leave the cell's realm holding its open database,
+/// so reporting it stopped is what makes that dangerous: the core answers a
+/// stop by starting the cell again — on the current application generation
+/// for a swap, or on another node after a handoff — against storage the old
+/// realm may still have. Both stop paths therefore retry rather than report,
+/// and they share this loop so neither can drift into reporting first.
+///
+/// The retry is unbounded on purpose. The core arms an operation deadline on
+/// the `Cleaning` phase this answers, so a host that never lets go is bounded
+/// there rather than by a count guessed here.
+async fn report_stopped_when_released<F, Fut>(
+    op: OpId,
+    cell: String,
+    epoch: u64,
+    event: &'static str,
+    mut release: F,
+) -> CompletedEffect
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    while let Err(error) = release().await {
+        tracing::warn!(
+            event,
+            %cell,
+            epoch,
+            %error,
+            "the host did not release the cell; retrying before reporting it stopped"
+        );
+        crate::asyncrt::sleep(std::time::Duration::from_millis(
+            crate::replication::CELL_RELEASE_RETRY_BASE_MS,
+        ))
+        .await;
+    }
+    CompletedEffect::plain(Event::RuntimeStopped { op })
+}
+
 fn mono_elapsed_us(started_mono_ms: u64) -> u64 {
     crate::asyncrt::mono_ms()
         .saturating_sub(started_mono_ms)
@@ -737,12 +1125,25 @@ fn drain_step_output(
     }
 }
 
+/// The largest request body that a node accepts unless the operator lowers
+/// the limit. The value keeps the large git-pack ingress use case supported.
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 1 << 30;
+
+/// The generation census `/state` reports beside the serving deployment.
+pub struct SwapCensus {
+    /// Resident cells moving to the current generation right now.
+    pub swapping: usize,
+    /// Each resident cell and the generation its runtime started on.
+    pub generations: Vec<(String, u64)>,
+}
+
 #[derive(Clone)]
 pub struct AppHandle {
     pub tx: mpsc::UnboundedSender<Message>,
     pub runtime: Option<RuntimeManager>,
-    pub assets: Arc<HashMap<String, AssetResolver>>,
-    pub asset_script: Option<Arc<str>>,
+    /// Asks the pointer watcher to adopt the current deployment now. Sending
+    /// fails on a node with no pointer to watch, such as a local-script node.
+    pub reload: crate::generation::ReloadSender,
     pub peer_http: reqwest::Client,
     pub peer_auth: Arc<PeerAuth>,
     pub advertise: String,
@@ -755,31 +1156,93 @@ pub struct AppHandle {
     /// Concurrent outbound WebSockets one cell may hold, for the refusal
     /// message; the core enforces it.
     pub max_outbound_websockets: usize,
-    /// Set the instant a graceful shutdown begins, so `/__celld/health` reports
+    /// Set the instant a graceful shutdown begins, so `/.well-known/celld/health` reports
     /// unhealthy and a load balancer stops routing here before teardown.
     pub draining: Arc<std::sync::atomic::AtomicBool>,
+    /// The one-shot fleet gate on the first health 200. A fresh process
+    /// reports ready only after no peer donor is mid-handoff, or after a
+    /// bounded wait, so a rolling update cannot advance faster than the
+    /// fleet recovers. Fleet state never demotes readiness after the gate
+    /// opens; peers reach owned cells directly regardless.
+    pub fleet_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Public requests which passed the shutdown gate and have not finished.
+    /// This includes the complete top-level Worker call, so a cell write it
+    /// goes on to make cannot outlive the pre-handoff durability boundary.
+    pub public_in_flight: Arc<AtomicUsize>,
+    /// Shell-side phases joined to the decision core's exact eviction pins.
+    pub drain_pins: DrainPinRegistry,
     /// The log tier's follower store: this node holds peers' log fragments
     /// whatever its own durability posture. `None` without a bucket.
     pub follower: Option<Arc<crate::node_log::FollowerStore>>,
     /// Whether forwarded scheme and host headers can set `request.url`.
     /// The default is false because a direct client controls both headers.
     pub trust_forwarded_headers: bool,
+    /// The maximum body size for public Worker ingress and direct Durable
+    /// Object ingress. The same value must govern both entry points because a
+    /// caller can choose either route for an ordinary Durable Object.
+    pub max_request_body_bytes: usize,
 }
 
 impl AppHandle {
     pub async fn request(&self, cell: String) -> Result<Routed, RequestError> {
-        self.request_with_mode(cell, false).await
+        self.request_with_mode(cell, false, None).await
+    }
+
+    /// Route one test request and retain which asynchronous seam produced the
+    /// result. The shipping method keeps its compact public result, while this
+    /// receipt prevents an inference from `NodeFenced` or an error string.
+    #[cfg(all(test, celld_internal_tests))]
+    pub(crate) async fn request_with_receipt_for_test(
+        &self,
+        cell: String,
+    ) -> RequestPathReceiptForTest {
+        let (request, outcome) = self.request_path(cell, false, None).await;
+        match outcome {
+            RequestPathOutcome::SubmissionFailure => {
+                RequestPathReceiptForTest::SubmissionFailure { request }
+            }
+            RequestPathOutcome::ReplyChannelClosed => {
+                RequestPathReceiptForTest::ReplyChannelClosed { request }
+            }
+            RequestPathOutcome::Returned(result) => RequestPathReceiptForTest::Returned {
+                allocated_request: request,
+                result: result.map(|routed| (routed.request, routed.route)),
+            },
+        }
     }
 
     pub async fn capacity_request(&self, cell: String) -> Result<Routed, RequestError> {
-        self.request_with_mode(cell, true).await
+        self.request_with_mode(cell, true, None).await
+    }
+
+    pub async fn websocket_request(
+        &self,
+        cell: String,
+        websocket: u64,
+    ) -> Result<Routed, RequestError> {
+        self.request_with_mode(cell, false, Some(websocket)).await
     }
 
     async fn request_with_mode(
         &self,
         cell: String,
         capacity_handoff: bool,
+        websocket: Option<u64>,
     ) -> Result<Routed, RequestError> {
+        match self.request_path(cell, capacity_handoff, websocket).await.1 {
+            RequestPathOutcome::Returned(result) => result,
+            RequestPathOutcome::SubmissionFailure | RequestPathOutcome::ReplyChannelClosed => {
+                Err(RequestError::NodeFenced)
+            }
+        }
+    }
+
+    async fn request_path(
+        &self,
+        cell: String,
+        capacity_handoff: bool,
+        websocket: Option<u64>,
+    ) -> (u64, RequestPathOutcome) {
         let request = crate::asyncrt::next_core_request();
         let (reply, receive) = oneshot::channel();
         if self
@@ -788,24 +1251,107 @@ impl AppHandle {
                 request,
                 cell,
                 capacity_handoff,
+                handoff_accept: None,
+                websocket,
                 reply,
+            })
+            .is_err()
+        {
+            return (request, RequestPathOutcome::SubmissionFailure);
+        }
+        let mut cancel = RouteCancelGuard::new(self.tx.clone(), request);
+        let outcome = match receive.await {
+            Ok(result) => RequestPathOutcome::Returned(result),
+            Err(_) => RequestPathOutcome::ReplyChannelClosed,
+        };
+        cancel.disarm();
+        (request, outcome)
+    }
+
+    /// Acquire a released cell without materializing its runtime. The donor's
+    /// final snapshot makes a later demand-driven restore authoritative, and
+    /// avoiding an eager restore keeps a fleet restart from becoming a cold
+    /// start storm.
+    pub async fn accept_handoff(
+        &self,
+        cell: String,
+        released_epoch: u64,
+    ) -> Result<HandoffAttempt, RequestError> {
+        let request = crate::asyncrt::next_core_request();
+        let (route_reply, mut route_receive) = oneshot::channel();
+        let (accept_reply, mut accept_receive) = oneshot::channel();
+        if self
+            .tx
+            .send(Message::Request {
+                request,
+                cell: cell.clone(),
+                capacity_handoff: true,
+                handoff_accept: Some(HandoffAcceptWaiter {
+                    released_epoch,
+                    reply: accept_reply,
+                }),
+                websocket: None,
+                reply: route_reply,
             })
             .is_err()
         {
             return Err(RequestError::NodeFenced);
         }
         let mut cancel = RouteCancelGuard::new(self.tx.clone(), request);
-        let result = receive.await.unwrap_or(Err(RequestError::NodeFenced));
+        let result = crate::asyncrt::select_biased! {
+            "a completed route wins a tie so current ownership precedes the accept acknowledgement";
+            routed = &mut route_receive => match routed
+                .unwrap_or(Err(RequestError::NodeFenced))?
+            {
+                Routed {
+                    request,
+                    route: Route::Local,
+                } => {
+                    // A repeated request can find the cell published already.
+                    drop(self.activity(request, cell.clone()));
+                    self.resident_epoch(cell)
+                        .await
+                        .filter(|epoch| *epoch > released_epoch)
+                        .map(|epoch| HandoffAttempt::Accepted(AdoptedCell {
+                            node: self.peer_auth.source().to_string(),
+                            addr: self.advertise.clone(),
+                            epoch,
+                            peer_protocol: peer_auth::PROTOCOL_VERSION,
+                        }))
+                        .ok_or(RequestError::AcquireFailed)
+                }
+                Routed {
+                    route: Route::Remote {
+                        node,
+                        addr,
+                        epoch,
+                        peer_protocol,
+                    },
+                    ..
+                } => Ok(HandoffAttempt::CurrentOwner(AdoptedCell {
+                    node,
+                    addr,
+                    epoch,
+                    peer_protocol,
+                })),
+            },
+            accepted = &mut accept_receive => accepted
+                .map(HandoffAttempt::Accepted)
+                .map_err(|_| RequestError::NodeFenced),
+        };
+        // The ownership acknowledgement deliberately leaves no route waiter:
+        // real traffic, not this synthetic request, starts materialization.
         cancel.disarm();
+        let _ = self.tx.send(Message::CancelRoute { request });
         result
     }
 
-    // Orphaned by the always-pool Worker entry below. The whole landing-cell
-    // machinery (this, `Message::WorkerRequest`, `WorkerRouted`,
-    // `fetch_worker_on_cell`, `CellJob::WorkerFetch`, the logic `worker_request`,
-    // and the inline co-hosted-write gate) is removed together in the DO-dispatch
-    // refactor ([[designs/do-fast-path]]) so the RPO=0 co-hosted path is reworked
-    // coherently rather than unpicked here.
+    // Orphaned by the always-pool Worker entry below. What remains of the
+    // landing-cell machinery -- this, `Message::WorkerRequest`, `WorkerRouted`,
+    // `fetch_worker_on_cell`, `CellJob::WorkerFetch`, and the logic
+    // `worker_request` -- is kept together so it can be removed in one piece
+    // rather than unpicked here. The in-isolate dispatch it was paired with is
+    // already gone, and with it the gate that path needed.
     #[allow(dead_code)]
     async fn worker_route(&self) -> anyhow::Result<WorkerRouted> {
         let (reply, receive) = oneshot::channel();
@@ -851,11 +1397,24 @@ impl AppHandle {
     }
 
     pub fn activity(&self, request: u64, cell: String) -> ActivityGuard {
+        self.activity_for(request, cell, None, "local")
+    }
+
+    pub fn activity_for(
+        &self,
+        request: u64,
+        cell: String,
+        request_id: Option<crate::js::RequestId>,
+        origin: &'static str,
+    ) -> ActivityGuard {
+        let cancellation = self.drain_pins.begin(request, request_id, origin);
         ActivityGuard {
             tx: self.tx.clone(),
             request,
             runtime: self.runtime.clone(),
             cell,
+            drain_pins: self.drain_pins.clone(),
+            cancellation,
         }
     }
 
@@ -865,22 +1424,41 @@ impl AppHandle {
     pub async fn gate_output(
         &self,
         request: u64,
+        channel: Channel,
         position: Option<u64>,
     ) -> Result<(), RequestError> {
+        match self.gate_output_path(request, channel, position).await {
+            OutputGateOutcome::Returned(result) => result,
+            OutputGateOutcome::SubmissionFailure | OutputGateOutcome::ReplyChannelClosed => {
+                Err(RequestError::NodeFenced)
+            }
+        }
+    }
+
+    async fn gate_output_path(
+        &self,
+        request: u64,
+        channel: Channel,
+        position: Option<u64>,
+    ) -> OutputGateOutcome {
         let started_mono_ms = crate::asyncrt::mono_ms();
         let (reply, receive) = oneshot::channel();
         if self
             .tx
-            .send(Message::GateWrite {
+            .send(Message::Output {
                 request,
+                channel,
                 position,
                 reply,
             })
             .is_err()
         {
-            return Err(RequestError::NodeFenced);
+            return OutputGateOutcome::SubmissionFailure;
         }
-        let result = receive.await.unwrap_or(Err(RequestError::NodeFenced));
+        let outcome = match receive.await {
+            Ok(result) => OutputGateOutcome::Returned(result),
+            Err(_) => OutputGateOutcome::ReplyChannelClosed,
+        };
         tracing::debug!(
             target: "timing",
             event = "gate_write_timing",
@@ -888,11 +1466,35 @@ impl AppHandle {
             total_us = mono_elapsed_us(started_mono_ms),
             "output gate resolved"
         );
-        result
+        outcome
+    }
+
+    /// Run one test output gate without collapsing its two channel failures
+    /// into a returned engine rejection. The request travels in every arm, so
+    /// a consumer cannot attach the receipt to another caller.
+    #[cfg(all(test, celld_internal_tests))]
+    pub(crate) async fn gate_output_with_receipt_for_test(
+        &self,
+        request: u64,
+        channel: Channel,
+        position: Option<u64>,
+    ) -> OutputGateReceiptForTest {
+        match self.gate_output_path(request, channel, position).await {
+            OutputGateOutcome::SubmissionFailure => {
+                OutputGateReceiptForTest::SubmissionFailure { request }
+            }
+            OutputGateOutcome::ReplyChannelClosed => {
+                OutputGateReceiptForTest::ReplyChannelClosed { request }
+            }
+            OutputGateOutcome::Returned(result) => {
+                OutputGateReceiptForTest::Returned { request, result }
+            }
+        }
     }
 
     pub async fn gate_write(&self, request: u64, position: u64) -> Result<(), RequestError> {
-        self.gate_output(request, Some(position)).await
+        self.gate_output(request, Channel::Response, Some(position))
+            .await
     }
 
     /// Hand a finished `webSocketMessage`'s frames to the cell's output gate.
@@ -982,13 +1584,72 @@ impl AppHandle {
         if self.tx.send(Message::Snapshot { reply }).is_err() {
             return "{\"error\":\"actor_stopped\"}".into();
         }
-        receive
-            .await
-            .unwrap_or_else(|_| "{\"error\":\"actor_stopped\"}".into())
+        let Ok((state, pins, census)) = receive.await else {
+            return "{\"error\":\"actor_stopped\"}".into();
+        };
+        let pins = self.drain_pins.snapshot(pins);
+        let Ok(mut state) = serde_json::from_str::<serde_json::Value>(&state) else {
+            return state;
+        };
+        if !pins.is_empty() {
+            state["drainPins"] =
+                serde_json::to_value(pins).unwrap_or_else(|_| serde_json::json!([]));
+        }
+        // Which deployment this node serves, and which ones it is still
+        // draining. Nothing else in the process records the version, so
+        // this is how an operator learns whether a deploy took.
+        if let Some(runtime) = &self.runtime {
+            let generation = runtime.generation();
+            state["deployment"] = serde_json::json!({
+                "version": generation.version(),
+                "prefix": generation.prefix(),
+                "generation": generation.id(),
+                "draining": runtime
+                    .draining_generations()
+                    .into_iter()
+                    .map(|(id, version)| serde_json::json!({"generation": id, "version": version}))
+                    .collect::<Vec<_>>(),
+                // Resident cells moving to the current generation right now,
+                // and the generation each resident cell runs: the two numbers
+                // an operator watches while a deployment converges.
+                "swapping": census.swapping,
+                "cells": census
+                    .generations
+                    .into_iter()
+                    .map(|(cell, generation)| (cell, serde_json::Value::from(generation)))
+                    .collect::<serde_json::Map<_, _>>(),
+            });
+        }
+        state.to_string()
     }
 
     pub fn is_draining(&self) -> bool {
         self.draining.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn fleet_ready(&self) -> bool {
+        self.fleet_ready.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Atomically cross the public shutdown gate. The second draining read
+    /// closes the race where shutdown stores the flag between the first read
+    /// and the counter increment: that request backs out before user code runs.
+    pub fn admit_public(&self) -> Option<PublicRequestGuard> {
+        if self.draining.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.public_in_flight.fetch_add(1, Ordering::SeqCst);
+        if self.draining.load(Ordering::SeqCst) {
+            self.public_in_flight.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(PublicRequestGuard {
+            in_flight: self.public_in_flight.clone(),
+        })
+    }
+
+    pub fn public_in_flight(&self) -> usize {
+        self.public_in_flight.load(Ordering::SeqCst)
     }
 
     /// A dead actor has nothing left to hand off, so channel failure
@@ -1014,6 +1675,12 @@ impl AppHandle {
         self.tx.send(Message::Presence { reply }).ok()?;
         receive.await.ok()
     }
+
+    async fn resident_epoch(&self, cell: String) -> Option<u64> {
+        let (reply, receive) = oneshot::channel();
+        self.tx.send(Message::ResidentEpoch { cell, reply }).ok()?;
+        receive.await.ok().flatten()
+    }
 }
 
 /// One cell's WebSocket output gate: an ordered queue of write barriers.
@@ -1038,32 +1705,64 @@ struct WsBarrier {
     frames: Vec<(u64, WsOut)>,
 }
 
+/// The shell identity for one output held by the core.
+///
+/// One request can hold output on multiple channels. Keeping both values in
+/// the map key prevents a later channel from replacing the first channel's
+/// waiter before the core releases it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct HeldOutputKey {
+    request: u64,
+    channel: Channel,
+}
+
+impl HeldOutputKey {
+    const fn websocket(request: u64) -> Self {
+        Self {
+            request,
+            channel: Channel::WsHibernatable,
+        }
+    }
+}
+
 pub struct Actor {
-    state: State,
+    state: ActorState,
     pub ownership: Ownership,
+    peer_http: reqwest::Client,
+    peer_auth: Arc<PeerAuth>,
+    paced_handoff: bool,
+    handoff_directory: Arc<Mutex<HandoffDirectory>>,
     host: Option<CellHost>,
+    drain_pins: DrainPinRegistry,
+    /// Per-cell handoff pipeline timings, one entry per quiesce nomination.
+    /// Each phase is measured from effect dispatch to its answering event,
+    /// so queue time counts because that is the serial cost of the drain.
+    handoff_timings: HashMap<String, HandoffCellTiming>,
+    /// The in-flight pipeline step for each timed handoff operation.
+    handoff_phase_ops: HashMap<OpId, (String, HandoffPhase, u64)>,
     /// The node-log manager, filled at boot once the log tier exists:
     /// the executor's RecoverNodeLog effect runs through it directly.
     pub node_log: Arc<std::sync::Mutex<Option<Arc<crate::node_log::NodeLogManager>>>>,
     region: String,
     pending: BTreeMap<u64, oneshot::Sender<Result<Routed, RequestError>>>,
     request_cells: BTreeMap<u64, String>,
+    handoff_accepts: BTreeMap<u64, (String, HandoffAcceptWaiter)>,
     route_timings: BTreeMap<String, CellRouteTiming>,
     pending_workers: BTreeMap<u64, oneshot::Sender<WorkerRouted>>,
     eviction_waiters: BTreeMap<String, Vec<oneshot::Sender<()>>>,
     durability_waiters: BTreeMap<u64, (String, Vec<oneshot::Sender<()>>)>,
     eviction_stops: BTreeMap<u64, Vec<oneshot::Sender<()>>>,
-    /// Local write responses held open by the output gate, keyed by request,
-    /// released when the core emits `ReleaseResponse`.
-    gated_responses: BTreeMap<u64, oneshot::Sender<Result<(), RequestError>>>,
+    /// Outputs held by the gate, keyed by request and channel. Every output but
+    /// a captured `WsHibernatable` frame waits here for the core's `Release`.
+    gated_responses: BTreeMap<HeldOutputKey, oneshot::Sender<Result<(), RequestError>>>,
     /// Per-cell WebSocket output gate: a FIFO of write barriers, each holding
     /// the outbound frames produced up to it. The front drains in write order as
     /// durability proves, so no client ever sees a frame that trails an
     /// unproven write (the Cloudflare per-object output gate).
     ws_gates: BTreeMap<String, WsGate>,
-    /// Gated `webSocketMessage` requests, mapping each to its cell so a
-    /// `ReleaseResponse` routes to the WebSocket gate rather than an HTTP reply.
-    ws_gated: BTreeMap<u64, String>,
+    /// Gated `webSocketMessage` batches map each request-channel pair to its
+    /// cell, so `Release` routes to the barrier queue rather than a oneshot.
+    ws_gated: BTreeMap<HeldOutputKey, String>,
     published: BTreeSet<String>,
     fail_publish_once: bool,
     publishes: u64,
@@ -1092,6 +1791,135 @@ pub struct Actor {
     preserving: bool,
 }
 
+/// One handoff pipeline step whose dispatch-to-completion time is measured.
+#[derive(Clone, Copy, PartialEq)]
+enum HandoffPhase {
+    Durability,
+    Stop,
+    Release,
+    Adopt,
+}
+
+/// The accumulating phase durations for one quiescing cell's handoff.
+struct HandoffCellTiming {
+    nominated_mono_ms: u64,
+    quiesce_us: Option<u64>,
+    durability_us: Option<u64>,
+    stop_us: Option<u64>,
+    release_us: Option<u64>,
+}
+
+#[derive(Default)]
+struct HandoffDirectory {
+    sampled_at_mono_ms: Option<u64>,
+    peers: Vec<CapacityPeer>,
+}
+
+const HANDOFF_DIRECTORY_MAX_AGE_MS: u64 = 500;
+const HANDOFF_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A deterministic final tie-break spreads one concurrent batch across peers
+/// whose published load is equal. The load remains the primary ranking input.
+fn handoff_tie_break(cell: &str, node: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in cell
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(std::iter::once(0xff))
+        .chain(node.as_bytes().iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+async fn handoff_candidates(
+    ownership: &Ownership,
+    directory: &Arc<Mutex<HandoffDirectory>>,
+    source: &str,
+    cell: &str,
+) -> Result<Vec<CapacityPeer>, Failure> {
+    let mut directory = directory.lock().await;
+    let now_mono_ms = crate::asyncrt::mono_ms();
+    let stale = directory
+        .sampled_at_mono_ms
+        .is_none_or(|sampled| now_mono_ms.saturating_sub(sampled) >= HANDOFF_DIRECTORY_MAX_AGE_MS);
+    if stale {
+        directory.peers = ownership.read_capacity_peers().await?;
+        directory.sampled_at_mono_ms = Some(now_mono_ms);
+    }
+    let current_ms = now_ms();
+    let mut peers: Vec<_> = directory
+        .peers
+        .iter()
+        .filter(|peer| {
+            peer.node != source
+                && peer.expires_ms > current_ms
+                && !peer.addr.is_empty()
+                && peer.peer_protocol == peer_auth::PROTOCOL_VERSION
+                && peer.sampled_ms != 0
+                && !peer.pressured
+                && peer.paced_handoff
+        })
+        .cloned()
+        .collect();
+    peers.sort_by_key(|peer| {
+        (
+            peer.resident_cells,
+            peer.host_websockets,
+            peer.rss_bytes,
+            handoff_tie_break(cell, &peer.node),
+            peer.node.clone(),
+        )
+    });
+    Ok(peers)
+}
+
+pub enum HandoffAttempt {
+    Accepted(AdoptedCell),
+    CurrentOwner(AdoptedCell),
+    Refused,
+}
+
+async fn request_peer_handoff(
+    http: &reqwest::Client,
+    auth: &PeerAuth,
+    peer: &AdoptedCell,
+    request: &HandoffRequest,
+) -> anyhow::Result<HandoffAttempt> {
+    let path = "/peer/handoff";
+    let body = serde_json::to_vec(request)?;
+    let outbound = auth.sign(
+        http.post(format!("http://{}{path}", peer.addr)),
+        "POST",
+        path,
+        &body,
+        &peer.node,
+    )?;
+    let response = outbound.body(body).send().await?;
+    peer_auth::validate_response(response.headers())?;
+    let status = response.status();
+    let response: HandoffResponse = match response.json().await {
+        Ok(response) => response,
+        Err(_) => return Ok(HandoffAttempt::Refused),
+    };
+    let owner = AdoptedCell {
+        node: response.node,
+        addr: response.addr,
+        epoch: response.epoch,
+        peer_protocol: response.peer_protocol,
+    };
+    if status == reqwest::StatusCode::OK && response.published {
+        Ok(HandoffAttempt::Accepted(owner))
+    } else if status == reqwest::StatusCode::CONFLICT && !response.published {
+        Ok(HandoffAttempt::CurrentOwner(owner))
+    } else {
+        Ok(HandoffAttempt::Refused)
+    }
+}
+
 pub struct AdmissionLimits {
     pub resident: usize,
     pub activations: usize,
@@ -1105,6 +1933,24 @@ pub struct ActorIdentity {
     pub region: String,
 }
 
+pub struct ActorServices {
+    pub runtime: Option<RuntimeManager>,
+    pub drain_pins: DrainPinRegistry,
+    pub ownership: Option<Ownership>,
+    pub peer_http: reqwest::Client,
+    pub peer_auth: Arc<PeerAuth>,
+    pub paced_handoff: bool,
+}
+
+struct ActorHostServices {
+    host: Option<CellHost>,
+    drain_pins: DrainPinRegistry,
+    ownership: Option<Ownership>,
+    peer_http: reqwest::Client,
+    peer_auth: Arc<PeerAuth>,
+    paced_handoff: bool,
+}
+
 impl Actor {
     pub async fn from_environment(
         limits: AdmissionLimits,
@@ -1115,12 +1961,53 @@ impl Actor {
         identity: ActorIdentity,
         resume_generation: Option<String>,
     ) -> anyhow::Result<Self> {
+        let peer_auth = Arc::new(PeerAuth::new([0; 32], identity.node.clone())?);
         Self::from_environment_with_cell_host(
             limits,
             fail_publish_once,
             fence,
-            runtime.map(CellHost::V8),
+            ActorHostServices {
+                host: runtime.map(CellHost::V8),
+                drain_pins: DrainPinRegistry::default(),
+                ownership,
+                peer_http: reqwest::Client::new(),
+                peer_auth,
+                paced_handoff: false,
+            },
+            identity,
+            resume_generation,
+        )
+        .await
+    }
+
+    pub async fn from_environment_with_services(
+        limits: AdmissionLimits,
+        fail_publish_once: bool,
+        fence: mpsc::UnboundedSender<i32>,
+        services: ActorServices,
+        identity: ActorIdentity,
+        resume_generation: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let ActorServices {
+            runtime,
+            drain_pins,
             ownership,
+            peer_http,
+            peer_auth,
+            paced_handoff,
+        } = services;
+        Self::from_environment_with_cell_host(
+            limits,
+            fail_publish_once,
+            fence,
+            ActorHostServices {
+                host: runtime.map(CellHost::V8),
+                drain_pins,
+                ownership,
+                peer_http,
+                peer_auth,
+                paced_handoff,
+            },
             identity,
             resume_generation,
         )
@@ -1137,12 +2024,19 @@ impl Actor {
         identity: ActorIdentity,
         resume_generation: Option<String>,
     ) -> anyhow::Result<Self> {
+        let peer_auth = Arc::new(PeerAuth::new([0; 32], identity.node.clone())?);
         Self::from_environment_with_cell_host(
             limits,
             fail_publish_once,
             fence,
-            Some(CellHost::Scripted(host)),
-            ownership,
+            ActorHostServices {
+                host: Some(CellHost::Scripted(host)),
+                drain_pins: DrainPinRegistry::default(),
+                ownership,
+                peer_http: reqwest::Client::new(),
+                peer_auth,
+                paced_handoff: false,
+            },
             identity,
             resume_generation,
         )
@@ -1153,11 +2047,18 @@ impl Actor {
         limits: AdmissionLimits,
         fail_publish_once: bool,
         fence: mpsc::UnboundedSender<i32>,
-        host: Option<CellHost>,
-        ownership: Option<Ownership>,
+        services: ActorHostServices,
         identity: ActorIdentity,
         resume_generation: Option<String>,
     ) -> anyhow::Result<Self> {
+        let ActorHostServices {
+            host,
+            drain_pins,
+            ownership,
+            peer_http,
+            peer_auth,
+            paced_handoff,
+        } = services;
         let ActorIdentity {
             node,
             advertise,
@@ -1201,7 +2102,7 @@ impl Actor {
         };
         Ok(Self {
             node_log: Arc::new(std::sync::Mutex::new(None)),
-            state: State::new(
+            state: ActorState::from(State::new(
                 node,
                 Config {
                     max_resident: limits.resident,
@@ -1211,10 +2112,7 @@ impl Actor {
                     alarm_resident_ms: crate::wake::resident_ms().max(0) as u64,
                     require_node_lease: true,
                     peer_protocol: crate::peer_auth::PROTOCOL_VERSION,
-                    operation_deadline_ms: Some(crate::env_vars::positive_or(
-                        "CELLD_OPERATION_DEADLINE_MS",
-                        DEFAULT_OPERATION_DEADLINE_MS,
-                    )?),
+                    operation_deadline_ms: Some(operation_deadline_ms()?),
                     idle_evict_ms: crate::env_vars::positive::<u64>("CELLD_IDLE_EVICT_S")?
                         .map(|seconds| seconds.saturating_mul(1_000)),
                     pressure: pressure_config_from_environment()?,
@@ -1232,12 +2130,20 @@ impl Actor {
                         Ownership::Bucket(_) => ownership_on_evict_from_environment()?,
                     },
                 },
-            ),
+            )),
             ownership,
+            peer_http,
+            peer_auth,
+            paced_handoff,
+            handoff_directory: Arc::new(Mutex::new(HandoffDirectory::default())),
             host,
+            drain_pins,
+            handoff_timings: HashMap::new(),
+            handoff_phase_ops: HashMap::new(),
             region,
             pending: BTreeMap::new(),
             request_cells: BTreeMap::new(),
+            handoff_accepts: BTreeMap::new(),
             route_timings: BTreeMap::new(),
             pending_workers: BTreeMap::new(),
             eviction_waiters: BTreeMap::new(),
@@ -1281,13 +2187,6 @@ impl Actor {
         match input {
             ActorInput::Message(message) => self.handle_message(message, out),
             ActorInput::Completed(completed) => {
-                #[cfg(all(test, celld_internal_tests))]
-                if crate::asyncrt::sabotage_active(
-                    crate::host_services::EngineSabotage::SuppressReleasingDecrement,
-                ) && matches!(&completed.event, Event::OwnerReleased { .. })
-                {
-                    return;
-                }
                 let route_cell = completed.timing.as_ref().map(|timing| timing.cell.clone());
                 if let Some(timing) = completed.timing {
                     self.record_effect_timing(timing);
@@ -1327,6 +2226,8 @@ impl Actor {
                 request,
                 cell,
                 capacity_handoff,
+                handoff_accept,
+                websocket,
                 reply,
             } => {
                 let retired_durability = match self.state.phase(&cell) {
@@ -1334,10 +2235,29 @@ impl Actor {
                     _ => None,
                 };
                 self.pending.insert(request, reply);
+                let ownership_handoff = handoff_accept.is_some();
+                if let Some(waiter) = handoff_accept {
+                    self.handoff_accepts.insert(request, (cell.clone(), waiter));
+                }
                 self.begin_route_if_cold(&cell);
                 self.request_cells.insert(request, cell.clone());
                 self.drive(
-                    if capacity_handoff {
+                    if let Some(websocket) = websocket {
+                        Event::WebSocketRequestAt {
+                            request,
+                            cell: cell.clone(),
+                            websocket,
+                            now_ms: now_ms(),
+                            now_mono_ms: crate::asyncrt::mono_ms(),
+                        }
+                    } else if ownership_handoff {
+                        Event::HandoffRequestAt {
+                            request,
+                            cell: cell.clone(),
+                            now_ms: now_ms(),
+                            now_mono_ms: crate::asyncrt::mono_ms(),
+                        }
+                    } else if capacity_handoff {
                         Event::CapacityRequestAt {
                             request,
                             cell: cell.clone(),
@@ -1363,6 +2283,7 @@ impl Actor {
             }
             Message::CancelRoute { request } => {
                 self.pending.remove(&request);
+                self.handoff_accepts.remove(&request);
                 if let Some(cell) = self.request_cells.remove(&request) {
                     self.finish_route(&cell, "cancelled", "caller_disconnected", None);
                 }
@@ -1380,13 +2301,37 @@ impl Actor {
                 self.drive(Event::WorkerRequest { request }, out);
             }
             Message::ReleaseAll => self.drive(Event::ReleaseAll, out),
+            Message::GenerationChanged {
+                generation,
+                max_age_ms,
+                eager_classes,
+            } => self.drive(
+                Event::GenerationChanged {
+                    generation,
+                    now_mono_ms: crate::asyncrt::mono_ms(),
+                    max_age_ms,
+                    eager_classes,
+                },
+                out,
+            ),
             Message::Drained { reply } => {
                 let _ = reply.send(DrainStatus {
                     occupied: self.state.occupied(),
                     activating: self.state.activating(),
+                    quiescing: self.state.quiescing(),
                     evicting: self.state.evicting(),
                     releasing: self.state.releasing(),
+                    adopting: self.state.adopting(),
+                    handed_off: self.state.handed_off(),
                 });
+            }
+            Message::ResidentEpoch { cell, reply } => {
+                let epoch = match self.state.phase(&cell) {
+                    Some(Phase::Resident { epoch })
+                    | Some(Phase::EnsuringDurability { epoch, .. }) => Some(*epoch),
+                    _ => None,
+                };
+                let _ = reply.send(epoch);
             }
             Message::SampleLoad if self.preserving => {}
             Message::SampleLoad => {
@@ -1399,13 +2344,14 @@ impl Actor {
                     resident_cells: occupied,
                     rss_bytes: metrics.rss_bytes,
                     in_use_bytes: metrics.in_use_bytes,
+                    cgroup_working_set_bytes: metrics.cgroup_working_set_bytes,
+                    cgroup_current_bytes: metrics.cgroup_current_bytes,
                 };
                 let now_mono_ms = crate::asyncrt::mono_ms();
                 self.drive(Event::LoadSampled { load, now_mono_ms }, out);
-                // Report a change of shed reason once. `rss-hard` is the one
-                // that needs an operator: it says the resident set size crossed
-                // the absolute cap, so the allocator is holding memory that
-                // shedding may not return, and the process is near a kill.
+                // Report a change of shed reason once. `rss-hard` retains its
+                // established name, but in a Linux cgroup it says
+                // `memory.current` crossed the absolute cap.
                 let reason = self.state.shed_reason();
                 if reason != self.logged_shed_reason {
                     self.logged_shed_reason = reason;
@@ -1423,14 +2369,17 @@ impl Actor {
                         Some(celld_logic::pressure::SHED_RSS_HARD) => tracing::warn!(
                             rss_bytes = load.rss_bytes,
                             in_use_bytes = load.in_use_bytes,
+                            cgroup_working_set_bytes = load.cgroup_working_set_bytes,
+                            cgroup_current_bytes = load.cgroup_current_bytes,
                             heaps,
-                            "shedding on the absolute resident-set cap: the \
-                             allocator holds memory that shedding cannot return"
+                            "shedding on the absolute memory cap"
                         ),
                         Some(reason) => tracing::info!(
                             reason,
                             rss_bytes = load.rss_bytes,
                             in_use_bytes = load.in_use_bytes,
+                            cgroup_working_set_bytes = load.cgroup_working_set_bytes,
+                            cgroup_current_bytes = load.cgroup_current_bytes,
                             heaps,
                             "shedding"
                         ),
@@ -1446,21 +2395,26 @@ impl Actor {
                         .store(self.state.host_websockets(), Ordering::Relaxed);
                     live.pressured
                         .store(self.state.shedding(), Ordering::Relaxed);
+                    live.memory_headroom
+                        .store(self.state.memory_headroom(), Ordering::Relaxed);
                     live.cpu_percent_x100.store(cpu, Ordering::Relaxed);
                     live.restoring
                         .store(self.state.activation_backlog() as u64, Ordering::Relaxed);
                 }
             }
-            Message::GateWrite {
+            Message::Output {
                 request,
+                channel,
                 position,
                 reply,
             } => {
-                self.gated_responses.insert(request, reply);
+                self.gated_responses
+                    .insert(HeldOutputKey { request, channel }, reply);
                 self.drive(
-                    match position {
-                        Some(position) => Event::Wrote { request, position },
-                        None => Event::ReadOutput { request },
+                    Event::Output {
+                        request,
+                        channel,
+                        position,
                     },
                     out,
                 );
@@ -1484,7 +2438,7 @@ impl Actor {
                 // Both registrations happen before the drive, and must: `drive`
                 // runs the effects it produces synchronously, so a read with no
                 // barrier open on its cell is released inside the call below.
-                // Moved after it, that `Effect::ReleaseResponse` would find no
+                // Moved after it, that `Effect::Release` would find no
                 // `ws_gated` entry, fall through to the `gated_responses` map,
                 // match nothing, and strand these frames behind a barrier that
                 // nothing will ever settle.
@@ -1497,15 +2451,16 @@ impl Actor {
                         settled: None,
                         frames,
                     });
-                self.ws_gated.insert(request, scope);
+                self.ws_gated
+                    .insert(HeldOutputKey::websocket(request), scope);
+                // The core answers for every writer on the cell, including an
+                // alarm: its consuming commit opens a barrier of its own, so a
+                // read-only batch trails that too.
                 self.drive(
-                    match write_position {
-                        Some(position) => Event::Wrote { request, position },
-                        // A known gap remains on the other side of this
-                        // question: an alarm handler proves its own write
-                        // durable inline and registers no barrier with the
-                        // core, so a frame revealing one is released early.
-                        None => Event::ReadOutput { request },
+                    Event::Output {
+                        request,
+                        channel: Channel::WsHibernatable,
+                        position: write_position,
                     },
                     out,
                 );
@@ -1660,7 +2615,20 @@ impl Actor {
                 let _ = reply.send(());
             }
             Message::Snapshot { reply } => {
-                let _ = reply.send(self.state_json());
+                let generations = self
+                    .state
+                    .residents()
+                    .into_iter()
+                    .map(|cell| {
+                        let generation = self.state.cell_generation(&cell).unwrap_or(0);
+                        (cell, generation)
+                    })
+                    .collect();
+                let census = SwapCensus {
+                    swapping: self.state.swapping(),
+                    generations,
+                };
+                let _ = reply.send((self.state_json(), self.state.drain_pins(), census));
             }
             Message::Health { reply } => {
                 let _ = reply.send(self.state.ready_to_serve());
@@ -1675,8 +2643,8 @@ impl Actor {
     /// barrier durable and flush the durable prefix in write order; on failure
     /// break the whole cell gate — drop every held frame and reset its sockets,
     /// since an unproven write must never leave an acknowledged trace.
-    fn ws_release(&mut self, request: u64, ok: bool) {
-        let Some(scope) = self.ws_gated.remove(&request) else {
+    fn ws_release(&mut self, held: HeldOutputKey, ok: bool) {
+        let Some(scope) = self.ws_gated.remove(&held) else {
             return;
         };
         let mut flush = Vec::new();
@@ -1684,7 +2652,7 @@ impl Actor {
             let Some(gate) = self.ws_gates.get_mut(&scope) else {
                 return;
             };
-            if let Some(barrier) = gate.barriers.iter_mut().find(|b| b.request == request) {
+            if let Some(barrier) = gate.barriers.iter_mut().find(|b| b.request == held.request) {
                 barrier.settled = Some(ok);
             }
             if gate.barriers.iter().any(|b| b.settled == Some(false)) {
@@ -1718,9 +2686,64 @@ impl Actor {
         }
     }
 
+    /// Close a timed handoff pipeline step when its answering event arrives,
+    /// and emit the cell's aggregate timing once adoption succeeds. A failed
+    /// adoption keeps the cell entry so its retry accumulates on the same
+    /// record; an expired operation abandons its pipeline entirely.
+    fn close_handoff_phase(&mut self, event: &Event) {
+        let (op, adopted) = match event {
+            Event::DurabilityChecked { op, .. }
+            | Event::RuntimeStopped { op }
+            | Event::OwnerReleased { op, .. } => (*op, None),
+            Event::SuccessorAdopted { op, result } => (*op, Some(result.is_ok())),
+            Event::TimerFired {
+                timer: Timer::OperationDeadline { op },
+                ..
+            } => {
+                if let Some((cell, _, _)) = self.handoff_phase_ops.remove(op) {
+                    self.handoff_timings.remove(&cell);
+                }
+                return;
+            }
+            _ => return,
+        };
+        let Some((cell, phase, started_mono_ms)) = self.handoff_phase_ops.remove(&op) else {
+            return;
+        };
+        let elapsed = mono_elapsed_us(started_mono_ms);
+        if phase == HandoffPhase::Adopt {
+            if adopted == Some(true) {
+                if let Some(timing) = self.handoff_timings.remove(&cell) {
+                    tracing::info!(
+                        event = "cell_handoff_timing",
+                        %cell,
+                        quiesce_us = timing.quiesce_us.unwrap_or(0),
+                        durability_us = timing.durability_us.unwrap_or(0),
+                        stop_us = timing.stop_us.unwrap_or(0),
+                        release_us = timing.release_us.unwrap_or(0),
+                        adopt_us = elapsed,
+                        total_us = mono_elapsed_us(timing.nominated_mono_ms),
+                        "handoff pipeline completed"
+                    );
+                }
+            }
+            return;
+        }
+        let Some(timing) = self.handoff_timings.get_mut(&cell) else {
+            return;
+        };
+        match phase {
+            HandoffPhase::Durability => timing.durability_us = Some(elapsed),
+            HandoffPhase::Stop => timing.stop_us = Some(elapsed),
+            HandoffPhase::Release => timing.release_us = Some(elapsed),
+            HandoffPhase::Adopt => {}
+        }
+    }
+
     fn drive(&mut self, first: Event, out: &mut StepOutput) {
         let mut events = VecDeque::from([first]);
         while let Some(event) = events.pop_front() {
+            self.close_handoff_phase(&event);
             let durability = match &event {
                 Event::DurabilityChecked { op, .. } => Some(*op),
                 // A deadline resolves the same operation the proof would
@@ -1737,7 +2760,7 @@ impl Actor {
                 Event::RuntimeStopped { op } => Some(*op),
                 _ => None,
             };
-            let effects = on_event(&mut self.state, event);
+            let effects = apply_core_event(&mut self.state, event);
             if let Some(op) = durability {
                 if let Some((_, waiters)) = self.durability_waiters.remove(&op) {
                     let stop = effects.iter().find_map(|effect| match effect {
@@ -1760,6 +2783,7 @@ impl Actor {
             for effect in effects {
                 self.execute(effect, &mut events, out);
             }
+            self.settle_handoff_accepts();
             if let Some(op) = stopped {
                 if let Some(waiters) = self.eviction_stops.remove(&op) {
                     for waiter in waiters {
@@ -1773,18 +2797,33 @@ impl Actor {
         }
     }
 
+    fn settle_handoff_accepts(&mut self) {
+        let accepted: Vec<_> = self
+            .handoff_accepts
+            .iter()
+            .filter_map(|(request, (cell, waiter))| {
+                self.state
+                    .accepted_epoch(cell)
+                    .filter(|epoch| *epoch > waiter.released_epoch)
+                    .map(|epoch| (*request, epoch))
+            })
+            .collect();
+        for (request, epoch) in accepted {
+            let Some((_, waiter)) = self.handoff_accepts.remove(&request) else {
+                continue;
+            };
+            let _ = waiter.reply.send(AdoptedCell {
+                node: self.state.node().to_string(),
+                addr: self.lease_spec.addr.clone(),
+                epoch,
+                peer_protocol: peer_auth::PROTOCOL_VERSION,
+            });
+        }
+    }
+
     fn execute(&mut self, effect: Effect, immediate: &mut VecDeque<Event>, out: &mut StepOutput) {
         match effect {
             Effect::ScheduleTimer { timer, at_mono_ms } => {
-                #[cfg(all(test, celld_internal_tests))]
-                if matches!(
-                    timer,
-                    Timer::NodeLeaseFence { .. } | Timer::CellAlarm { .. }
-                ) && crate::asyncrt::sabotage_active(
-                    crate::host_services::EngineSabotage::DropTimerArm,
-                ) {
-                    return;
-                }
                 let (arm, _) = self.timer_slots.arm(timer, at_mono_ms, ());
                 out.timers.push(arm);
             }
@@ -1972,15 +3011,6 @@ impl Actor {
             }
             Effect::RecoverNodeLog { op, cell, owner } => {
                 self.route_effect_started(&cell);
-                #[cfg(all(test, celld_internal_tests))]
-                let interlock = if crate::asyncrt::sabotage_active(
-                    crate::host_services::EngineSabotage::SkipTakeoverInterlock,
-                ) {
-                    None
-                } else {
-                    self.node_log.lock().unwrap().clone()
-                };
-                #[cfg(not(all(test, celld_internal_tests)))]
                 let interlock = self.node_log.lock().unwrap().clone();
                 let timing_cell = cell.clone();
                 out.effects.push(Box::pin(async move {
@@ -2074,8 +3104,8 @@ impl Actor {
                             // the core orders it from the far side of the
                             // output gate: `alarm_finished` gates the
                             // consuming commit, and only a proven
-                            // DurableReached — with C1's ownership read
-                            // behind a bucket proof — lets the alarm settle
+                            // DurableReached — with an ownership read behind a
+                            // bucket proof — lets the alarm settle
                             // into this reconcile. So by the time this delete
                             // is ordered, the proof already happened, and
                             // nothing here decides anything. The old
@@ -2091,11 +3121,154 @@ impl Actor {
                 }
             }
             Effect::ReleaseOwner { op, cell, epoch } => {
+                if self.handoff_timings.contains_key(&cell) {
+                    self.handoff_phase_ops.insert(
+                        op,
+                        (
+                            cell.clone(),
+                            HandoffPhase::Release,
+                            crate::asyncrt::mono_ms(),
+                        ),
+                    );
+                }
                 let ownership = self.ownership.clone();
                 out.effects.push(Box::pin(async move {
                     let result = ownership.release_owner(&cell, epoch).await;
                     CompletedEffect::plain(Event::OwnerReleased { op, result })
                 }));
+            }
+            Effect::AdoptReleased {
+                op,
+                cell,
+                released_epoch,
+            } => {
+                // The in-memory adapter is one process, so it has no successor
+                // to acknowledge a handoff. The feature switch is an escape
+                // hatch for mixed operational use, not the production default.
+                if !self.paced_handoff || matches!(&self.ownership, Ownership::Memory(_)) {
+                    immediate.push_back(Event::SuccessorAdopted {
+                        op,
+                        result: Err(Failure::Definite),
+                    });
+                    return;
+                }
+                if self.handoff_timings.contains_key(&cell) {
+                    self.handoff_phase_ops.insert(
+                        op,
+                        (cell.clone(), HandoffPhase::Adopt, crate::asyncrt::mono_ms()),
+                    );
+                }
+                let ownership = self.ownership.clone();
+                let directory = self.handoff_directory.clone();
+                let http = self.peer_http.clone();
+                let auth = self.peer_auth.clone();
+                let source = self.state.node().to_string();
+                out.effects.push(Box::pin(async move {
+                    let started_mono_ms = crate::asyncrt::mono_ms();
+                    let request = HandoffRequest {
+                        cell: cell.clone(),
+                        released_epoch,
+                    };
+                    let mut attempts = 0_u64;
+                    loop {
+                        let peers = handoff_candidates(&ownership, &directory, &source, &cell)
+                            .await
+                            .unwrap_or_default();
+                        for peer in peers {
+                            let mut target = AdoptedCell {
+                                node: peer.node,
+                                addr: peer.addr,
+                                epoch: 0,
+                                peer_protocol: peer.peer_protocol,
+                            };
+                            let mut visited = BTreeSet::new();
+                            for _ in 0..4 {
+                                if target.node == source
+                                    || target.addr.is_empty()
+                                    || target.peer_protocol != peer_auth::PROTOCOL_VERSION
+                                    || !visited.insert(target.node.clone())
+                                {
+                                    break;
+                                }
+                                attempts = attempts.saturating_add(1);
+                                match request_peer_handoff(&http, &auth, &target, &request).await {
+                                    Ok(HandoffAttempt::Accepted(adopted))
+                                        if adopted.epoch > released_epoch =>
+                                    {
+                                        tracing::info!(
+                                            event = "cell_handoff_accepted",
+                                            %cell,
+                                            released_epoch,
+                                            successor = %adopted.node,
+                                            successor_epoch = adopted.epoch,
+                                            attempts,
+                                            elapsed_ms = crate::asyncrt::mono_ms()
+                                                .saturating_sub(started_mono_ms),
+                                            "successor acquired a released cell for demand-driven restore"
+                                        );
+                                        return CompletedEffect::plain(Event::SuccessorAdopted {
+                                            op,
+                                            result: Ok(adopted),
+                                        });
+                                    }
+                                    Ok(HandoffAttempt::CurrentOwner(owner)) => {
+                                        target = owner;
+                                    }
+                                    Ok(HandoffAttempt::Accepted(_))
+                                    | Ok(HandoffAttempt::Refused)
+                                    | Err(_) => break,
+                                }
+                            }
+                        }
+                        // No peer can accept yet. Retain the core permit and
+                        // retry until the process-wide shutdown deadline.
+                        crate::asyncrt::sleep(HANDOFF_RETRY_DELAY).await;
+                    }
+                }));
+            }
+            Effect::CancelCellActivity {
+                cell,
+                requests,
+                websockets,
+                keep_hibernatable,
+            } => {
+                self.handoff_timings
+                    .entry(cell.clone())
+                    .or_insert(HandoffCellTiming {
+                        nominated_mono_ms: crate::asyncrt::mono_ms(),
+                        quiesce_us: None,
+                        durability_us: None,
+                        stop_us: None,
+                        release_us: None,
+                    });
+                for request in requests {
+                    if let Some((request_id, phase)) = self
+                        .drain_pins
+                        .cancel_core_request(request, "shutdown_quiesce")
+                    {
+                        if phase == "handler" {
+                            if let (Some(runtime), Some(request_id)) = (&self.host, request_id) {
+                                runtime.abort_fetch(&cell, request_id);
+                            }
+                        }
+                    }
+                }
+                if !websockets.is_empty() {
+                    if keep_hibernatable {
+                        for websocket in &websockets {
+                            crate::js::ws_close(*websocket, 1012, "service restart");
+                        }
+                    } else {
+                        crate::js::ws_close_scope(&cell, 1012, "service restart");
+                    }
+                    for websocket in websockets {
+                        crate::js::ws_unregister(websocket);
+                        immediate.push_back(Event::WebSocketClosed {
+                            cell: cell.clone(),
+                            websocket,
+                        });
+                    }
+                }
             }
             Effect::Restore { op, cell, spec } => {
                 self.route_effect_started(&cell);
@@ -2154,11 +3327,16 @@ impl Actor {
                                 eprintln!("celld runtime start failed for {cell}: {error:#}");
                                 Failure::Definite
                             });
-                        let isolate = placed.as_ref().ok().copied();
+                        let isolate = placed.as_ref().ok().map(|(isolate, _)| *isolate);
+                        let generation = placed
+                            .as_ref()
+                            .ok()
+                            .map_or(0, |(_, generation)| *generation);
                         CompletedEffect::timed(
                             Event::RuntimeStarted {
                                 op,
                                 isolate,
+                                generation,
                                 result: placed.map(|_| ()),
                             },
                             timing_cell,
@@ -2175,6 +3353,7 @@ impl Actor {
                     immediate.push_back(Event::RuntimeStarted {
                         op,
                         isolate: None,
+                        generation: 0,
                         result: Ok(()),
                     });
                 }
@@ -2210,6 +3389,19 @@ impl Actor {
                 immediate.push_back(Event::Published { op, result });
             }
             Effect::EnsureDurable { op, cell, epoch } => {
+                if let Some(timing) = self.handoff_timings.get_mut(&cell) {
+                    if timing.quiesce_us.is_none() {
+                        timing.quiesce_us = Some(mono_elapsed_us(timing.nominated_mono_ms));
+                    }
+                    self.handoff_phase_ops.insert(
+                        op,
+                        (
+                            cell.clone(),
+                            HandoffPhase::Durability,
+                            crate::asyncrt::mono_ms(),
+                        ),
+                    );
+                }
                 let waiters = self.eviction_waiters.remove(&cell).unwrap_or_default();
                 self.durability_waiters.insert(op, (cell.clone(), waiters));
                 if let Some(runtime) = self.host.clone() {
@@ -2240,21 +3432,11 @@ impl Actor {
                         // The replicator reports the position it actually
                         // proved durable and which mechanism proved it; the
                         // core acks only if the position covers this write,
-                        // and decides per source whether C1's ownership
+                        // and decides per source whether ownership
                         // verification must run first (Effect::VerifyOwnership).
                         let (result, source) =
                             match runtime.await_durable(&cell, epoch, position).await {
-                                Ok((durable, source)) => {
-                                    #[cfg(all(test, celld_internal_tests))]
-                                    let durable = if crate::asyncrt::sabotage_active(
-                                        crate::host_services::EngineSabotage::MisreportGatePosition,
-                                    ) {
-                                        durable.saturating_sub(1)
-                                    } else {
-                                        durable
-                                    };
-                                    (Ok(durable), source)
-                                }
+                                Ok((durable, source)) => (Ok(durable), source),
                                 Err(error) => {
                                     eprintln!(
                                         "celld output-gate durability proof failed for {cell} \
@@ -2274,8 +3456,8 @@ impl Actor {
                 }
             }
             Effect::VerifyOwnership { op, cell, epoch } => {
-                // C1 for bucket-proof acks. Durable in `e<epoch>/` is not
-                // the same as durable: if the cell has been taken over, that
+                // Verify ownership for bucket-proof acks. Durable in
+                // `e<epoch>/` is not the same as durable: if the cell has been taken over, that
                 // prefix is orphaned — the next owner restores a higher
                 // epoch and this write is gone. A read is enough, and is why
                 // this is one GET rather than a compare-and-swap: if the
@@ -2285,15 +3467,6 @@ impl Actor {
                 let ownership = self.ownership.clone();
                 let node = self.state.node().to_string();
                 out.effects.push(Box::pin(async move {
-                    #[cfg(all(test, celld_internal_tests))]
-                    if crate::asyncrt::sabotage_active(
-                        crate::host_services::EngineSabotage::SkipBucketProofOwnershipRead,
-                    ) {
-                        return CompletedEffect::plain(Event::OwnershipVerified {
-                            op,
-                            result: Ok(()),
-                        });
-                    }
                     let result = match ownership.read_owner(&cell).await {
                         Ok(Some(record))
                             if record.node.as_deref() == Some(node.as_str())
@@ -2314,11 +3487,41 @@ impl Actor {
                     CompletedEffect::plain(Event::OwnershipVerified { op, result })
                 }));
             }
-            Effect::ReleaseResponse { request, result } => {
-                if self.ws_gated.contains_key(&request) {
-                    self.ws_release(request, result.is_ok());
-                } else if let Some(reply) = self.gated_responses.remove(&request) {
-                    let _ = reply.send(result);
+            // The shell's only per-channel code: how the effect was held, and
+            // how it is released. Five of the six channels take a durability
+            // ticket and wait on a oneshot, so they collapse onto one adapter.
+            // Only `WsHibernatable` needs another, and only because a socket is
+            // an ordered stream whose frames must drain in barrier order.
+            //
+            // The channel says which way the effect leaves; `ws_gated` says how
+            // this one is being held. They agree except in one case, and there
+            // the holding mechanism decides: a frame for a hibernatable socket
+            // raised OUTSIDE a `webSocketMessage` handler -- from `fetch`, an
+            // alarm, or `webSocketClose` -- is never captured, so it waits on a
+            // ticket like every other channel rather than in the cell's barrier
+            // queue. Routing it to the barrier queue would find no entry and
+            // strand the task waiting on the ticket.
+            Effect::Release {
+                request,
+                channel,
+                result,
+            } => {
+                let held = HeldOutputKey { request, channel };
+                match channel {
+                    Channel::WsHibernatable if self.ws_gated.contains_key(&held) => {
+                        self.ws_release(held, result.is_ok())
+                    }
+                    Channel::Response
+                    | Channel::Fetch
+                    | Channel::WsHibernatable
+                    | Channel::WsSelf
+                    | Channel::Service
+                    | Channel::CellRpc
+                    | Channel::Queue => {
+                        if let Some(reply) = self.gated_responses.remove(&held) {
+                            let _ = reply.send(result);
+                        }
+                    }
                 }
             }
             Effect::StopRuntime {
@@ -2327,46 +3530,93 @@ impl Actor {
                 epoch,
                 cause,
             } => {
-                #[cfg(all(test, celld_internal_tests))]
-                if matches!(cause, StopCause::Reset)
-                    && crate::asyncrt::sabotage_active(
-                        crate::host_services::EngineSabotage::SuppressResetStop,
-                    )
-                {
-                    return;
+                if self.handoff_timings.contains_key(&cell) {
+                    self.handoff_phase_ops.insert(
+                        op,
+                        (cell.clone(), HandoffPhase::Stop, crate::asyncrt::mono_ms()),
+                    );
                 }
                 self.stops += 1;
-                let evicting = matches!(cause, StopCause::Evict { .. });
-                if matches!(cause, StopCause::Fence) {
-                    // A fenced cell's wake entry belongs to whoever takes the
-                    // cell over; a retained local belief would collide with
-                    // the new owner's arm/consume traffic on the same key.
-                    crate::js::forget_wake_entry(&cell);
-                }
-                // Handing the cell away makes the local snapshot dead weight;
-                // keeping it is the whole point of an idle eviction. A
-                // reset must keep nothing: the local database is precisely
-                // what could not be proved durable, so the next activation has
-                // to come from the bucket.
-                let preserve_local = !matches!(
-                    cause,
-                    StopCause::Evict { rebalance: true } | StopCause::Reset
-                );
-                if evicting {
-                    if let Some(live) = &self.live_load {
-                        live.shed_cells.fetch_add(1, Ordering::Relaxed);
+                if matches!(cause, StopCause::Swap) {
+                    // A generation swap: the cell leaves its isolate and
+                    // nothing else changes. No durability barrier, no
+                    // replica release, no local unlink -- the same epoch
+                    // starts again on the current generation as soon as the
+                    // core hears the stop.
+                    self.published.remove(&cell);
+                    if let Some(runtime) = self.host.clone() {
+                        let released = cell.clone();
+                        let task = crate::asyncrt::spawn(report_stopped_when_released(
+                            op,
+                            cell,
+                            epoch,
+                            "generation_swap_out_retry",
+                            move || {
+                                let runtime = runtime.clone();
+                                let cell = released.clone();
+                                async move { runtime.swap_out_cell(&cell, epoch).await }
+                            },
+                        ));
+                        out.effects.push(Box::pin(async move {
+                            task.await.expect("swap out task panicked")
+                        }));
+                    } else {
+                        immediate.push_back(Event::RuntimeStopped { op });
                     }
-                }
-                self.published.remove(&cell);
-                if let Some(runtime) = self.host.clone() {
-                    out.effects.push(Box::pin(async move {
-                        runtime
-                            .stop_cell(&cell, epoch, evicting, preserve_local)
-                            .await;
-                        CompletedEffect::plain(Event::RuntimeStopped { op })
-                    }));
                 } else {
-                    immediate.push_back(Event::RuntimeStopped { op });
+                    let evicting = matches!(cause, StopCause::Evict { .. });
+                    if matches!(cause, StopCause::Fence) {
+                        // A fenced cell's wake entry belongs to whoever takes the
+                        // cell over; a retained local belief would collide with
+                        // the new owner's arm/consume traffic on the same key.
+                        crate::js::forget_wake_entry(&cell);
+                    }
+                    // Keep the persistence decision whole. A cleanup still has
+                    // authority, so it makes the closed image a proved local
+                    // base. A fence can only close in place, and a reset must
+                    // discard the database that failed its durability proof.
+                    let stop_mode = match cause {
+                        StopCause::Evict { rebalance } => crate::runtime::StopMode::Evict {
+                            preserve_local: !rebalance,
+                        },
+                        StopCause::Cleanup => crate::runtime::StopMode::Rebase,
+                        StopCause::Fence => crate::runtime::StopMode::CloseInPlace,
+                        StopCause::Reset => crate::runtime::StopMode::Discard,
+                        StopCause::Swap => unreachable!("generation swaps return above"),
+                    };
+                    if evicting {
+                        if let Some(live) = &self.live_load {
+                            live.shed_cells.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    self.published.remove(&cell);
+                    if let Some(runtime) = self.host.clone() {
+                        // A stop closes a whole database. It fsyncs the directory
+                        // and the file, then unlinks the local copy, and it does
+                        // all of that inside one synchronous call. Poll it on the
+                        // host runtime: this future lives in `out`, which the core
+                        // thread drives in the same select as the timer queue, and
+                        // the core owns the node lease timer. A slow fsync on the
+                        // core thread starves the lease renew and the lease fence,
+                        // and the node then fences itself.
+                        let released = cell.clone();
+                        let task = crate::asyncrt::spawn(report_stopped_when_released(
+                            op,
+                            cell,
+                            epoch,
+                            "stop_runtime_retry",
+                            move || {
+                                let runtime = runtime.clone();
+                                let cell = released.clone();
+                                async move { runtime.stop_cell(&cell, epoch, stop_mode).await }
+                            },
+                        ));
+                        out.effects.push(Box::pin(async move {
+                            task.await.expect("stop runtime task panicked")
+                        }));
+                    } else {
+                        immediate.push_back(Event::RuntimeStopped { op });
+                    }
                 }
             }
             Effect::FireAlarm {
@@ -2395,22 +3645,6 @@ impl Actor {
                                 eprintln!("celld alarm dispatch failed: {error:#}");
                                 Failure::Definite
                             });
-                        // The tooth for the gate the core opens below. It
-                        // restores the shape this change replaced: prove the
-                        // commit here, privately, and tell the core nothing —
-                        // so the proof still runs, and every reader of the
-                        // cell is still released against it.
-                        #[cfg(all(test, celld_internal_tests))]
-                        let result = if crate::asyncrt::sabotage_active(
-                            crate::host_services::EngineSabotage::SkipAlarmWriteGate,
-                        ) {
-                            if let Ok((_, _, Some(position))) = result {
-                                let _ = runtime.await_durable(&cell, epoch, position).await;
-                            }
-                            result.map(|(at_ms, covered, _)| (at_ms, covered, None))
-                        } else {
-                            result
-                        };
                         CompletedEffect::plain(Event::AlarmFinished {
                             op,
                             cell,
@@ -2510,6 +3744,7 @@ impl Actor {
     }
 
     fn state_json(&self) -> String {
+        let activity = self.state.presence_snapshot().activity;
         let residents = self
             .state
             .residents()
@@ -2541,20 +3776,31 @@ impl Actor {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{{\"ownership\":{:?},\"occupied\":{},\"evicting\":{},\"restoring\":{},\"activating\":{},\"activation_waiting\":{},\"capacity_waiting\":{},\"phases\":{{{}}},\"shedding\":{},\"rss_bytes\":{},\"in_use_bytes\":{},\"residents\":[{}],\"published\":[{}],\"publishes\":{},\"stops\":{}}}",
+            "{{\"ownership\":{:?},\"occupied\":{},\"quiescing\":{},\"evicting\":{},\"releasing\":{},\"adopting\":{},\"restoring\":{},\"activating\":{},\"activation_waiting\":{},\"capacity_waiting\":{},\"phases\":{{{}}},\"handed_off\":{},\"handoff_failed\":{},\"shedding\":{},\"rss_bytes\":{},\"in_use_bytes\":{},\"cgroup_working_set_bytes\":{},\"cgroup_current_bytes\":{},\"residents\":[{}],\"published\":[{}],\"publishes\":{},\"stops\":{}}}",
             self.ownership.name(),
             self.state.occupied(),
+            self.state.quiescing(),
             self.state.evicting(),
+            self.state.releasing(),
+            self.state.adopting(),
             self.state.activation_backlog(),
             self.state.activating(),
             self.state.activation_waiting().len(),
             self.state.waiting().len(),
             phases,
+            activity.handed_off,
+            activity.handoff_failed,
             self.state
                 .shed_reason()
                 .map_or_else(|| "null".to_string(), |reason| format!("{reason:?}")),
             memory.rss_bytes,
             memory.in_use_bytes,
+            memory
+                .cgroup_working_set_bytes
+                .map_or_else(|| "null".to_string(), |bytes| bytes.to_string()),
+            memory
+                .cgroup_current_bytes
+                .map_or_else(|| "null".to_string(), |bytes| bytes.to_string()),
             residents,
             published,
             self.publishes,
@@ -2652,6 +3898,14 @@ fn request_error_phase(error: RequestError) -> &'static str {
         RequestError::PublishFailed => "registry_insert",
         RequestError::DurabilityUnproven => "output_gate",
     }
+}
+
+#[cfg(not(all(test, celld_internal_tests)))]
+type ActorState = State;
+
+#[cfg(not(all(test, celld_internal_tests)))]
+fn apply_core_event(state: &mut ActorState, event: Event) -> Vec<Effect> {
+    on_event(state, event)
 }
 
 #[cfg(all(test, celld_internal_tests))]

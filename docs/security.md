@@ -3,101 +3,136 @@
 celld is an alpha. It is not safe for hostile multi-tenant use. Security fixes
 apply to the latest release only, so older alpha builds do not receive fixes.
 
-## Separate the public and internal listeners
+## Security boundary
+
+One fleet runs one application, and celld trusts the application code, the fleet
+nodes, and the operators. Application code can use its configured bindings and
+can consume shared node resources. Do not run code from mutually distrusting
+tenants in one fleet.
+
+celld depends on two external security boundaries:
+
+- A trusted private network protects the internal listener. Use an encrypted
+  overlay when the private network does not provide confidentiality.
+- Object storage credentials control the fleet. Give each credential access to
+  one fleet bucket only.
+
+## Separate the listeners
 
 celld opens two HTTP listeners. The public listener serves the deployed Worker,
 and the internal listener serves the peer protocol and the operator API.
 
-Use `--listen` for the public listener. Expose only this listener through a load
+Use `--listen` for the public listener. Expose this listener through a load
 balancer, a reverse proxy, or a public firewall rule.
 
 Use `--internal-listen` for the internal listener. Its default address is
-`127.0.0.1:0`, so celld selects an available loopback port at each start.
-The startup output reports the selected address.
-
-Use `--advertise` to give peers the address of the internal listener. Bind the
-internal listener to a private interface, or protect it with a private overlay.
-Do not expose this listener to the public internet.
+`127.0.0.1:0`, so celld selects an available loopback port at each start. Use
+`--advertise` to give peers an address that reaches this listener.
 
 An explicit advertised address requires an explicit internal-listener address.
-Set both command-line options, or use their equivalent environment variables.
 celld also rejects an explicit non-loopback public listener without an explicit
-internal listener. This rule identifies an obsolete one-listener configuration.
+internal listener. These checks prevent an obsolete one-listener configuration.
 
-celld cannot verify that an advertised hostname or a translated port reaches
-the internal listener. You must route the advertised address to the internal
-listener, and you must not route it to the public Worker listener.
+celld cannot verify a hostname or a translated port. You must route the
+advertised address to the internal listener, and you must not route it to the
+public listener.
 
-The public listener reserves only `/__celld/health`. A healthy node returns a
-200 response with `{"ok":true}`, and an unhealthy node returns a 503 response.
-The deployed Worker owns `/health` and every other public path.
+The public listener reserves only `/.well-known/celld/health`. A healthy node
+returns a 200 response with `{"ok":true}`, and an unhealthy node returns a 503
+response. The deployed Worker owns `/health` and every other public path.
 
 The internal listener does not pass an unknown path to the Worker. It returns a
 404 response, so an operator request cannot become an application request.
 
+## Protect each surface
+
+| Surface | Required protection |
+| --- | --- |
+| The public listener | Terminate TLS and authenticate users in a proxy or the application. |
+| The internal listener | Restrict access to trusted operators and fleet nodes. Use an encrypted overlay when the private network does not provide confidentiality. |
+| The fleet bucket | Restrict the credentials to one fleet bucket. |
+
+The internal listener has three request groups:
+
+- Most operator routes let an operator inspect or control a node without
+  request authentication.
+- The `/peer/tunnel` route establishes a tunnel for cell fetch, RPC, and
+  WebSocket calls. The establishment request carries the fleet HMAC, a clock
+  limit, and replay protection, so only a holder of the fleet secret can open
+  a tunnel. Each call then crosses inside the tunnel as plain HTTP with the
+  cell scope in a reserved header, and these inner calls are not signed.
+- The peer-control routes coordinate fleet nodes, and the reserved-cell routes
+  access runtime state. These routes use the fleet HMAC for request
+  authentication, a clock limit, and replay protection.
+
+All three groups require the trusted private network.
+
+The tunnel permits a request body to stream to the owner, so the fleet HMAC
+cannot sign an individual call. The establishment signature decides who can
+open a tunnel, and a tunneled call can address an application class or a
+runtime class, so every path to a runtime class demands the fleet secret.
+The signature does not authenticate the bytes after the establishment, and
+it does not encrypt any traffic. The private network must therefore stay
+trusted, and the fleet HMAC does not replace this network boundary.
+
+celld does not terminate TLS on either listener. Do not expose the internal
+listener to the public internet. Use an encrypted overlay such as WireGuard or
+Tailscale when the network does not provide the required confidentiality.
+
+## Use the internal operator API
+
+The internal operator API is available in the released binary. It is an alpha
+interface, so a release can change its paths or response formats.
+
+These routes do not authenticate the caller:
+
+- `/state` reports node state.
+- `/cell/<SCOPE>` resolves or activates a cell.
+- `/evict/<SCOPE>` evicts a resident cell.
+- `/do/<ID>` sends a direct request to an ordinary Durable Object.
+- `POST /shutdown` starts a graceful ownership handoff. The
+  `handoff=preserve` query prepares a same-node reload.
+
+The `/do/<ID>` route refuses every reserved runtime class. These classes include
+D1, Workflows, KV, and Queues. Their operator protocols can access application
+data or change runtime state, so they use the HMAC-authenticated
+`/runtime/<SCOPE>` route.
+
+`/peer/probe` returns a signed diagnostic response. The peer protocol also
+uses other reserved internal paths. An operator must not call these paths
+directly.
+
 ## Set the forwarded-header policy
 
-A Worker reads the request URL from `request.url`. An application can route on
-the hostname and build an absolute link from this URL. Therefore, celld ignores
-`X-Forwarded-Host` and `X-Forwarded-Proto` by default.
+celld ignores `X-Forwarded-Host` and `X-Forwarded-Proto` by default. Set
+`--trust-forwarded-headers` or `CELLD_TRUST_FORWARDED_HEADERS=1` only when a
+trusted proxy replaces both headers. celld uses the last value in each header,
+so an earlier client value does not override the proxy value.
 
-Set `--trust-forwarded-headers` only when a trusted proxy replaces both headers.
-celld then reads the last value in each header, so an earlier client value does
-not override the proxy value. The equivalent environment variable is
-`CELLD_TRUST_FORWARDED_HEADERS=1`.
+celld always takes the path and query from the request target. It ignores the
+scheme and authority in an absolute-form target, so a client cannot bypass the
+host policy through the request line.
 
-celld always takes the path and query from the request target. It ignores an
-absolute-form request target's scheme and authority, so a direct client cannot
-bypass the host policy through the request line.
+Without a trusted proxy, the `Host` header controls the hostname in
+`request.url`. celld accepts a hostname, an IPv4 address, or a bracketed IPv6
+address, with an optional port. It rejects malformed and noncanonical values,
+and it uses `celld.local` when no source gives a valid host.
 
-## Protect the internal listener
+These checks keep the path and query valid, but they do not make the hostname
+trustworthy. An application must not use an unchecked hostname for an
+authorization decision. Use a trusted proxy or check the hostname against a
+list in the Worker.
 
-Most of the operator API does not authenticate its requests. A client that
-can reach the internal listener can inspect state, start direct work, evict a
-cell, or stop the process. Therefore, a firewall or a private overlay must
-restrict access to trusted operators and fleet nodes.
+## Limit request bodies
 
-The D1 route is the exception, because a D1 database holds application data
-and runs the SQL that a caller sends. That route authenticates each request
-with the fleet secret, and the unauthenticated `/do/NAME` route refuses a D1
-database. An unauthenticated client on the internal listener can therefore
-stop a node, but it cannot read or change the contents of a D1 database.
-The refusal protects only the D1 database: the `/do/NAME` route still sends
-an unauthenticated request to the `fetch` handler of an ordinary Durable
-Object, so that handler runs whatever code it contains for that request. The
-difference is the SQL: only the D1 route runs arbitrary SQL that the caller
-wrote, and a Durable Object runs only its own code.
+The public Worker listener and `/do/<ID>` have a 1 GiB request body limit by
+default. Set `CELLD_MAX_REQUEST_BODY_BYTES` to a smaller positive value to
+change the limit. celld returns status 413 for a declared oversized body and
+when a Worker reads past the limit.
 
-Peer requests on the same listener keep their protocol authentication. Each
-peer request has an HMAC, a body signature, a clock limit, and replay
-protection. The private network adds protection, but it does not replace the
-peer authentication.
-
-celld does not terminate TLS on the internal listener. Use an encrypted overlay
-such as WireGuard or Tailscale when the private network does not provide the
-required confidentiality.
-
-## Internal operator API
-
-The internal operator API is available in the released binary. The API is an
-alpha interface, so a release can change its paths or response formats.
-
-- `/state` reports the current occupancy, eviction, and restoration values. It
-  remains available while a graceful shutdown drains existing work.
-- `/cell/NAME` resolves or activates a cell for an operator check.
-- `/evict/NAME` evicts a resident cell.
-- `/do/NAME` sends a direct Durable Object request. This route refuses a D1
-  database, because the route does not authenticate its caller.
-- `/__d1/SCOPE` sends SQL to a D1 database. This route authenticates each
-  request with the fleet secret, so a caller needs the bucket credentials.
-  The `celld d1` command uses this route.
-- `POST /shutdown` starts a graceful ownership handoff.
-- `POST /shutdown?handoff=preserve` prepares a clean same-node reload and keeps
-  the ownership records.
-- `/__celld/probe` serves the signed diagnostic probe.
-
-The peer protocol also uses reserved internal paths. An operator must not call
-these paths directly, and celld continues to authenticate each peer request.
+For a method other than `GET` or `HEAD`, `/do/<ID>` streams a body when its
+declared length is at least 1 MiB or its length is unknown. celld collects each
+smaller body before dispatch.
 
 ## Protect the fleet bucket
 
@@ -109,23 +144,12 @@ A person who holds the bucket credentials controls the fleet. Give each
 credential access to one fleet bucket only, and replace a credential after a
 suspected disclosure.
 
-## Keep one writer for each cell
+## Understand cell ownership
 
 Each cell is a SQLite database with one writer. One node owns a cell at a time,
-and an ownership epoch fences each cell.
+and an ownership epoch fences each cell. A node that loses its lease cannot
+modify the current cell state.
 
-A node that loses its lease cannot modify the current cell state. The
-[ownership and fencing](fencing.md) page describes this mechanism.
-
-A fleet has no shared multi-tenant scheduler or shared placement layer. A
-defective cell can access only its own database, but it can consume resources
-on its fleet nodes.
-
-## Protect the public application
-
-celld does not authenticate the users of the deployed application. It also does
-not terminate public TLS. Put the required authentication and TLS in front of
-the public listener.
-
-Keep the internal listener private, and keep the bucket credentials secret.
-See the [limitations](limitations.md) page for the complete alpha boundary.
+This fencing protects storage consistency, but it does not isolate hostile
+applications. See [what celld guarantees](guarantees.md) for the storage protocol,
+and see [limitations](limitations.md) for the complete alpha boundary.

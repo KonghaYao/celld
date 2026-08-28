@@ -1,7 +1,8 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-// Isolate admission and deadlines are in the V8 arm outside the World.
-#![allow(clippy::disallowed_macros, clippy::disallowed_methods)]
+// Isolate admission and deadlines are in the V8 arm outside the Actor execution
+// domain.
+#![allow(clippy::disallowed_methods)]
 
 //! The isolate pool: the shell around `celld_logic::isolate`.
 //!
@@ -22,6 +23,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
 
 use anyhow::Result;
@@ -34,6 +36,122 @@ use celld_logic::isolate::Refusal;
 
 use crate::js;
 
+/// One Queue producer event can execute while one successor waits. A third
+/// event cannot enter the isolate queue, because producer work must not hide
+/// the alarms and settlements that drain the durable backlog.
+pub(crate) const MAX_QUEUE_PRODUCER_EVENTS_PER_CELL: usize = 2;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum TurnLane {
+    Stateless,
+    Cell(String),
+}
+
+#[derive(Default)]
+struct TurnSchedule {
+    current: Option<TurnLane>,
+    ready: std::collections::VecDeque<TurnLane>,
+    waiting: std::collections::HashMap<
+        TurnLane,
+        std::collections::VecDeque<tokio::sync::oneshot::Sender<()>>,
+    >,
+}
+
+#[derive(Default)]
+struct TurnScheduler {
+    schedule: Mutex<TurnSchedule>,
+}
+
+struct TurnPermit<'a>(&'a TurnScheduler);
+
+impl TurnScheduler {
+    async fn acquire(&self, lane: TurnLane) -> TurnPermit<'_> {
+        let receive = {
+            let mut schedule = self.schedule.lock().expect("turn scheduler poisoned");
+            if schedule.current.is_none() {
+                schedule.current = Some(lane);
+                None
+            } else {
+                let (send, receive) = tokio::sync::oneshot::channel();
+                if !schedule.waiting.contains_key(&lane) && schedule.current.as_ref() != Some(&lane)
+                {
+                    schedule.ready.push_back(lane.clone());
+                }
+                schedule.waiting.entry(lane).or_default().push_back(send);
+                Some(receive)
+            }
+        };
+        if let Some(receive) = receive {
+            // Cancellation leaves a closed sender in this lane. `release`
+            // skips it, so a dropped waiter cannot strand the active token.
+            let _ = receive.await;
+        }
+        TurnPermit(self)
+    }
+
+    fn release(&self) {
+        let mut schedule = self.schedule.lock().expect("turn scheduler poisoned");
+        let current = schedule
+            .current
+            .take()
+            .expect("a released turn scheduler has a current lane");
+        if schedule
+            .waiting
+            .get(&current)
+            .is_some_and(|waiters| !waiters.is_empty())
+        {
+            schedule.ready.push_back(current);
+        }
+        while let Some(lane) = schedule.ready.pop_front() {
+            let (send, keep_lane) = {
+                let waiters = schedule
+                    .waiting
+                    .get_mut(&lane)
+                    .expect("a ready turn lane has waiters");
+                (waiters.pop_front().unwrap(), !waiters.is_empty())
+            };
+            if !keep_lane {
+                schedule.waiting.remove(&lane);
+            }
+            if send.send(()).is_ok() {
+                schedule.current = Some(lane);
+                return;
+            }
+            if keep_lane {
+                schedule.ready.push_back(lane);
+            }
+        }
+    }
+}
+
+impl Drop for TurnPermit<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+pub(crate) struct QueueProducerPermit {
+    slot: Arc<Slot>,
+    scope: String,
+}
+
+impl Drop for QueueProducerPermit {
+    fn drop(&mut self) {
+        let mut producers = self
+            .slot
+            .queue_producers
+            .lock()
+            .expect("Queue producer admission poisoned");
+        let active = producers
+            .get_mut(&self.scope)
+            .expect("a Queue producer permit has an admission");
+        *active -= 1;
+        if *active == 0 {
+            producers.remove(&self.scope);
+        }
+    }
+}
+
 /// One isolate, and everything the decision core needs to know about it.
 pub struct Slot {
     pub id: IsolateId,
@@ -45,6 +163,8 @@ pub struct Slot {
     /// retiring slot is filtered out of every placement decision, so nothing
     /// can arrive afterwards. Entering one would be a bug in this module.
     worker: tokio::sync::Mutex<Option<js::Worker>>,
+    turn_scheduler: TurnScheduler,
+    queue_producers: Mutex<std::collections::HashMap<String, usize>>,
     turns: AtomicUsize,
     requests: AtomicUsize,
     /// The pool's admission bell, cloned into every slot so an
@@ -55,6 +175,8 @@ pub struct Slot {
     /// why `retire` refuses an isolate holding any.
     cells: AtomicUsize,
     retiring: AtomicBool,
+    #[cfg(celld_internal_tests)]
+    turn_observations: Mutex<Vec<String>>,
 }
 
 impl Slot {
@@ -73,6 +195,17 @@ impl Slot {
     /// isolate across an await is unwritable rather than a rule a comment
     /// asks callers to remember.
     pub async fn turn<T>(&self, f: impl FnOnce(&mut js::Worker) -> T) -> T {
+        self.turn_in(TurnLane::Stateless, f).await
+    }
+
+    /// Enter one cell turn through a round-robin lane for that cell. A hot
+    /// cell can retain its next place, but it cannot take the next place from
+    /// another cell that already waits on the same isolate.
+    pub async fn turn_cell<T>(&self, scope: &str, f: impl FnOnce(&mut js::Worker) -> T) -> T {
+        self.turn_in(TurnLane::Cell(scope.to_string()), f).await
+    }
+
+    async fn turn_in<T>(&self, lane: TurnLane, f: impl FnOnce(&mut js::Worker) -> T) -> T {
         struct Counted<'a>(&'a Slot);
         impl Drop for Counted<'_> {
             fn drop(&mut self) {
@@ -81,12 +214,37 @@ impl Slot {
         }
         self.turns.fetch_add(1, Ordering::Relaxed);
         let _turn = Counted(self);
+        let _scheduled = self.turn_scheduler.acquire(lane.clone()).await;
         let mut worker = self.worker.lock().await;
         let worker = match worker.as_mut() {
             Some(worker) => worker,
             None => panic!("entered isolate {} after it was freed", self.id),
         };
+        #[cfg(celld_internal_tests)]
+        self.turn_observations.lock().unwrap().push(match lane {
+            TurnLane::Stateless => "stateless".to_string(),
+            TurnLane::Cell(scope) => scope,
+        });
         f(worker)
+    }
+
+    /// Reserve one of the two producer positions before the event can wait
+    /// for an isolate turn. The permit spans the complete cell event, so a
+    /// suspended producer still occupies its position.
+    pub(crate) fn try_queue_producer(self: &Arc<Self>, scope: &str) -> Option<QueueProducerPermit> {
+        let mut producers = self
+            .queue_producers
+            .lock()
+            .expect("Queue producer admission poisoned");
+        let active = producers.entry(scope.to_string()).or_default();
+        if *active >= MAX_QUEUE_PRODUCER_EVENTS_PER_CELL {
+            return None;
+        }
+        *active += 1;
+        Some(QueueProducerPermit {
+            slot: self.clone(),
+            scope: scope.to_string(),
+        })
     }
 
     /// Mark a request as living in this isolate. Held for the request's whole
@@ -105,17 +263,45 @@ impl Slot {
         Arc::new(Slot {
             id: 0,
             worker: tokio::sync::Mutex::new(Some(worker)),
+            turn_scheduler: TurnScheduler::default(),
+            queue_producers: Mutex::new(std::collections::HashMap::new()),
             turns: AtomicUsize::new(0),
             requests: AtomicUsize::new(0),
             freed: Arc::new(tokio::sync::Notify::new()),
             cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
+            #[cfg(celld_internal_tests)]
+            turn_observations: Mutex::new(Vec::new()),
         })
     }
 
-    #[cfg(all(test, celld_internal_tests))]
+    #[cfg(celld_internal_tests)]
     pub fn for_test(worker: js::Worker) -> Arc<Self> {
         Self::standalone(worker)
+    }
+
+    #[cfg(celld_internal_tests)]
+    #[doc(hidden)]
+    pub async fn hold_turn_for_test(&self) -> impl Drop + '_ {
+        self.worker.lock().await
+    }
+
+    #[cfg(celld_internal_tests)]
+    #[doc(hidden)]
+    pub fn queued_turns_for_test(&self) -> usize {
+        self.turns.load(Ordering::Relaxed)
+    }
+
+    #[cfg(celld_internal_tests)]
+    #[doc(hidden)]
+    pub fn reset_turn_observations_for_test(&self) {
+        self.turn_observations.lock().unwrap().clear();
+    }
+
+    #[cfg(celld_internal_tests)]
+    #[doc(hidden)]
+    pub fn turn_observations_for_test(&self) -> Vec<String> {
+        self.turn_observations.lock().unwrap().clone()
     }
 
     /// Give this isolate a cell's realm. Held for as long as the cell lives
@@ -184,6 +370,11 @@ pub struct Pool {
     build: Build,
     freed: Arc<tokio::sync::Notify>,
     admission_wait: std::time::Duration,
+    /// The whole pool belongs to a superseded generation. An isolate grown
+    /// after this is set starts out retiring: a placement that snapshotted
+    /// the old generation just before the flip can still land, but nothing
+    /// it builds outlives the work it was built for.
+    retired: AtomicBool,
     /// Keeps admission and cell placement from racing isolate retirement.
     /// Stateless admission takes a shared guard, while maintenance and cell
     /// placement take the exclusive guard.
@@ -198,6 +389,7 @@ impl Pool {
             build,
             freed: Arc::new(tokio::sync::Notify::new()),
             admission_wait,
+            retired: AtomicBool::new(false),
             maintenance: RwLock::new(()),
         }
     }
@@ -253,11 +445,15 @@ impl Pool {
         let slot = Arc::new(Slot {
             id,
             worker: tokio::sync::Mutex::new(Some(worker)),
+            turn_scheduler: TurnScheduler::default(),
+            queue_producers: Mutex::new(std::collections::HashMap::new()),
             turns: AtomicUsize::new(0),
             requests: AtomicUsize::new(0),
             freed: self.freed.clone(),
             cells: AtomicUsize::new(0),
-            retiring: AtomicBool::new(false),
+            retiring: AtomicBool::new(self.retired.load(Ordering::Relaxed)),
+            #[cfg(celld_internal_tests)]
+            turn_observations: Mutex::new(Vec::new()),
         });
         if let Some(id) = reusable {
             slots[id] = slot.clone();
@@ -324,7 +520,8 @@ impl Pool {
     /// refuses at once: pressure means give resources back, not hold
     /// callers.
     pub async fn admit_or_wait(&self, shedding: bool) -> Result<Affiliation, AdmitError> {
-        let deadline = tokio::time::Instant::now() + self.admission_wait;
+        let deadline_ms =
+            crate::asyncrt::mono_ms().saturating_add(self.admission_wait.as_millis() as u64);
         loop {
             // Armed before the check: a slot freed between a failed admit
             // and the park would otherwise be a lost wakeup.
@@ -332,9 +529,15 @@ impl Pool {
             match self.admit(shedding) {
                 Err(AdmitError::Refused(Refusal::NodeFull)) => {
                     tokio::pin!(freed);
-                    tokio::select! {
-                        _ = &mut freed => {}
-                        _ = tokio::time::sleep_until(deadline) => {
+                    // A freed slot before the deadline: both arms end the
+                    // wait, so declaring the order costs nothing and makes
+                    // the branch replayable. Priority to the wakeup, because
+                    // a slot that freed in the same instant the deadline
+                    // expired is a slot the caller can have.
+                    crate::asyncrt::select_biased! {
+                        "a slot freed in the same instant as the deadline goes to the caller";
+                        _ = &mut freed => {},
+                        _ = crate::asyncrt::sleep_until(deadline_ms) => {
                             return Err(AdmitError::Refused(Refusal::NodeFull));
                         }
                     }
@@ -389,6 +592,33 @@ impl Pool {
         self.free_retired();
     }
 
+    /// Retire every isolate, housed or not: the pool belongs to a superseded
+    /// application generation and must take no new work. Stateless slots
+    /// free as their affiliations drop; a slot hosting cells frees once the
+    /// last of them has moved to a newer generation, which `may_free`
+    /// enforces by refusing a housed isolate.
+    pub fn retire_all(&self) {
+        let _maintenance = self.maintenance.write().expect("pool poisoned");
+        self.retired.store(true, Ordering::Relaxed);
+        for slot in self.slots.read().expect("pool poisoned").iter() {
+            if !slot.retiring.swap(true, Ordering::Relaxed) {
+                tracing::info!(isolate = slot.id, "isolate retiring");
+            }
+        }
+        self.free_retired();
+    }
+
+    /// Whether every isolate this pool ever built has been freed. True for a
+    /// pool that never grew, so a generation whose scripts took no traffic
+    /// drains at once.
+    pub fn is_drained(&self) -> bool {
+        self.slots
+            .read()
+            .expect("pool poisoned")
+            .iter()
+            .all(|slot| slot.worker.try_lock().is_ok_and(|worker| worker.is_none()))
+    }
+
     fn retire_one(&self) -> bool {
         let Some(id) = celld_logic::isolate::retire(&self.load()) else {
             return false;
@@ -418,7 +648,7 @@ impl Pool {
         }
     }
 
-    /// Live isolates, for tests and diagnostics.
+    /// Return the current live-isolate count.
     pub fn live(&self) -> usize {
         self.slots
             .read()

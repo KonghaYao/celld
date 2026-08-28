@@ -2,6 +2,7 @@
 
 //! Durable types on the bucket contract between deployment tools and celld.
 //! These objects are the interface; nothing else is exchanged.
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use sha2::Sha256;
@@ -31,6 +32,11 @@ pub struct Manifest {
     /// needs no migration of an already-armed alarm.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub crons: Vec<String>,
+    /// Push consumers attached to this Worker deployment. Producer bindings
+    /// remain in `raw_metadata.bindings`, because they become values in `env`;
+    /// consumers drive the broker and have no environment binding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queue_consumers: Vec<QueueConsumerConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_features: Vec<String>,
     /// wrangler's raw metadata, retained verbatim for anything we don't yet model.
@@ -49,8 +55,12 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_ASSETS_V1,
     FEATURE_CRON_V1,
     FEATURE_D1_V1,
+    FEATURE_KV_V1,
+    FEATURE_QUEUES_V1,
     FEATURE_SQLITE_VEC_V1,
+    FEATURE_R2_V1,
     FEATURE_WASM_V1,
+    FEATURE_WORKFLOWS_V1,
 ];
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
@@ -63,8 +73,220 @@ pub const FEATURE_D1_V1: &str = "d1-v1";
 /// reserved cron cell would load the manifest, ignore `crons`, and silently
 /// never fire — the quiet failure the gate exists to prevent.
 pub const FEATURE_CRON_V1: &str = "cron-v1";
+/// A deployment with `r2_buckets` bindings. Required because a build without
+/// the R2 binding would load the manifest and then throw on every method the
+/// application calls, at request time, on a node the developer is not
+/// watching — the gate moves that failure to the deploy.
+pub const FEATURE_R2_V1: &str = "r2-v1";
 pub const FEATURE_SQLITE_VEC_V1: &str = "sqlite-vec-v1";
 pub const FEATURE_WASM_V1: &str = "wasm-v1";
+/// A deployment with `workflows` bindings. Required because a build without
+/// the reserved workflow cell would load the manifest, build an `env` missing
+/// the binding, and fail only when the application first calls `create()` —
+/// in production, with an error that blames the application.
+pub const FEATURE_WORKFLOWS_V1: &str = "workflows-v1";
+
+/// A deployment with `kv_namespaces` bindings. Gated for the same reason
+/// workflows are, and not for D1's reason: a build without KV would load the
+/// manifest, build an `env` with no `KV` on it, and fail only when the
+/// application first reads a key. D1's absence fails loudly at load instead,
+/// because its reserved class is in `do_classes` and the loader refuses a
+/// class it does not know.
+pub const FEATURE_KV_V1: &str = "kv-v1";
+
+/// A deployment with a Queue producer or consumer. A node without the broker
+/// would otherwise omit a producer binding or silently stop consuming.
+pub const FEATURE_QUEUES_V1: &str = "queues-v1";
+
+pub const QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION: u32 = 1;
+
+/// `deploy/queues/<queue>/consumer.json` — the one deployment allowed to
+/// consume a fleet-global queue. The record keeps an exact deployment
+/// reference, because the script's named pointer can move independently
+/// between the attachment read and the Worker load.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueConsumerAttachment {
+    pub schema_version: u32,
+    pub queue: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer: Option<QueueConsumerDeployment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueConsumerDeployment {
+    pub script_name: String,
+    pub version: String,
+    pub prefix: String,
+}
+
+pub fn queue_consumer_attachment_key(queue: &str) -> Option<String> {
+    celld_logic::cell::valid_cell_scope(queue)
+        .then(|| format!("deploy/queues/{queue}/consumer.json"))
+}
+
+pub fn validate_queue_consumer_attachment(
+    expected_queue: &str,
+    attachment: &QueueConsumerAttachment,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        attachment.schema_version == QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
+        "queue consumer attachment for {expected_queue:?} has unsupported schema version {}",
+        attachment.schema_version
+    );
+    anyhow::ensure!(
+        attachment.queue == expected_queue,
+        "queue consumer attachment for {expected_queue:?} names queue {:?}",
+        attachment.queue
+    );
+    if let Some(consumer) = &attachment.consumer {
+        anyhow::ensure!(
+            !consumer.script_name.is_empty()
+                && !consumer.version.is_empty()
+                && consumer.prefix
+                    == format!("deploy/{}/{}", consumer.script_name, consumer.version),
+            "queue consumer attachment for {expected_queue:?} has an invalid deployment reference"
+        );
+    }
+    Ok(())
+}
+
+/// The normalized push-consumer settings stored in a deployment manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueConsumerConfig {
+    pub queue: String,
+    pub max_batch_size: u16,
+    pub max_batch_timeout: u16,
+    pub max_retries: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead_letter_queue: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_delay: Option<u32>,
+}
+
+/// Validate every Queue value before a deployment becomes runtime state.
+///
+/// A native deploy validates its source configuration before it writes a
+/// manifest. A managed deploy has a separate TypeScript producer, so the node
+/// repeats the authoritative checks from `celld-logic` when it loads either
+/// manifest. This prevents a malformed producer from becoming a missing
+/// binding and prevents an invalid consumer policy from reaching the broker.
+#[doc(hidden)]
+pub fn validate_queue_manifest(manifest: &Manifest) -> anyhow::Result<()> {
+    let queue_bindings = manifest
+        .raw_metadata
+        .get("bindings")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|binding| binding.get("type").and_then(serde_json::Value::as_str) == Some("queue"))
+        .collect::<Vec<_>>();
+    if queue_bindings.is_empty() && manifest.queue_consumers.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::ensure!(
+        manifest
+            .required_features
+            .iter()
+            .any(|feature| feature == FEATURE_QUEUES_V1),
+        "Queue deployment does not require {FEATURE_QUEUES_V1}"
+    );
+    anyhow::ensure!(
+        manifest
+            .do_classes
+            .iter()
+            .any(|class| class == celld_logic::queue::RESERVED_CLASS)
+            && manifest
+                .sqlite_classes
+                .iter()
+                .any(|class| class == celld_logic::queue::RESERVED_CLASS),
+        "Queue deployment does not install the reserved SQLite Queue class"
+    );
+
+    for binding in queue_bindings {
+        let environment = binding
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| valid_binding_name(name))
+            .context("Queue binding has an invalid environment name")?;
+        let queue = binding
+            .get("queue")
+            .and_then(serde_json::Value::as_str)
+            .filter(|queue| celld_logic::cell::valid_cell_scope(queue))
+            .with_context(|| format!("Queue binding {environment:?} has an invalid queue name"))?;
+        let delivery_delay_seconds = match binding.get("delivery_delay") {
+            None => 0,
+            Some(value) => value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .with_context(|| {
+                    format!("Queue binding {environment:?} has an invalid delivery_delay")
+                })?,
+        };
+        celld_logic::queue::validate_config(&celld_logic::queue::QueueConfig {
+            max_batch_size: celld_logic::queue::DEFAULT_MAX_BATCH_SIZE,
+            max_batch_timeout_seconds: celld_logic::queue::DEFAULT_MAX_BATCH_TIMEOUT_SECONDS,
+            max_retries: celld_logic::queue::DEFAULT_MAX_RETRIES,
+            max_concurrency: None,
+            delivery_delay_seconds,
+            retry_delay_seconds: None,
+        })
+        .map_err(anyhow::Error::new)
+        .with_context(|| format!("Queue binding {environment:?} for {queue:?} is invalid"))?;
+    }
+
+    anyhow::ensure!(
+        manifest.queue_consumers.is_empty() || manifest.main_module.is_some(),
+        "Queue consumer deployment has no Worker module"
+    );
+    let mut consumed = std::collections::BTreeSet::new();
+    for consumer in &manifest.queue_consumers {
+        anyhow::ensure!(
+            celld_logic::cell::valid_cell_scope(&consumer.queue),
+            "Queue consumer has an invalid queue name {:?}",
+            consumer.queue
+        );
+        anyhow::ensure!(
+            consumed.insert(&consumer.queue),
+            "Queue consumer deployment repeats queue {:?}",
+            consumer.queue
+        );
+        if let Some(dead_letter_queue) = &consumer.dead_letter_queue {
+            anyhow::ensure!(
+                celld_logic::cell::valid_cell_scope(dead_letter_queue)
+                    && dead_letter_queue != &consumer.queue,
+                "Queue consumer for {:?} has an invalid dead-letter queue {:?}",
+                consumer.queue,
+                dead_letter_queue
+            );
+        }
+        celld_logic::queue::validate_config(&celld_logic::queue::QueueConfig {
+            max_batch_size: consumer.max_batch_size,
+            max_batch_timeout_seconds: consumer.max_batch_timeout,
+            max_retries: consumer.max_retries,
+            max_concurrency: consumer.max_concurrency,
+            delivery_delay_seconds: 0,
+            retry_delay_seconds: consumer.retry_delay,
+        })
+        .map_err(anyhow::Error::new)
+        .with_context(|| format!("Queue consumer for {:?} is invalid", consumer.queue))?;
+    }
+    Ok(())
+}
+
+fn valid_binding_name(name: &str) -> bool {
+    name.len() <= 128
+        && name
+            .chars()
+            .next()
+            .is_some_and(|value| value == '_' || value == '$' || value.is_ascii_alphabetic())
+        && name
+            .chars()
+            .skip(1)
+            .all(|value| value == '_' || value == '$' || value.is_ascii_alphanumeric())
+}
 
 /// Reject a manifest requiring any feature this build does not support. Both
 /// load paths (control-plane deployments and fleet pointer loads) must apply
@@ -109,7 +331,7 @@ pub struct AssetManifestRef {
 }
 
 /// `deploy/<script>/<version>/assets.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AssetIndex {
     pub schema_version: u32,
     pub entries: BTreeMap<String, AssetEntry>,

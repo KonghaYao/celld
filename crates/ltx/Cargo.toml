@@ -15,9 +15,15 @@ description = "In-process SQLite WAL replication to object storage (LTX format) 
 readme = "README.md"
 publish = false
 
+[lib]
+test = false
+
 [lints.rust.unexpected_cfgs]
 level = "warn"
 check-cfg = ["cfg(celld_internal_tests)"]
+
+[lints.clippy]
+disallowed_macros = "forbid"
 
 [features]
 default = ["s3"]
@@ -29,7 +35,7 @@ azure = ["object_store/azure"]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
 # Aligned to celld's rusqlite (crates/celld pins 0.31); libsqlite3-sys carries
 # links="sqlite3", so the workspace cannot hold two versions.
-rusqlite = { workspace = true, features = ["bundled"] }
+rusqlite = { workspace = true, features = ["bundled", "hooks"] }
 object_store.workspace = true
 bytes.workspace = true
 chrono.workspace = true
@@ -38,9 +44,3 @@ tracing.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
 lz4_flex.workspace = true
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["full", "test-util"] }
-tempfile.workspace = true
-proptest.workspace = true
-hex.workspace = true

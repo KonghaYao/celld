@@ -1,8 +1,8 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-// The binary is now connection, startup, shutdown, and V8 shell code. The
-// World boundary lives in the library Actor and its domain-routed adapters.
-#![allow(clippy::disallowed_macros, clippy::disallowed_methods)]
+// The binary contains connection, startup, shutdown, and V8 shell code. The
+// library Actor owns the execution domain and its routed adapters.
+#![allow(clippy::disallowed_methods)]
 
 //! Runnable celld vertical slice.
 //!
@@ -12,28 +12,31 @@
 //! when a storage operation remains hung, without spawning a task per effect.
 
 use anyhow::Context as _;
-use base64::Engine as _;
 use celld::actor::*;
+use celld::bucket::Bucket;
 use celld::fleet;
+use celld::generation::{
+    DeploymentGraph, Generation, GenerationOptions, ReloadOutcome, ReloadRequest, FIRST_GENERATION,
+};
 use celld::js::{
-    ArmGate, AssetCallReq, Compat, DoCallReq, HttpResponse, RpcCallReq, SvcCallReq, SvcRpcReq,
-    WorkerConfigOptions,
+    ArmGate, AssetCallReq, Compat, DoCallReq, HttpResponse, HttpResponseWebSocket, QueueBinding,
+    QueueDispatchReq, RpcCallReq, SvcCallReq, SvcRpcReq, WorkerConfigOptions, WorkflowBinding,
 };
 use celld::ownership_store::{now_ms, BucketOwnership};
 use celld::peer_auth::{self, PeerAuth};
-use celld::runtime::{CohostedWorker, Replication, RuntimeFetch, RuntimeManager, RuntimeOptions};
+use celld::protocol::DeployPointer;
+use celld::runtime::{Replication, RuntimeFetch, RuntimeManager, RuntimeOptions, ServiceFetch};
 use celld_logic::{RequestError, Route, WebSocketKind};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, Full, StreamBody};
-use hyper::body::{Bytes, Frame, Incoming};
+use http_body_util::{BodyExt, Full, Limited, StreamBody};
+use hyper::body::{Body as _, Bytes, Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::convert::Infallible;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -58,9 +61,119 @@ const CONNECTION_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_se
 static LOG_GUARD: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> =
     std::sync::Mutex::new(None);
 
+static CONNECTION_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONNECTION_ERRORS_REPORTED: AtomicU64 = AtomicU64::new(0);
+static CONNECTION_ERROR_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+static CONNECTION_ERRORS_INCOMPLETE: AtomicU64 = AtomicU64::new(0);
+static CONNECTION_ERRORS_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+static CONNECTION_ERRORS_OTHER: AtomicU64 = AtomicU64::new(0);
+
+fn record_connection_error(
+    error: &hyper::Error,
+    surface: HttpSurface,
+    peer: Option<std::net::SocketAddr>,
+) {
+    static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let total = CONNECTION_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    let (cause, cause_total) = if error.is_incomplete_message() {
+        (
+            "incomplete_message",
+            CONNECTION_ERRORS_INCOMPLETE.fetch_add(1, Ordering::Relaxed) + 1,
+        )
+    } else if error.is_timeout() {
+        (
+            "timeout",
+            CONNECTION_ERRORS_TIMEOUT.fetch_add(1, Ordering::Relaxed) + 1,
+        )
+    } else {
+        (
+            "other",
+            CONNECTION_ERRORS_OTHER.fetch_add(1, Ordering::Relaxed) + 1,
+        )
+    };
+    let elapsed_ms = STARTED.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    let last = CONNECTION_ERROR_LAST_LOG_MS.load(Ordering::Relaxed);
+    let observed = elapsed_ms.max(1);
+    if (last != 0 && elapsed_ms.saturating_sub(last) < 1_000)
+        || CONNECTION_ERROR_LAST_LOG_MS
+            .compare_exchange(last, observed, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let reported = CONNECTION_ERRORS_REPORTED.swap(total, Ordering::Relaxed);
+    tracing::warn!(
+        event = "http_connection_failures",
+        total,
+        since_last = total.saturating_sub(reported),
+        cause,
+        cause_total,
+        surface = surface.name(),
+        ?peer,
+        %error,
+        "HTTP connections failed"
+    );
+}
+
 fn exit_flushed(code: i32) -> ! {
     drop(LOG_GUARD.lock().unwrap().take());
     std::process::exit(code);
+}
+
+/// Await shutdown work only while the orchestrator-compatible process budget
+/// remains. A zero budget does not poll the future, so best-effort store and
+/// diagnostic work cannot begin after the absolute deadline.
+async fn before_process_deadline<F>(deadline: tokio::time::Instant, future: F) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    tokio::time::timeout(remaining, future).await.ok()
+}
+
+// Keep the runtime owner and the follower fallback in one consumed selection.
+// The process must finalize this value before it starts application services,
+// so a caller cannot forget the follower-only owner on a non-runtime path.
+struct DurabilityOwnerSelection {
+    runtime_owner: Option<celld::node_log::DurabilityOwner>,
+    follower: Option<Arc<celld::node_log::FollowerStore>>,
+}
+
+impl DurabilityOwnerSelection {
+    fn new(follower: Option<Arc<celld::node_log::FollowerStore>>) -> Self {
+        Self {
+            runtime_owner: None,
+            follower,
+        }
+    }
+
+    fn install_runtime(&mut self, owner: celld::node_log::DurabilityOwner) {
+        assert!(
+            self.runtime_owner.is_none(),
+            "the runtime durability owner was already installed"
+        );
+        self.runtime_owner = Some(owner);
+    }
+
+    fn select(self) -> Option<celld::node_log::DurabilityOwner> {
+        self.runtime_owner.or_else(|| {
+            self.follower
+                .map(celld::node_log::DurabilityOwner::new_follower)
+        })
+    }
+}
+
+// Keep the phase-one durability result inside the complete preparation
+// decision. A timeout runs fallback, so it must override a successful drain.
+fn clean_reload_is_eligible(
+    durability_quiesced: bool,
+    drained: bool,
+    shutdown_mode: ShutdownMode,
+) -> bool {
+    durability_quiesced && drained && shutdown_mode == ShutdownMode::Preserve
 }
 
 type HttpReply = Response<UnsyncBoxBody<Bytes, std::io::Error>>;
@@ -76,10 +189,9 @@ fn owner_unreachable(scope: &str, owner: &str, source: anyhow::Error) -> anyhow:
     // already ran it. Without these an operator cannot tell an unreachable
     // peer from one that answered badly, and neither can a bug report.
     let transport = source.downcast_ref::<reqwest::Error>();
-    let cause = source
-        .source()
-        .map(ToString::to_string)
-        .unwrap_or_else(|| source.to_string());
+    // The full chain, because the root cause is the actionable part: a
+    // "connect error" one level down still hides refused vs. out-of-fds.
+    let cause = format!("{source:#}");
     tracing::warn!(
         %scope,
         %owner,
@@ -123,16 +235,37 @@ fn peer_response(mut response: HttpReply) -> HttpReply {
     response
 }
 
-fn runtime_response(worker_response: celld::js::HttpResponse) -> HttpReply {
+/// Decides whether a Worker-set response header reaches the caller. The
+/// `connection` and `transfer-encoding` headers describe the Worker-side hop,
+/// and the host frames every body it sends, so a Worker `content-length` is
+/// stale framing it must not repeat — except on a HEAD response, where the
+/// body the host measures is empty and the Worker's value is the only
+/// representation length the client can get. RFC 9110 forbids the header on a
+/// 1xx or 204 status, so those never carry one even on a HEAD path.
+fn forwards_worker_header(
+    name: &str,
+    preserve_representation_length: bool,
+    status: StatusCode,
+) -> bool {
+    !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection" | "transfer-encoding"
+    ) && (!name.eq_ignore_ascii_case("content-length")
+        || (preserve_representation_length
+            && !status.is_informational()
+            && status != StatusCode::NO_CONTENT))
+}
+
+fn runtime_response(
+    worker_response: celld::js::HttpResponse,
+    preserve_representation_length: bool,
+) -> HttpReply {
     let Ok(status) = StatusCode::from_u16(worker_response.status) else {
         return response(StatusCode::INTERNAL_SERVER_ERROR, "invalid Worker status");
     };
     let mut builder = Response::builder().status(status);
     for (name, value) in worker_response.headers {
-        if matches!(
-            name.to_ascii_lowercase().as_str(),
-            "connection" | "content-length" | "transfer-encoding"
-        ) {
+        if !forwards_worker_header(&name, preserve_representation_length, status) {
             continue;
         }
         builder = builder.header(name, value);
@@ -153,55 +286,6 @@ fn runtime_response(worker_response: celld::js::HttpResponse) -> HttpReply {
     builder
         .body(body)
         .unwrap_or_else(|_| response(StatusCode::INTERNAL_SERVER_ERROR, "invalid Worker headers"))
-}
-
-fn peer_runtime_response(worker_response: celld::js::HttpResponse) -> HttpReply {
-    let wire_status = if worker_response.status == 101 && worker_response.ws.is_some() {
-        StatusCode::OK
-    } else {
-        let Ok(status) = StatusCode::from_u16(worker_response.status) else {
-            return peer_response(response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "invalid Worker status",
-            ));
-        };
-        status
-    };
-    let mut builder = Response::builder().status(wire_status);
-    for (name, value) in worker_response.headers {
-        if matches!(
-            name.to_ascii_lowercase().as_str(),
-            "connection" | "content-length" | "transfer-encoding"
-        ) {
-            continue;
-        }
-        builder = builder.header(name, value);
-    }
-    if let Some(target) = worker_response.ws {
-        if let Ok(value) = serde_json::to_string(&target) {
-            builder = builder.header("x-celld-ws-target", value);
-        }
-    }
-    // Say whether this body is streamed. The peer reads an unmarked body
-    // rather than handing it on, so without this every response looked
-    // buffered and streaming was off across the hop.
-    if worker_response.stream.is_some() {
-        builder = builder.header("x-celld-body-stream", "1");
-    }
-    let body = match worker_response.stream {
-        Some(stream) => {
-            let stream = stream.map(|chunk| {
-                chunk
-                    .map(|bytes| Frame::data(Bytes::from(bytes)))
-                    .map_err(std::io::Error::other)
-            });
-            StreamBody::new(stream).boxed_unsync()
-        }
-        None => Full::new(Bytes::from(worker_response.body))
-            .map_err(|never| match never {})
-            .boxed_unsync(),
-    };
-    peer_response(builder.body(body).expect("Worker peer response"))
 }
 
 #[derive(Debug)]
@@ -285,12 +369,13 @@ impl WebSocketRouteTiming {
     }
 }
 
-/// The output gate for the co-hosted (same-isolate) Durable Object fast path.
-/// That path runs a resident DO's `fetch` inline, bypassing `dispatch_do_call`;
-/// when it writes, the inline handler calls here to hold its response until the
-/// cell is durable. Reuses the routed machinery: `request` pins the cell (no
-/// eviction mid-wait) and `gate_write` drives the core gate. `Ok` releases the
-/// inline response; `Err` breaks the call, as a routed gate failure would.
+/// The output gate for an effect raised inside a handler, as opposed to the
+/// handler's own response.
+///
+/// Every in-handler channel arrives here holding a `GateReq`. Reuses the routed
+/// machinery: `request` pins the cell (no eviction mid-wait) and the core gate
+/// decides. `Ok` releases the held effect; `Err` breaks the call, as a routed
+/// gate failure would.
 async fn dispatch_gate(app: AppHandle, req: celld::js::GateReq) {
     if !app.output_gate {
         let _ = req.reply.send(Ok(()));
@@ -307,7 +392,8 @@ async fn dispatch_gate(app: AppHandle, req: celld::js::GateReq) {
     // branch does not leak the just-acquired request.
     let _activity = app.activity(routed.request, req.scope.clone());
     let result = if routed.route == Route::Local {
-        app.gate_output(routed.request, req.position).await
+        app.gate_output(routed.request, req.channel, req.position)
+            .await
     } else {
         // The owning isolate should route the cell locally; if it moved off the
         // node mid-call, fail closed rather than acknowledge an unproven write.
@@ -316,11 +402,124 @@ async fn dispatch_gate(app: AppHandle, req: celld::js::GateReq) {
     let _ = req.reply.send(result);
 }
 
+/// Propagates a forwarding-side cancellation over the authenticated peer
+/// protocol. Dropping a Reqwest future does not guarantee that its pooled
+/// HTTP/1 transport closes, so the owner cannot use transport EOF alone.
+struct RemoteFetchAbortGuard {
+    http: reqwest::Client,
+    auth: Arc<PeerAuth>,
+    node: String,
+    addr: String,
+    scope: String,
+    request: Option<celld::js::RequestId>,
+    phase: &'static str,
+}
+
+impl RemoteFetchAbortGuard {
+    fn new(
+        app: &AppHandle,
+        node: String,
+        addr: String,
+        scope: String,
+        request: Option<celld::js::RequestId>,
+    ) -> Self {
+        Self {
+            http: app.peer_http.clone(),
+            auth: app.peer_auth.clone(),
+            node,
+            addr,
+            scope,
+            request,
+            phase: "response_head",
+        }
+    }
+
+    fn body_active(&mut self) {
+        self.phase = "response_body";
+    }
+
+    fn disarm(&mut self) {
+        self.request = None;
+    }
+}
+
+impl Drop for RemoteFetchAbortGuard {
+    fn drop(&mut self) {
+        let Some(request) = self.request.take() else {
+            return;
+        };
+        let http = self.http.clone();
+        let auth = self.auth.clone();
+        let node = self.node.clone();
+        let addr = self.addr.clone();
+        let scope = self.scope.clone();
+        let phase = self.phase;
+        celld::asyncrt::op_handle().spawn(async move {
+            let abort = send_peer_abort(http, auth, node.clone(), addr, scope.clone(), request);
+            match tokio::time::timeout(std::time::Duration::from_secs(2), abort).await {
+                Ok(Ok(())) => tracing::debug!(
+                    event = "peer_fetch_abort_sent",
+                    %node,
+                    %scope,
+                    request_id = %celld::js::request_id_string(request),
+                    phase,
+                    "propagated a disconnected caller to the cell owner"
+                ),
+                Ok(Err(error)) => tracing::debug!(
+                    event = "peer_fetch_abort_failed",
+                    %node,
+                    %scope,
+                    %error,
+                    "could not propagate a disconnected caller to the cell owner"
+                ),
+                Err(_) => tracing::debug!(
+                    event = "peer_fetch_abort_timed_out",
+                    %node,
+                    %scope,
+                    "timed out propagating a disconnected caller to the cell owner"
+                ),
+            }
+        });
+    }
+}
+
+async fn send_peer_abort(
+    http: reqwest::Client,
+    auth: Arc<PeerAuth>,
+    node: String,
+    addr: String,
+    scope: String,
+    request: celld::js::RequestId,
+) -> anyhow::Result<()> {
+    let encoded_scope =
+        percent_encoding::utf8_percent_encode(&scope, percent_encoding::NON_ALPHANUMERIC);
+    let path = format!(
+        "/peer/abort/{encoded_scope}/{}",
+        celld::js::request_id_string(request)
+    );
+    let request = auth.sign(
+        http.post(format!("http://{addr}{path}")),
+        "POST",
+        &path,
+        &[],
+        &node,
+    )?;
+    let response = request.body(Vec::new()).send().await?;
+    peer_auth::validate_response(response.headers())?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "peer abort failed with {}",
+        response.status()
+    );
+    Ok(())
+}
+
 /// Call the reserved cron cell's arm endpoint, through the ordinary Durable
 /// Object routing path so ownership resolution and remote forwarding are the
 /// ones every other call gets.
 async fn arm_cron_schedule(app: AppHandle, cell: String) -> anyhow::Result<()> {
     let (reply, receive) = tokio::sync::oneshot::channel();
+    let body = celld::js::RequestBody::Bytes(Bytes::new());
     dispatch_do_call(
         app,
         DoCallReq {
@@ -331,7 +530,8 @@ async fn arm_cron_schedule(app: AppHandle, cell: String) -> anyhow::Result<()> {
             name: None,
             url: "https://cron.celld.internal/arm".to_string(),
             method: "POST".to_string(),
-            body: Vec::new(),
+            body_guard: celld::js::RequestBodyGuard::of(&body),
+            body,
             headers: Vec::new(),
             reply,
             order: None,
@@ -346,6 +546,274 @@ async fn arm_cron_schedule(app: AppHandle, cell: String) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Arm the current deployment's cron schedule, if it declares one.
+///
+/// A cron cell has no client to wake it, so somebody has to make the first
+/// call; every node makes it, and ownership CAS decides which one keeps the
+/// cell while the others route to that owner. No new election, no reserved
+/// node -- the same arbiter that makes an alarm fire once per fleet makes a
+/// cron trigger fire once too. Boot and adoption both come through here, so
+/// a schedule change arrives with the deployment that carries it.
+fn spawn_cron_arm(app: AppHandle) {
+    let Some(cell) = app.runtime.as_ref().and_then(|runtime| runtime.cron_cell()) else {
+        return;
+    };
+    tokio::spawn(async move {
+        // Routing needs node authority, exactly as the wake scan does.
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        while !app.healthy().await {
+            if Instant::now() >= deadline {
+                tracing::warn!(cell, "cron schedule not armed: no node authority");
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // A failed arm leaves the schedule silent until the next adoption,
+        // so retry rather than log once. The backoff is bounded because a
+        // fleet that cannot route for a minute has a larger problem.
+        for attempt in 0..5 {
+            match arm_cron_schedule(app.clone(), cell.clone()).await {
+                Ok(()) => return,
+                Err(error) if attempt == 4 => {
+                    tracing::error!(cell, %error, "cron schedule not armed");
+                }
+                Err(error) => {
+                    tracing::warn!(cell, %error, attempt, "cron arm failed, retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(500 << attempt.min(5)))
+                        .await;
+                }
+            }
+        }
+    });
+}
+
+/// Adopt the deployment `pointer` names.
+///
+/// The same two calls boot makes -- `DeploymentGraph::load` and
+/// `Generation::build` -- then the flip and the cron arm. A build that fails
+/// leaves the current generation serving; nothing has changed until `adopt`.
+async fn adopt_deployment(
+    app: &AppHandle,
+    bucket: &Bucket,
+    node: &str,
+    region: &str,
+    pointer: DeployPointer,
+    force: bool,
+) -> ReloadOutcome {
+    let Some(runtime) = app.runtime.as_ref() else {
+        return ReloadOutcome::Failed {
+            version: pointer.version,
+            prefix: pointer.prefix,
+            error: "this node has no Worker runtime".to_string(),
+        };
+    };
+    let current = runtime.generation();
+    if !force && pointer.version == current.version() && pointer.prefix == current.prefix() {
+        return ReloadOutcome::Unchanged {
+            generation: current.id(),
+            version: current.version().to_string(),
+        };
+    }
+    let failed = |error: String| ReloadOutcome::Failed {
+        version: pointer.version.clone(),
+        prefix: pointer.prefix.clone(),
+        error,
+    };
+    let graph = match DeploymentGraph::load(bucket, node.to_string()).await {
+        Ok(graph) => graph,
+        Err(error) => return failed(format!("{error:#}")),
+    };
+    let id = runtime.next_generation_id();
+    let options = GenerationOptions {
+        loader_binding: worker_loader_binding(),
+        node: node.to_string(),
+        region: region.to_string(),
+    };
+    // Building compiles every script, so it runs on a blocking thread.
+    let built = tokio::task::spawn_blocking(move || Generation::build(id, graph, options)).await;
+    let generation = match built {
+        Ok(Ok(generation)) => generation,
+        Ok(Err(error)) => return failed(format!("{error:#}")),
+        Err(error) => return failed(format!("generation build panicked: {error}")),
+    };
+    let adopted = runtime.adopt(generation);
+    // Tell the core, so resident cells move to the new generation at their
+    // safe points. The reserved cells move at once, ahead of the cron arm
+    // below, which must reach a cron cell already running the new schedule.
+    let _ = app.tx.send(Message::GenerationChanged {
+        generation: adopted.id(),
+        max_age_ms: celld::generation::max_age().as_millis() as u64,
+        eager_classes: adopted.reserved_classes(),
+    });
+    spawn_cron_arm(app.clone());
+    ReloadOutcome::Adopted {
+        generation: adopted.id(),
+        version: adopted.version().to_string(),
+        prefix: adopted.prefix().to_string(),
+    }
+}
+
+/// The pointer watcher: the node's one reader of `deploy/current.json`
+/// after boot.
+///
+/// It polls on a slow interval and adopts what the pointer names through
+/// `adopt_deployment`; a `POST /reload` or a managed notification only makes
+/// it look now. The pointer is the authority, so a missed nudge degrades to
+/// "adopts one interval later". A version that failed to build is remembered
+/// and not retried until the pointer names something else or a reload is
+/// forced: a broken bundle must not recompile every interval on every node.
+fn start_pointer_watcher(
+    app: AppHandle,
+    bucket: Bucket,
+    node: String,
+    region: String,
+    mut requests: celld::generation::ReloadReceiver,
+) {
+    tokio::spawn(async move {
+        let period = celld::generation::poll_interval();
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut failed: Option<ReloadOutcome> = None;
+        loop {
+            let request = celld::asyncrt::select! {
+                _ = tick.tick() => ReloadRequest { force: false, reply: None },
+                request = requests.recv() => match request {
+                    Some(request) => request,
+                    None => return,
+                },
+            };
+            let outcome = match fleet::read_current_pointer(&bucket).await {
+                Err(error) => {
+                    tracing::warn!(event = "deployment_pointer_unreadable", %error);
+                    ReloadOutcome::Failed {
+                        version: String::new(),
+                        prefix: String::new(),
+                        error: format!("{error:#}"),
+                    }
+                }
+                Ok(pointer) => match &failed {
+                    Some(ReloadOutcome::Failed {
+                        version, prefix, ..
+                    }) if !request.force
+                        && version == &pointer.version
+                        && prefix == &pointer.prefix =>
+                    {
+                        failed.clone().expect("matched above")
+                    }
+                    _ => {
+                        adopt_deployment(&app, &bucket, &node, &region, pointer, request.force)
+                            .await
+                    }
+                },
+            };
+            match &outcome {
+                ReloadOutcome::Adopted {
+                    generation,
+                    version,
+                    prefix,
+                } => {
+                    failed = None;
+                    tracing::info!(
+                        event = "deployment_adopted",
+                        generation,
+                        version = %version,
+                        prefix = %prefix,
+                        "deployment adopted in place"
+                    );
+                }
+                ReloadOutcome::Unchanged { .. } => {}
+                ReloadOutcome::Failed {
+                    version,
+                    prefix,
+                    error,
+                } => {
+                    if failed.as_ref() != Some(&outcome) {
+                        tracing::error!(
+                            event = "deployment_adoption_failed",
+                            version = %version,
+                            prefix = %prefix,
+                            %error,
+                            "deployment did not build; the current generation keeps serving"
+                        );
+                    }
+                    if !version.is_empty() {
+                        failed = Some(outcome.clone());
+                    }
+                }
+            }
+            if let Some(reply) = request.reply {
+                let _ = reply.send(outcome);
+            }
+        }
+    });
+}
+
+/// `POST /reload`: adopt the pointer's deployment now and report the outcome.
+/// Forced, so an unchanged pointer still builds a new generation and a vars
+/// file edit takes effect.
+async fn internal_reload(app: AppHandle) -> HttpReply {
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    let sent = app
+        .reload
+        .send(ReloadRequest {
+            force: true,
+            reply: Some(reply),
+        })
+        .is_ok();
+    let outcome = if sent { receive.await.ok() } else { None };
+    let (status, body) = match outcome {
+        Some(ReloadOutcome::Adopted {
+            generation,
+            version,
+            prefix,
+        }) => (
+            StatusCode::OK,
+            serde_json::json!({
+                "ok": true,
+                "outcome": "adopted",
+                "generation": generation,
+                "version": version,
+                "prefix": prefix,
+            }),
+        ),
+        Some(ReloadOutcome::Unchanged {
+            generation,
+            version,
+        }) => (
+            StatusCode::OK,
+            serde_json::json!({
+                "ok": true,
+                "outcome": "unchanged",
+                "generation": generation,
+                "version": version,
+            }),
+        ),
+        Some(ReloadOutcome::Failed {
+            version,
+            prefix,
+            error,
+        }) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({
+                "ok": false,
+                "outcome": "failed",
+                "version": version,
+                "prefix": prefix,
+                "error": error,
+            }),
+        ),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "ok": false,
+                "outcome": "unavailable",
+                "error": "this node has no deployment pointer to reload from",
+            }),
+        ),
+    };
+    response(status, body.to_string())
+}
+
 async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
     let DoCallReq {
         request_id,
@@ -356,6 +824,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
         url,
         method,
         body,
+        mut body_guard,
         headers,
         reply,
         order,
@@ -375,6 +844,9 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
             attempts: 0,
         });
     let operation = async {
+        // Reclaims a streamed body abandoned by an early error below. A local
+        // target or the peer HTTP body takes ownership before this guard is
+        // disarmed.
         anyhow::ensure!(
             celld_logic::cell::valid_cell_scope(&scope),
             "cell scope is malformed or exceeds the fleet storage limit"
@@ -398,7 +870,8 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                 route.await
             } else {
                 match cancel.as_mut() {
-                    Some(cancel) => celld::asyncrt::select! {
+                    Some(cancel) => celld::asyncrt::select_biased! {
+                        "a cancellation that ties route resolution prevents dispatch from starting";
                         _ = cancel => break Err(anyhow::anyhow!("Durable Object call cancelled")),
                         routed = route => routed,
                     },
@@ -426,7 +899,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
             let (node, addr, epoch, peer_protocol) = match route {
                 Route::Local => {
                     let dispatch_started = Instant::now();
-                    let _activity = app.activity(request, scope.clone());
+                    let activity = app.activity_for(request, scope.clone(), request_id, "local");
                     let result = async {
                         let runtime = app.runtime.as_ref().context("no cell runtime")?;
                         let response = runtime
@@ -449,7 +922,11 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                                 cancel.take(),
                             )
                             .await?;
-                        if let Some(target) = &response.ws {
+                        // `fetch_cell` cannot return a response until the cell
+                        // has installed its request context. That context now
+                        // owns an unread tail through its waitUntil work.
+                        body_guard.disarm();
+                        if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
                             let kind = if celld::js::ws_hibernatable(target.id).unwrap_or(false) {
                                 WebSocketKind::Hibernatable
                             } else {
@@ -468,12 +945,37 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                     // acknowledges a write the node cannot prove durable.
                     let result = match result {
                         Ok(response) if app.output_gate => {
-                            match app.gate_output(request, response.write_position).await {
+                            activity.set_phase("output_gate", false, false);
+                            if let Some(position) = response.write_position {
+                                activity.gate_started(position);
+                            }
+                            let gated = app
+                                .gate_output(
+                                    request,
+                                    celld_logic::Channel::Response,
+                                    response.write_position,
+                                )
+                                .await;
+                            activity.gate_finished(gated.is_ok());
+                            match gated {
                                 Ok(()) => Ok(response),
                                 Err(error) => Err(anyhow::Error::new(RoutedRequestError(error))),
                             }
                         }
                         Ok(response) => Ok(response),
+                        Err(error) => Err(error),
+                    };
+                    let result = match result {
+                        Ok(mut response) => {
+                            let body_active = response.stream.is_some();
+                            activity.set_phase("response_body", true, body_active);
+                            if let Some(stream) = response.stream.take() {
+                                response.stream = Some(local_response_stream(stream, activity));
+                            } else {
+                                drop(activity);
+                            }
+                            Ok(response)
+                        }
                         Err(error) => Err(error),
                     };
                     if let Some(timing) = websocket_timing.as_mut() {
@@ -499,105 +1001,139 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                 } => (node, addr, epoch, peer_protocol),
             };
             let dispatch_started = Instant::now();
+            let streamed_attempt = matches!(body, celld::js::RequestBody::Stream(_));
             let remote_call = async {
                 anyhow::ensure!(
                     peer_protocol == peer_auth::PROTOCOL_VERSION,
                     "peer {node} speaks incompatible protocol {peer_protocol}"
                 );
-                let encoded = serde_json::json!({
-                    "name": &name,
-                    "url": &url,
-                    "method": &method,
-                    "bodyBase64": base64::engine::general_purpose::STANDARD.encode(&body),
-                    "headers": &headers,
-                    "requestId": request_id.map(celld::js::request_id_string),
-                    "capacityHandoff": epoch == 0,
-                });
-                let encoded = serde_json::to_vec(&encoded)?;
-                let path = format!("/__do/{scope}");
-                let request = app.peer_auth.sign(
-                    app.peer_http.post(format!("http://{addr}{path}")),
-                    "POST",
-                    &path,
-                    &encoded,
-                    &node,
-                )?;
-                let response =
-                    request.body(encoded).send().await.map_err(|error| {
-                        owner_unreachable(&scope, &addr, anyhow::Error::new(error))
-                    })?;
-                peer_auth::validate_response(response.headers())?;
-                if response
-                    .headers()
-                    .get(STALE_ROUTE_HEADER)
-                    .is_some_and(|value| value == STALE_ROUTE_VALUE)
                 {
-                    return Err(owner_unreachable(
-                        &scope,
-                        &addr,
-                        anyhow::Error::new(StalePeerRoute {
-                            scope: scope.clone(),
-                        }),
-                    ));
-                }
-                let mut websocket: Option<celld::js::WsTarget> = response
-                    .headers()
-                    .get("x-celld-ws-target")
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| serde_json::from_str(value).ok());
-                if let Some(target) = websocket.as_mut() {
-                    target.peer_node = Some(node.clone());
-                    target.peer_addr = Some(addr.clone());
-                    target.peer_epoch = Some(epoch);
-                }
-                let status = if websocket.is_some() && response.status() == StatusCode::OK {
-                    101
-                } else {
-                    response.status().as_u16()
-                };
-                let headers = response
-                    .headers()
-                    .iter()
-                    .filter(|(name, _)| {
-                        name.as_str() != "x-celld-ws-target"
-                            && name.as_str() != "x-celld-body-stream"
-                    })
-                    .filter_map(|(name, value)| {
-                        value
-                            .to_str()
-                            .ok()
-                            .map(|value| (name.to_string(), value.to_string()))
-                    })
-                    .collect();
-                let (body, stream) = if websocket.is_some() {
-                    (Vec::new(), None)
-                } else {
-                    // Every proxied body streams through, marked or not. The
-                    // owner already ran the request, so a failure mid-body is
-                    // ambiguous and must surface without a redispatch -- and
-                    // streaming makes that structural: the 200 head has gone
-                    // out before the failure is known, a chunk error aborts
-                    // the client's read instead of ending it cleanly, and
-                    // nothing upstream of a sent head can re-send. Buffering
-                    // here was the old shape; it turned a truncated body into
-                    // a whole-response failure after the owner had committed.
-                    (
-                        Vec::new(),
-                        Some(celld::js::reqwest_response_stream(response)),
+                    let control = peer_tunnel::TunnelControl {
+                        scope: scope.clone(),
+                        name: name.clone(),
+                        request_id,
+                        capacity_handoff: epoch == 0,
+                    };
+                    let attempt_body = match &body {
+                        celld::js::RequestBody::Bytes(bytes) => {
+                            celld::js::RequestBody::Bytes(bytes.clone())
+                        }
+                        celld::js::RequestBody::Stream(stream_id) => {
+                            celld::js::RequestBody::Stream(*stream_id)
+                        }
+                    };
+                    let mut abort = RemoteFetchAbortGuard::new(
+                        &app,
+                        node.clone(),
+                        addr.clone(),
+                        scope.clone(),
+                        request_id,
+                    );
+                    let response = peer_tunnel::fetch(
+                        &peer_tunnel::Peer {
+                            http: &app.peer_http,
+                            auth: &app.peer_auth,
+                            addr: &addr,
+                            node: &node,
+                        },
+                        &control,
+                        url.clone(),
+                        method.clone(),
+                        headers.clone(),
+                        attempt_body,
                     )
-                };
-                Ok(HttpResponse {
-                    status,
-                    headers,
-                    body,
-                    ws: websocket,
-                    stream,
-                    // A proxied remote response wrote on the owner, not here.
-                    write_position: None,
-                })
+                    .await
+                    .map_err(|error| owner_unreachable(&scope, &addr, error))?;
+                    // Only after the tunnel has taken the stream: `disarm`
+                    // releases the guard's registry claim, and a claim that
+                    // drops to zero deletes the entry, so disarming before
+                    // the take deletes the body out from under the attempt.
+                    // An error above keeps the guard armed so an untaken
+                    // stream is still cleaned up.
+                    body_guard.disarm();
+                    if response
+                        .headers()
+                        .get(STALE_ROUTE_HEADER)
+                        .is_some_and(|value| value == STALE_ROUTE_VALUE)
+                    {
+                        abort.disarm();
+                        return Err(owner_unreachable(
+                            &scope,
+                            &addr,
+                            anyhow::Error::new(StalePeerRoute {
+                                scope: scope.clone(),
+                            }),
+                        ));
+                    }
+                    let status = response.status().as_u16();
+                    if status == 101 {
+                        // A tunneled upgrade: the inner 101 is the cell's
+                        // own handshake for this client's key. Park the
+                        // inner upgrade; once this node's client socket
+                        // upgrades, the two splice and the hop copies
+                        // bytes. The handshake fields are dropped because
+                        // the client-facing 101 regenerates them.
+                        let response_headers = response
+                            .headers()
+                            .iter()
+                            .filter(|(header, _)| {
+                                let header = header.as_str();
+                                header != "upgrade"
+                                    && header != "connection"
+                                    && header != "sec-websocket-accept"
+                            })
+                            .filter_map(|(header, value)| {
+                                value
+                                    .to_str()
+                                    .ok()
+                                    .map(|value| (header.to_string(), value.to_string()))
+                            })
+                            .collect();
+                        abort.disarm();
+                        let mut response = response;
+                        let parked = peer_tunnel::park_upgrade(hyper::upgrade::on(&mut response));
+                        return Ok(HttpResponse {
+                            status,
+                            headers: response_headers,
+                            body: Vec::new(),
+                            websocket: Some(HttpResponseWebSocket::Cell(celld::js::WsTarget {
+                                id: 0,
+                                scope: scope.clone(),
+                                tunnel: Some(parked),
+                            })),
+                            stream: None,
+                            write_position: None,
+                        });
+                    }
+                    let response_headers = response
+                        .headers()
+                        .iter()
+                        .filter_map(|(header, value)| {
+                            value
+                                .to_str()
+                                .ok()
+                                .map(|value| (header.to_string(), value.to_string()))
+                        })
+                        .collect();
+                    let stream = forwarder_response_stream(
+                        peer_tunnel::response_stream(response.into_body()),
+                        abort,
+                    );
+                    Ok(HttpResponse {
+                        status,
+                        headers: response_headers,
+                        body: Vec::new(),
+                        websocket: None,
+                        stream: Some(stream),
+                        // A proxied remote response wrote on the owner, not
+                        // here.
+                        write_position: None,
+                    })
+                }
             };
             let remote = match cancel.as_mut() {
-                Some(cancel) => celld::asyncrt::select! {
+                Some(cancel) => celld::asyncrt::select_biased! {
+                    "a cancellation that ties the remote response prevents returning abandoned work";
                     _ = cancel => break Err(anyhow::anyhow!("Durable Object call cancelled")),
                     remote = remote_call => remote,
                 },
@@ -616,9 +1152,16 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                     break Ok(response);
                 }
                 Err(error) => {
-                    // Epoch zero is a candidate, not an owner. A signed peer
-                    // refusal proves this attempt did not execute and should
-                    // not consume the ordinary one-owner stale-route budget;
+                    // A streamed upload is not replayable after the HTTP
+                    // client starts pulling it. Retrying would send only the
+                    // unread suffix as a new request, so fail this attempt
+                    // instead of manufacturing a truncated body.
+                    if streamed_attempt {
+                        break Err(error);
+                    }
+                    // Epoch zero is a candidate, not an owner. A peer refusal
+                    // proves this attempt did not execute and must not consume
+                    // the ordinary one-owner stale-route budget;
                     // the core excludes that exact load sample before the
                     // next deterministic placement decision.
                     let capacity_refused = epoch == 0
@@ -627,6 +1170,12 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                             .any(|cause| cause.downcast_ref::<StalePeerRoute>().is_some());
                     if capacity_refused {
                         app.invalidate_remote(scope.clone(), node, epoch).await;
+                        // Pace this unbounded retry. Each attempt now costs a
+                        // fresh tunnel connection, and a tight loop against a
+                        // candidate that is still restoring floods the client
+                        // ephemeral-port range into TIME_WAIT (os error 49),
+                        // which then poisons every dial for the next 15s.
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                         continue;
                     }
                     let attempt = classify_remote_attempt(&error);
@@ -680,9 +1229,13 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                     // activity guard is still alive, so the cell stays pinned
                     // across the wait.
                     if app.output_gate {
-                        app.gate_output(request, outcome.write_position)
-                            .await
-                            .map_err(|error| anyhow::Error::new(RoutedRequestError(error)))?;
+                        app.gate_output(
+                            request,
+                            celld_logic::Channel::Response,
+                            outcome.write_position,
+                        )
+                        .await
+                        .map_err(|error| anyhow::Error::new(RoutedRequestError(error)))?;
                     }
                     return Ok(outcome.data);
                 }
@@ -697,63 +1250,68 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                 peer_protocol == peer_auth::PROTOCOL_VERSION,
                 "peer {node} speaks incompatible protocol {peer_protocol}"
             );
-            let structured = matches!(args, celld::js::RpcData::V8(_));
-            let envelope = match &args {
-                celld::js::RpcData::Json(json) => serde_json::json!({
-                    "name": &name,
-                    "method": &method,
-                    "args": serde_json::from_str::<serde_json::Value>(json)
-                        .unwrap_or_else(|_| serde_json::json!([])),
-                }),
-                celld::js::RpcData::V8(bytes) => serde_json::json!({
-                    "name": &name,
-                    "method": &method,
-                    "sc": base64::engine::general_purpose::STANDARD.encode(bytes),
-                }),
-            };
-            let encoded = serde_json::to_vec(&envelope)?;
-            let path = format!("/__rpc/{scope}");
-            let request = app.peer_auth.sign(
-                app.peer_http.post(format!("http://{addr}{path}")),
-                "POST",
-                &path,
-                &encoded,
-                &node,
-            )?;
-            let response = request.body(encoded).send().await;
-            let response = match response {
-                Ok(response) => response,
-                Err(error) => {
-                    let attempt = classify_remote_attempt(&anyhow::Error::new(error));
-                    if dispatcher.redispatch(attempt) {
+            let expects_structured_response = matches!(args, celld::js::RpcData::V8(_));
+            {
+                let response = peer_tunnel::rpc(
+                    &peer_tunnel::Peer {
+                        http: &app.peer_http,
+                        auth: &app.peer_auth,
+                        addr: &addr,
+                        node: &node,
+                    },
+                    &scope,
+                    name.as_deref(),
+                    &method,
+                    &args,
+                )
+                .await;
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let attempt = classify_remote_attempt(&error);
+                        if dispatcher.redispatch(attempt) {
+                            app.invalidate_remote(scope.clone(), node, epoch).await;
+                            continue;
+                        }
+                        return Err(anyhow::anyhow!("remote RPC transport failed: {error:#}"));
+                    }
+                };
+                if response
+                    .headers()
+                    .get(STALE_ROUTE_HEADER)
+                    .is_some_and(|value| value == STALE_ROUTE_VALUE)
+                {
+                    if dispatcher.redispatch(celld_logic::routing::Attempt::NotOwner) {
                         app.invalidate_remote(scope.clone(), node, epoch).await;
                         continue;
                     }
-                    return Err(anyhow::anyhow!("remote RPC transport failed"));
+                    anyhow::bail!("remote RPC owner was stale");
                 }
-            };
-            peer_auth::validate_response(response.headers())?;
-            if response
-                .headers()
-                .get(STALE_ROUTE_HEADER)
-                .is_some_and(|value| value == STALE_ROUTE_VALUE)
-            {
-                if dispatcher.redispatch(celld_logic::routing::Attempt::NotOwner) {
-                    app.invalidate_remote(scope.clone(), node, epoch).await;
-                    continue;
+                if response.status() == StatusCode::SERVICE_UNAVAILABLE
+                    && response
+                        .headers()
+                        .get("x-celld-overload")
+                        .is_some_and(|value| value == "cell")
+                {
+                    return Err(anyhow::Error::new(celld::js::CellOverloaded));
                 }
-                anyhow::bail!("remote RPC owner was stale");
+                anyhow::ensure!(
+                    response.status().is_success(),
+                    "remote RPC failed with {}",
+                    response.status()
+                );
+                let body = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("remote RPC body: {error}"))?
+                    .to_bytes();
+                return Ok(if expects_structured_response {
+                    celld::js::RpcData::V8(body)
+                } else {
+                    celld::js::RpcData::Json(String::from_utf8_lossy(&body).into_owned())
+                });
             }
-            anyhow::ensure!(
-                response.status().is_success(),
-                "remote RPC failed with {}",
-                response.status()
-            );
-            return Ok(if structured {
-                celld::js::RpcData::V8(response.bytes().await?.to_vec())
-            } else {
-                celld::js::RpcData::Json(response.text().await?)
-            });
         }
     }
     .await;
@@ -763,14 +1321,12 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
 async fn request_payload(
     request: Request<Incoming>,
     trust_forwarded_headers: bool,
+    max_body_bytes: usize,
 ) -> Result<(String, String, Vec<u8>, Vec<(String, String)>), HttpReply> {
     let (parts, body) = request.into_parts();
-    let body = body.collect().await.map_err(|error| {
-        response(
-            StatusCode::BAD_REQUEST,
-            format!("request body failed: {error}"),
-        )
-    })?;
+    let body = collect_limited_body(body, max_body_bytes)
+        .await
+        .map_err(|error| body_read_error("request", error))?;
     let headers = parts
         .headers
         .iter()
@@ -784,7 +1340,7 @@ async fn request_payload(
     Ok((
         request_url(&parts, trust_forwarded_headers),
         parts.method.to_string(),
-        body.to_bytes().to_vec(),
+        body.to_vec(),
         headers,
     ))
 }
@@ -797,13 +1353,157 @@ async fn request_payload(
 /// operations that read it in parts. The host also streams a body that
 /// declares no length, because the host cannot know the size of that body.
 const INGRESS_STREAM_THRESHOLD: u64 = 1 << 20;
+/// Peer fetches and RPC calls can carry the same application data as public
+/// ingress. The frame needs room for its bounded metadata in addition to the
+/// application body.
+const MAX_PEER_FORWARD_BODY_BYTES: usize = DEFAULT_MAX_REQUEST_BODY_BYTES + (1 << 20);
+/// Operator requests carry JSON commands, migration SQL, or workflow event
+/// arguments. The 64 MiB ceiling leaves headroom above the 32 MiB D1 result
+/// contract without giving an operator route the 1 GiB forwarding allowance.
+const MAX_PEER_PROTOCOL_BODY_BYTES: usize = 64 << 20;
+/// Control messages contain identifiers and counters, not application data.
+const MAX_PEER_CONTROL_BODY_BYTES: usize = 64 << 10;
+const INTERNAL_LOG_APPEND_PATH: &str = "/peer/log/append";
+/// A streamed body crosses the isolate boundary through a string-only error
+/// channel. Keep one private marker in that string so the HTTP entry point can
+/// restore status 413; a generic stream error would turn the refusal into 500.
+const BODY_LIMIT_STREAM_ERROR: &str = "celld request body limit exceeded";
+
+enum BodyReadError {
+    TooLarge,
+    Invalid(String),
+}
+
+async fn collect_limited_body(body: Incoming, limit: usize) -> Result<Bytes, BodyReadError> {
+    if body.size_hint().lower() > limit as u64 {
+        return Err(BodyReadError::TooLarge);
+    }
+    Limited::new(body, limit)
+        .collect()
+        .await
+        .map(|body| body.to_bytes())
+        .map_err(|error| {
+            if error
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
+                BodyReadError::TooLarge
+            } else {
+                BodyReadError::Invalid(error.to_string())
+            }
+        })
+}
+
+fn body_read_error(context: &str, error: BodyReadError) -> HttpReply {
+    match error {
+        BodyReadError::TooLarge => {
+            response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
+        }
+        BodyReadError::Invalid(error) => response(
+            StatusCode::BAD_REQUEST,
+            format!("invalid {context} body: {error}"),
+        ),
+    }
+}
+
+fn request_body_limit_error(error: &anyhow::Error) -> bool {
+    // The Worker runtime adds context around a host-stream failure, so inspect
+    // the chain instead of requiring the marker to remain the top-level error.
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains(BODY_LIMIT_STREAM_ERROR))
+}
+
+fn cell_overload_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<celld::js::CellOverloaded>().is_some()
+            // A Queue producer call crosses V8's promise boundary before the
+            // public Worker response fails. The opaque text marker prevents an
+            // application error from accidentally receiving the 503 contract.
+            || cause
+                .to_string()
+                .contains(celld::js::CELL_OVERLOAD_ERROR_MARKER)
+    })
+}
+
+fn cell_overload_response() -> HttpReply {
+    let mut refused = response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{\"error\":\"cell admission refused\"}",
+    );
+    refused.headers_mut().insert(
+        hyper::header::RETRY_AFTER,
+        hyper::header::HeaderValue::from_static("1"),
+    );
+    refused.headers_mut().insert(
+        hyper::header::HeaderName::from_static("x-celld-overload"),
+        hyper::header::HeaderValue::from_static("cell"),
+    );
+    refused
+}
+
+// The peer parser returns before a streamed body can cross its limit, so this
+// error arrives from the Worker and must retain the ingress 413 contract.
+fn internal_do_worker_error(error: anyhow::Error) -> HttpReply {
+    if request_body_limit_error(&error) {
+        return response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+    }
+    if cell_overload_error(&error) {
+        return cell_overload_response();
+    }
+    response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("cell Worker failed: {error:#}"),
+    )
+}
 
 /// Divide an ingress request into its metadata and a body that the Worker
 /// can read. The function streams the body if one copy of the body costs
 /// more than the operations that read it in parts.
-fn ingress_payload(
+async fn ingress_payload(
     request: Request<Incoming>,
     trust_forwarded_headers: bool,
+    max_body_bytes: usize,
+) -> Result<
+    (
+        String,
+        String,
+        celld::js::RequestBody,
+        Vec<(String, String)>,
+    ),
+    HttpReply,
+> {
+    let declared = request
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|length| length > max_body_bytes as u64) {
+        return Err(response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body too large",
+        ));
+    }
+    let (url, method, body, headers, held) =
+        ingress_payload_parts(request, trust_forwarded_headers, max_body_bytes);
+    // The host collects a small body here. A read failure at this point
+    // can still return status 400. A streamed body has no such point,
+    // because that body fails while the handler reads it. The failure
+    // surfaces there instead.
+    let body = match held {
+        None => body,
+        Some(held) => match collect_limited_body(held, max_body_bytes).await {
+            Ok(collected) => celld::js::RequestBody::Bytes(collected),
+            Err(error) => return Err(body_read_error("request", error)),
+        },
+    };
+    Ok((url, method, body, headers))
+}
+
+fn ingress_payload_parts(
+    request: Request<Incoming>,
+    trust_forwarded_headers: bool,
+    max_body_bytes: usize,
 ) -> (
     String,
     String,
@@ -837,16 +1537,25 @@ fn ingress_payload(
         return (
             url,
             method,
-            celld::js::RequestBody::Bytes(Vec::new()),
+            celld::js::RequestBody::Bytes(Bytes::new()),
             headers,
             Some(body),
         );
     }
-    let chunks = body.into_data_stream().map(|chunk| {
-        chunk
-            .map(|bytes| bytes.to_vec())
-            .map_err(|error| error.to_string())
-    });
+    let chunks = Limited::new(body, max_body_bytes)
+        .into_data_stream()
+        .map(|chunk| {
+            chunk.map(|bytes| bytes.to_vec()).map_err(|error| {
+                if error
+                    .downcast_ref::<http_body_util::LengthLimitError>()
+                    .is_some()
+                {
+                    BODY_LIMIT_STREAM_ERROR.to_string()
+                } else {
+                    error.to_string()
+                }
+            })
+        });
     let stream_id = celld::js::register_body_stream(Box::pin(chunks));
     (
         url,
@@ -871,6 +1580,29 @@ fn malformed_scope() -> HttpReply {
     )
 }
 
+/// Can celld put this host in `request.url`?
+///
+/// `celld_logic::http::authority_decision` returns the complete sans-IO
+/// decision. A Punycode label is the one part that decision cannot settle,
+/// because deciding it is the whole of IDNA: `xn--a` passes every other rule
+/// and still makes `new URL(request.url)` throw inside a Worker.
+///
+/// So celld runs a parser only when the decision requires one. The parser is
+/// the same `url::Url::parse` that backs `URL` in the isolate, therefore this
+/// check agrees with the Worker by construction rather than by a rule celld
+/// keeps in step by hand.
+fn well_formed_host(host: &str) -> Option<&str> {
+    match celld_logic::http::authority_decision(host) {
+        celld_logic::http::AuthorityDecision::Reject => None,
+        celld_logic::http::AuthorityDecision::Use(host) => Some(host),
+        celld_logic::http::AuthorityDecision::NeedsUrlParser(host) => {
+            url::Url::parse(&format!("http://{host}/"))
+                .is_ok()
+                .then_some(host)
+        }
+    }
+}
+
 /// `request.url` controls application routing and absolute links, so celld
 /// does not let an untrusted forwarding header or request-target authority set
 /// its scheme or host. The path and query always come from the request target.
@@ -880,31 +1612,57 @@ fn malformed_scope() -> HttpReply {
 /// An operator can set `--trust-forwarded-headers` when a trusted proxy
 /// replaces both forwarded headers. The trusted read takes the last value
 /// because a proxy can append its value after a client-supplied value.
+///
+/// The host and the scheme are validated whatever their source. `Host` is
+/// client-controlled whenever no proxy sits in front, which is the default, so
+/// trusting its source is not the same as trusting its shape: an unchecked
+/// value moves the path into a fragment or a query. `well_formed_host` is the
+/// gate. A value that fails it is dropped rather than repaired, and the next
+/// source in the chain applies.
+/// A malformed `X-Forwarded-Host` therefore falls through to `Host`, and only
+/// an empty chain reaches the fallback host. `Host` can still carry a client
+/// value in that case, because a proxy often forwards it rather than replacing
+/// it, so the fall-through trades a known-safe host for a well-formed one. The
+/// gate is what makes that trade safe: neither value can reshape the URL, and
+/// no hostname in `request.url` is trustworthy anyway.
 fn request_url(parts: &hyper::http::request::Parts, trust_forwarded_headers: bool) -> String {
-    let header = |name: &str, take_last: bool| {
+    // A header can arrive as several lines as well as one comma-joined line,
+    // and `HeaderMap::get` returns only the first line. Select the actual final
+    // field before validating it. Skipping an unusable final field would expose
+    // an earlier client value again, which is the defect this gate prevents.
+    let last_value = |name: &str| {
+        parts
+            .headers
+            .get_all(name)
+            .into_iter()
+            .next_back()
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next_back())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let first_value = |name: &str| {
         parts
             .headers
             .get(name)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| {
-                if take_last {
-                    value.split(',').next_back()
-                } else {
-                    value.split(',').next()
-                }
-            })
+            .and_then(|value| value.split(',').next())
             .map(str::trim)
             .filter(|value| !value.is_empty())
     };
-    let forwarded = |name: &str| {
-        trust_forwarded_headers
-            .then(|| header(name, true))
-            .flatten()
-    };
+    let forwarded = |name: &str| trust_forwarded_headers.then(|| last_value(name)).flatten();
+
+    // The gate applies per source, not once at the end of the chain, so a
+    // malformed forwarded value falls through to `Host` instead of discarding
+    // the whole chain.
     let host = forwarded("x-forwarded-host")
-        .or_else(|| header("host", false))
+        .and_then(well_formed_host)
+        .or_else(|| first_value("host").and_then(well_formed_host))
         .unwrap_or("celld.local");
-    let scheme = forwarded("x-forwarded-proto").unwrap_or("http");
+    let canonical = |scheme: &str| celld_logic::http::canonical_scheme(scheme);
+    let scheme = forwarded("x-forwarded-proto")
+        .and_then(canonical)
+        .unwrap_or("http");
     let path_and_query = parts
         .uri
         .path_and_query()
@@ -923,15 +1681,17 @@ fn request_url(parts: &hyper::http::request::Parts, trust_forwarded_headers: boo
 ///
 /// Going through `dispatch_do_call` also inherits the redispatch policy and
 /// the cancellation channel, so a client that hangs up reaches the owner
-/// rather than only the node it connected to. `/do/` and `/__d1/` share this:
+/// rather than only the node it connected to. `/do/` and `/runtime/` share this:
 /// they differ in what they authenticate, not in how they reach a cell.
 async fn dispatch_cell_fetch(
     cell: String,
+    name: Option<String>,
     url: String,
     method: String,
-    body: Vec<u8>,
+    body: celld::js::RequestBody,
     headers: Vec<(String, String)>,
 ) -> HttpReply {
+    let preserve_representation_length = method.eq_ignore_ascii_case("HEAD");
     let (reply, receive) = oneshot::channel();
     let (cancel_tx, cancel) = oneshot::channel();
     let accepted = celld::js::submit_do_call(celld::js::DoCallReq {
@@ -942,17 +1702,17 @@ async fn dispatch_cell_fetch(
         cancel: Some(cancel),
         deliver_abort_to_handler: false,
         scope: cell,
-        name: None,
+        name,
         url,
         method,
+        body_guard: celld::js::RequestBodyGuard::of(&body),
         body,
         headers,
         reply,
         // An ingress call has no caller in this process to be ordered against.
         order: None,
-        // A direct-DO ingress caller's traceparent joins with the cross-node
-        // propagation work (otel.md phase 2), which is where remote parents of
-        // cell spans get their sampling decision.
+        // Cross-node trace propagation is not available here, so a direct-DO
+        // ingress starts without a remote parent.
         parent: None,
     });
     if !accepted {
@@ -963,7 +1723,13 @@ async fn dispatch_cell_fetch(
     }
     let _hangup = HangUp(Some(cancel_tx));
     match receive.await {
-        Ok(Ok(worker_response)) => runtime_response(worker_response),
+        Ok(Ok(worker_response)) => {
+            runtime_response(worker_response, preserve_representation_length)
+        }
+        Ok(Err(error)) if request_body_limit_error(&error) => {
+            response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
+        }
+        Ok(Err(error)) if cell_overload_error(&error) => cell_overload_response(),
         Ok(Err(error)) => match error.downcast_ref::<RoutedRequestError>() {
             Some(error) => response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -981,81 +1747,43 @@ async fn dispatch_cell_fetch(
     }
 }
 
-async fn internal_do(request: Request<Incoming>, app: AppHandle, scope: String) -> HttpReply {
-    let method = request.method().clone();
-    let path_and_query = request
-        .uri()
-        .path_and_query()
-        .map_or_else(|| request.uri().path().to_string(), ToString::to_string);
-    let request_headers = request.headers().clone();
-    let body = match request.into_body().collect().await {
-        Ok(body) => body.to_bytes(),
-        Err(error) => {
-            return peer_response(response(
-                StatusCode::BAD_REQUEST,
-                format!("invalid body: {error}"),
-            ));
-        }
-    };
-    if let Err(error) = app.peer_auth.verify(
-        &method,
-        &path_and_query,
-        &request_headers,
-        &body,
-        app.peer_auth.source(),
-    ) {
-        let mut denied = response(error.status(), error.message());
-        if matches!(error, peer_auth::VerifyError::WrongTarget) {
-            denied.headers_mut().insert(
-                hyper::header::HeaderName::from_static(STALE_ROUTE_HEADER),
-                hyper::header::HeaderValue::from_static(STALE_ROUTE_VALUE),
-            );
-        }
-        return peer_response(denied);
-    }
-    let value: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(value) => value,
-        Err(error) => {
-            return peer_response(response(
-                StatusCode::BAD_REQUEST,
-                format!("invalid JSON: {error}"),
-            ));
-        }
-    };
-    let url = value
-        .get("url")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("http://cell/")
-        .to_string();
-    let method = value
-        .get("method")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("GET")
-        .to_string();
-    let name = value
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let request_body = value
-        .get("bodyBase64")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|body| base64::engine::general_purpose::STANDARD.decode(body).ok())
-        .unwrap_or_default();
-    let headers = serde_json::from_value(
-        value
-            .get("headers")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!([])),
-    )
-    .unwrap_or_default();
-    let request_id = value
-        .get("requestId")
-        .and_then(serde_json::Value::as_str)
-        .and_then(celld::js::parse_request_id);
-    let capacity_handoff = value
-        .get("capacityHandoff")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+/// One forwarded cell fetch, after transport decode.
+pub(crate) struct ForwardedFetch {
+    pub(crate) name: Option<String>,
+    pub(crate) url: String,
+    pub(crate) method: String,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) request_id: Option<celld::js::RequestId>,
+    pub(crate) capacity_handoff: bool,
+}
+
+pub(crate) enum ForwardedFetchOutcome {
+    /// A plain application response, headers truthful — no sidecars.
+    Reply(HttpReply),
+    /// The cell accepted a WebSocket, already registered with the core.
+    /// The transport decides how the 101 reaches the caller.
+    WebSocket {
+        target: celld::js::WsTarget,
+        headers: Vec<(String, String)>,
+    },
+}
+
+pub(crate) async fn dispatch_forwarded_fetch(
+    app: AppHandle,
+    scope: String,
+    fetch: ForwardedFetch,
+    request_body: celld::js::RequestBody,
+) -> ForwardedFetchOutcome {
+    let ForwardedFetch {
+        name,
+        url,
+        method,
+        headers,
+        request_id,
+        capacity_handoff,
+    } = fetch;
+    let _request_body_guard = celld::js::RequestBodyGuard::of(&request_body);
+    let preserve_representation_length = method.eq_ignore_ascii_case("HEAD");
     let routed = if capacity_handoff {
         app.capacity_request(scope.clone()).await
     } else {
@@ -1066,9 +1794,12 @@ async fn internal_do(request: Request<Incoming>, app: AppHandle, scope: String) 
             request,
             route: Route::Local,
         }) => {
-            let _activity = app.activity(request, scope.clone());
+            let activity = app.activity_for(request, scope.clone(), request_id, "forwarded");
             let Some(runtime) = &app.runtime else {
-                return response(StatusCode::SERVICE_UNAVAILABLE, "no cell runtime");
+                return ForwardedFetchOutcome::Reply(response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no cell runtime",
+                ));
             };
             let abort_scope = scope.clone();
             // The forwarding node hangs up when its own client does, so this
@@ -1081,6 +1812,8 @@ async fn internal_do(request: Request<Incoming>, app: AppHandle, scope: String) 
                 runtime: runtime.clone(),
                 scope: abort_scope,
                 request_id,
+                drain_pins: app.drain_pins.clone(),
+                handler_active: true,
             };
             match runtime
                 .fetch_cell(
@@ -1092,8 +1825,8 @@ async fn internal_do(request: Request<Incoming>, app: AppHandle, scope: String) 
                         body: request_body,
                         headers,
                         request_id,
-                        // A peer's call has no caller in this process; its
-                        // trace context crossing nodes is phase 2.
+                        // A peer's call has no caller in this process, and the
+                        // peer protocol does not carry trace context.
                         order: None,
                         parent: None,
                     },
@@ -1101,27 +1834,35 @@ async fn internal_do(request: Request<Incoming>, app: AppHandle, scope: String) 
                 )
                 .await
             {
-                Ok(worker_response) => {
-                    abort.request_id = None;
+                Ok(mut worker_response) => {
+                    abort.handler_answered();
                     // Output gate (RPO=0): a peer-served handler that advanced
                     // the cell's committed position holds its reply until the
                     // cell is proven durable, exactly as the local dispatch
                     // path does. This path used to acknowledge unproven writes
-                    // — the loss the takeover tests catch. The activity guard
-                    // is still alive, so the request stays pinned across the
-                    // wait.
+                    // and could lose them during takeover. The activity guard
+                    // is still alive, so the request stays pinned across the wait.
                     if app.output_gate {
-                        if let Err(error) = app
-                            .gate_output(request, worker_response.write_position)
-                            .await
-                        {
-                            return peer_response(response(
+                        activity.set_phase("output_gate", false, false);
+                        if let Some(position) = worker_response.write_position {
+                            activity.gate_started(position);
+                        }
+                        let gated = app
+                            .gate_output(
+                                request,
+                                celld_logic::Channel::Response,
+                                worker_response.write_position,
+                            )
+                            .await;
+                        activity.gate_finished(gated.is_ok());
+                        if let Err(error) = gated {
+                            return ForwardedFetchOutcome::Reply(peer_response(response(
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 format!("durability unproven: {error:?}"),
-                            ));
+                            )));
                         }
                     }
-                    if let Some(target) = &worker_response.ws {
+                    if let Some(HttpResponseWebSocket::Cell(target)) = &worker_response.websocket {
                         let kind = if celld::js::ws_hibernatable(target.id).unwrap_or(false) {
                             WebSocketKind::Hibernatable
                         } else {
@@ -1131,18 +1872,34 @@ async fn internal_do(request: Request<Incoming>, app: AppHandle, scope: String) 
                             .websocket_opened(target.scope.clone(), target.id, kind)
                             .await
                         {
-                            return peer_response(response(
+                            return ForwardedFetchOutcome::Reply(peer_response(response(
                                 StatusCode::SERVICE_UNAVAILABLE,
                                 format!("WebSocket core registration failed: {error:#}"),
-                            ));
+                            )));
                         }
                     }
-                    peer_runtime_response(worker_response)
+                    if let Some(HttpResponseWebSocket::Cell(target)) =
+                        worker_response.websocket.take()
+                    {
+                        abort.disarm();
+                        drop(activity);
+                        return ForwardedFetchOutcome::WebSocket {
+                            target,
+                            headers: worker_response.headers,
+                        };
+                    }
+                    let body_active = worker_response.stream.is_some();
+                    activity.set_phase("response_body", true, body_active);
+                    if let Some(stream) = worker_response.stream.take() {
+                        worker_response.stream =
+                            Some(owner_response_stream(stream, activity, abort));
+                    } else {
+                        abort.disarm();
+                        drop(activity);
+                    }
+                    runtime_response(worker_response, preserve_representation_length)
                 }
-                Err(error) => response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("cell Worker failed: {error:#}"),
-                ),
+                Err(error) => internal_do_worker_error(error),
             }
         }
         Ok(Routed {
@@ -1169,19 +1926,14 @@ async fn internal_do(request: Request<Incoming>, app: AppHandle, scope: String) 
             format!("route failed: {error:?}"),
         ),
     };
-    peer_response(result)
+    ForwardedFetchOutcome::Reply(peer_response(result))
 }
 
 async fn internal_abort(request: Request<Incoming>, app: AppHandle, path: String) -> HttpReply {
     let (parts, body) = request.into_parts();
-    let body = match body.collect().await {
-        Ok(body) => body.to_bytes(),
-        Err(error) => {
-            return peer_response(response(
-                StatusCode::BAD_REQUEST,
-                format!("invalid abort body: {error}"),
-            ));
-        }
+    let body = match collect_limited_body(body, MAX_PEER_CONTROL_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(error) => return peer_response(body_read_error("abort", error)),
     };
     let path_and_query = parts
         .uri
@@ -1210,7 +1962,7 @@ async fn internal_abort(request: Request<Incoming>, app: AppHandle, path: String
         ));
     }
     let Some((encoded_scope, encoded_request)) = path
-        .strip_prefix("/__abort/")
+        .strip_prefix("/peer/abort/")
         .and_then(|rest| rest.rsplit_once('/'))
     else {
         return peer_response(response(StatusCode::BAD_REQUEST, "invalid abort target"));
@@ -1225,103 +1977,32 @@ async fn internal_abort(request: Request<Incoming>, app: AppHandle, path: String
     let Some(request_id) = celld::js::parse_request_id(encoded_request) else {
         return peer_response(response(StatusCode::BAD_REQUEST, "invalid request id"));
     };
-    let result = match app.request(scope.clone()).await {
-        Ok(Routed {
-            request,
-            route: Route::Local,
-        }) => {
-            let _activity = app.activity(request, scope.clone());
-            match &app.runtime {
-                Some(runtime) => {
-                    runtime.abort_fetch(&scope, request_id);
-                    response(StatusCode::NO_CONTENT, Bytes::new())
-                }
-                None => response(StatusCode::SERVICE_UNAVAILABLE, "no cell runtime"),
+    let result = match &app.runtime {
+        Some(runtime) => {
+            // The signed target is the exact node session that received the
+            // forwarded fetch. A cancellation must not route the cell again:
+            // routing can activate work solely to cancel a request that never
+            // arrived, and the request id is already process-wide.
+            let phase = app
+                .drain_pins
+                .cancel_request(request_id, "peer_abort_received");
+            if phase.is_none() || phase == Some("handler") {
+                runtime.abort_fetch(&scope, request_id);
             }
+            response(StatusCode::NO_CONTENT, Bytes::new())
         }
-        Ok(Routed {
-            route: Route::Remote { .. },
-            ..
-        }) => {
-            let mut stale = response(StatusCode::CONFLICT, "stale route");
-            stale.headers_mut().insert(
-                hyper::header::HeaderName::from_static(STALE_ROUTE_HEADER),
-                hyper::header::HeaderValue::from_static(STALE_ROUTE_VALUE),
-            );
-            stale
-        }
-        Err(error) => response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("abort route failed: {error:?}"),
-        ),
+        None => response(StatusCode::SERVICE_UNAVAILABLE, "no cell runtime"),
     };
     peer_response(result)
 }
 
-async fn internal_rpc(request: Request<Incoming>, app: AppHandle, scope: String) -> HttpReply {
-    let method = request.method().clone();
-    let path_and_query = request
-        .uri()
-        .path_and_query()
-        .map_or_else(|| request.uri().path().to_string(), ToString::to_string);
-    let request_headers = request.headers().clone();
-    let body = match request.into_body().collect().await {
-        Ok(body) => body.to_bytes(),
-        Err(error) => {
-            return peer_response(response(
-                StatusCode::BAD_REQUEST,
-                format!("invalid body: {error}"),
-            ));
-        }
-    };
-    if let Err(error) = app.peer_auth.verify(
-        &method,
-        &path_and_query,
-        &request_headers,
-        &body,
-        app.peer_auth.source(),
-    ) {
-        let mut denied = response(error.status(), error.message());
-        if matches!(error, peer_auth::VerifyError::WrongTarget) {
-            denied.headers_mut().insert(
-                hyper::header::HeaderName::from_static(STALE_ROUTE_HEADER),
-                hyper::header::HeaderValue::from_static(STALE_ROUTE_VALUE),
-            );
-        }
-        return peer_response(denied);
-    }
-    let value: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(value) => value,
-        Err(error) => {
-            return peer_response(response(
-                StatusCode::BAD_REQUEST,
-                format!("invalid JSON: {error}"),
-            ));
-        }
-    };
-    let name = value
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let rpc_method = value
-        .get("method")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let args = match value.get("sc").and_then(serde_json::Value::as_str) {
-        Some(bytes) => celld::js::RpcData::V8(
-            base64::engine::general_purpose::STANDARD
-                .decode(bytes)
-                .unwrap_or_default(),
-        ),
-        None => celld::js::RpcData::Json(
-            value
-                .get("args")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!([]))
-                .to_string(),
-        ),
-    };
+pub(crate) async fn dispatch_forwarded_rpc(
+    app: AppHandle,
+    scope: String,
+    name: Option<String>,
+    rpc_method: String,
+    args: celld::js::RpcData,
+) -> HttpReply {
     let result = match app.request(scope.clone()).await {
         Ok(Routed {
             request,
@@ -1337,7 +2018,14 @@ async fn internal_rpc(request: Request<Incoming>, app: AppHandle, scope: String)
             match runtime.rpc(scope, name, rpc_method, args).await {
                 Ok(outcome) => {
                     if app.output_gate {
-                        if let Err(error) = app.gate_output(request, outcome.write_position).await {
+                        if let Err(error) = app
+                            .gate_output(
+                                request,
+                                celld_logic::Channel::Response,
+                                outcome.write_position,
+                            )
+                            .await
+                        {
                             return peer_response(response(
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 format!("durability unproven: {error:?}"),
@@ -1379,12 +2067,13 @@ async fn internal_rpc(request: Request<Incoming>, app: AppHandle, scope: String)
                 .status(StatusCode::OK)
                 .header("content-type", "application/octet-stream")
                 .body(
-                    Full::new(Bytes::from(bytes))
+                    Full::new(bytes)
                         .map_err(|never| match never {})
                         .boxed_unsync(),
                 )
                 .expect("RPC clone response"),
         ),
+        Err(error) if cell_overload_error(&error) => peer_response(cell_overload_response()),
         Err(error) => peer_response(response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("RPC failed: {error:#}"),
@@ -1392,9 +2081,11 @@ async fn internal_rpc(request: Request<Incoming>, app: AppHandle, scope: String)
     }
 }
 
+#[path = "main/peer_tunnel.rs"]
+mod peer_tunnel;
 #[path = "main/websocket.rs"]
 mod websocket;
-use websocket::{handle_peer_websocket, handle_websocket, outbound_websocket_task};
+use websocket::{handle_websocket, outbound_websocket_task};
 
 async fn handle_ingress(
     request: Request<Incoming>,
@@ -1402,11 +2093,11 @@ async fn handle_ingress(
     connection: ConnectionWorkerRequests,
 ) -> HttpReply {
     if matches!(*request.method(), hyper::Method::GET | hyper::Method::HEAD) {
-        if let Some(resolver) = app
-            .asset_script
-            .as_deref()
-            .and_then(|script| app.assets.get(script))
-        {
+        // One snapshot for the asset decision and the Worker it may fall
+        // into, so a deployment adopted mid-request cannot serve the new
+        // generation's index with the old generation's Worker.
+        let generation = app.runtime.as_ref().map(RuntimeManager::generation);
+        if let Some(resolver) = generation.as_deref().and_then(Generation::ingress_assets) {
             let path = request.uri().path();
             if !resolver.should_run_worker_first(path) {
                 let head = request.method() == hyper::Method::HEAD;
@@ -1431,28 +2122,26 @@ async fn handle_ingress(
         }
     }
 
-    let (url, method, body, headers, held) = ingress_payload(request, app.trust_forwarded_headers);
-    // The host collects a small body here. A read failure at this point
-    // can still return status 400. A streamed body has no such point,
-    // because that body fails while the handler reads it. The failure
-    // surfaces there instead.
-    let body = match held {
-        None => body,
-        Some(held) => match held.collect().await {
-            Ok(collected) => celld::js::RequestBody::Bytes(collected.to_bytes().to_vec()),
-            Err(error) => {
-                return response(
-                    StatusCode::BAD_REQUEST,
-                    format!("request body failed: {error}"),
-                );
-            }
-        },
+    let (url, method, body, headers) = match ingress_payload(
+        request,
+        app.trust_forwarded_headers,
+        app.max_request_body_bytes,
+    )
+    .await
+    {
+        Ok(payload) => payload,
+        Err(response) => return response,
     };
+    let preserve_representation_length = method.eq_ignore_ascii_case("HEAD");
     match app
         .fetch_worker(url, method, body, headers, connection)
         .await
     {
-        Ok(worker_response) => runtime_response(worker_response),
+        Ok(worker_response) => runtime_response(worker_response, preserve_representation_length),
+        Err(error) if request_body_limit_error(&error) => {
+            response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
+        }
+        Err(error) if cell_overload_error(&error) => cell_overload_response(),
         Err(error) => match error.downcast_ref::<celld::pool::AdmitError>() {
             // Saturation is not a failure of the request. Answering it now
             // lets the caller retry or shed; holding the connection until its
@@ -1471,7 +2160,11 @@ async fn handle_ingress(
 }
 
 async fn dispatch_asset_call(app: AppHandle, call: AssetCallReq) {
-    let response = match app.assets.get(&call.script) {
+    let generation = app
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.generation_by_id(call.generation));
+    let response = match generation.as_deref().and_then(|g| g.assets(&call.script)) {
         Some(resolver) => {
             resolver
                 .binding_response(&call.url, &call.method, &call.headers)
@@ -1486,16 +2179,44 @@ async fn dispatch_asset_call(app: AppHandle, call: AssetCallReq) {
 }
 
 async fn dispatch_service_call(app: AppHandle, call: SvcCallReq) {
+    // The target request owns a streamed body once it starts. Keep a fallback
+    // guard here as well, so a missing runtime or a cancellation before
+    // admission cannot leave the source in the process registry.
+    let mut body_guard = call.body_guard;
     let response = match &app.runtime {
         Some(runtime) => {
             runtime
-                .fetch_service(
+                .fetch_service(ServiceFetch {
+                    generation: call.generation,
+                    script: call.script,
+                    url: call.url,
+                    method: call.method,
+                    body: call.body,
+                    headers: call.headers,
+                    cancel: call.cancel,
+                })
+                .await
+        }
+        None => Err(anyhow::anyhow!("no Worker runtime")),
+    };
+    if response.is_ok() {
+        // A successful response proves that the target installed its request
+        // context. Keep an unread tail there until its waitUntil work ends.
+        body_guard.disarm();
+    }
+    let _ = call.reply.send(response);
+}
+
+async fn dispatch_service_rpc(app: AppHandle, call: SvcRpcReq) {
+    let response = match &app.runtime {
+        Some(runtime) => {
+            runtime
+                .rpc_service(
+                    call.generation,
                     &call.script,
-                    call.url,
+                    call.entrypoint,
                     call.method,
-                    call.body,
-                    call.headers,
-                    call.cancel,
+                    call.args,
                 )
                 .await
         }
@@ -1504,28 +2225,96 @@ async fn dispatch_service_call(app: AppHandle, call: SvcCallReq) {
     let _ = call.reply.send(response);
 }
 
-async fn dispatch_service_rpc(app: AppHandle, call: SvcRpcReq) {
-    let response = match &app.runtime {
-        Some(runtime) => {
-            runtime
-                .rpc_service(&call.script, call.entrypoint, call.method, call.args)
-                .await
-        }
+async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
+    let QueueDispatchReq {
+        scope,
+        generation,
+        script,
+        lease_id,
+        leases,
+        batch,
+    } = call;
+    let queue = batch.queue.clone();
+    let result = match &app.runtime {
+        Some(runtime) => runtime.queue_service(generation, &script, batch).await,
         None => Err(anyhow::anyhow!("no Worker runtime")),
     };
-    let _ = call.reply.send(response);
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::warn!(%scope, %queue, %script, %error, "Queue dispatch failed; its lease will expire");
+            return;
+        }
+    };
+    let outcome = match result.outcome {
+        celld::js::QueueOutcome::Ok => "ok",
+        celld::js::QueueOutcome::Exception => "exception",
+    };
+    let body = serde_json::json!({
+        "leaseId": lease_id,
+        "leases": leases,
+        "outcome": outcome,
+        "error": result.error,
+        "ackAll": result.ack_all,
+        "retryBatch": {
+            "retry": result.retry_batch.retry,
+            "delaySeconds": result.retry_batch.delay_seconds,
+        },
+        "explicitAcks": result.explicit_acks,
+        "retryMessages": result.retry_messages.into_iter().map(|retry| serde_json::json!({
+            "msgId": retry.msg_id,
+            "delaySeconds": retry.delay_seconds,
+        })).collect::<Vec<_>>(),
+    });
+    let body = celld::js::RequestBody::Bytes(body.to_string().into_bytes().into());
+    let (reply, receive) = oneshot::channel();
+    dispatch_do_call(
+        app,
+        DoCallReq {
+            request_id: None,
+            cancel: None,
+            deliver_abort_to_handler: false,
+            scope: scope.clone(),
+            name: None,
+            url: "https://queue.celld.internal/__qSettle".to_string(),
+            method: "POST".to_string(),
+            body_guard: celld::js::RequestBodyGuard::of(&body),
+            body,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            reply,
+            order: None,
+            parent: None,
+        },
+    )
+    .await;
+    match receive.await {
+        Ok(Ok(response)) if (200..300).contains(&response.status) => {}
+        Ok(Ok(response)) => tracing::warn!(
+            %scope,
+            %queue,
+            status = response.status,
+            "Queue settlement was refused; its lease will expire"
+        ),
+        Ok(Err(error)) => tracing::warn!(
+            %scope,
+            %queue,
+            %error,
+            "Queue settlement routing failed; its lease will expire"
+        ),
+        Err(error) => tracing::warn!(
+            %scope,
+            %queue,
+            %error,
+            "Queue settlement dispatcher dropped; its lease will expire"
+        ),
+    }
 }
 
 async fn internal_probe(request: Request<Incoming>, app: AppHandle) -> HttpReply {
     let (parts, body) = request.into_parts();
-    let body = match body.collect().await {
-        Ok(body) => body.to_bytes(),
-        Err(error) => {
-            return peer_response(response(
-                StatusCode::BAD_REQUEST,
-                format!("invalid probe body: {error}"),
-            ));
-        }
+    let body = match collect_limited_body(body, MAX_PEER_CONTROL_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(error) => return peer_response(body_read_error("probe", error)),
     };
     let path_and_query = parts
         .uri
@@ -1565,23 +2354,21 @@ async fn internal_probe(request: Request<Incoming>, app: AppHandle) -> HttpReply
     }
 }
 
-/// The log tier's follower endpoints (crate::node_log): append fsyncs
-/// entries and answers the ack-all vote, seal persists the fence mark
-/// before replying, tail hands recovery the held fragment. Fleet-HMAC
-/// verified like every internal peer surface.
-async fn internal_log(request: Request<Incoming>, app: AppHandle, path: String) -> HttpReply {
-    let Some(follower) = app.follower.clone() else {
-        return peer_response(response(StatusCode::NOT_FOUND, "no follower store"));
-    };
+/// Adopt one released cell for a terminating peer. A successful response
+/// proves that this node acquired the next ownership epoch. The restored
+/// runtime remains dormant until real traffic needs it. If another peer won
+/// the race, the response identifies that current owner.
+async fn internal_handoff(request: Request<Incoming>, app: AppHandle) -> HttpReply {
+    if app.is_draining() {
+        return peer_response(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{\"ok\":false,\"draining\":true}",
+        ));
+    }
     let (parts, body) = request.into_parts();
-    let body = match body.collect().await {
-        Ok(body) => body.to_bytes(),
-        Err(error) => {
-            return peer_response(response(
-                StatusCode::BAD_REQUEST,
-                format!("invalid log body: {error}"),
-            ));
-        }
+    let body = match collect_limited_body(body, MAX_PEER_CONTROL_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(error) => return peer_response(body_read_error("handoff", error)),
     };
     let path_and_query = parts
         .uri
@@ -1602,21 +2389,176 @@ async fn internal_log(request: Request<Incoming>, app: AppHandle, path: String) 
             "method not allowed",
         ));
     }
+    let request: HandoffRequest = match serde_json::from_slice::<HandoffRequest>(&body) {
+        Ok(request) if !request.cell.is_empty() && request.released_epoch > 0 => request,
+        Ok(_) => {
+            return peer_response(response(
+                StatusCode::BAD_REQUEST,
+                "invalid handoff cell or epoch",
+            ));
+        }
+        Err(error) => {
+            return peer_response(response(
+                StatusCode::BAD_REQUEST,
+                format!("invalid handoff JSON: {error}"),
+            ));
+        }
+    };
+    let mut attempt = app
+        .accept_handoff(request.cell.clone(), request.released_epoch)
+        .await;
+    // Concurrent traffic commonly leaves this successor with a cached route
+    // to the donor. The signed release says that exact generation is stale.
+    // Retire it and resolve the owner record again; otherwise the successor
+    // redirects the donor back to itself forever and no cell is adopted.
+    if let Ok(HandoffAttempt::CurrentOwner(owner)) = &attempt {
+        if owner.epoch <= request.released_epoch {
+            app.invalidate_remote(request.cell.clone(), owner.node.clone(), owner.epoch)
+                .await;
+            attempt = app
+                .accept_handoff(request.cell.clone(), request.released_epoch)
+                .await;
+        }
+    }
+    let (status, result) = match attempt {
+        Ok(HandoffAttempt::Accepted(owner)) if owner.epoch > request.released_epoch => (
+            StatusCode::OK,
+            HandoffResponse {
+                node: owner.node,
+                addr: owner.addr,
+                epoch: owner.epoch,
+                peer_protocol: owner.peer_protocol,
+                published: true,
+            },
+        ),
+        Ok(HandoffAttempt::CurrentOwner(owner)) => (
+            StatusCode::CONFLICT,
+            HandoffResponse {
+                node: owner.node,
+                addr: owner.addr,
+                epoch: owner.epoch,
+                peer_protocol: owner.peer_protocol,
+                published: false,
+            },
+        ),
+        Ok(HandoffAttempt::Accepted(_)) | Ok(HandoffAttempt::Refused) | Err(_) => {
+            return peer_response(response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "handoff capacity unavailable",
+            ));
+        }
+    };
+    match serde_json::to_vec(&result) {
+        Ok(body) => peer_response(response(status, body)),
+        Err(_) => peer_response(response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "encode handoff response",
+        )),
+    }
+}
+
+/// The log tier's follower endpoints (crate::node_log): append fsyncs
+/// entries and answers the ack-all vote, seal persists the fence mark
+/// before replying, tail hands recovery the held fragment. Fleet-HMAC
+/// verified like every internal peer surface.
+async fn internal_log(request: Request<Incoming>, app: AppHandle, path: String) -> HttpReply {
+    let Some(follower) = app.follower.clone() else {
+        return peer_response(response(StatusCode::NOT_FOUND, "no follower store"));
+    };
+    let entered = celld::asyncrt::mono_us();
+    let (mut parts, body) = request.into_parts();
+    let body_limit = if path == INTERNAL_LOG_APPEND_PATH {
+        // An append includes the LTX bytes from an application transaction,
+        // so it needs the same allowance as other application-data routes.
+        MAX_PEER_FORWARD_BODY_BYTES
+    } else {
+        MAX_PEER_CONTROL_BODY_BYTES
+    };
+    let body = match collect_limited_body(body, body_limit).await {
+        Ok(body) => body,
+        Err(error) => return peer_response(body_read_error("log", error)),
+    };
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| parts.uri.path().to_string(), ToString::to_string);
+    if let Err(error) = app.peer_auth.verify(
+        &parts.method,
+        &path_and_query,
+        &parts.headers,
+        &body,
+        app.peer_auth.source(),
+    ) {
+        return peer_response(response(error.status(), error.message()));
+    }
+    if parts.method != hyper::Method::POST {
+        return peer_response(response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+        ));
+    }
+    if path == "/peer/log/stream" {
+        // The ordered append stream (the ordered-transport design):
+        // the handshake is fleet-HMAC verified above like every log route,
+        // the 101 carries the response auth the leader validates before it
+        // upgrades, and the upgraded duplex is served by one reader so
+        // apply order equals arrival order.
+        let Some(upgrade) = parts.extensions.remove::<hyper::upgrade::OnUpgrade>() else {
+            return peer_response(response(
+                StatusCode::BAD_REQUEST,
+                "stream requires an upgradable connection",
+            ));
+        };
+        let store = follower.clone();
+        celld::asyncrt::spawn(async move {
+            match upgrade.await {
+                Ok(upgraded) => {
+                    let io = TokioIo::new(upgraded);
+                    if let Err(error) = celld::node_log::serve_log_stream(io, store).await {
+                        tracing::debug!(%error, "log stream ended");
+                    }
+                }
+                Err(error) => tracing::debug!(%error, "log stream upgrade failed"),
+            }
+        })
+        .detach();
+        let mut reply = response(StatusCode::SWITCHING_PROTOCOLS, "");
+        reply.headers_mut().insert(
+            hyper::header::UPGRADE,
+            hyper::header::HeaderValue::from_static("celld-log-stream"),
+        );
+        reply.headers_mut().insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("upgrade"),
+        );
+        return peer_response(reply);
+    }
     let result: anyhow::Result<Vec<u8>> = match path.as_str() {
         // The append body and the tail response are binary — the entries
         // dominate both — while every control message stays JSON.
-        "/__log/append" => match celld::node_log::decode_append(&body) {
-            Ok(req) => serde_json::to_vec(&follower.append(req).await).map_err(Into::into),
+        INTERNAL_LOG_APPEND_PATH => match celld::node_log::decode_append(&body) {
+            Ok(req) => {
+                let collected = celld::asyncrt::mono_us();
+                let resp = follower.append(req).await;
+                tracing::info!(
+                    event = "log_append_router",
+                    collect_ms = collected.saturating_sub(entered) / 1000,
+                    append_ms = (celld::asyncrt::mono_us() - collected) / 1000,
+                    body_len = body.len(),
+                    "append routed"
+                );
+                serde_json::to_vec(&resp).map_err(Into::into)
+            }
             Err(error) => Err(error),
         },
-        "/__log/seal" => match serde_json::from_slice::<celld::node_log::SealReq>(&body) {
+        "/peer/log/seal" => match serde_json::from_slice::<celld::node_log::SealReq>(&body) {
             Ok(req) => match follower.seal(&req).await {
                 Ok(resp) => serde_json::to_vec(&resp).map_err(Into::into),
                 Err(error) => Err(error),
             },
             Err(error) => Err(error.into()),
         },
-        "/__log/tail" => serde_json::from_slice::<celld::node_log::TailReq>(&body)
+        "/peer/log/tail" => serde_json::from_slice::<celld::node_log::TailReq>(&body)
             .map_err(anyhow::Error::from)
             .map(|req| celld::node_log::encode_tail_resp(&follower.tail(&req))),
         _ => Err(anyhow::anyhow!("unknown log endpoint")),
@@ -1634,32 +2576,39 @@ async fn handle_public(
 ) -> Result<HttpReply, Infallible> {
     let path = request.uri().path().to_string();
     let draining = app.is_draining();
-    if draining && path != "/__celld/health" {
-        let mut refused = response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "{\"ok\":false,\"draining\":true}",
-        );
-        refused.headers_mut().insert(
-            hyper::header::RETRY_AFTER,
-            hyper::header::HeaderValue::from_static("1"),
-        );
-        refused.headers_mut().insert(
-            hyper::header::CONNECTION,
-            hyper::header::HeaderValue::from_static("close"),
-        );
-        return Ok(refused);
-    }
-    if path != "/__celld/health"
+    let _public_admission = if path == "/.well-known/celld/health" {
+        None
+    } else {
+        let Some(admission) = app.admit_public() else {
+            let mut refused = response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{\"ok\":false,\"draining\":true}",
+            );
+            refused.headers_mut().insert(
+                hyper::header::RETRY_AFTER,
+                hyper::header::HeaderValue::from_static("1"),
+            );
+            refused.headers_mut().insert(
+                hyper::header::CONNECTION,
+                hyper::header::HeaderValue::from_static("close"),
+            );
+            return Ok(refused);
+        };
+        Some(admission)
+    };
+    if path != "/.well-known/celld/health"
         && app.runtime.is_some()
         && fastwebsockets::upgrade::is_upgrade_request(&request)
     {
         return Ok(handle_websocket(request, app).await);
     }
     let mut result = match path.as_str() {
-        "/__celld/health" if !app.is_draining() && app.healthy().await => {
+        "/.well-known/celld/health"
+            if !app.is_draining() && app.fleet_ready() && app.healthy().await =>
+        {
             response(StatusCode::OK, "{\"ok\":true}")
         }
-        "/__celld/health" => response(StatusCode::SERVICE_UNAVAILABLE, "{\"ok\":false}"),
+        "/.well-known/celld/health" => response(StatusCode::SERVICE_UNAVAILABLE, "{\"ok\":false}"),
         _ if app.runtime.is_some() => handle_ingress(request, app, connection).await,
         _ => response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}"),
     };
@@ -1679,33 +2628,15 @@ async fn handle_internal(
 ) -> Result<HttpReply, Infallible> {
     let path = request.uri().path().to_string();
     let draining = app.is_draining();
-    // A draining node accepts no new work: a request for a cell it just
-    // released would re-claim the cell and undo the handoff, so everything
-    // but diagnostics is refused, and `Connection: close` tears the
-    // keep-alive down so the drain loop can finish instead of holding every
-    // idle connection open until the deadline.
-    if draining && !matches!(path.as_str(), "/__celld/probe" | "/state") {
-        let mut refused = response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "{\"ok\":false,\"draining\":true}",
-        );
-        refused.headers_mut().insert(
-            hyper::header::RETRY_AFTER,
-            hyper::header::HeaderValue::from_static("1"),
-        );
-        refused.headers_mut().insert(
-            hyper::header::CONNECTION,
-            hyper::header::HeaderValue::from_static("close"),
-        );
-        return Ok(refused);
-    }
-    if path.starts_with("/__ws/") && fastwebsockets::upgrade::is_upgrade_request(&request) {
-        return Ok(handle_peer_websocket(request, app, &path).await);
-    }
     let result = match path.as_str() {
-        "/__celld/probe" => internal_probe(request, app).await,
-        _ if path.starts_with("/__log/") => internal_log(request, app, path.clone()).await,
+        "/peer/probe" => internal_probe(request, app).await,
+        "/peer/handoff" => internal_handoff(request, app).await,
+        _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, app.snapshot().await),
+        "/reload" if request.method() != hyper::Method::POST => {
+            response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+        }
+        "/reload" => internal_reload(app).await,
         "/shutdown" if request.method() != hyper::Method::POST => {
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
@@ -1722,57 +2653,65 @@ async fn handle_internal(
             let _ = shutdown.send(mode);
             response(StatusCode::OK, "{\"ok\":true}")
         }
-        _ if path.starts_with("/__abort/") && app.runtime.is_some() => {
+        _ if path.starts_with("/peer/abort/") && app.runtime.is_some() => {
             internal_abort(request, app, path).await
         }
-        _ if path.starts_with("/__do/") && app.runtime.is_some() => {
-            if celld_logic::cell::valid_cell_scope(&path[6..]) {
-                internal_do(request, app, path[6..].to_string()).await
+        "/peer/tunnel" if app.runtime.is_some() => {
+            if peer_tunnel::is_tunnel_request(&request) {
+                peer_tunnel::accept(request, app)
             } else {
-                peer_response(malformed_scope())
+                peer_response(response(
+                    StatusCode::BAD_REQUEST,
+                    "tunnel establishment must upgrade",
+                ))
             }
         }
-        _ if path.starts_with("/__rpc/") && app.runtime.is_some() => {
-            if celld_logic::cell::valid_cell_scope(&path[7..]) {
-                internal_rpc(request, app, path[7..].to_string()).await
-            } else {
-                peer_response(malformed_scope())
-            }
-        }
-        // `celld d1`'s way in: the same forwarding dispatch `/do/` uses, with
-        // the peer authentication `/do/` does not have. A D1 database holds
-        // application data and answers arbitrary SQL, so it must not be
-        // reachable from an unauthenticated operator route; `/do/` refuses a
-        // D1 scope below and sends the caller here.
-        _ if path.starts_with("/__d1/") && app.runtime.is_some() => {
-            let scope = path[6..].to_string();
+        // The operator CLIs' way in (`celld d1`, queues, workflows): the same
+        // forwarding dispatch `/do/` uses, with the fleet authentication
+        // `/do/` does not have. A runtime class holds application data and
+        // answers an operator protocol — arbitrary SQL for D1 — so it must
+        // not be reachable from an unauthenticated route; `/do/` refuses a
+        // reserved scope below and sends the caller here.
+        //
+        // It is one route rather than one per class on purpose. D1's design
+        // page records what writing the second by hand would cost: the
+        // refusal on the *other* route has to be widened in the same change,
+        // and gating only the new route "would have left the hole open".
+        // With one entrance and one refusal, a class added to
+        // `RESERVED_CLASSES` inherits both. (The pre-v5 `/__d1/` alias died
+        // with the v0.4.0 stop-the-world upgrade; the CLI in this tree sends
+        // `/runtime/`.)
+        _ if path.starts_with("/runtime/") && app.runtime.is_some() => {
+            let scope = path
+                .strip_prefix("/runtime/")
+                .expect("matched the prefix")
+                .to_string();
             if !celld_logic::cell::valid_cell_scope(&scope) {
                 return Ok(peer_response(malformed_scope()));
             }
-            // The mirror of `/do/`'s refusal: that route serves everything
-            // but D1, this one serves nothing but D1. Without the check, a
-            // signed request could drive an ordinary Durable Object through
-            // a route whose only documented contract is SQL to a database.
-            if !celld::deploy::is_d1_scope(&scope) {
+            // The mirror of `/do/`'s refusal: that route serves every ordinary
+            // Durable Object and no reserved one, this route serves the
+            // reserved ones and nothing else. Without the check, a signed
+            // request could drive a user's Durable Object through a route
+            // whose only contract is an operator protocol.
+            if !celld::deploy::is_reserved_scope(&scope) {
                 return Ok(peer_response(response(
                     StatusCode::FORBIDDEN,
-                    "{\"error\":\"only a D1 database is served on /__d1/; use /do/ for a Durable Object\"}",
+                    "{\"error\":\"only a runtime class is served on /runtime/; use /do/ for a Durable Object\"}",
                 )));
             }
+            let operator_query = request.uri().query().map(str::to_owned);
             let method = request.method().clone();
             let path_and_query = request
                 .uri()
                 .path_and_query()
                 .map_or_else(|| request.uri().path().to_string(), ToString::to_string);
             let request_headers = request.headers().clone();
-            let body = match request.into_body().collect().await {
-                Ok(body) => body.to_bytes(),
-                Err(error) => {
-                    return Ok(peer_response(response(
-                        StatusCode::BAD_REQUEST,
-                        format!("invalid body: {error}"),
-                    )));
-                }
+            let body = match collect_limited_body(request.into_body(), MAX_PEER_PROTOCOL_BODY_BYTES)
+                .await
+            {
+                Ok(body) => body,
+                Err(error) => return Ok(peer_response(body_read_error("operator cell", error))),
             };
             if let Err(error) = app.peer_auth.verify(
                 &method,
@@ -1783,11 +2722,27 @@ async fn handle_internal(
             ) {
                 return Ok(peer_response(response(error.status(), error.message())));
             }
+            let mut name = None;
+            for (key, value) in url::form_urlencoded::parse(
+                operator_query.as_deref().unwrap_or_default().as_bytes(),
+            ) {
+                if key != "name" || name.is_some() || value.is_empty() {
+                    return Ok(peer_response(response(
+                        StatusCode::BAD_REQUEST,
+                        "{\"error\":\"invalid operator query\"}",
+                    )));
+                }
+                name = Some(value.into_owned());
+            }
+            // A Queue needs its name before its constructor chooses a
+            // consumer. The runtime also proves that this name hashes to the
+            // requested scope before it exposes the identity to JavaScript.
             dispatch_cell_fetch(
                 scope,
+                name,
                 "http://cell/".to_string(),
                 "POST".to_string(),
-                body.to_vec(),
+                celld::js::RequestBody::Bytes(body),
                 vec![("content-type".to_string(), "application/json".to_string())],
             )
             .await
@@ -1800,22 +2755,38 @@ async fn handle_internal(
                     return Ok(response(StatusCode::BAD_REQUEST, format!("{error:#}")));
                 }
             };
-            // This route has no authentication, so it must not reach a D1
-            // database: the cell answers arbitrary SQL, and its scope is an
-            // HMAC over the script and database names, both of which sit in
-            // the project's config. `/__d1/` serves D1 and is authenticated.
-            if celld::deploy::is_d1_scope(&cell) {
+            // This route has no authentication, so it must reach no reserved
+            // class at all. A reserved cell's whole fetch surface is an
+            // operator protocol — arbitrary SQL for D1, create/terminate/
+            // events for a workflow — and its scope is an HMAC over names that
+            // sit in the project's config rather than a secret.
+            //
+            // One question, not one per class. Two hand-written refusals stood
+            // here before, and a third reserved class would have needed a third
+            // that nothing forces anyone to write. `is_reserved_scope` closes
+            // the door for every class in `RESERVED_CLASSES`; the hint below
+            // is the only part that is per-class, and a class without one still
+            // gets refused.
+            if let Some(class) = celld::deploy::reserved_class_of(&cell) {
+                let hint = celld::deploy::operator_hint(class);
                 return Ok(response(
                     StatusCode::FORBIDDEN,
-                    "{\"error\":\"a D1 database is not reachable over /do/; use `celld d1`\"}",
+                    format!(
+                        "{{\"error\":\"{class} is a runtime class and is not reachable over /do/; {hint}\"}}"
+                    ),
                 ));
             }
-            let (url, method, body, headers) =
-                match request_payload(request, app.trust_forwarded_headers).await {
-                    Ok(payload) => payload,
-                    Err(response) => return Ok(response),
-                };
-            dispatch_cell_fetch(cell, url, method, body, headers).await
+            let (url, method, body, headers) = match ingress_payload(
+                request,
+                app.trust_forwarded_headers,
+                app.max_request_body_bytes,
+            )
+            .await
+            {
+                Ok(payload) => payload,
+                Err(response) => return Ok(response),
+            };
+            dispatch_cell_fetch(cell, None, url, method, body, headers).await
         }
         _ if path.starts_with("/cell/") && !celld_logic::cell::valid_cell_scope(&path[6..]) => {
             malformed_scope()
@@ -1868,7 +2839,11 @@ async fn handle_internal(
     // can finish. A request that raced the drain flag converges on its
     // next request, which hits the gate above.
     let mut result = result;
-    if draining {
+    // A 101 is exempt: `Connection: close` on it breaks the upgrade, and a
+    // tunnel establishment during a drain is exactly how a draining owner
+    // keeps serving the calls its handoff has not yet moved. The upgraded
+    // connection leaves keep-alive rotation on its own when the call ends.
+    if draining && result.status() != StatusCode::SWITCHING_PROTOCOLS {
         result.headers_mut().insert(
             hyper::header::CONNECTION,
             hyper::header::HeaderValue::from_static("close"),
@@ -1881,6 +2856,15 @@ async fn handle_internal(
 enum HttpSurface {
     Public,
     Internal,
+}
+
+impl HttpSurface {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Internal => "internal",
+        }
+    }
 }
 
 fn serve_http_connection(
@@ -1897,6 +2881,7 @@ fn serve_http_connection(
     // when written, on every surface.
     let _ = stream.set_nodelay(true);
     Box::pin(async move {
+        let peer = stream.peer_addr().ok();
         // Serve on the runtime, not on this task. `main` drives its loop with
         // `block_on`, so serving there put every connection on one core.
         // Awaiting the spawned task keeps shutdown tracking unchanged.
@@ -1923,7 +2908,7 @@ fn serve_http_connection(
                 .serve_connection(TokioIo::new(stream), service)
                 .with_upgrades();
             tokio::pin!(connection);
-            let result = tokio::select! {
+            let result = celld::asyncrt::select! {
                 result = &mut connection => Some(result),
                 _ = connection_drain.changed() => {
                     connection.as_mut().graceful_shutdown();
@@ -1934,7 +2919,7 @@ fn serve_http_connection(
             };
             connection_requests.abort_all();
             match result {
-                Some(Err(error)) => eprintln!("celld connection failed: {error}"),
+                Some(Err(error)) => record_connection_error(&error, surface, peer),
                 None => tracing::warn!(
                     event = "connection_drain_forced",
                     grace_ms = connection_grace.as_millis(),
@@ -1946,10 +2931,42 @@ fn serve_http_connection(
         let _ = served.await;
     })
 }
-
 #[path = "main/cli.rs"]
 mod cli;
 use cli::{action_from_process, print_help, worker_loader_binding, Action};
+
+fn node_bucket(
+    settings: &cli::Settings,
+    managed: Option<&celld::control_plane::ManagedStorageConfig>,
+    lease: bool,
+) -> anyhow::Result<celld::bucket::Bucket> {
+    if let Some(database) = &settings.dev_store {
+        anyhow::ensure!(
+            managed.is_none(),
+            "a development node cannot use managed storage"
+        );
+        return celld::dev::open_local_bucket(database);
+    }
+    let bucket = settings
+        .bucket
+        .as_deref()
+        .context("the node has no fleet bucket")?;
+    if lease {
+        fleet::lease_bucket_client_with_credentials(
+            bucket,
+            settings.endpoint.as_deref(),
+            &settings.region,
+            managed,
+        )
+    } else {
+        fleet::bucket_client_with_credentials(
+            bucket,
+            settings.endpoint.as_deref(),
+            &settings.region,
+            managed,
+        )
+    }
+}
 
 /// Cold routes are I/O concurrency, but must stay below the point where they
 /// can starve the node lease heartbeat or object store.
@@ -1959,11 +2976,10 @@ const DEFAULT_MAX_CONCURRENT_ACTIVATIONS: usize = 128;
 /// working set prove durability at once turns a walk down into a thundering
 /// herd against the bucket.
 const DEFAULT_MAX_CONCURRENT_EVICTIONS: usize = 4;
-/// The shutdown handoff bound. Wider than the eviction bound because a
-/// draining node has no live traffic left to protect and a stop grace to
-/// beat, but still bounded so a node-wide handoff cannot thundering-herd
-/// the bucket.
-const DEFAULT_MAX_CONCURRENT_RELEASES: usize = 128;
+/// The shutdown handoff bound covers the successor's complete restore and
+/// publication. A small batch keeps the surviving nodes responsive while it
+/// still overlaps object-store latency.
+const DEFAULT_MAX_CONCURRENT_RELEASES: usize = 8;
 /// Preserved SQLite snapshots make a same-node wake a rename instead of a
 /// remote restore, but must not grow with the lifetime population of a node.
 /// The walk is O(cached cells), so keep it off the hot maintenance cadence.
@@ -1993,28 +3009,57 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // Docker and journald can stop consuming the process pipe during a log
     // burst. Logging must lose diagnostics under that backpressure rather
     // than block the Tokio workers that route requests and renew authority.
+    // Parsed before the subscriber exists, because where the log goes depends
+    // on which invocation this is: a node logs to stdout, and a CLI subcommand
+    // must keep stdout for its answer.
+    let action = action_from_process()?;
+    let log_filter = if matches!(
+        &action,
+        Action::Dev(arguments) if !arguments.iter().any(|argument| argument == "--logs")
+    ) {
+        // `celld dev` is an application-facing supervisor. Its default view
+        // must stay concise even when the parent inherited a broad RUST_LOG;
+        // --logs is the explicit opt-in to that diagnostic stream.
+        tracing_subscriber::EnvFilter::new("error")
+    } else {
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())
+    };
+    let (log_sink, log_is_terminal): (Box<dyn std::io::Write + Send>, bool) =
+        if action.stdout_is_data() {
+            (
+                Box::new(std::io::stderr()),
+                std::io::IsTerminal::is_terminal(&std::io::stderr()),
+            )
+        } else {
+            (
+                Box::new(std::io::stdout()),
+                std::io::IsTerminal::is_terminal(&std::io::stdout()),
+            )
+        };
     let (log_writer, log_guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
         .buffered_lines_limit(8_192)
         .lossy(true)
-        .finish(std::io::stdout());
+        .finish(log_sink);
     *LOG_GUARD.lock().unwrap() = Some(log_guard);
     tracing_subscriber::fmt()
         .with_writer(log_writer)
         // The custom writer defeats fmt's own TTY detection, and journald
         // must not receive ANSI escapes.
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_ansi(log_is_terminal)
+        .with_env_filter(log_filter)
         .init();
     // After the subscriber, because this reports whether the allocator agreed
     // to return freed pages on a timer. A node without that thread holds
     // retention until a thread allocates again, which is the condition behind
     // issue #36, so the operator has to be able to read the answer.
     celld::memory::tune_allocator();
-    let mut settings = match action_from_process()? {
+    let mut settings = match action {
         Action::Deploy(arguments) => return fleet::run_deploy(arguments).await,
+        Action::Dev(arguments) => return celld::dev::run(arguments).await,
+        Action::Cell(arguments) => return celld::cell_cli::run(arguments).await,
         Action::D1(arguments) => return celld::d1_cli::run(arguments).await,
+        Action::Kv(arguments) => return celld::kv_cli::run(arguments).await,
+        Action::Queue(arguments) => return celld::queue_cli::run(arguments).await,
         Action::Connect(arguments) => {
             return celld::control_plane::handle_connect_command(arguments).await
         }
@@ -2028,7 +3073,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             return celld::control_plane::handle_disconnect_command(arguments).await
         }
         Action::Help => {
-            print_help();
+            print_help()?;
             return Ok(());
         }
         Action::Version => {
@@ -2037,13 +3082,15 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             } else {
                 ""
             };
-            println!("celld {}{profile}", env!("CARGO_PKG_VERSION"));
+            celld::cli_output::Output::new(celld::cli_output::Format::Text)
+                .line(format_args!("celld {}{profile}", env!("CARGO_PKG_VERSION")))?;
             return Ok(());
         }
         Action::Diagnose {
             mut settings,
             peers,
             read_only,
+            json,
         } => {
             let ingress = celld::startup::bind_ingress_listener(&settings.listen).await?;
             let internal =
@@ -2055,19 +3102,25 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 .await?;
             // The bind proves the address is free; diagnose never serves on it,
             // and an operator should not read this line as a running listener.
-            println!(
-                "ok listen {} (bind check; diagnose does not serve)",
-                ingress.listen
-            );
-            println!(
-                "ok internal listen {} (bind check; diagnose does not serve)",
-                internal.listen
-            );
-            println!(
-                "ok advertise {} ({}; direct reachability is not inferred)",
-                internal.advertise,
-                internal.advertise.scope()
-            );
+            // These reach the terminal through `fleet::diagnose`, so that one
+            // `Output` renders every check and `--json` stays parseable.
+            let preamble = vec![
+                celld::fleet::Check::ok(
+                    format!("listen {}", ingress.listen),
+                    "bind check; diagnose does not serve",
+                ),
+                celld::fleet::Check::ok(
+                    format!("internal listen {}", internal.listen),
+                    "bind check; diagnose does not serve",
+                ),
+                celld::fleet::Check::ok(
+                    format!("advertise {}", internal.advertise),
+                    format!(
+                        "{}; direct reachability is not inferred",
+                        internal.advertise.scope()
+                    ),
+                ),
+            ];
             let managed_storage = if settings.control_plane {
                 match celld::control_plane::installation_storage().context(
                     "managed diagnostics require an existing enrollment; run `celld --control-plane` first",
@@ -2097,8 +3150,15 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 &settings.region,
                 managed_storage.as_ref(),
             )?;
-            return fleet::diagnose(&client, peers, settings.unsafe_public_advertise, read_only)
-                .await;
+            return fleet::diagnose(
+                &client,
+                peers,
+                settings.unsafe_public_advertise,
+                read_only,
+                json,
+                preamble,
+            )
+            .await;
         }
         Action::Run(settings) => settings,
     };
@@ -2109,6 +3169,14 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         // introduced eviction churn in otherwise unconstrained workloads and
         // made cancellation semantics depend on cold-reactivation latency.
         .unwrap_or(usize::MAX);
+    let max_request_body_bytes = celld::env_vars::positive_or(
+        "CELLD_MAX_REQUEST_BODY_BYTES",
+        DEFAULT_MAX_REQUEST_BODY_BYTES,
+    )?;
+    anyhow::ensure!(
+        max_request_body_bytes <= DEFAULT_MAX_REQUEST_BODY_BYTES,
+        "CELLD_MAX_REQUEST_BODY_BYTES cannot exceed {DEFAULT_MAX_REQUEST_BODY_BYTES}"
+    );
     let local_cache_max_bytes = local_cache_max_bytes_from_environment()?;
     let fail_publish_once = std::env::var_os("CELLD_TEST_FAIL_PUBLISH_ONCE").is_some();
     let ingress = celld::startup::bind_ingress_listener(&settings.listen).await?;
@@ -2216,204 +3284,224 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join(format!("celld-{}", std::process::id())));
     let mut deploy_agent = None;
-    let (runtime, ownership, peer_key, wake_scan, assets, asset_script) = if let Some(bucket) =
-        settings.bucket.clone().filter(|_| settings.load_deployment)
-    {
-        let client = fleet::bucket_client_with_credentials(
-            &bucket,
-            settings.endpoint.as_deref(),
-            &settings.region,
-            managed_storage.as_ref(),
-        )?;
-        if settings.control_plane {
-            fleet::validate_managed_bucket(&client).await?;
-        } else {
-            fleet::validate_bucket(&client).await?;
-        }
-        // The list above proves the bucket answers; it does not prove
-        // the store enforces the conditional write this node fences
-        // with. A store that ignores it makes the node self-fence in
-        // a restart loop, so test it once, here, before serving.
-        if settings.storage_probe {
-            fleet::probe_storage_before_serving(&client, settings.control_plane).await?;
-        }
-        let lease_client = fleet::lease_bucket_client_with_credentials(
-            &bucket,
-            settings.endpoint.as_deref(),
-            &settings.region,
-            managed_storage.as_ref(),
-        )?;
-        if settings.control_plane {
-            celld::control_plane::wait_for_initial_deployment(&client).await?;
-            deploy_agent = Some(client.clone());
-        }
-        let peer_key = peer_auth::load_or_create(&client).await?;
-        let mut deployment = fleet::load_current_worker(&client, node.clone()).await?;
-        let primary_script = deployment.script_name.clone();
-        let mut asset_resolvers = HashMap::new();
-        if let Some(resolver) = deployment.assets.take() {
-            asset_resolvers.insert(primary_script.clone(), resolver);
-        }
-        let mut visited = BTreeSet::from([primary_script.clone()]);
-        let mut queue = deployment
-            .services
-            .iter()
-            .map(|(_, script, _)| script.clone())
-            .collect::<VecDeque<_>>();
-        let mut cohosted = Vec::new();
-        while let Some(target) = queue.pop_front() {
-            if target == primary_script || !visited.insert(target.clone()) {
-                continue;
+    // The channel `POST /reload` and a managed notification nudge the pointer
+    // watcher through. Without a deployment bucket the receiver is dropped
+    // and a reload reports that there is no pointer to reload from.
+    let (reload_tx, reload_rx) = celld::generation::reload_channel();
+    let (runtime, ownership, peer_key, wake_scan, deploy_bucket) =
+        if settings.bucket.is_some() && settings.load_deployment {
+            let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
+            if settings.control_plane {
+                fleet::validate_managed_bucket(&client).await?;
+            } else {
+                fleet::validate_bucket(&client).await?;
             }
-            let mut loaded = fleet::load_named_worker(&client, &target, node.clone())
-                .await
-                .with_context(|| format!("load service binding target {target}"))?;
-            if loaded.script_name != target {
-                anyhow::bail!(
-                    "service pointer {target} resolved script {}",
-                    loaded.script_name
-                );
+            // The list above proves the bucket answers; it does not prove
+            // the store enforces the conditional write this node fences
+            // with. A store that ignores it makes the node self-fence in
+            // a restart loop, so test it once, here, before serving.
+            if settings.storage_probe {
+                fleet::probe_storage_before_serving(&client, settings.control_plane).await?;
             }
-            queue.extend(loaded.services.iter().map(|(_, script, _)| script.clone()));
-            // A node runs the schedule of the deployment it was given and
-            // of no other. The reserved class is one key, so a second
-            // script's cron cell would resolve to the first script's
-            // config and run the wrong `scheduled` handler. Dropping the
-            // schedule is the safe half of that trade and this says so out
-            // loud, because a trigger that never fires and says nothing is
-            // the failure the whole feature is built to avoid. Deploy the
-            // script as a node's own deployment to run its crons.
-            if !loaded.crons.is_empty() {
-                tracing::warn!(
-                    script = %target,
-                    crons = %loaded.crons.join(", "),
-                    "a service binding target declares cron triggers; a node fires only its own deployment's schedule, so these never run here"
-                );
+            let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
+            if settings.control_plane {
+                celld::control_plane::wait_for_initial_deployment(&client).await?;
+                deploy_agent = Some(client.clone());
             }
-            if let Some(resolver) = loaded.assets.take() {
-                asset_resolvers.insert(target, resolver);
-            }
-            cohosted.push(CohostedWorker {
-                options: loaded.options,
-                services: loaded.services,
-                asset_binding: loaded.asset_binding,
+            let peer_key = peer_auth::load_or_create(&client).await?;
+            let graph = DeploymentGraph::load(&client, node.clone()).await?;
+            let wake = Arc::new(celld::wake::WakeFlusher::new());
+            celld::js::set_arm_gate(ArmGate {
+                bucket: client.clone(),
+                flusher: wake.clone(),
             });
-        }
-        let wake = Arc::new(celld::wake::WakeFlusher::new());
-        celld::js::set_arm_gate(ArmGate {
-            bucket: client.clone(),
-            flusher: wake.clone(),
-        });
-        // celld treats replication as a node service, not as a property
-        // of today's manifest. Start it even for a stateless deployment
-        // so a later deployment can introduce cells without changing the
-        // durability contract underneath the node.
-        let replication = Some(Replication::start(
-            client.clone(),
-            &data_dir,
-            settings.endpoint.clone(),
-            settings.region.clone(),
-            storage_credentials.clone(),
-        )?);
-        let asset_script = Some(Arc::<str>::from(primary_script));
-        let assets = Arc::new(asset_resolvers);
-        let runtime = RuntimeManager::start(RuntimeOptions {
-            worker: deployment.options,
-            crons: deployment.crons,
-            services: deployment.services,
-            asset_binding: deployment.asset_binding,
-            loader_binding: worker_loader_binding(),
-            cohosted,
-            data_dir: data_dir.clone(),
-            replication,
-            wake: Some(wake.clone()),
-            alarm_observer: alarm_observer.clone(),
-            node: node.clone(),
-            region: settings.region.clone(),
-        })?;
-        let wake_scan = Some((client.clone(), wake.clone()));
-        let ownership = Ownership::Bucket(Arc::new(
-            BucketOwnership::new(client, lease_client, node.clone(), probe_public_key.clone())
-                .with_lease_ttl_ms(lease_ttl_ms_from_environment()),
-        ));
-        (
-            Some(runtime),
-            Some(ownership),
-            peer_key,
-            wake_scan,
-            assets,
-            asset_script,
-        )
-    } else if let Ok(script_path) = std::env::var("CELLD_TEST_SCRIPT_PATH") {
-        let source = std::fs::read_to_string(&script_path)?;
-        let do_classes = std::env::var("CELLD_TEST_DO_CLASSES")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .collect();
-        let bindings = std::env::var("CELLD_TEST_DO_BINDINGS")
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|value| value.split_once('='))
-            .map(|(name, class)| (name.trim().to_string(), class.trim().to_string()))
-            .filter(|(name, class)| !name.is_empty() && !class.is_empty())
-            .collect();
-        // `BINDING=database` pairs, the local-script equivalent of
-        // `d1_databases` in a deployed project.
-        let d1_bindings: Vec<(String, String)> = std::env::var("CELLD_TEST_D1_BINDINGS")
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|value| value.split_once('='))
-            .map(|(name, database)| (name.trim().to_string(), database.trim().to_string()))
-            .filter(|(name, database)| !name.is_empty() && !database.is_empty())
-            .collect();
-        let mut do_classes: Vec<String> = do_classes;
-        if !d1_bindings.is_empty() {
-            do_classes.push(celld::deploy::D1_CLASS.to_string());
-        }
-        let crons: Vec<String> = std::env::var("CELLD_TEST_CRONS")
-            .unwrap_or_default()
-            .split(';')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .collect();
-        let options = WorkerConfigOptions {
-            src: source,
-            script_name: std::env::var("CELLD_TEST_SCRIPT_NAME")
-                .unwrap_or_else(|_| "celld-local".to_string()),
-            do_classes,
-            bindings,
-            r2_bindings: Vec::new(),
-            d1_bindings,
-            ai_binding: fleet::configured_ai_binding(None),
-            vars: Vec::new(),
-            node: node.clone(),
-            modules: Vec::new(),
-            compat: Compat::default(),
-        };
-        let (ownership, peer_key, wake, wake_scan) = match settings.bucket.clone() {
-            Some(bucket) => {
-                let client = fleet::bucket_client_with_credentials(
-                    &bucket,
-                    settings.endpoint.as_deref(),
-                    &settings.region,
-                    managed_storage.as_ref(),
-                )?;
-                let lease_client = fleet::lease_bucket_client_with_credentials(
-                    &bucket,
-                    settings.endpoint.as_deref(),
-                    &settings.region,
-                    managed_storage.as_ref(),
-                )?;
+            // An `r2_buckets` binding lives in the fleet bucket, under the
+            // reserved `r2/<bucket_name>/` prefix. celld runs on blob storage
+            // rather than providing it, so a binding gets the store the node
+            // already holds credentials for instead of a second one.
+            celld::js::set_r2_store(client.clone());
+            // celld treats replication as a node service, not as a property
+            // of today's manifest. Start it even for a stateless deployment
+            // so a later deployment can introduce cells without changing the
+            // durability contract underneath the node.
+            let replication = Some(Replication::start(
+                client.clone(),
+                &data_dir,
+                settings.endpoint.clone(),
+                settings.region.clone(),
+                storage_credentials.clone(),
+            )?);
+            // The same two calls a reload makes: there is no boot-only way from
+            // a deployment to a serving generation.
+            let generation = Generation::build(
+                FIRST_GENERATION,
+                graph,
+                GenerationOptions {
+                    loader_binding: worker_loader_binding(),
+                    node: node.clone(),
+                    region: settings.region.clone(),
+                },
+            )?;
+            let runtime = RuntimeManager::start(
+                generation,
+                RuntimeOptions {
+                    data_dir: data_dir.clone(),
+                    replication,
+                    wake: Some(wake.clone()),
+                    alarm_observer: alarm_observer.clone(),
+                    node: node.clone(),
+                    region: settings.region.clone(),
+                },
+            )?;
+            let wake_scan = Some((client.clone(), wake.clone()));
+            let deploy_bucket = Some(client.clone());
+            let ownership = Ownership::Bucket(Arc::new(
+                BucketOwnership::new(client, lease_client, node.clone(), probe_public_key.clone())
+                    .with_lease_ttl_ms(lease_ttl_ms_from_environment()),
+            ));
+            (
+                Some(runtime),
+                Some(ownership),
+                peer_key,
+                wake_scan,
+                deploy_bucket,
+            )
+        } else if let Ok(script_path) = std::env::var("CELLD_TEST_SCRIPT_PATH") {
+            let source = std::fs::read_to_string(&script_path)?;
+            let do_classes = std::env::var("CELLD_TEST_DO_CLASSES")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect();
+            let bindings = std::env::var("CELLD_TEST_DO_BINDINGS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|value| value.split_once('='))
+                .map(|(name, class)| (name.trim().to_string(), class.trim().to_string()))
+                .filter(|(name, class)| !name.is_empty() && !class.is_empty())
+                .collect();
+            // `BINDING=database` pairs, the local-script equivalent of
+            // `d1_databases` in a deployed project.
+            let d1_bindings: Vec<(String, String)> = std::env::var("CELLD_TEST_D1_BINDINGS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|value| value.split_once('='))
+                .map(|(name, database)| (name.trim().to_string(), database.trim().to_string()))
+                .filter(|(name, database)| !name.is_empty() && !database.is_empty())
+                .collect();
+            // `BINDING=namespace-id`, the `CELLD_TEST_D1_BINDINGS` shape. Day one,
+            // for the reason D1's and Workflows' equivalents landed on day one:
+            // every runtime test needs it.
+            let kv_bindings: Vec<(String, String)> = std::env::var("CELLD_LOCAL_KV_BINDINGS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|value| value.split_once('='))
+                .map(|(name, id)| (name.trim().to_string(), id.trim().to_string()))
+                .filter(|(name, id)| !name.is_empty() && !id.is_empty())
+                .collect();
+            // `BINDING=queue`, the local-script equivalent of one Wrangler Queue
+            // producer. A local binding has no configuration object for a default
+            // delay, so it uses the Queue default of zero.
+            let queue_bindings: Vec<QueueBinding> = std::env::var("CELLD_LOCAL_QUEUE_BINDINGS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|value| value.split_once('='))
+                .map(|(environment, queue)| QueueBinding {
+                    environment: environment.trim().to_string(),
+                    queue: queue.trim().to_string(),
+                    delivery_delay: 0,
+                })
+                .filter(|binding| !binding.environment.is_empty() && !binding.queue.is_empty())
+                .collect();
+            for binding in &queue_bindings {
+                anyhow::ensure!(
+                    celld_logic::cell::valid_cell_scope(&binding.queue),
+                    "local Queue binding {} has a queue name that cannot name a cell: {:?}",
+                    binding.environment,
+                    binding.queue,
+                );
+            }
+            // `BINDING=bucket` pairs, the local-script equivalent of
+            // `r2_buckets` in a deployed project.
+            let r2_bindings: Vec<(String, String)> = std::env::var("CELLD_TEST_R2_BINDINGS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|value| value.split_once('='))
+                .map(|(name, bucket)| (name.trim().to_string(), bucket.trim().to_string()))
+                .filter(|(name, bucket)| !name.is_empty() && !bucket.is_empty())
+                .collect();
+            let mut do_classes: Vec<String> = do_classes;
+            if !d1_bindings.is_empty() {
+                do_classes.push(celld::deploy::D1_CLASS.to_string());
+            }
+            if !kv_bindings.is_empty() {
+                do_classes.push(celld::deploy::KV_CLASS.to_string());
+            }
+            if !queue_bindings.is_empty() {
+                do_classes.push(celld::deploy::QUEUE_CLASS.to_string());
+            }
+            let workflow_bindings: Vec<WorkflowBinding> =
+                std::env::var("CELLD_LOCAL_WORKFLOW_BINDINGS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter_map(|value| {
+                        let (binding, rest) = value.split_once('=')?;
+                        let (name, class) = rest.split_once('=')?;
+                        Some(WorkflowBinding {
+                            environment: binding.trim().to_string(),
+                            workflow: name.trim().to_string(),
+                            class: class.trim().to_string(),
+                        })
+                    })
+                    .filter(|binding| {
+                        !binding.environment.is_empty()
+                            && !binding.workflow.is_empty()
+                            && !binding.class.is_empty()
+                    })
+                    .collect();
+            // Resolved before the config is built, because the reserved workflow
+            // class is script-scoped and `do_classes` has to carry the scoped name.
+            let script_name = std::env::var("CELLD_TEST_SCRIPT_NAME")
+                .unwrap_or_else(|_| "celld-local".to_string());
+            if !workflow_bindings.is_empty() {
+                do_classes.push(celld::deploy::workflow_class(&script_name));
+            }
+            let crons: Vec<String> = std::env::var("CELLD_TEST_CRONS")
+                .unwrap_or_default()
+                .split(';')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect();
+            let options = WorkerConfigOptions {
+                src: source,
+                script_name,
+                do_classes,
+                bindings,
+                r2_bindings,
+                d1_bindings,
+                kv_bindings,
+                queue_bindings,
+                queue_consumers: Vec::new(),
+                workflow_bindings,
+                ai_binding: fleet::configured_ai_binding(None),
+                vars: Vec::new(),
+                node: node.clone(),
+                modules: Vec::new(),
+                compat: Compat::default(),
+            };
+            let (ownership, peer_key, wake, wake_scan) = if settings.bucket.is_some() {
+                let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
+                let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
                 let peer_key = peer_auth::load_or_create(&client).await?;
                 let wake = Arc::new(celld::wake::WakeFlusher::new());
                 celld::js::set_arm_gate(ArmGate {
                     bucket: client.clone(),
                     flusher: wake.clone(),
                 });
+                celld::js::set_r2_store(client.clone());
                 let wake_scan = Some((client.clone(), wake.clone()));
                 (
                     Some(Ownership::Bucket(Arc::new(
@@ -2429,45 +3517,51 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     Some(wake),
                     wake_scan,
                 )
-            }
-            None => (None, random_peer_key(), None, None),
-        };
-        (
-            Some(RuntimeManager::start(RuntimeOptions {
-                worker: options,
-                crons,
-                services: Vec::new(),
-                asset_binding: None,
-                loader_binding: worker_loader_binding(),
-                cohosted: Vec::new(),
-                data_dir: data_dir.clone(),
-                replication: None,
-                wake: wake.clone(),
-                alarm_observer: alarm_observer.clone(),
-                node: node.clone(),
-                region: settings.region.clone(),
-            })?),
-            ownership,
-            peer_key,
-            wake_scan,
-            Arc::new(HashMap::new()),
-            None,
-        )
-    } else {
-        let (ownership, peer_key) = match settings.bucket.clone() {
-            Some(bucket) => {
-                let client = fleet::bucket_client_with_credentials(
-                    &bucket,
-                    settings.endpoint.as_deref(),
-                    &settings.region,
-                    managed_storage.as_ref(),
-                )?;
-                let lease_client = fleet::lease_bucket_client_with_credentials(
-                    &bucket,
-                    settings.endpoint.as_deref(),
-                    &settings.region,
-                    managed_storage.as_ref(),
-                )?;
+            } else {
+                (None, random_peer_key(), None, None)
+            };
+            // A local script is a one-script deployment with no pointer behind
+            // it, built through the same function as a bucket deployment.
+            let script_name = options.script_name.clone();
+            let generation = Generation::build(
+                FIRST_GENERATION,
+                DeploymentGraph::single(fleet::LoadedDeployment {
+                    options,
+                    script_name,
+                    version: "local".to_string(),
+                    prefix: script_path.clone(),
+                    asset_binding: None,
+                    assets: None,
+                    services: Vec::new(),
+                    crons,
+                }),
+                GenerationOptions {
+                    loader_binding: worker_loader_binding(),
+                    node: node.clone(),
+                    region: settings.region.clone(),
+                },
+            )?;
+            (
+                Some(RuntimeManager::start(
+                    generation,
+                    RuntimeOptions {
+                        data_dir: data_dir.clone(),
+                        replication: None,
+                        wake: wake.clone(),
+                        alarm_observer: alarm_observer.clone(),
+                        node: node.clone(),
+                        region: settings.region.clone(),
+                    },
+                )?),
+                ownership,
+                peer_key,
+                wake_scan,
+                None,
+            )
+        } else {
+            let (ownership, peer_key) = if settings.bucket.is_some() {
+                let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
+                let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
                 let peer_key = peer_auth::load_or_create(&client).await?;
                 (
                     Some(Ownership::Bucket(Arc::new(
@@ -2481,37 +3575,34 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     ))),
                     peer_key,
                 )
-            }
-            None => (None, random_peer_key()),
+            } else {
+                (None, random_peer_key())
+            };
+            (None, ownership, peer_key, None, None)
         };
-        (
-            None,
-            ownership,
-            peer_key,
-            None,
-            Arc::new(HashMap::new()),
-            None,
-        )
-    };
     if let Some(config) = &telemetry_config {
         let sink_bucket = match config.sink {
             celld::telemetry::SinkChoice::Bucket => {
-                let Some(bucket) = settings.bucket.clone() else {
+                if settings.bucket.is_none() {
                     anyhow::bail!(
                         "CELLD_OTEL=1 but this node has no bucket; the \
                          bucket sink needs one (CELLD_BUCKET), or choose \
                          CELLD_OTEL_SINK=otlp"
                     );
-                };
+                }
                 // Its own client even for the fleet bucket: each open is its
                 // own transport (bucket.rs), so telemetry PUT bursts never
                 // share a connection pool with ownership traffic.
-                Some(fleet::bucket_client_with_credentials(
-                    config.bucket_override.as_deref().unwrap_or(&bucket),
-                    settings.endpoint.as_deref(),
-                    &settings.region,
-                    managed_storage.as_ref(),
-                )?)
+                Some(if let Some(bucket) = config.bucket_override.as_deref() {
+                    fleet::bucket_client_with_credentials(
+                        bucket,
+                        settings.endpoint.as_deref(),
+                        &settings.region,
+                        managed_storage.as_ref(),
+                    )?
+                } else {
+                    node_bucket(&settings, managed_storage.as_ref(), false)?
+                })
             }
             // The collector path needs no bucket at all.
             celld::telemetry::SinkChoice::Otlp => None,
@@ -2519,9 +3610,24 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         celld::telemetry::init(config, sink_bucket, node.clone(), settings.region.clone())?;
     }
     let peer_auth = Arc::new(PeerAuth::new(peer_key, node.clone())?);
+    // Connect-only timeout: a peer request may legitimately run through a
+    // restore, but a handshake that never completes provably ran nothing.
+    let peer_http = reqwest::Client::builder()
+        .connect_timeout(PEER_CONNECT_TIMEOUT)
+        // Nagle against delayed ACKs costs tens of milliseconds on every
+        // multi-segment peer body. Peer requests are latency-bound, so the
+        // socket must write eagerly.
+        .tcp_nodelay(true)
+        .build()
+        .unwrap();
+    let paced_handoff = !matches!(
+        std::env::var("CELLD_PACED_HANDOFF").as_deref(),
+        Ok("0" | "off" | "false")
+    );
     let resume_generation = celld::runtime::take_clean_reload_generation(&data_dir, &node);
     let clean_reload_candidate = resume_generation.is_some();
-    let actor = Actor::from_environment(
+    let drain_pins = DrainPinRegistry::default();
+    let actor = Actor::from_environment_with_services(
         AdmissionLimits {
             resident: max_resident,
             activations: max_activations,
@@ -2530,8 +3636,14 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         },
         fail_publish_once,
         fence_tx,
-        runtime.clone(),
-        ownership,
+        ActorServices {
+            runtime: runtime.clone(),
+            drain_pins: drain_pins.clone(),
+            ownership,
+            peer_http: peer_http.clone(),
+            peer_auth: peer_auth.clone(),
+            paced_handoff,
+        },
         ActorIdentity {
             node: node.clone(),
             advertise: advertise.clone(),
@@ -2542,6 +3654,16 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     .await?;
     let process_generation = actor.lease_spec.generation.clone();
     let ownership_name = actor.ownership.name();
+    // Keep the fleet reader beside the readiness task before the actor moves
+    // to its isolated thread. Both handles share the same lease adapter, so
+    // readiness evaluates exactly the records that placement publishes.
+    let ready_ownership = match &actor.ownership {
+        Ownership::Bucket(ownership) => Some(ownership.clone()),
+        Ownership::Memory(_) => None,
+    };
+    let fleet_bucket = ready_ownership
+        .as_ref()
+        .map(|ownership| ownership.bucket_client());
     let explorer_replication = runtime.as_ref().and_then(RuntimeManager::replication);
     let local_cache_replication = explorer_replication.clone();
     let (websocket_tx, mut websocket_rx) = mpsc::unbounded_channel();
@@ -2558,25 +3680,18 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         }
         _ => None,
     };
-    if let Some(store) = &follower {
-        celld::node_log::spawn_fragment_gc(store.clone());
-    }
     let app = AppHandle {
         tx,
         runtime,
-        assets,
-        asset_script,
-        // Connect-only timeout: a peer request may legitimately run long, but
-        // a handshake that never completes provably ran nothing, so failing it
-        // fast lets the caller re-resolve the owner and redispatch.
-        peer_http: reqwest::Client::builder()
-            .connect_timeout(PEER_CONNECT_TIMEOUT)
-            .build()
-            .unwrap(),
+        reload: reload_tx.clone(),
+        peer_http,
         peer_auth,
         advertise: advertise.clone(),
         websockets: websocket_tx,
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        fleet_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        public_in_flight: Arc::new(AtomicUsize::new(0)),
+        drain_pins,
         trust_forwarded_headers: settings.trust_forwarded_headers,
         // RPO=0 is the default. An operator can disable the output gate to
         // remove object-store replication latency from the write response,
@@ -2586,7 +3701,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             "CELLD_MAX_OUTBOUND_WEBSOCKETS",
             DEFAULT_MAX_OUTBOUND_WEBSOCKETS,
         )?,
-        follower,
+        max_request_body_bytes,
+        follower: follower.clone(),
     };
 
     // The in-fleet log tier, v0. The takeover interlock is installed in
@@ -2595,16 +3711,21 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // requires the explicit fleet posture.
     // Fleet is the DEFAULT (decided 2026-08-14): a single node behaves
     // exactly like sync-to-bucket — no peers means no record, no shipper,
-    // and bucket-proven acks — and the moment peers appear the
-    // maintenance tick recruits them and fleet replication turns on. One
-    // value serves the hobbyist's first node and the fleet it grows into;
-    // CELLD_DURABILITY=bucket remains the explicit opt-out.
+    // and bucket-proven acks — and once TWO peers appear the maintenance
+    // tick recruits them and fleet replication turns on. Two, not one:
+    // `maintain` takes(2) from a member set that excludes self, and
+    // `NodeLogManager::healthy` wants members.len() >= 2, so the posture
+    // engages at three nodes and not before. A one- or two-node fleet
+    // therefore asks for `fleet` and keeps bucket-proven acks, which is
+    // correct and much slower. One value serves the hobbyist's first node
+    // and the fleet it grows into; CELLD_DURABILITY=bucket remains the
+    // explicit opt-out.
     let durability = std::env::var("CELLD_DURABILITY").unwrap_or_else(|_| "fleet".into());
     anyhow::ensure!(
         matches!(durability.as_str(), "bucket" | "fleet"),
         "CELLD_DURABILITY must be `bucket` or `fleet`"
     );
-    let mut node_log_close: Option<Arc<celld::node_log::NodeLogManager>> = None;
+    let mut durability_owner = DurabilityOwnerSelection::new(follower.clone());
     if let Ownership::Bucket(bucket_ownership) = &actor.ownership {
         if let (Some(replication), Some(spec)) = (
             app.runtime.as_ref().and_then(RuntimeManager::replication),
@@ -2636,15 +3757,13 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 celld::node_log::eviction_policy_from_env()?,
             ));
             *actor.node_log.lock().unwrap() = Some(manager.clone());
-            node_log_close = Some(manager.clone());
-            // Recovery-before-install, EVERY posture, FATAL on failure
-            // (cold reviews, B2/B3 and the second pass's finding 2): the
+            // Recovery-before-install is fatal for every posture: the
             // predecessor's folded state lives in the lease record this
             // session is about to replace, and the install writes a fresh
             // log — so an unrecovered predecessor must stop the boot, or
             // the install erases the only evidence recovery was needed.
-            // The ladder waits out the predecessor's own lease (the S1
-            // fence recheck refuses a live lease), retries with backoff,
+            // The ladder waits out the predecessor's own lease because the
+            // fence recheck refuses a live lease, retries with backoff,
             // and exits on exhaustion; systemd restarts while peers'
             // follower stores come back. No hostage problem — this node
             // has no lease yet, and peers may race the same
@@ -2681,15 +3800,13 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     )
                 })?;
             }
-            if durability == "fleet" {
-                ltx.set_shipper(manager.clone());
-                if bundle_mode {
-                    ltx.set_bundle_sink(manager.clone());
-                }
-                celld::node_log::spawn_maintenance(manager);
-            }
+            let mut owner =
+                celld::node_log::DurabilityOwner::new(manager, durability == "fleet", bundle_mode);
+            owner.start_background(follower.clone());
+            durability_owner.install_runtime(owner);
         }
     }
+    let mut durability_owner = durability_owner.select();
     let (do_call_tx, mut do_call_rx) = mpsc::unbounded_channel();
     celld::js::set_do_call_tx(do_call_tx);
     let (gate_tx, mut gate_rx) = mpsc::unbounded_channel();
@@ -2700,10 +3817,20 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     celld::js::set_svc_call_tx(service_call_tx);
     let (service_rpc_tx, mut service_rpc_rx) = mpsc::unbounded_channel();
     celld::js::set_svc_rpc_tx(service_rpc_tx);
+    let (queue_dispatch_tx, mut queue_dispatch_rx) = mpsc::unbounded_channel();
+    celld::js::set_queue_dispatch_tx(queue_dispatch_tx);
     let (asset_call_tx, mut asset_call_rx) = mpsc::unbounded_channel();
     celld::js::set_asset_call_tx(asset_call_tx);
     let (outbound_ws_tx, mut outbound_ws_rx) = mpsc::unbounded_channel();
     celld::js::set_outbound_ws_tx(outbound_ws_tx);
+    // KV large values live in the fleet bucket. The cloneable handle follows
+    // the R2 binding's startup pattern, so independent cells issue bucket I/O
+    // independently instead of queueing behind one task. Blob I/O takes no
+    // part in the drain ordering: a blob is written before its row, so an
+    // interrupted write leaves collectable bytes and never a dangling row.
+    if let Ownership::Bucket(bucket_ownership) = &actor.ownership {
+        celld::js::set_kv_blob_store(bucket_ownership.bucket_client());
+    }
     // The core is a serial ownership actor, not a Worker executor. It owns the
     // node lease timer, so ingress, proxy retries, and restore completions must
     // not consume every scheduler turn it needs. Its isolated single-thread
@@ -2738,6 +3865,91 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             }
         })
         .detach();
+    }
+
+    // The fleet-aware first-readiness gate: withhold the first health 200
+    // until no donor is mid-handoff and every live peer publishes successor
+    // capacity, bounded by CELLD_READY_FLEET_GATE_MS. Orchestrators key rollout
+    // advance on readiness, so this paces a stock rolling update against fleet
+    // recovery. One-shot: once open, fleet state never demotes readiness, and
+    // a gated node still serves its owned cells through peers.
+    let ready_gate_ms: u64 = celld::env_vars::with_default("CELLD_READY_FLEET_GATE_MS", 120_000)?;
+    match (&ready_ownership, ready_gate_ms) {
+        (Some(ownership), gate_ms) if gate_ms > 0 => {
+            let ownership = ownership.clone();
+            let bucket = ownership.bucket_client();
+            let gate_node = node.clone();
+            let gate_flag = app.fleet_ready.clone();
+            let max_restoring = max_activations as u64;
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    let (current, peers) = tokio::join!(
+                        celld::drain_token::read(&bucket),
+                        ownership.read_capacity_peers()
+                    );
+                    // Judge lease and token expiry after the I/O. A slow list
+                    // must not make a record live at the time before the read.
+                    let now_ms = celld::ownership_store::now_ms();
+                    let status = match (&current, &peers) {
+                        (Ok(current), Ok(peers)) => celld_logic::drain::fleet_status(
+                            current.as_ref().and_then(|current| current.token.as_ref()),
+                            &gate_node,
+                            now_ms,
+                            peers,
+                            max_restoring,
+                        ),
+                        // An unreadable store is not settled; the deadline
+                        // bounds the wait.
+                        _ => Err(celld_logic::drain::FleetUnsettled::Unreadable),
+                    };
+                    let waited_ms = started.elapsed().as_millis() as u64;
+                    if status.is_ok() {
+                        let readiness_reason = if peers.as_ref().ok().is_some_and(|peers| {
+                            celld_logic::drain::joining_contributes_successor_capacity(
+                                peers, &gate_node, now_ms,
+                            )
+                        }) {
+                            "successor_capacity"
+                        } else {
+                            "fleet_settled"
+                        };
+                        gate_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        tracing::info!(
+                            event = "ready_gate_open",
+                            readiness_reason,
+                            waited_ms,
+                            "the fleet is settled; serving readiness is open"
+                        );
+                        return;
+                    }
+                    if waited_ms >= gate_ms {
+                        let holder = current
+                            .as_ref()
+                            .ok()
+                            .and_then(|current| current.as_ref())
+                            .and_then(|current| current.token.as_ref())
+                            .map(|token| token.node.as_str())
+                            .unwrap_or_default();
+                        gate_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        tracing::warn!(
+                            event = "ready_gate_expired",
+                            holder,
+                            reason = ?status.err(),
+                            waited_ms,
+                            "the ready-gate deadline expired with the fleet unsettled; falling open"
+                        );
+                        return;
+                    }
+                }
+            });
+        }
+        _ => app
+            .fleet_ready
+            .store(true, std::sync::atomic::Ordering::SeqCst),
     }
 
     if let Some((client, wake)) = wake_scan {
@@ -2792,49 +4004,20 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         .detach();
     }
 
-    // Arm this deployment's cron schedule. A cron cell has no client to wake
-    // it, so somebody has to make the first call; every node makes it, and
-    // ownership CAS decides which one keeps the cell while the others route to
-    // that owner. No new election, no reserved node -- the same arbiter that
-    // makes an alarm fire once per fleet makes a cron trigger fire once too.
-    //
-    // Nothing re-arms after this. Once the schedule is in the cell's alarm row
-    // it is durable, its wake entry is in the bucket, and losing the owner is
-    // the ordinary alarm-recovery path: the fleet waker finds the due entry
-    // and another node takes the cell over.
-    if let Some(cell) = app.runtime.as_ref().and_then(|runtime| runtime.cron_cell()) {
-        let arm_app = app.clone();
-        tokio::spawn(async move {
-            // Routing needs node authority, exactly as the wake scan does.
-            let deadline = Instant::now() + std::time::Duration::from_secs(30);
-            while !arm_app.healthy().await {
-                if Instant::now() >= deadline {
-                    tracing::warn!(cell, "cron schedule not armed: no node authority");
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            // A failed arm leaves the schedule silent until the next restart,
-            // so retry rather than log once. The backoff is bounded because a
-            // fleet that cannot route for a minute has a larger problem.
-            for attempt in 0..5 {
-                match arm_cron_schedule(arm_app.clone(), cell.clone()).await {
-                    Ok(()) => return,
-                    Err(error) if attempt == 4 => {
-                        tracing::error!(cell, %error, "cron schedule not armed");
-                    }
-                    Err(error) => {
-                        tracing::warn!(cell, %error, attempt, "cron arm failed, retrying");
-                        tokio::time::sleep(std::time::Duration::from_millis(500 << attempt.min(5)))
-                            .await;
-                    }
-                }
-            }
-        });
+    // Arm the schedule, then watch the pointer. Adoption arms it again, so
+    // a cron change travels with the deployment that carries it.
+    spawn_cron_arm(app.clone());
+    if let Some(bucket) = deploy_bucket {
+        start_pointer_watcher(
+            app.clone(),
+            bucket,
+            node.clone(),
+            settings.region.clone(),
+            reload_rx,
+        );
     }
-
     if let Some(client) = deploy_agent {
-        celld::control_plane::start_deploy_agent(client.clone(), Arc::new(AtomicBool::new(true)));
+        celld::control_plane::start_deploy_agent(client.clone(), reload_tx.clone());
         let presence_app = app.clone();
         celld::control_plane::start_presence_agent(celld::control_plane::PresenceRuntime {
             s3: client,
@@ -2848,18 +4031,19 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 let app = presence_app.clone();
                 Box::pin(async move { app.presence().await })
             }),
+            reload: reload_tx.clone(),
         });
     }
 
-    println!(
+    celld::cli_output::Output::new(celld::cli_output::Format::Text).line(format_args!(
         "celld listening on {} (ownership={ownership_name})",
         listener.local_addr()?
-    );
-    println!(
+    ))?;
+    celld::cli_output::Output::new(celld::cli_output::Format::Text).line(format_args!(
         "celld internal listening on {} (advertise={})",
         internal_listener.local_addr()?,
         app.advertise
-    );
+    ))?;
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
     // A SIGTERM (systemd stop, `docker stop`, a Kubernetes pod delete) or a
     // SIGINT begins the same graceful shutdown as `POST /shutdown`, so the
@@ -2868,6 +4052,10 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let (connection_drain_tx, connection_drain) = watch::channel(false);
     let drain_ms: u64 = celld::env_vars::positive("CELLD_SHUTDOWN_DRAIN_MS")?.unwrap_or(25_000);
+    let shutdown_total_ms: u64 =
+        celld::env_vars::positive("CELLD_SHUTDOWN_TOTAL_MS")?.unwrap_or(40_000);
+    let drain_token_wait_ms: u64 =
+        celld::env_vars::with_default("CELLD_DRAIN_TOKEN_WAIT_MS", 30_000)?;
     // A hung connection must not consume the whole preserve budget: the
     // semantic drain and the clean-reload certificate come out of the same
     // deadline.
@@ -2877,6 +4065,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let mut do_calls: FuturesUnordered<DoCallFuture> = FuturesUnordered::new();
     let mut gate_calls: FuturesUnordered<DoCallFuture> = FuturesUnordered::new();
     let mut service_calls: FuturesUnordered<DoCallFuture> = FuturesUnordered::new();
+    let mut queue_calls: FuturesUnordered<DoCallFuture> = FuturesUnordered::new();
     let mut asset_calls: FuturesUnordered<AssetCallFuture> = FuturesUnordered::new();
     let mut websockets: FuturesUnordered<WebSocketFuture> = FuturesUnordered::new();
     let mut cache_prunes: FuturesUnordered<CachePruneFuture> = FuturesUnordered::new();
@@ -2887,7 +4076,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     );
     local_cache_prune.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let shutdown_mode = loop {
-        tokio::select! {
+        celld::asyncrt::select! {
             connection = listener.accept() => {
                 let (stream, _) = connection?;
                 connections.push(serve_http_connection(
@@ -2938,6 +4127,13 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 service_calls.push(Box::pin(dispatch_service_rpc(app.clone(), call)));
             }
             Some(()) = service_calls.next(), if !service_calls.is_empty() => {}
+            call = queue_dispatch_rx.recv() => {
+                let Some(call) = call else {
+                    anyhow::bail!("Queue dispatch channel closed");
+                };
+                queue_calls.push(Box::pin(dispatch_queue_batch(app.clone(), call)));
+            }
+            Some(()) = queue_calls.next(), if !queue_calls.is_empty() => {}
             call = rpc_call_rx.recv() => {
                 let Some(call) = call else {
                     anyhow::bail!("Durable Object RPC channel closed");
@@ -3037,160 +4233,548 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             }
         }
     };
-    // Graceful shutdown. Report unhealthy so a load balancer sheds this node,
-    // and refuse new work. Keep accepting bounded health and diagnostic
-    // requests while the semantic drain runs. A node removal hands every
-    // resident cell to a peer. A planned same-node replacement preserves
-    // ownership and its local replica cache, so the replacement does not
-    // create a fleet-wide cold handoff or lasting skew.
+    // This deadline starts at the stop signal and covers token acquisition,
+    // request drain, ownership handoff, transport flush, and local durability
+    // shutdown. Progress can extend only the inner stall deadline. The
+    // absolute bound leaves the orchestrator time to observe an orderly exit
+    // instead of replacing a progressing donor with SIGKILL.
+    let process_deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_millis(shutdown_total_ms);
+    // Stop public admission immediately. Before a handoff changes any cell
+    // lifecycle, finish the public requests which crossed the old admission
+    // gate. A DO call reaches its output gate only after it writes, so
+    // beginning the final durability cut first would let that call cross the
+    // cut without a core activity pin. Peer connections stay open:
+    // cells outside the current batch must remain reachable during handoff.
     app.draining
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = connection_drain_tx.send(true);
-    // Receivers cloned from `connection_drain` have already observed an old
-    // version, so `changed()` would close each newly accepted connection
-    // before it could send a diagnostic response. Give drain-time connections
-    // their own signal. They are deliberately absent from `shell_drained`: an
-    // incomplete health request must not prevent a clean reload certificate.
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let stall_window = std::time::Duration::from_millis(drain_ms);
+    // New drain-time connections need a fresh watch version. A receiver cloned
+    // from `connection_drain` after its signal would close immediately, before
+    // it could serve a health response or authenticated peer request.
     let (drain_connection_tx, drain_connection) = watch::channel(false);
     let mut drain_connections: FuturesUnordered<ConnectionFuture> = FuturesUnordered::new();
-    if shutdown_mode == ShutdownMode::Handoff {
-        let _ = app.tx.send(Message::ReleaseAll);
-    } else {
-        let _ = app.tx.send(Message::BeginPreserve);
-    }
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(drain_ms);
-    let mut handoff = tokio::time::interval(std::time::Duration::from_millis(50));
-    let drained = loop {
-        let shell_drained = connections.is_empty()
-            && do_calls.is_empty()
-            && gate_calls.is_empty()
-            && service_calls.is_empty()
-            && asset_calls.is_empty()
-            && websockets.is_empty();
-        // The actor can be busy driving an immediate-effect failure loop, so
-        // a status request is not itself allowed to bypass the drain deadline.
-        let core_drained = if shell_drained {
-            tokio::time::timeout(std::time::Duration::from_millis(50), app.drain_status())
-                .await
-                .is_ok_and(|status| match shutdown_mode {
-                    ShutdownMode::Handoff => status.occupied == 0 && status.releasing == 0,
-                    ShutdownMode::Preserve => status.activating == 0 && status.evicting == 0,
-                })
-        } else {
-            false
-        };
-        if shell_drained && core_drained {
-            break true;
+    let mut drain_token_hold: Option<celld::drain_token::Hold> = None;
+    let handoff_started = if shutdown_mode == ShutdownMode::Handoff {
+        // Serialize donors: claim the fleet drain token beside the
+        // admitted-request drain, so simultaneous stop signals hand off one
+        // node at a time. A waiting donor keeps serving peers and refuses
+        // new handoffs because it is already draining. The wait has its own
+        // bound inside the task; the pre-drain deadline never covers it.
+        let drain_token: Arc<std::sync::Mutex<Option<celld::drain_token::Outcome>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        match &fleet_bucket {
+            Some(bucket) if drain_token_wait_ms > 0 => {
+                let bucket = bucket.clone();
+                let slot = drain_token.clone();
+                let token_node = clean_reload_node.clone();
+                let wait = std::time::Duration::from_millis(drain_token_wait_ms)
+                    .min(process_deadline.saturating_duration_since(tokio::time::Instant::now()));
+                tokio::spawn(async move {
+                    let outcome = celld::drain_token::acquire(&bucket, &token_node, wait).await;
+                    *slot.lock().expect("drain token slot") = Some(outcome);
+                });
+            }
+            _ => {
+                *drain_token.lock().expect("drain token slot") =
+                    Some(celld::drain_token::Outcome::Disabled);
+            }
         }
-        tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => break false,
-            _ = handoff.tick() => {}
-            connection = listener.accept() => {
-                let (stream, _) = connection?;
-                drain_connections.push(serve_http_connection(
-                    stream,
-                    HttpSurface::Public,
-                    app.clone(),
-                    shutdown_tx.clone(),
-                    drain_connection.clone(),
-                    connection_grace,
-                ));
+        let pre_drain_deadline = (tokio::time::Instant::now() + stall_window).min(process_deadline);
+        let mut pre_drain_tick = tokio::time::interval(std::time::Duration::from_millis(5));
+        let mut admitted = None;
+        let admitted_drained = loop {
+            if admitted.is_none() && app.public_in_flight() == 0 {
+                admitted = Some(true);
             }
-            connection = internal_listener.accept() => {
-                let (stream, _) = connection?;
-                drain_connections.push(serve_http_connection(
-                    stream,
-                    HttpSurface::Internal,
-                    app.clone(),
-                    shutdown_tx.clone(),
-                    drain_connection.clone(),
-                    connection_grace,
-                ));
+            if let Some(admitted_drained) = admitted {
+                if drain_token.lock().expect("drain token slot").is_some() {
+                    break admitted_drained;
+                }
             }
-            Some(_) = drain_connections.next(), if !drain_connections.is_empty() => {}
-            Some(_) = connections.next(), if !connections.is_empty() => {}
-            Some(_) = do_calls.next(), if !do_calls.is_empty() => {}
-            Some(_) = gate_calls.next(), if !gate_calls.is_empty() => {}
-            Some(_) = service_calls.next(), if !service_calls.is_empty() => {}
-            Some(_) = asset_calls.next(), if !asset_calls.is_empty() => {}
-            Some(_) = websockets.next(), if !websockets.is_empty() => {}
+            celld::asyncrt::select! {
+                _ = tokio::time::sleep_until(pre_drain_deadline), if admitted.is_none() => {
+                    admitted = Some(false);
+                }
+                _ = tokio::time::sleep_until(process_deadline) => break false,
+                _ = pre_drain_tick.tick() => {}
+                connection = listener.accept() => {
+                    let (stream, _) = connection?;
+                    drain_connections.push(serve_http_connection(
+                        stream,
+                        HttpSurface::Public,
+                        app.clone(),
+                        shutdown_tx.clone(),
+                        drain_connection.clone(),
+                        connection_grace,
+                    ));
+                }
+                connection = internal_listener.accept() => {
+                    let (stream, _) = connection?;
+                    drain_connections.push(serve_http_connection(
+                        stream,
+                        HttpSurface::Internal,
+                        app.clone(),
+                        shutdown_tx.clone(),
+                        drain_connection.clone(),
+                        connection_grace,
+                    ));
+                }
+                Some(_) = drain_connections.next(), if !drain_connections.is_empty() => {}
+                Some(_) = connections.next(), if !connections.is_empty() => {}
+                call = do_call_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("Durable Object call channel closed during shutdown pre-drain");
+                    };
+                    do_calls.push(Box::pin(dispatch_do_call(app.clone(), call)));
+                }
+                Some(_) = do_calls.next(), if !do_calls.is_empty() => {}
+                req = gate_rx.recv() => {
+                    let Some(req) = req else {
+                        anyhow::bail!("output-gate channel closed during shutdown pre-drain");
+                    };
+                    gate_calls.push(Box::pin(dispatch_gate(app.clone(), req)));
+                }
+                Some(_) = gate_calls.next(), if !gate_calls.is_empty() => {}
+                call = service_call_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("service call channel closed during shutdown pre-drain");
+                    };
+                    service_calls.push(Box::pin(dispatch_service_call(app.clone(), call)));
+                }
+                call = service_rpc_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("service RPC channel closed during shutdown pre-drain");
+                    };
+                    service_calls.push(Box::pin(dispatch_service_rpc(app.clone(), call)));
+                }
+                Some(_) = service_calls.next(), if !service_calls.is_empty() => {}
+                call = queue_dispatch_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("Queue dispatch channel closed during shutdown pre-drain");
+                    };
+                    queue_calls.push(Box::pin(dispatch_queue_batch(app.clone(), call)));
+                }
+                Some(_) = queue_calls.next(), if !queue_calls.is_empty() => {}
+                call = rpc_call_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("Durable Object RPC channel closed during shutdown pre-drain");
+                    };
+                    do_calls.push(Box::pin(dispatch_rpc_call(app.clone(), call)));
+                }
+                call = asset_call_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("asset call channel closed during shutdown pre-drain");
+                    };
+                    asset_calls.push(Box::pin(dispatch_asset_call(app.clone(), call)));
+                }
+                Some(_) = asset_calls.next(), if !asset_calls.is_empty() => {}
+                code = fence_rx.recv() => exit_flushed(code.unwrap_or(3)),
+                actor_exit = actor_exit_rx.recv() => {
+                    let error = match actor_exit {
+                        Some(Err(error)) => error,
+                        Some(Ok(())) => "the core actor stopped unexpectedly".to_string(),
+                        None => "the core actor thread panicked".to_string(),
+                    };
+                    tracing::error!(event = "core_actor_exit", %error, "SELF-FENCE during shutdown pre-drain");
+                    exit_flushed(3);
+                }
+            }
+        };
+        drain_token_hold = match drain_token.lock().expect("drain token slot").take() {
+            Some(celld::drain_token::Outcome::Acquired(hold)) => Some(hold),
+            _ => None,
+        };
+        if !admitted_drained {
+            tracing::warn!(
+                event = "shutdown_pre_drain_forced",
+                public_in_flight = app.public_in_flight(),
+                do_calls = do_calls.len(),
+                gate_calls = gate_calls.len(),
+                service_calls = service_calls.len(),
+                queue_calls = queue_calls.len(),
+                asset_calls = asset_calls.len(),
+                grace_ms = stall_window.as_millis(),
+                "shutdown reached its admitted-request deadline before cell handoff"
+            );
+        }
+        if admitted_drained {
+            let _ = app.tx.send(Message::ReleaseAll);
+        }
+        admitted_drained
+    } else {
+        let _ = connection_drain_tx.send(true);
+        let _ = app.tx.send(Message::BeginPreserve);
+        true
+    };
+    // Progress extends the stall deadline, but never the complete process
+    // deadline. A deadline-cut cell keeps its durable owner record and follows
+    // the same lease-expiry recovery path as an abrupt process loss.
+    let mut stall_deadline = (tokio::time::Instant::now() + stall_window).min(process_deadline);
+    let mut handed_off = 0;
+    let mut process_deadline_fired = false;
+    let mut handoff = tokio::time::interval(std::time::Duration::from_millis(50));
+    let drained = if shutdown_mode == ShutdownMode::Handoff && !handoff_started {
+        false
+    } else {
+        loop {
+            let shell_drained = connections.is_empty()
+                && do_calls.is_empty()
+                && gate_calls.is_empty()
+                && service_calls.is_empty()
+                && queue_calls.is_empty()
+                && asset_calls.is_empty()
+                && websockets.is_empty();
+            // The actor can be busy driving an immediate-effect failure loop, so
+            // a status request is not itself allowed to bypass the drain deadline.
+            let status = before_process_deadline(
+                process_deadline,
+                tokio::time::timeout(std::time::Duration::from_millis(50), app.drain_status()),
+            )
+            .await
+            .and_then(Result::ok);
+            if shutdown_mode == ShutdownMode::Handoff
+                && status.is_some_and(|status| status.handed_off > handed_off)
+            {
+                handed_off = status.expect("checked drain status").handed_off;
+                stall_deadline = (tokio::time::Instant::now() + stall_window).min(process_deadline);
+            }
+            // A drain that makes progress can outlive the token TTL, so the
+            // holder renews and only a dead holder lets the token lapse.
+            let renew_due = drain_token_hold.as_ref().is_some_and(|hold| {
+                celld::drain_token::renew_due(hold, celld::ownership_store::now_ms())
+            });
+            if renew_due {
+                let mut lost = false;
+                if let (Some(bucket), Some(hold)) = (&fleet_bucket, drain_token_hold.as_mut()) {
+                    let Some(renewed) = before_process_deadline(
+                        process_deadline,
+                        celld::drain_token::renew(bucket, &clean_reload_node, hold),
+                    )
+                    .await
+                    else {
+                        process_deadline_fired = true;
+                        break false;
+                    };
+                    lost = !renewed;
+                }
+                if lost {
+                    drain_token_hold = None;
+                }
+            }
+            let core_drained = status.is_some_and(|status| match shutdown_mode {
+                ShutdownMode::Handoff => {
+                    status.occupied == 0
+                        && status.activating == 0
+                        && status.quiescing == 0
+                        && status.evicting == 0
+                        && status.releasing == 0
+                        && status.adopting == 0
+                }
+                ShutdownMode::Preserve => status.activating == 0 && status.evicting == 0,
+            });
+            let completely_drained = match shutdown_mode {
+                ShutdownMode::Handoff => core_drained,
+                ShutdownMode::Preserve => shell_drained && core_drained,
+            };
+            if completely_drained {
+                break true;
+            }
+            celld::asyncrt::select! {
+                _ = tokio::time::sleep_until(stall_deadline) => {
+                    process_deadline_fired = tokio::time::Instant::now() >= process_deadline;
+                    break false;
+                },
+                _ = handoff.tick() => {}
+                connection = listener.accept() => {
+                    let (stream, _) = connection?;
+                    drain_connections.push(serve_http_connection(
+                        stream,
+                        HttpSurface::Public,
+                        app.clone(),
+                        shutdown_tx.clone(),
+                        drain_connection.clone(),
+                        connection_grace,
+                    ));
+                }
+                connection = internal_listener.accept() => {
+                    let (stream, _) = connection?;
+                    drain_connections.push(serve_http_connection(
+                        stream,
+                        HttpSurface::Internal,
+                        app.clone(),
+                        shutdown_tx.clone(),
+                        drain_connection.clone(),
+                        connection_grace,
+                    ));
+                }
+                Some(_) = drain_connections.next(), if !drain_connections.is_empty() => {}
+                Some(_) = connections.next(), if !connections.is_empty() => {}
+                call = do_call_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("Durable Object call channel closed during shutdown");
+                    };
+                    do_calls.push(Box::pin(dispatch_do_call(app.clone(), call)));
+                }
+                Some(_) = do_calls.next(), if !do_calls.is_empty() => {}
+                req = gate_rx.recv() => {
+                    let Some(req) = req else {
+                        anyhow::bail!("output-gate channel closed during shutdown");
+                    };
+                    gate_calls.push(Box::pin(dispatch_gate(app.clone(), req)));
+                }
+                Some(_) = gate_calls.next(), if !gate_calls.is_empty() => {}
+                call = service_call_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("service call channel closed during shutdown");
+                    };
+                    service_calls.push(Box::pin(dispatch_service_call(app.clone(), call)));
+                }
+                call = service_rpc_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("service RPC channel closed during shutdown");
+                    };
+                    service_calls.push(Box::pin(dispatch_service_rpc(app.clone(), call)));
+                }
+                Some(_) = service_calls.next(), if !service_calls.is_empty() => {}
+                call = queue_dispatch_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("Queue dispatch channel closed during shutdown");
+                    };
+                    queue_calls.push(Box::pin(dispatch_queue_batch(app.clone(), call)));
+                }
+                Some(_) = queue_calls.next(), if !queue_calls.is_empty() => {}
+                call = rpc_call_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("Durable Object RPC channel closed during shutdown");
+                    };
+                    do_calls.push(Box::pin(dispatch_rpc_call(app.clone(), call)));
+                }
+                call = asset_call_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("asset call channel closed during shutdown");
+                    };
+                    asset_calls.push(Box::pin(dispatch_asset_call(app.clone(), call)));
+                }
+                Some(_) = asset_calls.next(), if !asset_calls.is_empty() => {}
+                socket = websocket_rx.recv() => {
+                    let Some(socket) = socket else {
+                        anyhow::bail!("WebSocket channel closed during shutdown");
+                    };
+                    websockets.push(socket);
+                }
+                outbound = outbound_ws_rx.recv() => {
+                    let Some(outbound) = outbound else {
+                        anyhow::bail!("outbound WebSocket channel closed during shutdown");
+                    };
+                    let app = app.clone();
+                    websockets.push(Box::pin(async move {
+                        if let Err(error) = outbound_websocket_task(app, outbound).await {
+                            eprintln!("celld outbound WebSocket failed: {error:#}");
+                        }
+                    }));
+                }
+                Some(_) = websockets.next(), if !websockets.is_empty() => {}
+                code = fence_rx.recv() => exit_flushed(code.unwrap_or(3)),
+                actor_exit = actor_exit_rx.recv() => {
+                    let error = match actor_exit {
+                        Some(Err(error)) => error,
+                        Some(Ok(())) => "the core actor stopped unexpectedly".to_string(),
+                        None => "the core actor thread panicked".to_string(),
+                    };
+                    tracing::error!(event = "core_actor_exit", %error, "SELF-FENCE during shutdown");
+                    exit_flushed(3);
+                }
+            }
         }
     };
+    let _ = connection_drain_tx.send(true);
     let _ = drain_connection_tx.send(true);
-    if !drained && shutdown_mode == ShutdownMode::Handoff {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            app.drain_status(),
+    // Release the token whether or not the drain completed: the process is
+    // about to exit either way, and the next donor must not wait out the TTL.
+    // The connection flush below needs nothing from the token, so releasing
+    // first keeps the next donor off the TTL during the flush grace.
+    if let (Some(bucket), Some(hold)) = (&fleet_bucket, drain_token_hold.take()) {
+        if before_process_deadline(
+            process_deadline,
+            celld::drain_token::release(bucket, &clean_reload_node, hold),
         )
         .await
+        .is_none()
         {
-            Ok(status) => eprintln!(
-                "celld shutdown drain reached its {drain_ms}ms deadline: occupied={} activating={} evicting={} releasing={}",
-                status.occupied, status.activating, status.evicting, status.releasing
+            tracing::warn!(
+                event = "drain_token_release_deadline",
+                "the process deadline skipped or cancelled the drain token release; the TTL bounds the residue"
+            );
+        }
+    }
+    if !handoff_started {
+        tracing::error!(
+            event = "shutdown_handoff_not_started",
+            drain_ms,
+            admitted_public = app.public_in_flight(),
+            "the shutdown pre-drain did not finish"
+        );
+    } else if !drained && shutdown_mode == ShutdownMode::Handoff {
+        let drain_state = before_process_deadline(
+            process_deadline,
+            tokio::time::timeout(std::time::Duration::from_millis(50), app.snapshot()),
+        )
+        .await
+        .and_then(Result::ok)
+        .unwrap_or_else(|| "{\"error\":\"process_deadline\"}".to_string());
+        match before_process_deadline(
+            process_deadline,
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                app.drain_status(),
             ),
-            Err(_) => eprintln!(
-                "celld shutdown drain reached its {drain_ms}ms deadline: core status unavailable"
+        )
+        .await
+        .and_then(Result::ok)
+        {
+            Some(status) => tracing::error!(
+                event = "shutdown_handoff_stalled",
+                drain_ms,
+                shutdown_total_ms,
+                process_deadline_fired,
+                occupied = status.occupied,
+                activating = status.activating,
+                quiescing = status.quiescing,
+                evicting = status.evicting,
+                releasing = status.releasing,
+                adopting = status.adopting,
+                handed_off = status.handed_off,
+                drain_state,
+                "the shutdown handoff made no progress"
+            ),
+            None => tracing::error!(
+                event = "shutdown_handoff_stalled",
+                drain_ms,
+                shutdown_total_ms,
+                process_deadline_fired,
+                drain_state,
+                "the shutdown handoff made no observable progress because the core status was unavailable"
             ),
         }
     } else if !drained {
         eprintln!(
-            "celld preserve drain reached its {drain_ms}ms deadline: connections={} do_calls={} gate_calls={} service_calls={} asset_calls={} websockets={}",
+            "celld preserve drain reached its {drain_ms}ms deadline: connections={} do_calls={} gate_calls={} service_calls={} queue_calls={} asset_calls={} websockets={}",
             connections.len(),
             do_calls.len(),
             gate_calls.len(),
             service_calls.len(),
+            queue_calls.len(),
             asset_calls.len(),
             websockets.len(),
         );
     }
+    // Let every accepted connection FINISH its current response before the
+    // process exits. The demand-driven drain can complete in milliseconds
+    // on a quiet node, and exit_flushed is a hard process::exit — without
+    // this wait, a diagnostic request accepted during the drain window is
+    // reset mid-response, and a WebSocket close frame written during the
+    // release races the exit (#262). The watches above already told each
+    // connection to close after the response it is serving, so this drains
+    // fast; the grace only bounds a stuck peer. The dispatch sets (do_calls,
+    // gate_calls, service_calls, asset_calls) are NOT polled here: a
+    // connection whose response depends on one stalls for the grace and is
+    // then cut, so a drain-window internal route must never dispatch into a
+    // cell. Today none does — /state, /health, and /peer/abort answer from the
+    // shell.
+    let flush_connections = async {
+        while drain_connections.next().await.is_some() {}
+        while connections.next().await.is_some() {}
+        while websockets.next().await.is_some() {}
+    };
+    let _ = before_process_deadline(
+        process_deadline,
+        tokio::time::timeout(CONNECTION_DRAIN_GRACE, flush_connections),
+    )
+    .await;
     // The graceful-shutdown drain point: seal our node-log record so the
     // next incarnation starts with no gather. Guarded inside — it seals
     // only when every shipped frame is bucket-covered.
-    if let Some(manager) = &node_log_close {
-        manager.close_gracefully().await;
-    }
-    if drained && shutdown_mode == ShutdownMode::Preserve {
-        let prepared = match (&app.runtime, app.presence().await) {
-            (Some(runtime), Some(presence)) => {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                tokio::time::timeout(remaining, runtime.prepare_clean_reload(&presence.cells)).await
+    let durability_quiesced = if let Some(owner) = &mut durability_owner {
+        let remaining = process_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let completed = if remaining.is_zero() {
+            owner.stop_local_now();
+            false
+        } else {
+            owner.quiesce_and_seal_within(remaining).await
+        };
+        if !completed {
+            eprintln!("celld durability quiesce exceeded the process deadline");
+        }
+        completed
+    } else {
+        true
+    };
+    if clean_reload_is_eligible(durability_quiesced, drained, shutdown_mode) {
+        let presence = before_process_deadline(process_deadline, app.presence()).await;
+        let prepared = match (&app.runtime, presence) {
+            (Some(runtime), Some(Some(presence))) => {
+                before_process_deadline(
+                    process_deadline,
+                    runtime.prepare_clean_reload(&presence.cells),
+                )
+                .await
             }
-            _ => Ok(Err(anyhow::anyhow!(
+            (_, Some(None)) | (None, Some(Some(_))) => Some(Err(anyhow::anyhow!(
                 "clean reload requires a runtime and a resident snapshot"
             ))),
+            (_, None) => None,
         };
         match prepared {
-            Ok(Ok(pruned)) if app.healthy().await => {
-                match celld::runtime::write_clean_reload_marker(
-                    &data_dir,
-                    &clean_reload_node,
-                    &process_generation,
-                ) {
-                    Ok(()) => tracing::info!(
-                        event = "clean_reload_prepared",
-                        stale_live_databases_pruned = pruned,
-                        "prepared local cells for an exact-generation reload"
-                    ),
-                    Err(error) => tracing::warn!(
+            Some(Ok(pruned)) => {
+                match before_process_deadline(process_deadline, app.healthy()).await {
+                    Some(true) => match celld::runtime::write_clean_reload_marker(
+                        &data_dir,
+                        &clean_reload_node,
+                        &process_generation,
+                    ) {
+                        Ok(()) => tracing::info!(
+                            event = "clean_reload_prepared",
+                            stale_live_databases_pruned = pruned,
+                            "prepared local cells for an exact-generation reload"
+                        ),
+                        Err(error) => tracing::warn!(
+                            event = "clean_reload_abandoned",
+                            %error,
+                            "could not publish the clean local reload certificate"
+                        ),
+                    },
+                    Some(false) => tracing::warn!(
                         event = "clean_reload_abandoned",
-                        %error,
-                        "could not publish the clean local reload certificate"
+                        "node authority was lost while local cells were closing"
+                    ),
+                    None => tracing::warn!(
+                        event = "clean_reload_abandoned",
+                        "the process deadline skipped the final authority check"
                     ),
                 }
             }
-            Ok(Ok(_)) => tracing::warn!(
-                event = "clean_reload_abandoned",
-                "node authority was lost while local cells were closing"
-            ),
-            Ok(Err(error)) => tracing::warn!(
+            Some(Err(error)) => tracing::warn!(
                 event = "clean_reload_abandoned",
                 %error,
                 "local reload preparation failed; replacement will use normal recovery"
             ),
-            Err(_) => tracing::warn!(
+            None => tracing::warn!(
                 event = "clean_reload_abandoned",
                 "local reload preparation exceeded the shutdown deadline"
             ),
+        }
+    }
+    if let Some(owner) = &mut durability_owner {
+        let remaining = process_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let completed = if remaining.is_zero() {
+            owner.stop_local_now();
+            false
+        } else {
+            owner.shutdown_local_within(remaining).await
+        };
+        if !completed {
+            eprintln!("celld local durability shutdown exceeded the process deadline");
         }
     }
     // Exit without unwinding. Returning from here drops the tokio runtime
@@ -3220,17 +4804,136 @@ impl Drop for HangUp {
 }
 
 /// Abandons a forwarded fetch on the owner when the peer connection carrying
-/// it goes away. Disarmed by clearing the id once the fetch has answered.
+/// it goes away. After the handler answers, a drop cancels only its response
+/// body pin because the isolate has no unanswered request left to abort.
 struct AbortPeerFetchOnHangUp {
     runtime: RuntimeManager,
     scope: String,
     request_id: Option<celld::js::RequestId>,
+    drain_pins: DrainPinRegistry,
+    handler_active: bool,
+}
+
+impl AbortPeerFetchOnHangUp {
+    fn disarm(&mut self) {
+        self.request_id = None;
+    }
+
+    fn handler_answered(&mut self) {
+        self.handler_active = false;
+    }
 }
 
 impl Drop for AbortPeerFetchOnHangUp {
     fn drop(&mut self) {
         if let Some(request_id) = self.request_id {
-            self.runtime.abort_fetch(&self.scope, request_id);
+            let _ = self
+                .drain_pins
+                .cancel_request(request_id, "peer_connection_closed");
+            if self.handler_active {
+                self.runtime.abort_fetch(&self.scope, request_id);
+            }
         }
     }
+}
+
+fn forwarder_response_stream(
+    stream: celld::js::HttpChunkStream,
+    mut abort: RemoteFetchAbortGuard,
+) -> celld::js::HttpChunkStream {
+    abort.body_active();
+    Box::pin(futures_util::stream::unfold(
+        (stream, Some(abort)),
+        |(mut stream, mut abort)| async move {
+            match stream.next().await {
+                Some(chunk) => {
+                    // An upstream body error already ended the owner
+                    // transport. A second connection carrying an abort adds
+                    // no signal; only a downstream drop while the upstream is
+                    // still live needs the explicit peer request.
+                    if chunk.is_err() {
+                        if let Some(mut abort) = abort.take() {
+                            abort.disarm();
+                        }
+                    }
+                    Some((chunk, (stream, abort)))
+                }
+                None => {
+                    if let Some(mut abort) = abort.take() {
+                        abort.disarm();
+                    }
+                    None
+                }
+            }
+        },
+    ))
+}
+
+fn owner_response_stream(
+    stream: celld::js::HttpChunkStream,
+    activity: ActivityGuard,
+    abort: AbortPeerFetchOnHangUp,
+) -> celld::js::HttpChunkStream {
+    let cancellation = activity.cancellation();
+    Box::pin(futures_util::stream::unfold(
+        (stream, Some(activity), Some(abort), cancellation),
+        |(mut stream, activity, mut abort, mut cancellation)| async move {
+            let chunk = if *cancellation.borrow() {
+                None
+            } else {
+                celld::asyncrt::select! {
+                    chunk = stream.next() => chunk,
+                    changed = cancellation.changed() => {
+                        let _ = changed;
+                        None
+                    }
+                }
+            };
+            match chunk {
+                Some(chunk) => Some((chunk, (stream, activity, abort, cancellation))),
+                None => {
+                    if let Some(mut abort) = abort.take() {
+                        abort.disarm();
+                    }
+                    drop(activity);
+                    None
+                }
+            }
+        },
+    ))
+}
+
+fn local_response_stream(
+    stream: celld::js::HttpChunkStream,
+    activity: ActivityGuard,
+) -> celld::js::HttpChunkStream {
+    let cancellation = activity.cancellation();
+    Box::pin(futures_util::stream::unfold(
+        (stream, Some(activity), cancellation),
+        |(mut stream, activity, mut cancellation)| async move {
+            let chunk = if *cancellation.borrow() {
+                None
+            } else {
+                celld::asyncrt::select! {
+                    chunk = stream.next() => chunk,
+                    changed = cancellation.changed() => {
+                        let _ = changed;
+                        None
+                    }
+                }
+            };
+            match chunk {
+                Some(chunk) => Some((chunk, (stream, activity, cancellation))),
+                None => {
+                    drop(activity);
+                    None
+                }
+            }
+        },
+    ))
+}
+
+#[cfg(all(test, celld_internal_tests))]
+mod durability_lifecycle_private {
+    include!(env!("CELLD_CONFORMANCE_MAIN_DURABILITY_TESTS"));
 }

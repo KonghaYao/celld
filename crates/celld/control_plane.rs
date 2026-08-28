@@ -1,13 +1,10 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-// Managed control-plane sessions do not execute in the engine World.
-#![allow(
-    clippy::disallowed_macros,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+// Managed control-plane sessions execute outside the Actor execution domain.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use crate::bucket::Bucket;
+use crate::note;
 use crate::protocol::{asset_blob_key, AssetIndex, DeployPointer, Manifest};
 use anyhow::{anyhow, Context};
 use celld_logic::PresenceSnapshot;
@@ -21,7 +18,6 @@ use std::fs::File;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -39,9 +35,22 @@ const MAX_EXPLORER_RESPONSE_BYTES: usize = 96 * 1024;
 const MAX_MANAGED_MODULES: usize = 64;
 const MAX_MANAGED_MODULE_BYTES: usize = 25 * 1024 * 1024;
 
+/// Whether a managed deployment still replaces the process image, as it did
+/// before nodes adopted deployments in place. Off by default: the exec cut
+/// in-flight requests and cold-restored every resident cell. Kept for one
+/// release as an escape hatch, then removed.
 fn restart_on_deployment_enabled() -> bool {
-    crate::env_vars::flag("CELLD_CLOUD_RESTART_ON_DEPLOY", true)
+    crate::env_vars::flag("CELLD_CLOUD_RESTART_ON_DEPLOY", false)
         .expect("validated CELLD_CLOUD_RESTART_ON_DEPLOY")
+}
+
+/// React to a deployment the control plane says is current: nudge the
+/// pointer watcher, or under the escape hatch replace the process image.
+fn adopt_or_restart(reload: &crate::generation::ReloadSender) {
+    if restart_on_deployment_enabled() {
+        restart_for_deployment();
+    }
+    crate::generation::nudge(reload);
 }
 
 #[cfg(unix)]
@@ -341,30 +350,32 @@ struct AgentCommand {
 }
 
 #[derive(Deserialize)]
-struct AgentDeployment {
-    script_name: String,
-    version: String,
-    manifest: Manifest,
-    pointer: DeployPointer,
-    modules: Vec<AgentModule>,
+#[doc(hidden)]
+pub struct AgentDeployment {
+    pub script_name: String,
+    pub version: String,
+    pub manifest: Manifest,
+    pub pointer: DeployPointer,
+    pub modules: Vec<AgentModule>,
     #[serde(default)]
-    assets: Option<AgentAssets>,
+    pub assets: Option<AgentAssets>,
 }
 
 #[derive(Deserialize)]
-struct AgentModule {
-    name: String,
-    sha256: String,
-    download_url: String,
+#[doc(hidden)]
+pub struct AgentModule {
+    pub name: String,
+    pub sha256: String,
+    pub download_url: String,
 }
 
 #[derive(Deserialize)]
-struct AgentAssets {
-    index_download_url: String,
-    blob_download_base_url: String,
-    sha256: String,
-    file_count: u32,
-    total_bytes: u64,
+pub struct AgentAssets {
+    pub index_download_url: String,
+    pub blob_download_base_url: String,
+    pub sha256: String,
+    pub file_count: u32,
+    pub total_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -419,12 +430,12 @@ pub async fn handle_token_command(
 ) -> anyhow::Result<()> {
     let arguments = arguments.into_iter().collect::<Vec<_>>();
     if matches!(arguments.as_slice(), [a] if a == "--help" || a == "-h") {
-        println!(
+        // Help is prose an operator redirects on purpose, so it is stdout.
+        return crate::cli_output::Output::new(crate::cli_output::Format::Text).help(
             "Print this fleet's deploy token, and how to deploy with it.\n\n\
              USAGE:\n  celld token [--format shell]\n\n\
-             OPTIONS:\n  --format shell  Print only shell exports, suitable for `eval`.\n"
+             OPTIONS:\n  --format shell  Print only shell exports, suitable for `eval`.\n",
         );
-        return Ok(());
     }
     let shell_only = match arguments.as_slice() {
         [] => false,
@@ -472,39 +483,24 @@ pub async fn handle_token_command(
         api_base_url: String,
     }
     let issued: DeployTokenResponse = response.json().await.context("decode deploy token")?;
-    print!(
-        "{}",
-        render_deploy_token(
-            &issued.token,
-            &issued.account_id,
-            &issued.api_base_url,
-            shell_only,
-        )
-    );
-    Ok(())
+    let exports = render_deploy_token(&issued.token, &issued.account_id, &issued.api_base_url);
+    if !shell_only {
+        // Say what to do next, not merely what happened -- on stderr, so
+        // that `eval "$(celld token)"` sees only the exports.
+        note!("Deploy token for this fleet:\n\n  {}\n", issued.token);
+        note!("Deploy your app with these exports, then `npx wrangler@4 deploy`:\n");
+    }
+    crate::cli_output::Output::new(crate::cli_output::Format::Text).bytes(exports.as_bytes())
 }
 
-fn render_deploy_token(
-    token: &str,
-    account_id: &str,
-    api_base_url: &str,
-    shell_only: bool,
-) -> String {
-    let exports = format!(
+fn render_deploy_token(token: &str, account_id: &str, api_base_url: &str) -> String {
+    format!(
         "export CLOUDFLARE_API_TOKEN={}\n\
          export CLOUDFLARE_ACCOUNT_ID={}\n\
          export CLOUDFLARE_API_BASE_URL={}\n",
         shell_quote(token),
         shell_quote(account_id),
         shell_quote(api_base_url),
-    );
-    if shell_only {
-        return exports;
-    }
-    // Say what to do next, not merely what happened.
-    format!(
-        "Deploy token for this fleet:\n\n  {token}\n\n\
-         Deploy your app with:\n\n{exports}npx wrangler@4 deploy\n"
     )
 }
 
@@ -546,7 +542,7 @@ pub async fn handle_disconnect_command(
         .timeout(Duration::from_secs(15))
         .build()?;
     let archive = disconnect_at_path(path, &client).await?;
-    println!(
+    note!(
         "Disconnected this installation from the Managed Control Plane.\nArchived its revoked local record at {}.",
         archive.display()
     );
@@ -630,7 +626,7 @@ async fn refresh_credentials_at_path(
         config.credential_handoff_id = None;
         config.previous_credential = None;
         save_config(&path, &config)?;
-        println!(
+        note!(
             "Managed credential refresh completed (version {}).",
             config.credential_version
         );
@@ -645,7 +641,7 @@ async fn refresh_credentials_at_path(
         .await
         .context("request staged managed credential")?;
     if response.status() == reqwest::StatusCode::NO_CONTENT {
-        println!("No managed credential rotation is pending.");
+        note!("No managed credential rotation is pending.");
         return Ok(());
     }
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -695,7 +691,7 @@ async fn refresh_credentials_at_path(
     config.credential_handoff_id = None;
     config.previous_credential = None;
     save_config(&path, &config)?;
-    println!(
+    note!(
         "Managed credential refresh completed (version {}).",
         config.credential_version
     );
@@ -790,6 +786,8 @@ pub struct PresenceRuntime {
     /// snapshot as those credentials, not from a later presence-agent read.
     pub credential_version: u64,
     pub snapshot: PresenceSnapshotSource,
+    /// The pointer watcher a deployment notification nudges.
+    pub reload: crate::generation::ReloadSender,
 }
 
 pub fn start_presence_agent(runtime: PresenceRuntime) -> bool {
@@ -806,7 +804,7 @@ pub fn start_presence_agent(runtime: PresenceRuntime) -> bool {
         let mut consecutive_failures = 0_u32;
         loop {
             let started = Instant::now();
-            let result = tokio::select! {
+            let result = crate::asyncrt::select! {
                 result = presence_session(&config, &runtime, &hostname) => result,
                 credential_version = wait_for_credential_rotation(runtime.credential_version) => {
                     restart_for_credential_rotation(runtime.credential_version, credential_version);
@@ -837,7 +835,7 @@ pub fn start_presence_agent(runtime: PresenceRuntime) -> bool {
             let exponent = consecutive_failures.saturating_sub(1).min(5);
             let seconds = 2_u64.saturating_mul(1_u64 << exponent).min(60);
             let jitter_ms = (rand::random::<u16>() as u64) % 1000;
-            tokio::select! {
+            crate::asyncrt::select! {
                 _ = tokio::time::sleep(Duration::from_millis(seconds * 1000 + jitter_ms)) => {}
                 credential_version = wait_for_credential_rotation(runtime.credential_version) => {
                     restart_for_credential_rotation(runtime.credential_version, credential_version);
@@ -985,6 +983,8 @@ async fn presence_session(
                     "expired_owner_leases": snapshot.activity.expired_owner_leases,
                     "restored": snapshot.activity.restored,
                     "advanced_epochs": snapshot.activity.advanced_epochs,
+                    "handed_off": snapshot.activity.handed_off,
+                    "handoff_failed": snapshot.activity.handoff_failed,
                 },
             });
             if let Some(observation) = lease_shadow {
@@ -1012,14 +1012,11 @@ async fn presence_session(
                     if poll_and_apply(&client, config, &runtime.s3)
                         .await?
                         .is_some()
-                        && restart_on_deployment_enabled()
                     {
-                        restart_for_deployment();
+                        adopt_or_restart(&runtime.reload);
                     }
                 }
-                Some("deployment_current") if restart_on_deployment_enabled() => {
-                    restart_for_deployment();
-                }
+                Some("deployment_current") => adopt_or_restart(&runtime.reload),
                 _ => {}
             }
             Ok(None)
@@ -1035,9 +1032,8 @@ async fn presence_session(
 /// in local variables, so dropping that future keeps the buffer advanced and
 /// loses the header. The next read then treats a payload byte as a frame header
 /// and the stream never realigns. An earlier version of this session read the
-/// socket in the same `tokio::select!` as the heartbeat timer, so every tick
-/// dropped a read in progress; a test that cancels a read mid-payload fails
-/// against that shape.
+/// socket in the same select as the heartbeat timer, so every tick dropped a read
+/// in progress. Cancelling a read mid-payload fails against that shape.
 ///
 /// One async block therefore owns each direction, and the socket is split so
 /// that the heartbeat can write while the reader reads. The select at the end
@@ -1054,7 +1050,8 @@ async fn presence_session(
 /// `heartbeat` returns the message for one tick. `text` handles one text message
 /// and returns an optional reply. Ping and Close keep the automatic reply of the
 /// reader, so only Text reaches `text`.
-async fn pump_presence<S, H, HFut, T, TFut>(
+#[doc(hidden)]
+pub async fn pump_presence<S, H, HFut, T, TFut>(
     socket: fastwebsockets::WebSocket<S>,
     heartbeat_period: Duration,
     mut heartbeat: H,
@@ -1129,7 +1126,7 @@ where
 
     let mut beat = std::pin::pin!(beat);
     let mut read = std::pin::pin!(read);
-    tokio::select! {
+    crate::asyncrt::select! {
         result = &mut beat => result,
         result = &mut read => result,
     }
@@ -1222,7 +1219,11 @@ async fn handle_explorer_request(
             let Some(cell) = message
                 .get("cell_id")
                 .and_then(|value| value.as_str())
-                .filter(|cell| valid_explorer_cell_id(cell))
+                // The engine's storage fence, the same one the listing
+                // applies. An inbound id is spliced into a bucket key, so
+                // the charset that decides what a node could have written
+                // also decides what this can ask for.
+                .filter(|cell| celld_logic::cell::valid_cell_scope(cell))
             else {
                 return explorer_error(request_id, "invalid_request");
             };
@@ -1342,29 +1343,24 @@ fn explorer_error(request_id: &str, error: &str) -> serde_json::Value {
     })
 }
 
-fn valid_explorer_cell_id(cell: &str) -> bool {
-    !cell.is_empty()
-        && cell.len() <= MAX_PRESENCE_CELL_ID_BYTES
-        && !cell.contains('/')
-        && !cell.contains('\\')
-        && !cell.contains('?')
-        && !cell.contains('#')
-        && !cell.contains("..")
-        && cell.bytes().all(|byte| byte.is_ascii_graphic())
-}
-
 async fn list_durable_cells(
     bucket: &Bucket,
     cursor: Option<&str>,
 ) -> anyhow::Result<serde_json::Value> {
-    // object_store exposes no server-side cursor, so paging is client-side
-    // over the full delimiter listing (bounded by the fleet's cell count).
+    // Paging is client-side over the full delimiter listing, bounded by the
+    // fleet's cell count. `Bucket::common_prefixes_page` would bound the
+    // request too, but the explorer's cursor is a sorted position and the
+    // store lists in key order, which are not the same sequence.
     let mut cells = bucket
         .common_prefixes("cells/")
         .await?
         .into_iter()
         .filter_map(|prefix| prefix.strip_prefix("cells/").map(str::to_string))
-        .filter(|cell| valid_explorer_cell_id(cell))
+        // The same fence `celld cell list` applies: the engine's storage
+        // charset decides what a celld node could have written. A second
+        // opinion here would show foreign bucket content as a cell in one
+        // surface and hide it in the other.
+        .filter(|cell| celld_logic::cell::valid_cell_scope(cell))
         .collect::<Vec<_>>();
     cells.sort();
     if let Some(cursor) = cursor {
@@ -1603,7 +1599,7 @@ fn presence_request(
     Ok((url.into(), headers))
 }
 
-pub fn start_deploy_agent(bucket: Bucket, runtime_ready: Arc<AtomicBool>) -> bool {
+pub fn start_deploy_agent(bucket: Bucket, reload: crate::generation::ReloadSender) -> bool {
     let config = match connected_config() {
         Ok(Some(config)) => config,
         Ok(None) => return false,
@@ -1636,15 +1632,13 @@ pub fn start_deploy_agent(bucket: Bucket, runtime_ready: Arc<AtomicBool>) -> boo
                         );
                     }
                     consecutive_failures = 0;
-                    if runtime_ready.load(Ordering::SeqCst) && restart_on_deployment_enabled() {
-                        info!(
-                            event = "control_plane_restart_for_deploy",
-                            deployment_id = %applied.id,
-                            script_name = %applied.script_name,
-                            "deployment applied; restarting celld to load it"
-                        );
-                        restart_for_deployment();
-                    }
+                    info!(
+                        event = "control_plane_deployment_applied",
+                        deployment_id = %applied.id,
+                        script_name = %applied.script_name,
+                        "deployment applied to the fleet bucket; adopting it"
+                    );
+                    adopt_or_restart(&reload);
                 }
                 Ok(None) => {
                     if consecutive_failures > 0 {
@@ -1685,8 +1679,8 @@ pub async fn wait_for_initial_deployment(bucket: &Bucket) -> anyhow::Result<()> 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
-    println!("Waiting for the first Managed Control Plane deployment...");
-    println!(
+    note!("Waiting for the first Managed Control Plane deployment...");
+    note!(
         "Deploy from {}/control; this process will start automatically.",
         config.control_url.trim_end_matches('/')
     );
@@ -1805,7 +1799,8 @@ async fn poll_and_apply(
     }))
 }
 
-async fn apply_deployment(
+#[doc(hidden)]
+pub async fn apply_deployment(
     client: &reqwest::Client,
     token: &str,
     bucket: &Bucket,
@@ -1820,6 +1815,12 @@ async fn apply_deployment(
     validate_managed_module_envelope(deployment)?;
     validate_managed_class_migrations(&deployment.manifest)?;
     crate::protocol::validate_required_features(&deployment.manifest.required_features)?;
+    crate::protocol::validate_queue_manifest(&deployment.manifest)?;
+    // Read the current owner before writing this deployment's immutable
+    // objects. A competing Queue consumer must refuse the deployment without
+    // leaving a prefix that looks publishable.
+    let queue_attachments =
+        crate::deploy::prepare_queue_attachments(bucket, &deployment.manifest).await?;
 
     let mut asset_files = 0_u32;
     let mut asset_bytes = 0_u64;
@@ -1973,6 +1974,16 @@ async fn apply_deployment(
             serde_json::to_vec_pretty(&deployment.manifest)?,
         )
         .await?;
+    // A producer can run in a different script, so the manifest is not a
+    // discoverable consumer index. Publish the same fleet-wide attachment as
+    // `celld deploy`, after its exact deployment prefix is complete.
+    crate::deploy::publish_queue_attachments(
+        bucket,
+        &deployment.manifest,
+        &deployment.pointer.prefix,
+        queue_attachments,
+    )
+    .await?;
     bucket
         .put(
             &format!("deploy/{}/current.json", deployment.script_name),
@@ -2370,9 +2381,10 @@ async fn connect_at_path(path: PathBuf, options: ConnectOptions, wait: bool) -> 
         expires_in_seconds = claim.expires_in,
         "authenticate to connect this celld instance"
     );
-    println!(
+    note!(
         "\nConnect this celld instance to the Managed Control Plane:\n\n  {}\n\nEnvironment: {}\n",
-        claim.verification_uri_complete, config.environment
+        claim.verification_uri_complete,
+        config.environment
     );
 
     if wait {
@@ -2528,7 +2540,7 @@ async fn wait_for_approval(
             environment = %config.environment,
             "celld connected to the Managed Control Plane"
         );
-        println!(
+        note!(
             "Connected to the Managed Control Plane ({}).\n\
              Keep celld running. In your app directory, run `celld token`, apply the \
              exports it prints, then run `npx wrangler@4 deploy`.",
@@ -2538,7 +2550,7 @@ async fn wait_for_approval(
     }
     // Make expiry visible so an unattended process cannot keep displaying a
     // dead approval URL.
-    println!(
+    note!(
         "\nThe activation link expired before it was approved.\n\
          Restart celld to get a new one.\n"
     );
@@ -2789,7 +2801,7 @@ async fn wait_for_shared_enrollment(path: &Path) -> anyhow::Result<EnrollmentLoc
                 }
                 if let Some(pending) = config.pending_claim {
                     if pending.expires_at_ms > current_time_ms() {
-                        println!(
+                        note!(
                             "\nConnect this celld installation to the Managed Control Plane:\n\n  {}\n\nEnvironment: {}\n",
                             pending.verification_uri_complete, config.environment
                         );
@@ -2875,26 +2887,19 @@ fn machine_hostname() -> String {
 // The presence session read the socket in the same select! as the heartbeat
 // timer, so every tick dropped a read in progress. The fault is invisible from
 // outside: the session reconnects and only the messages in the window are gone,
-// so it takes a test that watches the frames themselves.
-#[cfg(all(test, celld_internal_tests))]
-mod presence_cancel_private {
-    include!(env!("CELLD_CONFORMANCE_PRESENCE_CANCEL_TESTS"));
-}
+// so frame-level observation is required.
 
 fn print_connect_help() {
-    println!(
-        "Connect this celld installation to the Managed Control Plane.\n\nUSAGE:\n  celld connect [--env prod] [--control-url https://celld.dev] [--force]"
-    );
+    let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text)
+        .help("Connect this celld installation to the Managed Control Plane.\n\nUSAGE:\n  celld connect [--env prod] [--control-url https://celld.dev] [--force]");
 }
 
 fn print_credentials_help() {
-    println!(
-        "Refresh a staged Managed Control Plane credential.\n\nUSAGE:\n  celld credentials refresh\n\nRunning celld processes sharing this installation automatically reload after the replacement is saved. Unix processes re-exec; other platforms exit 75 for their supervisor."
-    );
+    let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text)
+        .help("Refresh a staged Managed Control Plane credential.\n\nUSAGE:\n  celld credentials refresh\n\nRunning celld processes sharing this installation automatically reload after the replacement is saved. Unix processes re-exec; other platforms exit 75 for their supervisor.");
 }
 
 fn print_disconnect_help() {
-    println!(
-        "Revoke and disconnect this Managed Control Plane installation.\n\nUSAGE:\n  celld disconnect --yes\n\nStop every celld process sharing this installation first. Other installations in the fleet are unaffected."
-    );
+    let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text)
+        .help("Revoke and disconnect this Managed Control Plane installation.\n\nUSAGE:\n  celld disconnect --yes\n\nStop every celld process sharing this installation first. Other installations in the fleet are unaffected.");
 }

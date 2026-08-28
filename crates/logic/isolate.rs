@@ -300,11 +300,13 @@ pub fn place_cell(load: &PoolLoad) -> Placement {
 /// across suspensions — a suspended event holds no turn, so `turns`
 /// alone is not drained-ness, and freeing on it re-enters a freed heap
 /// when the event's host I/O completes (denoland/celld#147). `cells` is
-/// deliberately NOT consulted: retirement already refused a housed
-/// isolate, and a cell whose residency dropped mid-event is exactly the
-/// case the affiliation covers.
+/// consulted too: `retire` never selects a housed isolate, but a
+/// generation-wide retirement marks every isolate of a superseded
+/// deployment, housed or not, and freeing a housed one would drop every
+/// resident cell in it. A cell whose residency dropped mid-event is still
+/// the affiliation's case, not this one.
 pub fn may_free(load: &IsolateLoad) -> bool {
-    load.retiring && load.turns == 0 && load.requests == 0
+    load.retiring && load.turns == 0 && load.requests == 0 && load.cells == 0
 }
 
 pub fn retire(load: &PoolLoad) -> Option<IsolateId> {

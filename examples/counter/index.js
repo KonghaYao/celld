@@ -1,15 +1,18 @@
 export class Counter {
-  constructor(state, env) { this.state = state; }
+  constructor(state, env) {
+    this.state = state;
+  }
   async fetch(request) {
     let n = (await this.state.storage.get("n")) ?? 0;
     n++;
     await this.state.storage.put("n", n);
-    return new Response(JSON.stringify({ n, url: request.url }), { status: 200 });
+    return Response.json({ n, url: request.url });
   }
 }
 export default {
   async fetch(request, env) {
-    const id = env.COUNTER.idFromName("room-42");
+    const name = new URL(request.url).searchParams.get("name") ?? "default";
+    const id = env.COUNTER.idFromName(name);
     return env.COUNTER.get(id).fetch(request);
-  }
+  },
 };

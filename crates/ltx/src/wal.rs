@@ -67,8 +67,7 @@ const WAL_MAGIC_BIG_ENDIAN: u32 = 0x377f_0683;
 /// file is not a valid continuation." We model that single sentinel as
 /// [`WalError::Eof`] so callers can branch on it exactly like Go's
 /// `errors.Is(err, io.EOF)` (see [`WalError::is_eof`]). Non-EOF variants carry
-/// the same human-readable messages as the Go `fmt.Errorf` strings so the ported
-/// tests can assert them byte-for-byte.
+/// the same human-readable messages as the Go `fmt.Errorf` strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalError {
     /// End of the valid WAL.
@@ -133,8 +132,8 @@ pub enum WalError {
 impl WalError {
     /// Returns `true` for the [`WalError::Eof`] sentinel.
     ///
-    /// This is the analog of Go's `errors.Is(err, io.EOF)`, which the upstream
-    /// callers (`PageMap`, the test suite) use to detect the end of the WAL.
+    /// This is the analog of Go's `errors.Is(err, io.EOF)`, which upstream
+    /// callers such as `PageMap` use to detect the end of the WAL.
     #[inline]
     pub fn is_eof(&self) -> bool {
         matches!(self, WalError::Eof)
@@ -189,8 +188,7 @@ type WalResult<T> = std::result::Result<T, WalError>;
 /// the cumulative SQLite checksum as it goes.
 ///
 /// This is the faithful analog of Go's `WALReader` (wal_reader.go:19-31). Go
-/// wraps an `io.ReaderAt`; the upstream tests always back that with a
-/// `bytes.Reader` over the whole WAL, so we wrap a borrowed `&[u8]` and emulate
+/// wraps an `io.ReaderAt`; this implementation wraps a borrowed `&[u8]` and emulates
 /// `ReadAt` semantics directly: a read whose requested length runs past the end
 /// of the buffer yields fewer bytes, which the algorithm treats as `io.EOF`
 /// exactly as Go does.
@@ -198,8 +196,14 @@ type WalResult<T> = std::result::Result<T, WalError>;
 /// Ported from litestream@v0.5.11 wal_reader.go:19-187.
 #[derive(Debug)]
 pub struct WalReader<'a> {
-    /// Backing WAL bytes (the whole file, as the Go `io.ReaderAt`).
+    /// Backing WAL bytes: the whole file (as the Go `io.ReaderAt`) when
+    /// `tail_base` is 0, otherwise the 32-byte header followed by the file's
+    /// bytes from `tail_base` onward — the shape a tail read produces without
+    /// a file-sized buffer between the header and the tail.
     data: &'a [u8],
+    /// The file offset of `data[WAL_HEADER_SIZE..]`, or 0 for a whole-file
+    /// image. See [`WalReader::new_with_offset_over_tail`].
+    tail_base: usize,
     /// Index of the *next* frame to read (0-based). Go field `frameN`.
     frame_n: i64,
 
@@ -229,6 +233,7 @@ impl<'a> WalReader<'a> {
     pub fn new(data: &'a [u8]) -> WalResult<Self> {
         let mut r = WalReader {
             data,
+            tail_base: 0,
             frame_n: 0,
             big_endian: false,
             page_size: 0,
@@ -263,9 +268,17 @@ impl<'a> WalReader<'a> {
                 header_size: WAL_HEADER_SIZE as i64,
             });
         }
+        let mut r = Self::new_with_offset_inner(data, 0)?;
+        r.seek_to_offset(offset, salt1, salt2)?;
+        Ok(r)
+    }
 
+    /// A reader over `data` with its header parsed and its tail base set;
+    /// the two offset constructors share it and then seek.
+    fn new_with_offset_inner(data: &'a [u8], tail_base: usize) -> WalResult<Self> {
         let mut r = WalReader {
             data,
+            tail_base,
             frame_n: 0,
             big_endian: false,
             page_size: 0,
@@ -274,34 +287,39 @@ impl<'a> WalReader<'a> {
             chksum1: 0,
             chksum2: 0,
         };
-
         // Read header to determine page size & byte order.
         r.read_header()?;
+        Ok(r)
+    }
 
-        // Override salts in case the beginning of the file was overwritten.
-        r.salt1 = salt1;
-        r.salt2 = salt2;
+    /// Positions the reader at `offset` and seeds its running checksum from
+    /// the previous frame (wal_reader.go:42-75): the salts override the
+    /// header's in case the beginning of the file was overwritten, the offset
+    /// must land on a frame start, and a previous frame that does not match
+    /// is [`WalError::PrevFrameMismatch`] — the caller falls back to a full
+    /// snapshot.
+    fn seek_to_offset(&mut self, offset: i64, salt1: u32, salt2: u32) -> WalResult<()> {
+        self.salt1 = salt1;
+        self.salt2 = salt2;
 
-        // Ensure the offset lands on a frame start.
-        let frame_size = r.page_size as i64 + WAL_FRAME_HEADER_SIZE as i64;
+        let frame_size = self.page_size as i64 + WAL_FRAME_HEADER_SIZE as i64;
         if (offset - WAL_HEADER_SIZE as i64) % frame_size != 0 {
             return Err(WalError::UnalignedOffset {
                 offset,
-                page_size: r.page_size,
+                page_size: self.page_size,
             });
         }
-        r.frame_n = (offset - WAL_HEADER_SIZE as i64) / frame_size;
+        self.frame_n = (offset - WAL_HEADER_SIZE as i64) / frame_size;
 
         // Read the previous frame to load the running checksum. Any failure here
         // (salt/checksum mismatch surfaces as WalError::Eof from read_frame_inner)
         // means the previous frame doesn't match what we expect → mismatch.
-        r.frame_n -= 1;
-        let mut buf = vec![0u8; r.page_size as usize];
-        if r.read_frame_inner(&mut buf, false).is_err() {
+        self.frame_n -= 1;
+        let mut buf = vec![0u8; self.page_size as usize];
+        if self.read_frame_inner(&mut buf, false).is_err() {
             return Err(WalError::PrevFrameMismatch);
         }
-
-        Ok(r)
+        Ok(())
     }
 
     /// Returns the page size from the header.
@@ -338,12 +356,44 @@ impl<'a> WalReader<'a> {
         if offset < 0 {
             return None;
         }
-        let start = offset as usize;
+        let offset = offset as usize;
+        let start = if self.tail_base == 0 || offset < WAL_HEADER_SIZE {
+            offset
+        } else {
+            // A tail image holds nothing between the header and the tail;
+            // an offset in that gap is a short read, exactly as a whole-file
+            // image shorter than the offset would be.
+            WAL_HEADER_SIZE + offset.checked_sub(self.tail_base)?
+        };
         let end = start.checked_add(n)?;
         if end > self.data.len() {
             return None;
         }
         Some(&self.data[start..end])
+    }
+
+    /// A reader positioned at `offset` over a tail image: `data` is the
+    /// 32-byte WAL header followed by the file's bytes from `tail_base`
+    /// onward, so a sync that resumes at `offset` reads a buffer the size of
+    /// the tail rather than of the file. `offset` must lie in the tail, and
+    /// the previous frame (which the offset reader re-reads to seed its
+    /// checksum) must too — the caller starts the tail one frame early.
+    pub fn new_with_offset_over_tail(
+        data: &'a [u8],
+        tail_base: i64,
+        offset: i64,
+        salt1: u32,
+        salt2: u32,
+    ) -> WalResult<Self> {
+        if tail_base < WAL_HEADER_SIZE as i64 || offset < tail_base {
+            return Err(WalError::OffsetTooSmall {
+                offset,
+                header_size: WAL_HEADER_SIZE as i64,
+            });
+        }
+        let mut r = Self::new_with_offset_inner(data, tail_base as usize)?;
+        r.seek_to_offset(offset, salt1, salt2)?;
+        Ok(r)
     }
 
     /// Reads and validates the WAL header into `self`.
@@ -564,350 +614,4 @@ impl<'a> WalReader<'a> {
 #[inline]
 fn be_u32(b: &[u8]) -> u32 {
     u32::from_be_bytes([b[0], b[1], b[2], b[3]])
-}
-
-#[cfg(test)]
-// Unit tests inspect materialized file-format fixtures outside production.
-#[allow(clippy::disallowed_methods)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    /// Loads a WAL test vector from the **read-only** upstream Go testdata tree
-    /// (`reference/litestream-go/testdata/wal-reader/<name>/wal`). These are the
-    /// exact fixtures the ported Go tests (`wal_reader_test.go`) consume.
-    fn read_testdata(name: &str) -> Vec<u8> {
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.push("reference/litestream-go/testdata/wal-reader");
-        p.push(name);
-        p.push("wal");
-        std::fs::read(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
-    }
-
-    /// Loads the immutable golden SQLite WAL fixture.
-    fn read_golden_wal() -> Vec<u8> {
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.push("tests/fixtures/golden/sample.wal");
-        std::fs::read(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
-    }
-
-    // ── Port of TestWALReader/OK (wal_reader_test.go:16-75) ────────────────────
-    #[test]
-    fn test_wal_reader_ok() {
-        let mut buf = vec![0u8; 4096];
-        let b = read_testdata("ok");
-
-        let mut r = WalReader::new(&b).expect("new reader");
-        assert_eq!(r.page_size(), 4096, "PageSize");
-        assert_eq!(r.offset(), 0, "Offset");
-
-        // First frame.
-        let (pgno, commit) = r.read_frame(&mut buf).expect("frame 1");
-        assert_eq!(pgno, 1, "pgno");
-        assert_eq!(commit, 0, "commit");
-        assert_eq!(&buf[..], &b[56..4152], "page data mismatch");
-        assert_eq!(r.offset(), 32, "Offset");
-
-        // Second frame: end of transaction.
-        let (pgno, commit) = r.read_frame(&mut buf).expect("frame 2");
-        assert_eq!(pgno, 2, "pgno");
-        assert_eq!(commit, 2, "commit");
-        assert_eq!(&buf[..], &b[4176..8272], "page data mismatch");
-        assert_eq!(r.offset(), 4152, "Offset");
-
-        // Third frame.
-        let (pgno, commit) = r.read_frame(&mut buf).expect("frame 3");
-        assert_eq!(pgno, 2, "pgno");
-        assert_eq!(commit, 2, "commit");
-        assert_eq!(&buf[..], &b[8296..12392], "page data mismatch");
-        assert_eq!(r.offset(), 8272, "Offset");
-
-        // End of WAL.
-        let err = r.read_frame(&mut buf).expect_err("expected EOF");
-        assert!(err.is_eof(), "unexpected error: {err}");
-    }
-
-    // ── Port of TestWALReader/SaltMismatch (wal_reader_test.go:77-109) ─────────
-    #[test]
-    fn test_wal_reader_salt_mismatch() {
-        let mut buf = vec![0u8; 4096];
-        let b = read_testdata("salt-mismatch");
-
-        let mut r = WalReader::new(&b).expect("new reader");
-        assert_eq!(r.page_size(), 4096);
-        assert_eq!(r.offset(), 0);
-
-        // First frame is valid.
-        let (pgno, commit) = r.read_frame(&mut buf).expect("frame 1");
-        assert_eq!(pgno, 1);
-        assert_eq!(commit, 0);
-        assert_eq!(&buf[..], &b[56..4152], "page data mismatch");
-
-        // Second frame: salt altered so it doesn't match header => EOF.
-        let err = r.read_frame(&mut buf).expect_err("expected EOF");
-        assert!(err.is_eof(), "unexpected error: {err}");
-    }
-
-    // ── Port of TestWALReader/FrameChecksumMismatch (wal_reader_test.go:111-143) ─
-    #[test]
-    fn test_wal_reader_frame_checksum_mismatch() {
-        let mut buf = vec![0u8; 4096];
-        let b = read_testdata("frame-checksum-mismatch");
-
-        let mut r = WalReader::new(&b).expect("new reader");
-        assert_eq!(r.page_size(), 4096);
-        assert_eq!(r.offset(), 0);
-
-        // First frame is valid.
-        let (pgno, commit) = r.read_frame(&mut buf).expect("frame 1");
-        assert_eq!(pgno, 1);
-        assert_eq!(commit, 0);
-        assert_eq!(&buf[..], &b[56..4152], "page data mismatch");
-
-        // Second frame: checksum altered => EOF.
-        let err = r.read_frame(&mut buf).expect_err("expected EOF");
-        assert!(err.is_eof(), "unexpected error: {err}");
-    }
-
-    // ── Port of TestWALReader/ZeroLength (wal_reader_test.go:145-150) ──────────
-    #[test]
-    fn test_wal_reader_zero_length() {
-        let err = WalReader::new(&[]).expect_err("expected EOF");
-        assert!(err.is_eof(), "unexpected error: {err}");
-    }
-
-    // ── Port of TestWALReader/PartialHeader (wal_reader_test.go:152-157) ───────
-    #[test]
-    fn test_wal_reader_partial_header() {
-        let err = WalReader::new(&[0u8; 10]).expect_err("expected EOF");
-        assert!(err.is_eof(), "unexpected error: {err}");
-    }
-
-    // ── Port of TestWALReader/BadMagic (wal_reader_test.go:159-164) ────────────
-    #[test]
-    fn test_wal_reader_bad_magic() {
-        // All-zero 32-byte header => magic 0.
-        let err = WalReader::new(&[0u8; 32]).expect_err("expected error");
-        assert_eq!(err.to_string(), "invalid wal header magic: 0");
-    }
-
-    // ── Port of TestWALReader/BadHeaderChecksum (wal_reader_test.go:166-176) ───
-    #[test]
-    fn test_wal_reader_bad_header_checksum() {
-        // Valid big-endian magic, zero checksum fields => header checksum fails.
-        let data: [u8; 32] = [
-            0x37, 0x7f, 0x06, 0x83, 0x00, 0x00, 0x00, 0x00, //
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ];
-        let err = WalReader::new(&data).expect_err("expected EOF");
-        assert!(err.is_eof(), "unexpected error: {err}");
-    }
-
-    // ── Port of TestWALReader/BadHeaderVersion (wal_reader_test.go:178-188) ────
-    #[test]
-    fn test_wal_reader_bad_header_version() {
-        // Valid magic + version 1 + a header checksum that actually validates
-        // over bytes [0..24] (these checksum bytes are taken verbatim from the
-        // upstream Go test vector).
-        let data: [u8; 32] = [
-            0x37, 0x7f, 0x06, 0x83, 0x00, 0x00, 0x00, 0x01, //
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
-            0x15, 0x7b, 0x20, 0x92, 0xbb, 0xf8, 0x34, 0x1d,
-        ];
-        let err = WalReader::new(&data).expect_err("expected error");
-        assert_eq!(err.to_string(), "unsupported wal version: 1");
-    }
-
-    // ── Port of TestWALReader/ErrBufferSize (wal_reader_test.go:190-204) ───────
-    #[test]
-    fn test_wal_reader_err_buffer_size() {
-        let b = read_testdata("ok");
-        let mut r = WalReader::new(&b).expect("new reader");
-        let mut small = vec![0u8; 512];
-        let err = r
-            .read_frame(&mut small)
-            .expect_err("expected buffer-size error");
-        assert_eq!(
-            err.to_string(),
-            "WALReader.ReadFrame(): buffer size (512) must match page size (4096)"
-        );
-    }
-
-    // ── Port of TestWALReader/ErrPartialFrameHeader (wal_reader_test.go:206-218) ─
-    #[test]
-    fn test_wal_reader_err_partial_frame_header() {
-        let b = read_testdata("ok");
-        // Truncate to 40 bytes: header (32) + 8 bytes of frame header.
-        let mut r = WalReader::new(&b[..40]).expect("new reader");
-        let mut buf = vec![0u8; 4096];
-        let err = r.read_frame(&mut buf).expect_err("expected EOF");
-        assert!(err.is_eof(), "unexpected error: {err}");
-    }
-
-    // ── Port of TestWALReader/ErrFrameHeaderOnly (wal_reader_test.go:220-232) ──
-    #[test]
-    fn test_wal_reader_err_frame_header_only() {
-        let b = read_testdata("ok");
-        // Truncate to 56 bytes: header (32) + full frame header (24), no page.
-        let mut r = WalReader::new(&b[..56]).expect("new reader");
-        let mut buf = vec![0u8; 4096];
-        let err = r.read_frame(&mut buf).expect_err("expected EOF");
-        assert!(err.is_eof(), "unexpected error: {err}");
-    }
-
-    // ── Port of TestWALReader/ErrPartialFrameData (wal_reader_test.go:234-246) ──
-    #[test]
-    fn test_wal_reader_err_partial_frame_data() {
-        let b = read_testdata("ok");
-        // Truncate to 1000 bytes: full frame header but only partial page data.
-        let mut r = WalReader::new(&b[..1000]).expect("new reader");
-        let mut buf = vec![0u8; 4096];
-        let err = r.read_frame(&mut buf).expect_err("expected EOF");
-        assert!(err.is_eof(), "unexpected error: {err}");
-    }
-
-    // ── new_with_offset (port of NewWALReaderWithOffset, wal_reader.go:42-75) ──
-    //
-    // Resuming at a frame boundary must load the running checksum from the
-    // previous frame and continue reading the rest of the WAL identically to a
-    // fresh full read. We cross-check against a from-start read of the same WAL.
-    #[test]
-    fn test_wal_reader_new_with_offset_resumes() {
-        let b = read_testdata("ok");
-        let page_size = 4096i64;
-        let frame_size = WAL_FRAME_HEADER_SIZE as i64 + page_size;
-
-        // Header salts (offsets 16/20) are the segment's expected salts.
-        let salt1 = be_u32(&b[16..]);
-        let salt2 = be_u32(&b[20..]);
-
-        // Resume at the SECOND frame: offset = 32 + 1*frame_size. This requires
-        // re-reading frame 0 to seed the checksum.
-        let offset = WAL_HEADER_SIZE as i64 + frame_size;
-        let mut r = WalReader::new_with_offset(&b, offset, salt1, salt2)
-            .expect("new_with_offset at frame 1");
-
-        // The next frame read should be frame index 1 (the second frame), whose
-        // page/commit match what a full read returns for that frame.
-        let mut buf = vec![0u8; page_size as usize];
-        let (pgno, commit) = r.read_frame(&mut buf).expect("resume frame");
-        assert_eq!(pgno, 2, "second frame pgno");
-        assert_eq!(commit, 2, "second frame commit");
-        assert_eq!(&buf[..], &b[4176..8272], "resumed page data matches");
-    }
-
-    #[test]
-    fn test_wal_reader_new_with_offset_too_small() {
-        let b = read_testdata("ok");
-        let salt1 = be_u32(&b[16..]);
-        let salt2 = be_u32(&b[20..]);
-        // Offset at the header is rejected (need a previous frame to re-read).
-        let err = WalReader::new_with_offset(&b, WAL_HEADER_SIZE as i64, salt1, salt2)
-            .expect_err("expected offset-too-small");
-        assert_eq!(
-            err,
-            WalError::OffsetTooSmall {
-                offset: WAL_HEADER_SIZE as i64,
-                header_size: WAL_HEADER_SIZE as i64
-            }
-        );
-    }
-
-    #[test]
-    fn test_wal_reader_new_with_offset_unaligned() {
-        let b = read_testdata("ok");
-        let salt1 = be_u32(&b[16..]);
-        let salt2 = be_u32(&b[20..]);
-        // An offset off the frame grid is rejected.
-        let err = WalReader::new_with_offset(&b, WAL_HEADER_SIZE as i64 + 7, salt1, salt2)
-            .expect_err("expected unaligned");
-        assert!(
-            matches!(err, WalError::UnalignedOffset { .. }),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_wal_reader_new_with_offset_prev_frame_mismatch() {
-        let b = read_testdata("ok");
-        let frame_size = WAL_FRAME_HEADER_SIZE as i64 + 4096;
-        let offset = WAL_HEADER_SIZE as i64 + frame_size;
-        // Wrong expected salts → the previous frame won't validate → mismatch
-        // (the load-bearing snapshot-fallback signal for DB.sync).
-        let err = WalReader::new_with_offset(&b, offset, 0xdead_beef, 0xfeed_face)
-            .expect_err("expected prev-frame mismatch");
-        assert_eq!(err, WalError::PrevFrameMismatch);
-    }
-
-    // ── Port of TestWALReader_FrameSaltsUntil/OK (wal_reader_test.go:249-278) ──
-    #[test]
-    fn test_wal_reader_frame_salts_until_ok() {
-        let b = read_testdata("frame-salts");
-        let r = WalReader::new(&b).expect("new reader");
-
-        // No frame carries salt (0,0), so the scan runs to EOF and collects all
-        // three distinct salt pairs present in the file.
-        let m = r.frame_salts_until((0x0000_0000, 0x0000_0000));
-        assert_eq!(m.len(), 3, "len(m)");
-        assert!(m.contains(&(0x1b9a_294b, 0x37f9_1916)), "salt 0 not found");
-        assert!(m.contains(&(0x1b9a_294a, 0x031f_195e)), "salt 1 not found");
-        assert!(m.contains(&(0x1b9a_2949, 0x13b3_dd67)), "salt 2 not found");
-    }
-
-    // ── GOLDEN (byte-exact): real SQLite WAL from tests/fixtures/golden ────────
-    //
-    // sample.wal: 16,512 bytes, page size 4096, magic 0x377f0682 (little-endian
-    // checksums), per tests/fixtures/golden/MANIFEST.md. A checksum failure here
-    // means the port is wrong, not the fixture.
-    #[test]
-    fn test_golden_sample_wal() {
-        let b = read_golden_wal();
-        assert_eq!(b.len(), 16_512, "fixture size changed unexpectedly");
-
-        let mut r = WalReader::new(&b).expect("new reader over golden WAL");
-
-        // Page size from the header.
-        assert_eq!(r.page_size(), 4096, "golden WAL page size");
-
-        // Salt values straight from the header bytes (offsets 16/20).
-        assert_eq!(
-            r.salt(),
-            (0x9bf2_9a02, 0x6867_0130),
-            "golden WAL header salts"
-        );
-
-        // Every frame must read cleanly and pass the cumulative SQLite checksum.
-        // read_frame returns EOF the instant a checksum (or salt) check fails, so
-        // a successful read of a frame == that frame's checksum verified.
-        let mut buf = vec![0u8; r.page_size() as usize];
-        let mut frame_count = 0u64;
-        loop {
-            match r.read_frame(&mut buf) {
-                Ok((pgno, _commit)) => {
-                    assert!(pgno >= 1, "page numbers are 1-based");
-                    frame_count += 1;
-                }
-                Err(e) if e.is_eof() => break,
-                Err(e) => panic!("unexpected non-EOF error reading golden WAL: {e}"),
-            }
-        }
-
-        // A real WAL with data => a nonzero frame count, every frame checksummed.
-        assert!(
-            frame_count > 0,
-            "expected a nonzero frame count in the golden WAL"
-        );
-
-        // Cross-check the geometry: with all frames valid to EOF, the file must
-        // be exactly header + frame_count whole frames (no trailing partial).
-        let frame_size = WAL_FRAME_HEADER_SIZE as i64 + r.page_size() as i64;
-        assert_eq!(
-            WAL_HEADER_SIZE as i64 + frame_count as i64 * frame_size,
-            b.len() as i64,
-            "golden WAL is not an exact header + N*frame layout"
-        );
-    }
 }

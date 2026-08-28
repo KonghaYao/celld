@@ -1,7 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-// Authentication entropy and signature timestamps belong to the real peer
-// wire, which the World does not execute.
+// Authentication entropy and signature timestamps belong to the real peer wire.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use crate::bucket::Bucket;
@@ -14,8 +13,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const PROTOCOL_VERSION: u16 = 2;
-pub const PROTOCOL_VERSION_TEXT: &str = "2";
+pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION_TEXT: &str = "5";
 pub const RESPONSE_VERSION_HEADER: &str = "x-cells-peer-version";
 
 const SECRET_KEY: &str = "fleet/peer-auth.json";
@@ -131,12 +130,22 @@ impl PeerAuth {
         body: &[u8],
         target: &str,
     ) -> anyhow::Result<axum::http::HeaderMap> {
+        self.signed_headers_parts(method, path_and_query, &[body], target)
+    }
+
+    fn signed_headers_parts(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        body: &[&[u8]],
+        target: &str,
+    ) -> anyhow::Result<axum::http::HeaderMap> {
         validate_identity(target).context("invalid peer authentication target")?;
         let timestamp = now_ms()?;
         let mut nonce = [0_u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         let nonce = encode_hex(&nonce);
-        let body_hash = sha256_hex(body);
+        let body_hash = sha256_hex_parts(body);
         let canonical = CanonicalRequest {
             method,
             path_and_query,
@@ -345,6 +354,14 @@ fn now_ms() -> anyhow::Result<u64> {
 
 fn sha256_hex(body: &[u8]) -> String {
     encode_hex(&Sha256::digest(body))
+}
+
+fn sha256_hex_parts(parts: &[&[u8]]) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update(part);
+    }
+    encode_hex(&digest.finalize())
 }
 
 fn encode_hex(bytes: &[u8]) -> String {

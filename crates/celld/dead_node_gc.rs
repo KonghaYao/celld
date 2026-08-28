@@ -1,7 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-#![warn(clippy::disallowed_macros)]
-
 //! Compatibility garbage collection for dead celld process generations.
 //!
 //! Wake entries and lazy ownership takeover provide serving correctness.
@@ -90,7 +88,8 @@ impl DeadNodeGc {
         let pass = self.run_pass(bucket, tick_ms);
         tokio::pin!(pass);
         loop {
-            crate::asyncrt::select! {
+            crate::asyncrt::select_biased! {
+                "a due waker-lease renewal wins a tie with completion of the GC pass";
                 _ = renewal.tick() => {
                     if !crate::wake::try_hold_waker(
                         bucket,
@@ -317,9 +316,8 @@ async fn retire_dead_node(bucket: &Bucket, node: &str, now_ms: u64) -> anyhow::R
     ) {
         return Ok(false);
     }
-    // A folded record is never deleted (lease-fold, second cold review,
-    // finding 1). Two reasons compose. An unsealed log is the fleet's
-    // only pointer to an unrecovered tail, so the record must outlive
+    // A folded record is never deleted. Two reasons compose. An unsealed log
+    // is the fleet's only pointer to an unrecovered tail, so the record must outlive
     // recovery — the dead-leader sweep seals it, and a later pass
     // retires it here. And object_store has no conditional delete, so
     // an unconditional delete can land arbitrarily late — after the

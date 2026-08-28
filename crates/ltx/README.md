@@ -1,10 +1,14 @@
 # celld-ltx
 
-celld's in-process SQLite-to-object-store replication engine. It reads each
-cell's SQLite WAL, writes LTX files to a fleet bucket, restores a database from
-that bucket, and — as it grows — exposes the replicated position so celld can
-gate a write's response until it is durable. This is the foundation of celld's
-durability goal: RPO=0 for every cell write, matching Durable Objects.
+`celld-ltx` is celld's in-process SQLite replication library. It captures
+committed WAL data as L0 LTX segments and reports the captured position. The
+crate can write segments to a filesystem or an object store. It can restore a
+database, compact levels, create a snapshot, and read segments from bundle
+objects.
+
+celld uses this library inside a larger durability protocol. The output gate,
+epoch fencing, replicated node log, and takeover recovery enforce the write
+acknowledgement contract.
 
 ## Provenance and attribution
 
@@ -21,7 +25,7 @@ Attribution for the vendored and ported work:
 - **Litestream** (https://github.com/benbjohnson/litestream) — Copyright (c)
   Ben Johnson and the Litestream authors, licensed under the Apache License,
   Version 2.0. The original replication behavior comes from tag v0.5.11. The
-  current format oracle uses tag v0.5.16 because it includes LTX v0.5.2.
+  current block format follows tag v0.5.16 because it includes LTX v0.5.2.
 - **LTX file format and reference implementation**
   (https://github.com/superfly/ltx), tag v0.5.2 — Copyright (c) Superfly, Inc.,
   licensed under the Apache License, Version 2.0.
@@ -42,11 +46,7 @@ The full Apache License, Version 2.0 text is in [LICENSE](LICENSE). The full
 BSD 3-Clause License text is in
 [LICENSE.pierrec-lz4](LICENSE.pierrec-lz4).
 
-## Tests
-
-The suite ports the upstream conformance vectors. The codec and compactor
-fixtures compare complete output bytes with `superfly/ltx` v0.5.2. The tests
-also compact the older LZ4 frame fixtures from Litestream v0.5.11.
+## File compatibility
 
 Celld and Litestream v0.5.16 can read the new block files and the older frame
 files. Litestream v0.5.11 can read only the older frame files. This is a reader
@@ -59,20 +59,3 @@ by default. Every takeover target must have the dual decoder before the first
 L1 publication, so a mixed fleet must set `CELLD_LTX_COMPACTION=0` until all
 nodes can read block files. The same reader-first requirement applies to a
 later L0 writer switch.
-
-`differential_xtool` checks LTX reads and writes against a real Litestream
-binary in four directions. Three directions cover the L0 writer, the reader,
-and a byte-identical cross-check. The fourth direction compacts L0 into an L1
-object, therefore a real reader must accept the block representation that the
-compactor publishes.
-
-The `PINNED_LITESTREAM_VERSION` constant in that file records the oracle
-version, and it is the only place this repository pins it. The CI compatibility
-job reads the constant, downloads that release, and verifies the hash of the
-published tarball, so CI does not need the Go toolchain and the two pins cannot
-drift apart.
-
-The job also sets `CELLD_LTX_LITESTREAM_REQUIRED=1`. A missing binary or a
-wrong-era binary therefore fails the job. Without that variable the tests skip,
-so a local run needs no Litestream binary. `LITESTREAM_BIN` points the tests at
-a specific binary.

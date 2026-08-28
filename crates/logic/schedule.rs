@@ -6,8 +6,8 @@
 //! actor event, the fetch must reschedule to the stateless Worker pool — never
 //! run nested — carrying its request identity so the reply still lands
 //! (`js.rs`). The executor and the production run loop hold the isolate
-//! channels and the pool; this is the pure routing they consult, so
-//! deterministic harnesses can drive it directly.
+//! channels and the pool; this is the pure routing they consult, so a
+//! deterministic executor can drive it directly.
 //!
 //! Small protocol sequencing choices also live here when the executor owns
 //! the bytes but not the decision. That keeps the shell mechanical and lets

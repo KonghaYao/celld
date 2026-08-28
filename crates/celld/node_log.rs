@@ -1,7 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-#![warn(clippy::disallowed_macros)]
-
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
 //!
 //! Each node streams the per-cell L0 LTX segments it has captured but not
@@ -40,6 +38,7 @@ use celld_logic::log_tier::LogState;
 use tracing::info;
 use tracing::warn;
 
+use futures_util::FutureExt;
 use futures_util::StreamExt;
 
 use crate::bucket::Bucket;
@@ -51,7 +50,7 @@ use crate::peer_auth::PeerAuth;
 /// Production installs the signed `reqwest` implementation below. A
 /// scheduler-controlled implementation can replace the transport while all
 /// codecs and follower handlers remain the shipping ones.
-pub(crate) trait LogTransport: Send + Sync + 'static {
+pub trait LogTransport: Send + Sync + 'static {
     fn post<'a>(
         &'a self,
         node: &'a str,
@@ -62,6 +61,121 @@ pub(crate) trait LogTransport: Send + Sync + 'static {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = anyhow::Result<bytes::Bytes>> + Send + 'a>,
     >;
+
+    /// Open one long-lived ordered byte stream to a member
+    /// (the ordered-transport design). The default refuses, so
+    /// every test transport keeps its request-shaped world unless a test
+    /// opts in.
+    fn open_stream<'a>(
+        &'a self,
+        node: &'a str,
+        addr: &'a str,
+        path: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<LogStreamIo>> + Send + 'a>>
+    {
+        let _ = (node, addr, path);
+        Box::pin(async { anyhow::bail!("transport does not support ordered streams") })
+    }
+}
+
+/// The duplex an ordered stream rides. Anything tokio-readable and
+/// -writable serves: a reqwest upgrade in production, a `tokio::io::duplex`
+/// in the twins.
+pub trait LogStreamDuplex: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+impl<T> LogStreamDuplex for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+pub type LogStreamIo = Box<dyn LogStreamDuplex>;
+
+/// One stream frame: a little-endian length prefix and the payload.
+/// Leader-to-follower payloads are `encode_append` bodies; follower-to-
+/// leader payloads are JSON `AppendResp`s, answered strictly in arrival
+/// order. The cap bounds a corrupt or hostile length prefix.
+const STREAM_FRAME_CAP: usize = 64 * 1024 * 1024;
+
+#[doc(hidden)]
+pub async fn read_frame<R>(io: &mut R) -> anyhow::Result<Option<Vec<u8>>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut len = [0_u8; 4];
+    match io.read_exact(&mut len).await {
+        Ok(_) => {}
+        // EOF on a frame boundary is the peer closing; mid-frame EOF below
+        // is an error, exactly like a torn append body.
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let len = u32::from_le_bytes(len) as usize;
+    if len > STREAM_FRAME_CAP {
+        anyhow::bail!("stream frame of {len} bytes exceeds the cap");
+    }
+    let mut payload = vec![0_u8; len];
+    io.read_exact(&mut payload).await?;
+    Ok(Some(payload))
+}
+
+#[doc(hidden)]
+pub async fn write_frame<W>(io: &mut W, payload: &[u8]) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    io.write_all(&u32::try_from(payload.len())?.to_le_bytes())
+        .await?;
+    io.write_all(payload).await?;
+    io.flush().await?;
+    Ok(())
+}
+
+/// Serve one ordered append stream: read frames sequentially, apply each
+/// through the same handler `/peer/log/append` uses, answer in order. Apply
+/// order equals arrival order because this loop is the stream's only
+/// reader — that single fact is what lets the leader keep several frames
+/// in flight without the follower needing reorder state. Any error or EOF
+/// ends the stream with no cleanup: the contiguity rule already treats a
+/// half-received stream exactly like a half-delivered round, and the seal
+/// marks fence a zombie leader's frames here just as they fence its
+/// one-shot appends.
+pub async fn serve_log_stream<IO>(mut io: IO, store: Arc<FollowerStore>) -> anyhow::Result<()>
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut cycle_started = mono_us();
+    while let Some(frame) = read_frame(&mut io).await? {
+        // The cycle split is the follower-side latency ledger: `read_ms`
+        // is time waiting for (and reading) the next frame, and the rest
+        // is this loop's serial service — the lane's throughput ceiling.
+        let read_done = mono_us();
+        // The reader-idle ledger: a long read wait is either no traffic or a
+        // starved reader task; paired with the leader's head-stall event it
+        // tells which. One second is far past any honest inter-frame gap on
+        // a loaded lane.
+        let idle_ms = read_done.saturating_sub(cycle_started) / 1000;
+        if idle_ms >= 1_000 {
+            warn!(
+                event = "log_serve_idle",
+                idle_ms, "stream reader idle past one second"
+            );
+        }
+        let req = decode_append(&frame)?;
+        let decode_done = mono_us();
+        let entries = req.entries.len();
+        let resp = store.append(req).await;
+        let append_done = mono_us();
+        write_frame(&mut io, &serde_json::to_vec(&resp)?).await?;
+        let ack_done = mono_us();
+        info!(
+            event = "log_serve_cycle",
+            entries,
+            read_ms = read_done.saturating_sub(cycle_started) / 1000,
+            decode_ms = decode_done.saturating_sub(read_done) / 1000,
+            append_ms = append_done.saturating_sub(decode_done) / 1000,
+            ack_ms = ack_done.saturating_sub(append_done) / 1000,
+            "served one stream append frame"
+        );
+        cycle_started = ack_done;
+    }
+    Ok(())
 }
 
 /// Concurrent per-cell upload lanes during node-log recovery. The
@@ -72,10 +186,21 @@ pub(crate) trait LogTransport: Send + Sync + 'static {
 /// 429-class refusals with backoff.
 const RECOVERY_UPLOAD_CONCURRENCY: usize = 8;
 
+/// A contender observes a live recovery before it tries to replace it. The
+/// node-log tail is bounded to the flush window, so thirty seconds is enough
+/// for the elected reader in normal operation and still leaves ninety seconds
+/// inside the default rollout readiness bound after a crashed recoverer.
+const RECOVERY_CLAIM_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const RECOVERY_CLAIM_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Process-monotonic milliseconds for follower-health bookkeeping: latency
 /// windows and quarantine arithmetic must not jump with the wall clock.
 fn mono_ms() -> u64 {
     crate::asyncrt::mono_ms()
+}
+
+fn mono_us() -> u64 {
+    crate::asyncrt::mono_us()
 }
 
 /// The eviction policy, defaults per the design doc, every constant an E8
@@ -99,6 +224,9 @@ pub fn eviction_policy_from_env() -> anyhow::Result<celld_logic::log_evict::Evic
         )?,
         min_swap_interval_ms: default.min_swap_interval_ms,
         window_ms: default.window_ms,
+        min_samples: default.min_samples,
+        hedge_floor_ms: default.hedge_floor_ms,
+        hedge_factor: default.hedge_factor,
     })
 }
 
@@ -213,16 +341,13 @@ pub struct OwnLog {
     pub nudge: Box<dyn Fn() + Send + Sync>,
     /// One publish outstanding at a time: with the seq-tagged applied
     /// notification, "applied seq >= mine" then implies the applied body
-    /// IS my object. Also serializes maintain, activation, and the
-    /// graceful seal against each other (cold review, S3).
+    /// IS my object. The live transition capability holds its wider guard
+    /// across this publication and the decision that produced it.
     pub write_lock: tokio::sync::Mutex<()>,
 }
 
 impl OwnLog {
-    pub(crate) async fn write(
-        &self,
-        log: Option<crate::ownership_store::NodeLogWire>,
-    ) -> anyhow::Result<()> {
+    async fn write(&self, log: Option<crate::ownership_store::NodeLogWire>) -> anyhow::Result<()> {
         let _serialized = self.write_lock.lock().await;
         let mut rx = self.ownership.applied_log();
         let seq = self.ownership.set_own_log(log);
@@ -232,7 +357,8 @@ impl OwnLog {
             if rx.borrow_and_update().1 >= seq {
                 return Ok(());
             }
-            crate::asyncrt::select! {
+            crate::asyncrt::select_biased! {
+                "an applied-log change wins a tie so a completed write does not time out";
                 changed = rx.changed() => {
                     anyhow::ensure!(changed.is_ok(), "the lease writer is gone");
                 },
@@ -247,6 +373,81 @@ impl OwnLog {
 
     fn current(&self) -> Option<crate::ownership_store::NodeLogWire> {
         self.ownership.own_log()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeLogLifecycle {
+    Running,
+    Quiescing,
+}
+
+/// The one capability for a live session's record transitions. The guard
+/// covers the current-record read, the transition decision, the durable
+/// publication, and any in-memory value coupled to that publication. A
+/// separate check before this guard cannot enforce shutdown because close
+/// can start between that check and the record write.
+struct LiveLogTransitions {
+    own_log: Arc<OwnLog>,
+    lifecycle: tokio::sync::Mutex<NodeLogLifecycle>,
+}
+
+struct LiveLogTransition<'a> {
+    transitions: &'a LiveLogTransitions,
+    lifecycle: tokio::sync::MutexGuard<'a, NodeLogLifecycle>,
+}
+
+impl LiveLogTransitions {
+    fn new(own_log: Arc<OwnLog>) -> Self {
+        Self {
+            own_log,
+            lifecycle: tokio::sync::Mutex::new(NodeLogLifecycle::Running),
+        }
+    }
+
+    async fn lock(&self) -> LiveLogTransition<'_> {
+        LiveLogTransition {
+            transitions: self,
+            lifecycle: self.lifecycle.lock().await,
+        }
+    }
+
+    async fn activate(&self, expected: &log_tier::LogRecord) -> anyhow::Result<bool> {
+        let transition = self.lock().await;
+        if !transition.is_running() {
+            return Ok(false);
+        }
+        let Some(current) = transition.current() else {
+            return Ok(false);
+        };
+        let current_record = log_from_wire(&current)?;
+        if current_record != *expected {
+            return Ok(false);
+        }
+        transition.write(Some(log_to_wire(expected, true))).await?;
+        Ok(true)
+    }
+}
+
+impl LiveLogTransition<'_> {
+    fn is_running(&self) -> bool {
+        *self.lifecycle == NodeLogLifecycle::Running
+    }
+
+    fn begin_quiescing(&mut self) -> bool {
+        if !self.is_running() {
+            return false;
+        }
+        *self.lifecycle = NodeLogLifecycle::Quiescing;
+        true
+    }
+
+    fn current(&self) -> Option<crate::ownership_store::NodeLogWire> {
+        self.transitions.own_log.current()
+    }
+
+    async fn write(&self, log: Option<crate::ownership_store::NodeLogWire>) -> anyhow::Result<()> {
+        self.transitions.own_log.write(log).await
     }
 }
 
@@ -313,7 +514,8 @@ fn take_string(buf: &mut &[u8], what: &str) -> anyhow::Result<String> {
         .to_string())
 }
 
-fn encode_entry(entry: &Entry, out: &mut Vec<u8>) {
+#[doc(hidden)]
+pub fn encode_entry(entry: &Entry, out: &mut Vec<u8>) {
     out.extend_from_slice(ENTRY_MAGIC);
     out.extend_from_slice(&entry.seq.to_le_bytes());
     out.extend_from_slice(&(entry.cell.len() as u16).to_le_bytes());
@@ -412,6 +614,13 @@ pub fn decode_tail_resp(mut body: &[u8]) -> anyhow::Result<TailResp> {
 pub struct AppendResp {
     pub ok: bool,
     pub end: u64,
+    /// The fragment epoch the reported `end` belongs to. A refusal whose
+    /// echo matches the request epoch and whose end covers the batch still
+    /// confirms durability — the retransmission case — while a refusal
+    /// from another fragment says nothing about these sequences. Absent
+    /// from binaries that predate hedging, which reads as unconfirmable.
+    #[serde(default)]
+    pub epoch: Option<u64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -444,20 +653,22 @@ pub struct TailResp {
 // ── The follower side ───────────────────────────────────────────────────────
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Default)]
-struct FollowerState {
-    fragment_epoch: u64,
-    base: u64,
-    end: u64,
-    sealed_to: u64,
+#[doc(hidden)]
+pub struct FollowerState {
+    pub fragment_epoch: u64,
+    pub base: u64,
+    pub end: u64,
+    pub sealed_to: u64,
 }
 
-#[cfg(all(test, celld_internal_tests))]
-fn sync_directory(path: &Path) -> std::io::Result<()> {
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn sync_directory(path: &Path) -> std::io::Result<()> {
     let filesystem = celld_ltx::DirectFileSystem;
     celld_ltx::FileSystem::sync_all(&filesystem, path)
 }
 
-#[cfg(all(test, celld_internal_tests))]
+#[cfg(celld_internal_tests)]
 type DirectorySyncForTest = dyn Fn(&Path) -> std::io::Result<()> + Send + Sync;
 
 /// One node's store of the log fragments that it follows.
@@ -477,14 +688,21 @@ pub struct FollowerStore {
     /// persists writes the stale `sealed_to` back afterwards — the seal
     /// mark is atomic in the model and must be atomic here.
     guards: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    #[cfg(all(test, celld_internal_tests))]
+    /// Leaders whose directory chain this process has already fsynced to
+    /// the data root. Ancestor directory entries only change when the
+    /// leader directory is created, so re-syncing them on every state
+    /// persist was one serial fsync chain per append — the write-latency
+    /// floor the 2026-08-25 gate decomposition landed on. A restart
+    /// starts empty and conservatively re-syncs each chain once.
+    synced_namespaces: Mutex<std::collections::BTreeSet<String>>,
+    #[cfg(celld_internal_tests)]
     directory_sync_for_test: Arc<DirectorySyncForTest>,
 }
 
 impl FollowerStore {
     pub fn new(root: &Path, bucket: Option<Arc<Bucket>>, node: &str) -> Self {
         let filesystem = crate::asyncrt::fs();
-        #[cfg(all(test, celld_internal_tests))]
+        #[cfg(celld_internal_tests)]
         let directory_filesystem = filesystem.clone();
         Self {
             root: root.join("peerlog"),
@@ -493,13 +711,15 @@ impl FollowerStore {
             node: node.to_string(),
             logs: Mutex::new(HashMap::new()),
             guards: Mutex::new(HashMap::new()),
-            #[cfg(all(test, celld_internal_tests))]
+            synced_namespaces: Mutex::new(std::collections::BTreeSet::new()),
+            #[cfg(celld_internal_tests)]
             directory_sync_for_test: Arc::new(move |path| directory_filesystem.sync_all(path)),
         }
     }
 
-    #[cfg(all(test, celld_internal_tests))]
-    fn new_with_directory_sync_for_test(
+    #[cfg(celld_internal_tests)]
+    #[doc(hidden)]
+    pub fn new_with_directory_sync_for_test(
         root: &Path,
         bucket: Option<Arc<Bucket>>,
         node: &str,
@@ -510,12 +730,12 @@ impl FollowerStore {
         store
     }
 
-    #[cfg(all(test, celld_internal_tests))]
+    #[cfg(celld_internal_tests)]
     fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
         (self.directory_sync_for_test)(path)
     }
 
-    #[cfg(not(all(test, celld_internal_tests)))]
+    #[cfg(not(celld_internal_tests))]
     fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
         self.filesystem.sync_all(path)
     }
@@ -604,7 +824,8 @@ impl FollowerStore {
         sessions
     }
 
-    fn load(&self, leader: &str) -> FollowerState {
+    #[doc(hidden)]
+    pub fn load(&self, leader: &str) -> FollowerState {
         if let Some(state) = self.logs.lock().unwrap().get(leader) {
             return *state;
         }
@@ -618,7 +839,8 @@ impl FollowerStore {
         state
     }
 
-    fn persist(&self, leader: &str, state: FollowerState) -> anyhow::Result<()> {
+    #[doc(hidden)]
+    pub fn persist(&self, leader: &str, state: FollowerState) -> anyhow::Result<()> {
         let dir = self.dir(leader);
         self.filesystem.create_dir_all(&dir)?;
         let path = dir.join("state.json");
@@ -626,7 +848,24 @@ impl FollowerStore {
         self.filesystem.write(&tmp, &serde_json::to_vec(&state)?)?;
         self.filesystem.sync_all(&tmp)?;
         self.filesystem.rename(&tmp, &path)?;
-        self.sync_namespace_to_data_root(&dir)?;
+        // The leaf sync makes the rename durable on every persist. The
+        // ancestor chain only holds this directory's CREATION, so it is
+        // synced once per (process, leader); syncing it per persist was a
+        // serial fsync chain on every append serve cycle. A failed chain
+        // sync re-arms so the next persist retries it.
+        let first_persist = self
+            .synced_namespaces
+            .lock()
+            .unwrap()
+            .insert(leader.to_string());
+        if first_persist {
+            if let Err(error) = self.sync_namespace_to_data_root(&dir) {
+                self.synced_namespaces.lock().unwrap().remove(leader);
+                return Err(error);
+            }
+        } else {
+            self.sync_directory(&dir)?;
+        }
         self.logs.lock().unwrap().insert(leader.to_string(), state);
         Ok(())
     }
@@ -674,19 +913,39 @@ impl FollowerStore {
         };
         for item in read {
             let name = item.file_name;
-            let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".entry")) else {
-                continue;
-            };
-            if stem.parse::<u64>().is_ok_and(|s| s <= seq) {
-                let _ = self.filesystem.remove_file(&item.path);
+            let Some(name) = name.to_str() else { continue };
+            if let Some(stem) = name.strip_suffix(".entry") {
+                if stem.parse::<u64>().is_ok_and(|s| s <= seq) {
+                    let _ = self.filesystem.remove_file(&item.path);
+                }
+            } else if let Some(stem) = name.strip_suffix(".entries") {
+                // A batch file goes only when its WHOLE range is behind the
+                // watermark. A straddling batch keeps its covered entries:
+                // truncation is space reclamation, not a correctness
+                // boundary, so retaining them is free.
+                if stem
+                    .split_once('-')
+                    .and_then(|(_, last)| last.parse::<u64>().ok())
+                    .is_some_and(|last| last <= seq)
+                {
+                    let _ = self.filesystem.remove_file(&item.path);
+                }
             }
         }
         Ok(())
     }
 
     pub async fn append(&self, req: AppendReq) -> AppendResp {
+        let handled = mono_us();
         let guard = self.guard(&req.leader);
+        let guard_started = mono_us();
         let _held = guard.lock().await;
+        let guard_us = mono_us().saturating_sub(guard_started);
+        let _emit = HandleTiming {
+            handled,
+            guard_us,
+            entries: req.entries.len(),
+        };
         let mut state = self.load(&req.leader);
         if state.fragment_epoch != req.epoch {
             if req.entries.is_empty() {
@@ -697,6 +956,7 @@ impl FollowerStore {
                 return AppendResp {
                     ok: false,
                     end: state.end,
+                    epoch: Some(state.fragment_epoch),
                 };
             }
             let first = req.entries.first().map_or(0, |entry| entry.seq);
@@ -713,6 +973,7 @@ impl FollowerStore {
                 return AppendResp {
                     ok: false,
                     end: state.end,
+                    epoch: Some(state.fragment_epoch),
                 };
             }
             state = self.load(&req.leader);
@@ -731,22 +992,23 @@ impl FollowerStore {
             return AppendResp {
                 ok: false,
                 end: state.end,
+                epoch: Some(state.fragment_epoch),
             };
         }
+        // The accepted prefix of the batch persists as ONE file whose bytes
+        // are the wire body's entries section — one decoder for the wire
+        // and the disk, extended to batches — so an append costs one
+        // entry-file fsync regardless of its size instead of one per entry.
+        // The durability commit
+        // point is unchanged: `persist` below fsyncs the state whose `end`
+        // covers these entries, and anything above the persisted end is
+        // debris whether it sits in per-entry files or in a torn batch.
         let mut synced = false;
+        let persist_started = mono_ms();
+        let mut encoded = Vec::new();
+        let mut first_seq = None;
+        let mut last_seq = None;
         for entry in &req.entries {
-            #[cfg(all(test, celld_internal_tests))]
-            let accept = if crate::asyncrt::sabotage_active(
-                crate::host_services::EngineSabotage::AcceptAppendPastSeal,
-            ) && req.epoch == log.fragment_epoch
-                && entry.seq == log.end + 1
-            {
-                log.end = entry.seq;
-                true
-            } else {
-                log.accept_append(req.epoch, entry.seq)
-            };
-            #[cfg(not(all(test, celld_internal_tests)))]
             let accept = log.accept_append(req.epoch, entry.seq);
             if !accept {
                 warn!(
@@ -759,18 +1021,23 @@ impl FollowerStore {
                 );
                 break;
             }
-            let path = dir.join(format!("{}.entry", entry.seq));
-            let mut encoded = Vec::new();
             encode_entry(entry, &mut encoded);
+            first_seq.get_or_insert(entry.seq);
+            last_seq = Some(entry.seq);
+        }
+        if let (Some(first), Some(last)) = (first_seq, last_seq) {
+            let path = dir.join(format!("{first}-{last}.entries"));
             let write = self
                 .filesystem
                 .write(&path, &encoded)
                 .and_then(|()| self.filesystem.sync_all(&path));
             if write.is_err() {
-                log.end = entry.seq - 1;
-                break;
+                // None of the batch is durable; the model's end must not
+                // cover any of it.
+                log.end = first - 1;
+            } else {
+                synced = true;
             }
-            synced = true;
         }
         let ok = log.end >= req.entries.last().map_or(log.end, |entry| entry.seq);
         if synced {
@@ -790,21 +1057,26 @@ impl FollowerStore {
                 return AppendResp {
                     ok: false,
                     end: state.end,
+                    epoch: Some(state.fragment_epoch),
                 };
             }
         }
-        let new_state = FollowerState {
+        let handle_ms = mono_us().saturating_sub(_emit.handled) / 1000;
+        let persist_ms = mono_ms().saturating_sub(persist_started);
+        let mut new_state = FollowerState {
             fragment_epoch: log.fragment_epoch,
             base: log.base,
             end: log.end,
             sealed_to: log.sealed_to,
         };
-        if self.persist(&req.leader, new_state).is_err() {
-            return AppendResp {
-                ok: false,
-                end: state.end,
-            };
-        }
+        // The truncate folds into the batch persist: one state chain
+        // carries the new end AND the new base, where a second full
+        // tmp-write/fsync/rename chain per round was most of the untimed
+        // serial serve cost. Removing entry files before the persist keeps
+        // the crash-window shape recovery already tolerates — files gone,
+        // base still old — and the removed files sit below `covered_seq`,
+        // which the bucket already holds, so an unpersisted removal loses
+        // nothing.
         if req.truncate_to > 0 {
             let mut truncated = log_tier::FollowerLog {
                 fragment_epoch: new_state.fragment_epoch,
@@ -814,15 +1086,36 @@ impl FollowerStore {
             };
             truncated.truncate(req.truncate_to.min(new_state.end));
             let _ = self.remove_entries_below(&req.leader, truncated.base);
-            let _ = self.persist(
-                &req.leader,
-                FollowerState {
-                    base: truncated.base,
-                    ..new_state
-                },
-            );
+            new_state.base = truncated.base;
         }
-        AppendResp { ok, end: log.end }
+        // `state_ms` bills the folded state persist — the cost that was
+        // invisible before the 2026-08-25 ledger.
+        let state_started = mono_ms();
+        let state_ok = self.persist(&req.leader, new_state).is_ok();
+        // One entry-file fsync persists the accepted batch. This interval
+        // decides whether the fleet proof beats the bucket proof.
+        info!(
+            event = "log_append_serve",
+            leader = req.leader,
+            entries = req.entries.len(),
+            guard_ms = _emit.guard_us / 1000,
+            handle_ms,
+            persist_ms,
+            state_ms = mono_ms().saturating_sub(state_started),
+            "follower persisted an append batch"
+        );
+        if !state_ok {
+            return AppendResp {
+                ok: false,
+                end: state.end,
+                epoch: Some(state.fragment_epoch),
+            };
+        }
+        AppendResp {
+            ok,
+            end: log.end,
+            epoch: Some(log.fragment_epoch),
+        }
     }
 
     /// Persist the seal mark BEFORE answering: once the response leaves,
@@ -874,11 +1167,6 @@ impl FollowerStore {
             if state.fragment_epoch == 0 {
                 continue;
             }
-            #[cfg(all(test, celld_internal_tests))]
-            let closed = crate::asyncrt::sabotage_active(
-                crate::host_services::EngineSabotage::CollectOpenFragment,
-            ) || log_tier::fragment_closed(&record, state.fragment_epoch);
-            #[cfg(not(all(test, celld_internal_tests)))]
             let closed = log_tier::fragment_closed(&record, state.fragment_epoch);
             if !closed {
                 continue;
@@ -925,35 +1213,72 @@ impl FollowerStore {
     pub fn tail(&self, req: &TailReq) -> TailResp {
         // Entries above the persisted end are unacked debris a crash may
         // legitimately tear (the entry syncs before the state does), and
-        // including or losing an unacked frame is free. A torn entry AT OR
-        // BELOW the end would be an acked frame's only local copy, so it
-        // is skipped LOUDLY — write-all means another member still has it,
-        // and the line is what attributes the anomaly.
-        let end = self.load(&req.leader).end;
+        // including or losing an unacked frame is free. A torn entry ABOVE
+        // the base and AT OR BELOW the end would be an acked frame's only
+        // local copy, so it is skipped LOUDLY — write-all means another
+        // member still has it, and the line attributes the anomaly.
+        let state = self.load(&req.leader);
+        let base = state.base;
+        let end = state.end;
         let mut entries = Vec::new();
         let dir = self.dir(&req.leader);
         if let Ok(read) = self.filesystem.read_dir(&dir) {
             for item in read {
-                if item.path.extension().is_none_or(|ext| ext != "entry") {
-                    continue;
-                }
-                if let Ok(bytes) = self.filesystem.read(&item.path) {
-                    match decode_entry(&mut bytes.as_slice()) {
-                        Ok(entry) => entries.push(entry),
-                        Err(error) => {
-                            let torn_acked = item
-                                .file_name
-                                .to_str()
-                                .and_then(|name| name.strip_suffix(".entry"))
-                                .and_then(|stem| stem.parse::<u64>().ok())
-                                .is_some_and(|seq| seq <= end);
-                            if torn_acked {
-                                warn!(
-                                    leader = req.leader,
-                                    path = %item.path.display(),
-                                    %error,
-                                    "torn entry at or below the fragment end skipped in tail"
-                                );
+                let name = item.file_name;
+                let Some(name) = name.to_str() else { continue };
+                if let Some(stem) = name.strip_suffix(".entry") {
+                    if let Ok(bytes) = self.filesystem.read(&item.path) {
+                        match decode_entry(&mut bytes.as_slice()) {
+                            Ok(entry) => {
+                                if entry.seq > base {
+                                    entries.push(entry);
+                                }
+                            }
+                            Err(error) => {
+                                let torn_acked = stem
+                                    .parse::<u64>()
+                                    .is_ok_and(|seq| seq > base && seq <= end);
+                                if torn_acked {
+                                    warn!(
+                                        leader = req.leader,
+                                        path = %item.path.display(),
+                                        %error,
+                                        "torn entry at or below the fragment end skipped in tail"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(stem) = name.strip_suffix(".entries") {
+                    let Ok(bytes) = self.filesystem.read(&item.path) else {
+                        continue;
+                    };
+                    // Decode the batch until the tear, keeping every intact
+                    // entry. The first undecoded sequence starts at the
+                    // filename's range and follows the last decoded entry,
+                    // so the acked-tear classification is exact.
+                    let mut next = stem
+                        .split_once('-')
+                        .and_then(|(first, _)| first.parse::<u64>().ok());
+                    let mut buf = bytes.as_slice();
+                    while !buf.is_empty() {
+                        match decode_entry(&mut buf) {
+                            Ok(entry) => {
+                                next = Some(entry.seq + 1);
+                                if entry.seq > base {
+                                    entries.push(entry);
+                                }
+                            }
+                            Err(error) => {
+                                if next.is_some_and(|seq| seq > base && seq <= end) {
+                                    warn!(
+                                        leader = req.leader,
+                                        path = %item.path.display(),
+                                        %error,
+                                        "torn batch at or below the fragment end skipped in tail"
+                                    );
+                                }
+                                break;
                             }
                         }
                     }
@@ -1015,6 +1340,40 @@ impl LogTransport for SignedPeerTransport {
             Ok(response.bytes().await?)
         })
     }
+
+    fn open_stream<'a>(
+        &'a self,
+        node: &'a str,
+        addr: &'a str,
+        path: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<LogStreamIo>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // A dedicated client: the shared one carries a 10 s whole-request
+            // timeout that would sever a healthy long-lived stream. The
+            // handshake is authenticated both ways — the request by the
+            // peer HMAC, the 101 by the response validation — and the
+            // upgraded byte channel inherits that establishment, which is
+            // the same trust shape as every other authenticated connection.
+            let client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .tcp_nodelay(true)
+                .build()?;
+            let builder = client
+                .post(format!("http://{addr}{path}"))
+                .header(hyper::header::CONNECTION, "upgrade")
+                .header(hyper::header::UPGRADE, "celld-log-stream");
+            let request = self.auth.sign(builder, "POST", path, &[], node)?;
+            let response = request.send().await?;
+            if response.status() != reqwest::StatusCode::SWITCHING_PROTOCOLS {
+                let status = response.status();
+                return Err(anyhow::Error::new(PeerHttpError { status })
+                    .context(format!("peer {node} refused the stream: {status}")));
+            }
+            crate::peer_auth::validate_response(response.headers())?;
+            Ok(Box::new(response.upgrade().await?) as LogStreamIo)
+        })
+    }
 }
 
 /// A peer answered with an HTTP error status: typed so callers can tell
@@ -1034,9 +1393,139 @@ impl std::error::Error for PeerHttpError {}
 
 // ── The leader side ─────────────────────────────────────────────────────────
 
-struct Member {
-    node: String,
-    addr: String,
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct Member {
+    pub node: String,
+    pub addr: String,
+}
+
+/// One round's work for one member lane: the shared request and the slot
+/// its answer lands in.
+#[doc(hidden)]
+pub struct LaneJob {
+    pub req: Arc<AppendReq>,
+    /// Submission time, for the lane-wait split in the rtt event.
+    pub enqueued: u64,
+    /// The request's entry bytes, released from the stream window when the
+    /// member answers.
+    pub bytes: u64,
+    pub resp: tokio::sync::oneshot::Sender<Option<(String, u64)>>,
+}
+
+/// One outstanding round, counted from submission until its completion is
+/// applied or discarded. The completion owns this guard after the network
+/// future resolves, so cancellation releases every reservation exactly once.
+/// Follower-side handler timing carrier for the serve event.
+struct HandleTiming {
+    handled: u64,
+    guard_us: u64,
+    #[allow(dead_code)]
+    entries: usize,
+}
+
+struct OutstandingRound(Arc<std::sync::atomic::AtomicU64>);
+
+impl Drop for OutstandingRound {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The fleet shipper for ONE ensemble at one epoch: assigns sequence
+/// numbers, POSTs pipelined batches to every member, and reports all-acked.
+/// Each member's ordered lane keeps its fragment contiguous. Membership and
+/// epoch are immutable, so an ensemble change builds and swaps a new shipper.
+/// The stream window (the stream-window design): per-member
+/// append accounting and the fleet watermark. Each ordered lane keeps the
+/// contiguous acked end its follower reports, the watermark is the minimum
+/// across members, and admission is bounded per lane by appends and bytes,
+/// so a slow member becomes bounded backpressure instead of unbounded
+/// queueing. `CELLD_LOG_WINDOW=0` (the default) disables the stream and
+/// the ship loop keeps today's round bound.
+#[doc(hidden)]
+pub struct StreamWindow {
+    /// Appends one lane may hold in flight.
+    window: u64,
+    /// Request bytes one lane may hold in flight.
+    byte_cap: u64,
+    lanes: Vec<StreamLane>,
+    /// The fleet watermark: the minimum contiguous acked end across
+    /// members. Monotone by `fetch_max`; a concurrent stale minimum can
+    /// only be conservative, never ahead.
+    watermark: std::sync::atomic::AtomicU64,
+}
+
+struct StreamLane {
+    inflight: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+    /// This member's contiguous acked end. Monotone because the lane is
+    /// one ordered worker and `append_confirms` only accepts an end that
+    /// covers the batch at the leader's fragment epoch.
+    acked: std::sync::atomic::AtomicU64,
+}
+
+impl StreamWindow {
+    #[doc(hidden)]
+    pub fn new(window: u64, byte_cap: u64, members: usize) -> Self {
+        Self {
+            window,
+            byte_cap,
+            lanes: (0..members)
+                .map(|_| StreamLane {
+                    inflight: std::sync::atomic::AtomicU64::new(0),
+                    bytes: std::sync::atomic::AtomicU64::new(0),
+                    acked: std::sync::atomic::AtomicU64::new(0),
+                })
+                .collect(),
+            watermark: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// True while every lane has room for one more append. The slowest
+    /// member closes the window; its lane refilling is what reopens it.
+    #[doc(hidden)]
+    pub fn admit(&self) -> bool {
+        self.lanes.iter().all(|lane| {
+            lane.inflight.load(Ordering::SeqCst) < self.window
+                && lane.bytes.load(Ordering::SeqCst) < self.byte_cap
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn submitted(&self, lane: usize, bytes: u64) {
+        self.lanes[lane].inflight.fetch_add(1, Ordering::SeqCst);
+        self.lanes[lane].bytes.fetch_add(bytes, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn answered(&self, lane: usize, bytes: u64) {
+        self.lanes[lane].inflight.fetch_sub(1, Ordering::SeqCst);
+        self.lanes[lane].bytes.fetch_sub(bytes, Ordering::SeqCst);
+    }
+
+    /// A confirmed append: advance the lane's acked end to what its
+    /// follower reported and recompute the watermark. Returns the new
+    /// watermark when it moved. A refusal or failure never reaches here,
+    /// so a lagging or refusing member pins the watermark in place.
+    #[doc(hidden)]
+    pub fn confirmed(&self, lane: usize, end: u64) -> Option<u64> {
+        self.lanes[lane].acked.fetch_max(end, Ordering::SeqCst);
+        let minimum = self
+            .lanes
+            .iter()
+            .map(|lane| lane.acked.load(Ordering::SeqCst))
+            .min()
+            .unwrap_or(0);
+        let prior = self.watermark.fetch_max(minimum, Ordering::SeqCst);
+        (minimum > prior).then_some(minimum)
+    }
+
+    #[cfg(celld_internal_tests)]
+    #[doc(hidden)]
+    pub fn watermark(&self) -> u64 {
+        self.watermark.load(Ordering::SeqCst)
+    }
 }
 
 /// The fleet shipper for ONE ensemble at one epoch: assigns sequence
@@ -1047,42 +1536,54 @@ struct Member {
 pub struct FleetShipper {
     node: String,
     transport: Arc<dyn LogTransport>,
-    own_log: Arc<OwnLog>,
+    live_log: Arc<LiveLogTransitions>,
     record: log_tier::LogRecord,
-    /// The record's CAS token from the open; consumed by the activation
-    /// CAS below.
-    /// The first successful batch CASes `active` onto the record BEFORE its
-    /// acks are credited. Recovery uses `active` to tell a never-adopted
-    /// fragment (safe to seal empty) from an all-amnesiac ensemble (refuse
-    /// the silent seal). One CAS per ensemble epoch.
-    activated: std::sync::atomic::AtomicBool,
+    /// True only after the authoritative record applies `active` for this
+    /// ensemble. The first eligible batch publishes `active` before its
+    /// acknowledgements are credited; a failed publication permanently
+    /// degrades the shipper. Recovery uses `active` to tell a never-adopted
+    /// fragment (safe to seal empty) from an all-amnesiac ensemble (refuse the
+    /// silent seal).
+    activated: Arc<std::sync::atomic::AtomicBool>,
     epoch: u64,
     members: Vec<Member>,
+    /// One ordered lane per member: a single worker serves that member's
+    /// rounds strictly in submission order, so pipelining across rounds
+    /// can never reorder appends at a follower — contiguity holds by
+    /// construction and the follower needs no reorder state.
+    lanes: Vec<tokio::sync::mpsc::UnboundedSender<LaneJob>>,
+    /// Rounds the ship loop may keep in flight at once.
+    pipeline: usize,
     seq: std::sync::atomic::AtomicU64,
     /// A failed member degrades the shipper permanently: fleet proofs stop
     /// and every ack rides the bucket, which is always safe, until the
     /// maintenance loop CASes a fresh ensemble.
-    degraded: std::sync::atomic::AtomicBool,
-    /// A batch between capture and credit. The reconfigure barrier cannot
-    /// see such a batch in the shipped/tiered counters — its frames credit
-    /// only after `ship` returns — so `maintain` must refuse to step epochs
-    /// while one is out, or a frame covered only by the old ensemble could
-    /// ack under a record that no longer names its holders.
-    in_flight: std::sync::atomic::AtomicBool,
-    /// The gray-follower ledger, shared with the manager: append timings
-    /// feed it, the eviction watch reads it, and it outlives this shipper
+    degraded: Arc<std::sync::atomic::AtomicBool>,
+    /// Batches between capture and credit, one count per round. The
+    /// reconfigure barrier cannot see such a batch in the shipped/tiered
+    /// counters — its frames credit only after the round completes — so
+    /// `maintain` must refuse to step epochs while any is out, or a frame
+    /// covered only by the old ensemble could ack under a record that no
+    /// longer names its holders.
+    outstanding: Arc<std::sync::atomic::AtomicU64>,
+    /// The gray-follower ledger lives with the member lanes now: append
+    /// timings feed it from each lane worker, and it outlives this shipper
     /// so quarantine survives the swap.
-    health: Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
     policy: Arc<celld_logic::log_evict::EvictionPolicy>,
+    /// The stream window, when `CELLD_LOG_WINDOW` enables it. `None` keeps
+    /// the round-bounded ship loop unchanged.
+    stream: Option<Arc<StreamWindow>>,
 }
 
 impl crate::ltx_repl::Shipper for FleetShipper {
-    fn ship<'a>(
-        &'a self,
-        batch: &'a [ShipEntry],
+    fn ship(
+        &self,
+        batch: Vec<ShipEntry>,
         covered_seq: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<u64>> + Send + 'a>> {
-        Box::pin(self.ship_batch(batch, covered_seq))
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::ltx_repl::ShipCompletion> + Send + 'static>,
+    > {
+        self.ship_batch(batch, covered_seq)
     }
 
     fn active(&self) -> bool {
@@ -1093,12 +1594,24 @@ impl crate::ltx_repl::Shipper for FleetShipper {
         self.epoch
     }
 
-    fn batch_credited(&self) {
-        self.in_flight.store(false, Ordering::SeqCst);
+    fn pipeline(&self) -> usize {
+        self.pipeline
+    }
+
+    fn admit(&self) -> bool {
+        self.stream.as_ref().is_none_or(|stream| stream.admit())
     }
 }
 
 impl FleetShipper {
+    fn degrade(&self, why: &str) {
+        degrade_shared(&self.degraded, self.epoch, why);
+    }
+
+    async fn post_append(&self, member: &Member, req: &AppendReq) -> AppendSend {
+        post_append_to(&self.transport, &self.policy, member, req).await
+    }
+
     fn is_active(&self) -> bool {
         !self.degraded.load(Ordering::SeqCst)
     }
@@ -1114,210 +1627,980 @@ enum AppendSend {
     Failed(#[allow(dead_code)] anyhow::Error),
 }
 
-impl FleetShipper {
-    /// The append POST: a binary body (the entries dominate it), a JSON
-    /// response. Bounded by the eviction backstop, not the generic client
-    /// timeout: an append slower than the backstop triggers the evict
-    /// regardless, and a gray follower must not pin the in-flight batch
-    /// (and with it the reconfigure barrier) for ten seconds.
-    async fn post_append(&self, member: &Member, req: &AppendReq) -> AppendSend {
-        let deadline = std::time::Duration::from_millis(self.policy.backstop_ms + 100);
-        let bytes = match self
-            .transport
-            .post(
-                &member.node,
-                &member.addr,
-                "/__log/append",
-                encode_append(req),
-                Some(deadline),
-            )
-            .await
-        {
-            Ok(bytes) => bytes,
-            // A missing or unimplemented route is a binary that does not
-            // speak the log tier — the mixed-version seam. Everything
-            // else (timeouts, resets, 5xx) stays a transient failure.
-            Err(error) => {
-                let incapable = error
-                    .downcast_ref::<PeerHttpError>()
-                    .is_some_and(|http| matches!(http.status.as_u16(), 404 | 405 | 501));
-                return if incapable {
-                    AppendSend::Incapable(error)
-                } else {
-                    AppendSend::Failed(error)
-                };
+/// Whether one member's answer confirms this append. Direct acceptance
+/// confirms; a refusal still confirms when the follower echoes the same
+/// fragment epoch and its contiguous end covers the batch — the entries are
+/// durable there, which is all write-all needs, and it is exactly the shape
+/// a hedged retransmission produces when the original landed first. The
+/// epoch echo is what makes the refusal reading sound: a follower on
+/// another fragment reports an end that says nothing about these sequences.
+#[doc(hidden)]
+pub fn append_confirms(req_epoch: u64, last: u64, resp: &AppendResp) -> bool {
+    resp.ok || (resp.epoch == Some(req_epoch) && resp.end >= last)
+}
+
+/// Whether one ATTEMPT confirms this append. Only a well-formed answer can:
+/// a transport failure and a protocol-level incapability report on the
+/// attempt, not on what the follower holds.
+fn send_confirms(req_epoch: u64, last: u64, send: &AppendSend) -> bool {
+    matches!(send, AppendSend::Answered(resp) if append_confirms(req_epoch, last, resp))
+}
+
+fn degrade_shared(degraded: &std::sync::atomic::AtomicBool, epoch: u64, why: &str) {
+    if !degraded.swap(true, Ordering::SeqCst) {
+        warn!(epoch, why, "log ensemble degraded; acks ride the bucket");
+    }
+}
+
+/// The append POST: a binary body (the entries dominate it), a JSON
+/// response. Bounded by the eviction backstop, not the generic client
+/// timeout: an append slower than the backstop triggers the evict
+/// regardless, and a gray follower must not pin the in-flight batch
+/// (and with it the reconfigure barrier) for ten seconds.
+async fn post_append_to(
+    transport: &Arc<dyn LogTransport>,
+    policy: &celld_logic::log_evict::EvictionPolicy,
+    member: &Member,
+    req: &AppendReq,
+) -> AppendSend {
+    let deadline = std::time::Duration::from_millis(policy.backstop_ms + 100);
+    let encode_started = mono_us();
+    let body = encode_append(req);
+    let encode_us = mono_us().saturating_sub(encode_started);
+    let body_len = body.len();
+    let bytes = match transport
+        .post(
+            &member.node,
+            &member.addr,
+            "/peer/log/append",
+            body,
+            Some(deadline),
+        )
+        .await
+    {
+        Ok(bytes) => bytes,
+        // A missing or unimplemented route is a binary that does not
+        // speak the log tier — the mixed-version seam. Everything
+        // else (timeouts, resets, 5xx) stays a transient failure.
+        Err(error) => {
+            let incapable = error
+                .downcast_ref::<PeerHttpError>()
+                .is_some_and(|http| matches!(http.status.as_u16(), 404 | 405 | 501));
+            return if incapable {
+                AppendSend::Incapable(error)
+            } else {
+                AppendSend::Failed(error)
+            };
+        }
+    };
+    tracing::debug!(
+        target: "timing",
+        event = "log_append_encode",
+        encode_us,
+        body_len,
+        "append body encoded"
+    );
+    match serde_json::from_slice(&bytes) {
+        Ok(resp) => AppendSend::Answered(resp),
+        // A 200 whose body is not an AppendResp is no celld follower.
+        Err(error) => AppendSend::Incapable(error.into()),
+    }
+}
+
+/// How the lane arms its hedge deadline. `Fixed` is the lab override
+/// (`CELLD_LOG_HEDGE_MS`; 0 disables hedging); `Adaptive` derives the
+/// deadline from the follower-health ledger per arming, so the deadline
+/// tracks the fleet's measured honest tail instead of a constant that a
+/// loaded fleet's tail can cross (the log-hedge-deadline design).
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub enum HedgeMode {
+    Fixed(u64),
+    Adaptive,
+}
+
+fn resolve_hedge_ms(
+    tuning: &LaneTuning,
+    policy: &celld_logic::log_evict::EvictionPolicy,
+    health: &Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
+) -> u64 {
+    match tuning.hedge {
+        HedgeMode::Fixed(ms) => ms,
+        HedgeMode::Adaptive => health.lock().unwrap().hedge_deadline_ms(policy, mono_ms()),
+    }
+}
+
+/// The per-lane knobs that ride beside the transport handles: the hedge
+/// deadline, this lane's slot in the stream window when the window is on,
+/// and whether the lane speaks the ordered stream transport.
+#[doc(hidden)]
+pub struct LaneTuning {
+    pub hedge: HedgeMode,
+    pub stream: Option<(Arc<StreamWindow>, usize)>,
+    pub stream_transport: bool,
+}
+
+/// Resolve one append's answer: the health sample, the rtt event, the
+/// confirmation reading, the window accounting, and the caller's oneshot.
+/// Shared by the serial lane, the stream lane, and the stream lane's
+/// hedge and fallback paths, so every transport reads an answer the same
+/// way.
+#[allow(clippy::too_many_arguments)]
+fn resolve_append(
+    member: &Member,
+    policy: &celld_logic::log_evict::EvictionPolicy,
+    health: &Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
+    tuning: &LaneTuning,
+    job: LaneJob,
+    started: u64,
+    write_ms: u64,
+    resp: AppendSend,
+) {
+    let done = mono_ms();
+    health
+        .lock()
+        .unwrap()
+        .append_completed(&member.node, done, done.saturating_sub(started));
+    info!(
+        event = "log_append_rtt",
+        member = member.node,
+        entries = job.req.entries.len(),
+        lane_wait_ms = started.saturating_sub(job.enqueued),
+        rtt_ms = done.saturating_sub(started),
+        write_ms,
+        "append round trip completed"
+    );
+    let last = job.req.entries.last().map_or(0, |entry| entry.seq);
+    let outcome = match resp {
+        AppendSend::Answered(resp) if append_confirms(job.req.epoch, last, &resp) => {
+            Some((member.node.clone(), resp.end))
+        }
+        AppendSend::Incapable(error) => {
+            // Fast rejections read as healthy latency samples, so
+            // the gray verdicts never fire on this member and the
+            // rebuild re-picks it forever (#95): quarantine it
+            // here and the next rebuild recruits around it.
+            warn!(
+                member = member.node,
+                %error,
+                "follower cannot serve log appends; quarantined from recruitment"
+            );
+            health
+                .lock()
+                .unwrap()
+                .append_incapable(policy, &member.node, done);
+            None
+        }
+        AppendSend::Answered(_) | AppendSend::Failed(_) => None,
+    };
+    // The window accounting settles BEFORE the round future can
+    // resolve: by the time the ship loop sees a completed round, every
+    // one of its lane slots is already released.
+    if let Some((window, index)) = &tuning.stream {
+        window.answered(*index, job.bytes);
+        if let Some((_, end)) = &outcome {
+            if let Some(watermark) = window.confirmed(*index, *end) {
+                info!(
+                    event = "log_watermark_advance",
+                    watermark,
+                    member = member.node,
+                    "fleet watermark advanced"
+                );
             }
+        }
+    }
+    let _ = job.resp.send(outcome);
+}
+
+/// One job through the one-shot HTTP path, hedged: the serial lane's whole
+/// step, also the stream lane's fallback for an old follower.
+async fn http_append_job(
+    member: &Member,
+    transport: &Arc<dyn LogTransport>,
+    policy: &celld_logic::log_evict::EvictionPolicy,
+    health: &Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
+    tuning: &LaneTuning,
+    job: LaneJob,
+) {
+    let started = mono_ms();
+    health.lock().unwrap().append_started(&member.node, started);
+    let last = job.req.entries.last().map_or(0, |entry| entry.seq);
+    // The hedge: appends are idempotent per sequence — a duplicate of a
+    // persisted range refuses with an end that covers it, which
+    // `append_confirms` reads as the ack — so a round trip stuck in a
+    // platform tail is raced by a second copy. This is what keeps one
+    // slow append from stalling its round and every round behind it
+    // (#140).
+    //
+    // The race is for the first CONFIRMING answer, never for the first
+    // answer: a duplicate may only ever turn a non-confirmation into a
+    // confirmation, so in every other case the round's verdict and the
+    // health-ledger classification are the ORIGINAL attempt's, exactly
+    // as if no duplicate had been sent. Returning whichever attempt
+    // merely resolved first instead lets a hedge that fails fast cancel
+    // a healthy original — failing a round the original was about to
+    // confirm, degrading the whole shipper onto bucket acks for a tail
+    // it had already absorbed, and quarantining a live member for
+    // `quarantine_ms` when the duplicate's answer is an `Incapable` one.
+    // The lane therefore waits the loser out whenever the winner does
+    // not confirm. That wait is bounded and small: both attempts carry
+    // the same eviction-backstop deadline, so the lane holds a job for
+    // at most `hedge_ms` longer than the un-hedged path did.
+    let hedge_ms = resolve_hedge_ms(tuning, policy, health);
+    let resp = if hedge_ms == 0 {
+        post_append_to(transport, policy, member, &job.req).await
+    } else {
+        let mut original = std::pin::pin!(post_append_to(transport, policy, member, &job.req));
+        let inside_deadline = crate::asyncrt::select_biased! {
+            "the original response wins a tie with the hedge deadline so no duplicate is sent";
+            resp = &mut original => Some(resp),
+            _ = crate::asyncrt::sleep(std::time::Duration::from_millis(hedge_ms)) => None,
         };
-        match serde_json::from_slice(&bytes) {
-            Ok(resp) => AppendSend::Answered(resp),
-            // A 200 whose body is not an AppendResp is no celld follower.
-            Err(error) => AppendSend::Incapable(error.into()),
+        match inside_deadline {
+            // Answered before the deadline: no duplicate is sent, and
+            // the answer stands whether or not it confirms.
+            Some(resp) => resp,
+            None => {
+                info!(
+                    event = "log_append_hedge",
+                    member = member.node,
+                    entries = job.req.entries.len(),
+                    hedge_ms,
+                    "append hedged after the deadline"
+                );
+                let mut hedged =
+                    std::pin::pin!(post_append_to(transport, policy, member, &job.req));
+                let (winner, winner_is_original) = crate::asyncrt::select_biased! {
+                    "the original attempt wins simultaneous replies so it retains the verdict";
+                    resp = &mut original => (resp, true),
+                    resp = &mut hedged => (resp, false),
+                };
+                if send_confirms(job.req.epoch, last, &winner) {
+                    winner
+                } else if winner_is_original {
+                    // Give the duplicate the rest of its deadline, and
+                    // take it only to upgrade a non-confirmation.
+                    let late = hedged.await;
+                    if send_confirms(job.req.epoch, last, &late) {
+                        late
+                    } else {
+                        winner
+                    }
+                } else {
+                    // The duplicate answered first and did not confirm:
+                    // whatever it said, the original owns the verdict.
+                    original.await
+                }
+            }
+        }
+    };
+    resolve_append(member, policy, health, tuning, job, started, 0, resp);
+}
+
+/// One member's ordered append lane. A single worker serves the member's
+/// rounds strictly in submission order, so several rounds in flight can
+/// never reorder appends at this follower; the worker exits when its
+/// shipper is dropped and the channel closes. With the stream transport
+/// the same worker pumps one long-lived duplex instead of awaiting each
+/// request round trip.
+#[doc(hidden)]
+pub async fn member_lane(
+    member: Member,
+    transport: Arc<dyn LogTransport>,
+    policy: Arc<celld_logic::log_evict::EvictionPolicy>,
+    health: Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
+    tuning: LaneTuning,
+    mut jobs: tokio::sync::mpsc::UnboundedReceiver<LaneJob>,
+    stop: crate::ltx_repl::StopToken,
+) {
+    if tuning.stream_transport {
+        stream_lane(
+            &member, &transport, &policy, &health, &tuning, &mut jobs, &stop,
+        )
+        .await;
+        return;
+    }
+    loop {
+        let job = crate::asyncrt::select_biased! {
+            "a stop signal that ties queued work prevents the lane from taking another job";
+            _ = stop.stopped() => break,
+            job = jobs.recv() => job,
+        };
+        let Some(job) = job else { break };
+        let work = http_append_job(&member, &transport, &policy, &health, &tuning, job);
+        tokio::pin!(work);
+        crate::asyncrt::select_biased! {
+            "a stop signal that ties one-shot completion ends the lane before more work";
+            _ = stop.stopped() => break,
+            _ = &mut work => {},
+        }
+    }
+}
+
+/// One frame the stream lane has written and not yet matched to a
+/// response. `job` empties when the hedge answers first; the entry then
+/// only holds the FIFO slot for the stream's late duplicate answer.
+struct StreamInFlight {
+    job: Option<LaneJob>,
+    frame: Vec<u8>,
+    /// When the frame was written — queue residency starts here.
+    started: u64,
+    /// How long the socket write itself blocked the lane worker. Nonzero
+    /// values mean TCP backpressure paces the lane; ~zero means the lane
+    /// waits on the follower's serve cycle, not on the wire.
+    write_ms: u64,
+    /// The head-stall event fired for this frame (once per frame).
+    stall_reported: bool,
+    /// When the frame became the pipeline head — the follower's service
+    /// clock. The health ledger and the hedge run on THIS, not on the
+    /// write time: with W frames queued, write-to-resolve includes up to
+    /// W round trips of residency, and a ledger built for one-in-flight
+    /// lanes reads that as grayness and evicts a healthy member (the
+    /// 2026-08-21 stall attribution).
+    head_started: Option<u64>,
+    hedged: bool,
+}
+
+/// Arm the service clock on the current head — the first unresolved
+/// frame — and give the health ledger its start sample.
+fn arm_head(
+    member: &Member,
+    health: &Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
+    inflight: &mut std::collections::VecDeque<StreamInFlight>,
+) {
+    if let Some(head) = inflight.iter_mut().find(|entry| entry.job.is_some()) {
+        if head.head_started.is_none() {
+            let now = mono_ms();
+            head.head_started = Some(now);
+            health.lock().unwrap().append_started(&member.node, now);
+        }
+    }
+}
+
+/// The stream lane (the ordered-transport design): pump queued
+/// jobs down one ordered duplex and match responses strictly FIFO, so W
+/// frames ride the wire while the follower's single reader keeps apply
+/// order equal to submission order. The resume rule: on a broken stream,
+/// redial once and retransmit every unanswered frame in order — the
+/// follower's covering-end reading turns duplicates into acks, so the
+/// follower's own state decides what was persisted, never the leader's
+/// sent count (BrokenStreamResumeBlind is the model tooth). A break with
+/// no progress since the last dial fails every outstanding job instead,
+/// which degrades the shipper exactly as a failed append does today. A
+/// head frame stalled past the hedge deadline is raced by a one-shot
+/// duplicate; an old follower without the route drops the lane to the
+/// one-shot path for its lifetime.
+async fn stream_lane(
+    member: &Member,
+    transport: &Arc<dyn LogTransport>,
+    policy: &celld_logic::log_evict::EvictionPolicy,
+    health: &Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
+    tuning: &LaneTuning,
+    jobs: &mut tokio::sync::mpsc::UnboundedReceiver<LaneJob>,
+    stop: &crate::ltx_repl::StopToken,
+) {
+    type Writer = tokio::io::WriteHalf<LogStreamIo>;
+    let mut conn: Option<(Writer, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>)> = None;
+    let mut inflight: std::collections::VecDeque<StreamInFlight> =
+        std::collections::VecDeque::new();
+    let mut answered_since_dial = false;
+    let mut hedge_rx: Option<tokio::sync::oneshot::Receiver<AppendSend>> = None;
+
+    fn spawn_reader(
+        read: tokio::io::ReadHalf<LogStreamIo>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+        let (send, receive) = tokio::sync::mpsc::unbounded_channel();
+        crate::asyncrt::spawn(async move {
+            let mut read = read;
+            loop {
+                match read_frame(&mut read).await {
+                    Ok(Some(frame)) => {
+                        if send.send(frame).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) | Err(_) => return,
+                }
+            }
+        })
+        .detach();
+        receive
+    }
+
+    async fn dial(
+        member: &Member,
+        transport: &Arc<dyn LogTransport>,
+    ) -> anyhow::Result<(Writer, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>)> {
+        let io = transport
+            .open_stream(&member.node, &member.addr, "/peer/log/stream")
+            .await?;
+        let (read, write) = tokio::io::split(io);
+        Ok((write, spawn_reader(read)))
+    }
+
+    /// Fail every unanswered frame; the round futures then fail and the
+    /// shipper degrades through the existing path.
+    fn fail_all(
+        member: &Member,
+        policy: &celld_logic::log_evict::EvictionPolicy,
+        health: &Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
+        tuning: &LaneTuning,
+        inflight: &mut std::collections::VecDeque<StreamInFlight>,
+    ) {
+        for entry in inflight.drain(..) {
+            if let Some(job) = entry.job {
+                resolve_append(
+                    member,
+                    policy,
+                    health,
+                    tuning,
+                    job,
+                    entry.started,
+                    entry.write_ms,
+                    AppendSend::Failed(anyhow::anyhow!("append stream failed")),
+                );
+            }
         }
     }
 
-    /// Ship one batch to every member. `Some(last_seq)` only when every
-    /// member confirmed every entry fsync'd — the ack-all rule. Any failure
-    /// marks the shipper degraded: fleet proofs stop and the gate rides the
-    /// bucket upload, which is always safe. `covered_seq` rides along as
-    /// the followers' truncate_to: those entries are bucket-covered and the
-    /// fragments behind them can be dropped.
-    async fn ship_batch(&self, batch: &[ShipEntry], covered_seq: u64) -> Option<u64> {
-        if self.members.is_empty() {
-            return None;
+    loop {
+        // Disconnected: wait for work, then establish.
+        if conn.is_none() {
+            let job = crate::asyncrt::select_biased! {
+                "a stop signal that ties queued work prevents a new stream connection";
+                _ = stop.stopped() => None,
+                job = jobs.recv() => job,
+            };
+            let Some(job) = job else { return };
+            match dial(member, transport).await {
+                Ok(established) => {
+                    conn = Some(established);
+                    answered_since_dial = false;
+                }
+                Err(error) => {
+                    let incapable = error
+                        .downcast_ref::<PeerHttpError>()
+                        .is_some_and(|http| matches!(http.status.as_u16(), 404 | 405 | 501));
+                    if incapable {
+                        // An old follower: this lane speaks one-shot HTTP for
+                        // its lifetime. The mixed fleet is safe and merely
+                        // slow on this member.
+                        info!(
+                            member = member.node,
+                            "follower has no stream route; lane falls back to one-shot appends"
+                        );
+                        http_append_job(member, transport, policy, health, tuning, job).await;
+                        while let Some(job) = jobs.recv().await {
+                            http_append_job(member, transport, policy, health, tuning, job).await;
+                        }
+                        return;
+                    }
+                    let started = mono_ms();
+                    health.lock().unwrap().append_started(&member.node, started);
+                    resolve_append(
+                        member,
+                        policy,
+                        health,
+                        tuning,
+                        job,
+                        started,
+                        0,
+                        AppendSend::Failed(error),
+                    );
+                    continue;
+                }
+            }
+            // Fall through with the job still to write.
+            let (write, _) = conn.as_mut().expect("just established");
+            let frame = encode_append(&job.req);
+            let started = mono_ms();
+            if write_frame(write, &frame).await.is_err() {
+                conn = None;
+                health.lock().unwrap().append_started(&member.node, started);
+                resolve_append(
+                    member,
+                    policy,
+                    health,
+                    tuning,
+                    job,
+                    started,
+                    mono_ms().saturating_sub(started),
+                    AppendSend::Failed(anyhow::anyhow!("append stream write failed")),
+                );
+                continue;
+            }
+            inflight.push_back(StreamInFlight {
+                job: Some(job),
+                frame,
+                started,
+                write_ms: mono_ms().saturating_sub(started),
+                stall_reported: false,
+                head_started: None,
+                hedged: false,
+            });
+            arm_head(member, health, &mut inflight);
+            continue;
         }
-        // The flag must outlive this call on SUCCESS: ship_loop applies
-        // the shipped credits after ship() returns, and clearing here
-        // left a window where frames were invisible to both in_flight and
-        // all_shipped_tiered — the reconfigure/seal barriers could pass
-        // over acked frames (fidelity audit, DRIFTED #1). The guard now
-        // clears only on the failure paths; batch_credited() clears it
-        // after the credits land.
-        struct InFlight<'a>(&'a std::sync::atomic::AtomicBool);
-        impl Drop for InFlight<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::SeqCst);
+
+        // The hedge deadline for the head frame, when one is eligible.
+        let armed_hedge_ms = if hedge_rx.is_none() {
+            resolve_hedge_ms(tuning, policy, health)
+        } else {
+            0
+        };
+        let hedge_deadline = if armed_hedge_ms > 0 {
+            inflight
+                .iter()
+                .find(|entry| entry.job.is_some())
+                .filter(|entry| !entry.hedged)
+                .and_then(|entry| Some(entry.head_started? + armed_hedge_ms))
+        } else {
+            None
+        };
+        // The head-stall ledger (the overload-stability design): a head
+        // outstanding past half the backstop is on its way to evicting a
+        // member, and this is the leader's only view of WHERE the frame
+        // sat — write_ms says whether the socket write drained; a frame
+        // that wrote in ~0 ms yet goes unanswered was not read.
+        {
+            let now = mono_ms();
+            let queued = inflight.len();
+            if let Some(head) = inflight.iter_mut().find(|entry| entry.job.is_some()) {
+                if let Some(head_started) = head.head_started {
+                    let age_ms = now.saturating_sub(head_started);
+                    if !head.stall_reported && age_ms >= policy.backstop_ms / 2 {
+                        head.stall_reported = true;
+                        warn!(
+                            event = "log_head_stall",
+                            member = member.node,
+                            age_ms,
+                            queue_residency_ms = head_started.saturating_sub(head.started),
+                            write_ms = head.write_ms,
+                            entries = head.job.as_ref().map_or(0, |job| job.req.entries.len()),
+                            bytes = head.frame.len(),
+                            queued,
+                            "stream head outstanding past half the backstop"
+                        );
+                    }
+                }
             }
         }
-        // in_flight rises BEFORE the degraded check (cold review, S3):
-        // maintain sets degraded and then reads in_flight as its drain
-        // barrier, so the old order let a batch slip past a
+
+        let (_, responses) = conn.as_mut().expect("connected");
+        enum LaneEvent {
+            Job(Option<LaneJob>),
+            Response(Option<Vec<u8>>),
+            HedgeFire,
+            HedgeAnswer(AppendSend),
+            Stopped,
+        }
+        let hedge_side = async {
+            crate::asyncrt::select_biased! {
+                "an armed hedge deadline wins a tie with the preceding hedge answer";
+                fired = async {
+                    match hedge_deadline {
+                        Some(deadline) => {
+                            let wait = deadline.saturating_sub(mono_ms());
+                            crate::asyncrt::sleep(std::time::Duration::from_millis(wait)).await
+                        }
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let () = fired;
+                    LaneEvent::HedgeFire
+                },
+                answer = async {
+                    match &mut hedge_rx {
+                        Some(receiver) => match receiver.await {
+                            Ok(answer) => answer,
+                            Err(_) => AppendSend::Failed(anyhow::anyhow!("hedge task dropped")),
+                        },
+                        None => std::future::pending().await,
+                    }
+                } => LaneEvent::HedgeAnswer(answer),
+            }
+        };
+        let event = crate::asyncrt::select_biased! {
+            "a lane event wins a tie with hedge work so ordered stream progress runs first";
+            event = async {
+                crate::asyncrt::select_biased! {
+                    "a stop signal that ties stream activity closes the lane first";
+                    stopped = async {
+                        stop.stopped().await;
+                        LaneEvent::Stopped
+                    } => stopped,
+                    event = async {
+                        crate::asyncrt::select_biased! {
+                            "a queued append wins a tie with a response to preserve legacy lane order";
+                            job = jobs.recv() => LaneEvent::Job(job),
+                            response = responses.recv() => LaneEvent::Response(response),
+                        }
+                    } => event,
+                }
+            } => event,
+            event = hedge_side => event,
+        };
+
+        match event {
+            LaneEvent::Stopped => {
+                fail_all(member, policy, health, tuning, &mut inflight);
+                return;
+            }
+            LaneEvent::Job(None) => return,
+            LaneEvent::Job(Some(job)) => {
+                let (write, _) = conn.as_mut().expect("connected");
+                let frame = encode_append(&job.req);
+                let started = mono_ms();
+                let written = write_frame(write, &frame).await;
+                let write_ms = mono_ms().saturating_sub(started);
+                match written {
+                    Ok(()) => {
+                        inflight.push_back(StreamInFlight {
+                            job: Some(job),
+                            frame,
+                            started,
+                            write_ms,
+                            stall_reported: false,
+                            head_started: None,
+                            hedged: false,
+                        });
+                        arm_head(member, health, &mut inflight);
+                    }
+                    Err(_) => {
+                        inflight.push_back(StreamInFlight {
+                            job: Some(job),
+                            frame,
+                            started,
+                            write_ms,
+                            stall_reported: false,
+                            head_started: None,
+                            hedged: false,
+                        });
+                        conn = reconnect(
+                            member,
+                            transport,
+                            policy,
+                            health,
+                            tuning,
+                            &mut inflight,
+                            &mut answered_since_dial,
+                        )
+                        .await;
+                    }
+                }
+            }
+            LaneEvent::Response(Some(payload)) => {
+                let Some(mut entry) = inflight.pop_front() else {
+                    // A response with no frame outstanding is a protocol
+                    // violation; drop the stream and let redial sort it out.
+                    conn = reconnect(
+                        member,
+                        transport,
+                        policy,
+                        health,
+                        tuning,
+                        &mut inflight,
+                        &mut answered_since_dial,
+                    )
+                    .await;
+                    continue;
+                };
+                answered_since_dial = true;
+                let Some(job) = entry.job.take() else {
+                    // The hedge already answered this frame; the stream's
+                    // duplicate only frees the FIFO slot.
+                    arm_head(member, health, &mut inflight);
+                    continue;
+                };
+                let service_started = entry.head_started.unwrap_or(entry.started);
+                match serde_json::from_slice::<AppendResp>(&payload) {
+                    Ok(resp) => {
+                        resolve_append(
+                            member,
+                            policy,
+                            health,
+                            tuning,
+                            job,
+                            service_started,
+                            entry.write_ms,
+                            AppendSend::Answered(resp),
+                        );
+                        arm_head(member, health, &mut inflight);
+                    }
+                    Err(error) => {
+                        resolve_append(
+                            member,
+                            policy,
+                            health,
+                            tuning,
+                            job,
+                            service_started,
+                            entry.write_ms,
+                            AppendSend::Failed(error.into()),
+                        );
+                        conn = reconnect(
+                            member,
+                            transport,
+                            policy,
+                            health,
+                            tuning,
+                            &mut inflight,
+                            &mut answered_since_dial,
+                        )
+                        .await;
+                    }
+                }
+            }
+            LaneEvent::Response(None) => {
+                conn = reconnect(
+                    member,
+                    transport,
+                    policy,
+                    health,
+                    tuning,
+                    &mut inflight,
+                    &mut answered_since_dial,
+                )
+                .await;
+            }
+            LaneEvent::HedgeFire => {
+                if let Some(entry) = inflight
+                    .iter_mut()
+                    .find(|entry| entry.job.is_some())
+                    .filter(|entry| !entry.hedged)
+                {
+                    entry.hedged = true;
+                    info!(
+                        event = "log_append_hedge",
+                        member = member.node,
+                        hedge_ms = armed_hedge_ms,
+                        "stream head hedged after the deadline"
+                    );
+                    let (send, receive) = tokio::sync::oneshot::channel();
+                    hedge_rx = Some(receive);
+                    let transport = transport.clone();
+                    let policy_owned = policy.clone();
+                    let member_owned = member.clone();
+                    let req = entry
+                        .job
+                        .as_ref()
+                        .map(|job| job.req.clone())
+                        .expect("checked job.is_some");
+                    crate::asyncrt::spawn(async move {
+                        let resp =
+                            post_append_to(&transport, &policy_owned, &member_owned, &req).await;
+                        let _ = send.send(resp);
+                    })
+                    .detach();
+                }
+            }
+            LaneEvent::HedgeAnswer(resp) => {
+                hedge_rx = None;
+                if let Some(entry) = inflight
+                    .iter_mut()
+                    .find(|entry| entry.hedged && entry.job.is_some())
+                {
+                    // The one-shot duplicate may only ever turn a
+                    // non-confirmation into a confirmation (the #199 race
+                    // rule): a duplicate that failed fast or answered
+                    // Incapable proves nothing about what the follower
+                    // holds, and the stream's own answer — bounded by the
+                    // reconnect deadline — owns the verdict.
+                    let last = entry
+                        .job
+                        .as_ref()
+                        .map(|job| job.req.entries.last().map_or(0, |entry| entry.seq))
+                        .unwrap_or(0);
+                    let epoch = entry.job.as_ref().map(|job| job.req.epoch).unwrap_or(0);
+                    if send_confirms(epoch, last, &resp) {
+                        if let Some(job) = entry.job.take() {
+                            let service_started = entry.head_started.unwrap_or(entry.started);
+                            resolve_append(
+                                member,
+                                policy,
+                                health,
+                                tuning,
+                                job,
+                                service_started,
+                                entry.write_ms,
+                                resp,
+                            );
+                            answered_since_dial = true;
+                        }
+                    }
+                }
+                arm_head(member, health, &mut inflight);
+            }
+        }
+    }
+
+    /// Redial once and retransmit every unanswered frame in order. The
+    /// follower's reported state decides what those retransmissions mean:
+    /// a persisted range refuses with a covering end, which reads as the
+    /// ack. A break with no answer since the last dial fails everything
+    /// instead of looping.
+    async fn reconnect(
+        member: &Member,
+        transport: &Arc<dyn LogTransport>,
+        policy: &celld_logic::log_evict::EvictionPolicy,
+        health: &Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
+        tuning: &LaneTuning,
+        inflight: &mut std::collections::VecDeque<StreamInFlight>,
+        answered_since_dial: &mut bool,
+    ) -> Option<(
+        tokio::io::WriteHalf<LogStreamIo>,
+        tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    )> {
+        if !*answered_since_dial {
+            fail_all(member, policy, health, tuning, inflight);
+            return None;
+        }
+        // Hedge-resolved slots have no response coming on the new stream.
+        inflight.retain(|entry| entry.job.is_some());
+        // The retransmission restarts every frame's service; a stale head
+        // clock would bill the outage to the follower's health.
+        for entry in inflight.iter_mut() {
+            entry.head_started = None;
+        }
+        match dial(member, transport).await {
+            Ok((mut write, responses)) => {
+                for entry in inflight.iter() {
+                    if write_frame(&mut write, &entry.frame).await.is_err() {
+                        fail_all(member, policy, health, tuning, inflight);
+                        return None;
+                    }
+                }
+                *answered_since_dial = false;
+                arm_head(member, health, inflight);
+                Some((write, responses))
+            }
+            Err(_) => {
+                fail_all(member, policy, health, tuning, inflight);
+                None
+            }
+        }
+    }
+}
+
+impl FleetShipper {
+    /// Ship one batch to every member through its ordered lane.
+    ///
+    /// The synchronous prefix allocates the sequence range and enqueues the
+    /// round on every member lane BEFORE returning the future, so submission
+    /// order — not poll order — fixes the per-member append order. The
+    /// returned future only collects the answers: `Some(last_seq)` when
+    /// every member confirmed every entry fsync'd — the ack-all rule. Any
+    /// failure degrades the shipper: fleet proofs stop and the gate rides
+    /// the bucket upload, which is always safe. `covered_seq` rides along
+    /// as the followers' truncate_to.
+    fn ship_batch(
+        &self,
+        batch: Vec<ShipEntry>,
+        covered_seq: u64,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::ltx_repl::ShipCompletion> + Send + 'static>,
+    > {
+        if self.members.is_empty() || batch.is_empty() {
+            return Box::pin(std::future::ready(
+                crate::ltx_repl::ShipCompletion::unreserved(None),
+            ));
+        }
+        // The count rises BEFORE the degraded check:
+        // maintain sets degraded and then reads the outstanding count as
+        // its drain barrier, so the old order let a batch slip past a
         // reconfiguration's decision and fleet-ack frames on the retired
         // ensemble that the barrier never counted.
-        self.in_flight.store(true, Ordering::SeqCst);
-        let in_flight = InFlight(&self.in_flight);
+        self.outstanding.fetch_add(1, Ordering::SeqCst);
+        let outstanding = OutstandingRound(self.outstanding.clone());
         if self.degraded.load(Ordering::SeqCst) {
-            return None;
+            return Box::pin(async move {
+                crate::ltx_repl::ShipCompletion::reserved(None, outstanding)
+            });
         }
         let first = self.seq.fetch_add(batch.len() as u64, Ordering::SeqCst) + 1;
         let entries: Vec<Entry> = batch
-            .iter()
+            .into_iter()
             .enumerate()
             .map(|(index, entry)| Entry {
                 seq: first + index as u64,
-                cell: entry.cell.clone(),
+                cell: entry.cell,
                 cell_epoch: entry.epoch,
                 txid: entry.txid,
-                bytes: entry.bytes.clone(),
+                bytes: entry.bytes,
             })
             .collect();
-        let last = first + batch.len() as u64 - 1;
-        let req = AppendReq {
+        let last = first + entries.len() as u64 - 1;
+        let req = Arc::new(AppendReq {
             leader: self.node.clone(),
             epoch: self.epoch,
             truncate_to: covered_seq,
             entries,
-        };
-        let req = &req;
-        let sends = self.members.iter().map(|member| async move {
-            let started = mono_ms();
-            self.health
-                .lock()
-                .unwrap()
-                .append_started(&member.node, started);
-            let resp = self.post_append(member, req).await;
-            let done = mono_ms();
-            self.health.lock().unwrap().append_completed(
-                &member.node,
-                done,
-                done.saturating_sub(started),
-            );
-            match resp {
-                AppendSend::Answered(AppendResp { ok: true, end }) => {
-                    Some((member.node.clone(), end))
-                }
-                AppendSend::Incapable(error) => {
-                    // Fast rejections read as healthy latency samples, so
-                    // the gray verdicts never fire on this member and the
-                    // rebuild re-picks it forever (#95): quarantine it
-                    // here and the next rebuild recruits around it.
-                    warn!(
-                        member = member.node,
-                        %error,
-                        "follower cannot serve log appends; quarantined from recruitment"
-                    );
-                    self.health
-                        .lock()
-                        .unwrap()
-                        .append_incapable(&self.policy, &member.node, done);
-                    None
-                }
-                AppendSend::Answered(AppendResp { ok: false, .. }) | AppendSend::Failed(_) => None,
-            }
         });
-        // Write-all, ack-all is the core's decision: every ensemble member
-        // must confirm a contiguous end at or past the batch — a member
-        // that refused, errored, or answered short is a failed batch.
-        let ends: BTreeMap<String, u64> = futures_util::future::join_all(sends)
-            .await
-            .into_iter()
-            .flatten()
+        let req_bytes = req
+            .entries
+            .iter()
+            .map(|entry| entry.bytes.len() as u64)
+            .sum::<u64>();
+        let receivers: Vec<tokio::sync::oneshot::Receiver<Option<(String, u64)>>> = self
+            .lanes
+            .iter()
+            .enumerate()
+            .map(|(index, lane)| {
+                if let Some(stream) = &self.stream {
+                    stream.submitted(index, req_bytes);
+                }
+                let (resp, receive) = tokio::sync::oneshot::channel();
+                let _ = lane.send(LaneJob {
+                    req: req.clone(),
+                    enqueued: mono_ms(),
+                    bytes: req_bytes,
+                    resp,
+                });
+                receive
+            })
             .collect();
         let view = log_tier::LeaderView {
             epoch: self.epoch,
             ensemble: self.record.ensemble.clone(),
         };
-        if log_tier::ack_fleet_allowed(&view, &ends, last) {
-            // The activation fence: before the epoch's first fleet ack is
-            // credited, the record must say `active`, or a later recovery
-            // meeting only amnesiac members would seal an empty gather as
-            // if nothing had ever been acked.
-            if !self.activated.load(Ordering::SeqCst) {
-                #[cfg(all(test, celld_internal_tests))]
-                let active = if crate::asyncrt::sabotage_active(
-                    crate::host_services::EngineSabotage::SkipActivationFenceCas,
-                ) {
-                    self.activated.store(true, Ordering::SeqCst);
-                    true
-                } else {
-                    self.mark_active().await
-                };
-                #[cfg(not(all(test, celld_internal_tests)))]
-                let active = self.mark_active().await;
-                if !active {
-                    self.degrade("activation CAS lost");
-                    return None;
+        let activated = self.activated.clone();
+        let degraded = self.degraded.clone();
+        let live_log = self.live_log.clone();
+        let record = self.record.clone();
+        let epoch = self.epoch;
+        Box::pin(async move {
+            // Write-all, ack-all is the core's decision: every ensemble
+            // member must confirm a contiguous end at or past the batch — a
+            // member that refused, errored, or answered short is a failed
+            // batch.
+            let ends: BTreeMap<String, u64> = futures_util::future::join_all(receivers)
+                .await
+                .into_iter()
+                .flatten()
+                .flatten()
+                .collect();
+            if log_tier::ack_fleet_allowed(&view, &ends, last) {
+                // The activation fence: before the epoch's first fleet ack
+                // is credited, the record must say `active`, or a later
+                // recovery meeting only amnesiac members would seal an
+                // empty gather as if nothing had ever been acked.
+                if !activated.load(Ordering::SeqCst) {
+                    let active = live_log.activate(&record).await.unwrap_or(false);
+                    // Through the core's lease chain (lease-fold): a fenced
+                    // session's renewals stop applying, so the wait fails
+                    // and the ack must not credit.
+                    if active {
+                        activated.store(true, Ordering::SeqCst);
+                    } else {
+                        degrade_shared(&degraded, epoch, "activation transition not applied");
+                        return crate::ltx_repl::ShipCompletion::reserved(None, outstanding);
+                    }
                 }
+                return crate::ltx_repl::ShipCompletion::reserved(Some(last), outstanding);
             }
-            #[cfg(all(test, celld_internal_tests))]
-            let clear_early = crate::asyncrt::sabotage_active(
-                crate::host_services::EngineSabotage::ClearShipInFlightEarly,
-            );
-            #[cfg(not(all(test, celld_internal_tests)))]
-            let clear_early = false;
-            if !clear_early {
-                std::mem::forget(in_flight);
-            }
-            return Some(last);
-        }
-        self.degrade("member append failed");
-        None
-    }
-
-    fn degrade(&self, why: &str) {
-        if !self.degraded.swap(true, Ordering::SeqCst) {
-            warn!(
-                epoch = self.epoch,
-                why, "log ensemble degraded; acks ride the bucket"
-            );
-        }
-    }
-
-    async fn mark_active(&self) -> bool {
-        // Through the core's lease chain (lease-fold): a fenced session's
-        // renewals stop applying, so the wait fails and the ack must not
-        // credit — the same refusal the old CAS token gave, proved by the
-        // one writer the record has.
-        match self
-            .own_log
-            .write(Some(log_to_wire(&self.record, true)))
-            .await
-        {
-            Ok(()) => {
-                self.activated.store(true, Ordering::SeqCst);
-                true
-            }
-            Err(_) => false,
-        }
+            degrade_shared(&degraded, epoch, "member append failed");
+            crate::ltx_repl::ShipCompletion::reserved(None, outstanding)
+        })
     }
 }
 
@@ -1329,7 +2612,7 @@ pub struct NodeLogManager {
     node: String,
     /// The single-writer path for our own folded log state: publishes to
     /// the ownership store and rides the core's immediate renewal.
-    own_log: Arc<OwnLog>,
+    live_log: Arc<LiveLogTransitions>,
     /// This process session's log identity: `<node>/<generation>`, the
     /// generation from the node lease record. Every self record, bundle,
     /// fragment, and loss key hangs off it.
@@ -1356,7 +2639,7 @@ pub struct NodeLogManager {
     /// Sessions whose bundle subtree one sweep pass confirmed empty:
     /// a permanent tombstone (dead-lease GC never deletes a folded
     /// record) must not cost a bundle LIST on every sweep tick forever
-    /// (third cold review). Process-local; a restart re-confirms once.
+    /// Process-local; a restart re-confirms once.
     gc_confirmed_empty: Mutex<std::collections::HashSet<String>>,
     /// One-slot cache for the compactor's fetches: bundles are read many
     /// rows at a time, and re-GETting per row would refund the savings.
@@ -1371,36 +2654,362 @@ pub struct NodeLogManager {
     /// until any peer answers anything successfully. Cleared by a probe
     /// or append Ok; 37 doomed epochs in one 45 s partition taught the
     /// alternative.
-    suspect_self: std::sync::atomic::AtomicBool,
+    suspect_self: Arc<std::sync::atomic::AtomicBool>,
+    /// When we last said that the fleet posture is requested and not
+    /// achieved. `maintain` runs on a ticker and used to return silently
+    /// whenever it found no peer to recruit, so a fleet that never formed an
+    /// ensemble logged nothing at all — only a fleet that formed one and lost
+    /// it did. A single node then paid the bucket for every write with no
+    /// line anywhere saying why, or that a second node changes it.
+    shortfall_logged_ms: Arc<std::sync::atomic::AtomicU64>,
     /// The shutdown latch: once set, the bundle sink refuses new flushes
     /// so the graceful seal's uncovered-scan cannot go stale between the
-    /// LIST and the seal CAS (fidelity audit, DRIFTED #2).
+    /// LIST and the seal CAS.
     closing: std::sync::atomic::AtomicBool,
     /// A bundle flush between its PUT and its credit; the graceful seal
     /// waits this out after latching `closing`.
     flush_in_flight: std::sync::atomic::AtomicBool,
+    #[cfg(all(test, celld_internal_tests))]
+    close_transition_pause: Mutex<Option<Arc<NodeLogTransitionPause>>>,
+    #[cfg(all(test, celld_internal_tests))]
+    maintenance_install_pause: Mutex<Option<Arc<NodeLogTransitionPause>>>,
+    #[cfg(all(test, celld_internal_tests))]
+    maintenance_publish_pause: Mutex<Option<Arc<NodeLogTransitionPause>>>,
     /// Every predecessor session's log is proven recovered; see
     /// `ensure_predecessors_recovered` for why this can latch.
     predecessors_clean: std::sync::atomic::AtomicBool,
+    /// Process-local single-flight locks for dead-session recovery. The map
+    /// stores weak values, so observing many historical sessions does not
+    /// retain one allocation per session for the process lifetime.
+    recovery_locks: Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    /// Sessions for which this process won the Open -> Recovering CAS. A
+    /// failed elected pass can retry immediately; other processes wait for
+    /// the bounded claim before they compete to replace it.
+    claimed_recoveries: Mutex<BTreeSet<String>>,
+    task_stop: crate::ltx_repl::StopToken,
+    child_tasks: crate::ltx_repl::TaskGroup,
+}
+
+struct NodeLogTaskOwner {
+    stop: crate::ltx_repl::StopToken,
+    roots: crate::ltx_repl::TaskGroup,
+    children: crate::ltx_repl::TaskGroup,
+}
+
+struct FollowerTaskOwner {
+    store: Option<Arc<FollowerStore>>,
+    follower_stop: crate::ltx_repl::StopToken,
+    follower_tasks: crate::ltx_repl::TaskGroup,
+}
+
+struct OwnedDurabilityStack {
+    ltx: Arc<crate::ltx_repl::LtxRepl>,
+    manager: Arc<NodeLogManager>,
+    registration: Option<crate::ltx_repl::DurabilityRegistration>,
+    ltx_tasks: Option<crate::ltx_repl::LtxTaskOwner>,
+    replica_close_task: Option<crate::asyncrt::TaskHandle<()>>,
+    node_log_tasks: NodeLogTaskOwner,
+    fleet: bool,
+}
+
+/// The daemon's unique owner for one local durability stack.
+///
+/// Cloneable runtime handles can borrow the replicator and the manager, but
+/// only this value controls their coupled registration and background tasks.
+/// A drop requests the local fallback but does not join tasks. Call
+/// [`Self::shutdown_local`] to prove that all admitted tasks completed.
+pub struct DurabilityOwner {
+    stack: Option<OwnedDurabilityStack>,
+    follower_tasks: FollowerTaskOwner,
+}
+
+impl DurabilityOwner {
+    /// Creates the unique owner for a runtime durability stack.
+    ///
+    /// Set `fleet` to install the coupled node-log registration.
+    /// `bundle_mode` enables the LTX bundle sink when `fleet` is `true`.
+    ///
+    /// # Panics
+    ///
+    /// The function panics if another owner controls the LTX task set. It also
+    /// panics if a fleet registration targets a stopped LTX service.
+    pub fn new(manager: Arc<NodeLogManager>, fleet: bool, bundle_mode: bool) -> Self {
+        let ltx = manager.ltx.clone();
+        // Claim the unique lifecycle capability before changing the coupled
+        // registration. A duplicate construction fails here, so its unwind
+        // cannot supersede and then clear the live owner's generation.
+        let ltx_tasks = ltx.take_task_owner();
+        let registration = fleet.then(|| {
+            ltx.register_durability(
+                manager.clone(),
+                bundle_mode.then(|| manager.clone() as Arc<dyn crate::ltx_repl::BundleSink>),
+            )
+            .expect("a new durability owner cannot install on a stopped LTX service")
+        });
+        let follower_stop = crate::ltx_repl::StopToken::new();
+        let node_log_stop = manager.task_stop.clone();
+        let child_tasks = manager.child_tasks.clone();
+        Self {
+            stack: Some(OwnedDurabilityStack {
+                ltx,
+                manager,
+                registration,
+                ltx_tasks: Some(ltx_tasks),
+                replica_close_task: None,
+                node_log_tasks: NodeLogTaskOwner {
+                    stop: node_log_stop.clone(),
+                    roots: crate::ltx_repl::TaskGroup::new(node_log_stop),
+                    children: child_tasks,
+                },
+                fleet,
+            }),
+            follower_tasks: FollowerTaskOwner {
+                store: None,
+                follower_stop: follower_stop.clone(),
+                follower_tasks: crate::ltx_repl::TaskGroup::new(follower_stop),
+            },
+        }
+    }
+
+    /// Creates an owner for a follower store without a runtime durability stack.
+    ///
+    /// The owner starts and retains the follower fragment collector.
+    ///
+    /// # Panics
+    ///
+    /// The function panics outside the asynchronous runtime.
+    pub fn new_follower(follower: Arc<FollowerStore>) -> Self {
+        let follower_stop = crate::ltx_repl::StopToken::new();
+        let follower_tasks = crate::ltx_repl::TaskGroup::new(follower_stop.clone());
+        spawn_fragment_gc(follower.clone(), follower_stop.clone(), &follower_tasks);
+        Self {
+            stack: None,
+            follower_tasks: FollowerTaskOwner {
+                store: Some(follower),
+                follower_stop,
+                follower_tasks,
+            },
+        }
+    }
+
+    /// Starts the background tasks for a runtime durability stack.
+    ///
+    /// The optional follower store adds the follower fragment collector.
+    ///
+    /// # Panics
+    ///
+    /// The function panics for a follower-only owner or outside the asynchronous
+    /// runtime. It also panics while node-log roots are active or when a
+    /// follower store is already installed.
+    pub fn start_background(&mut self, follower: Option<Arc<FollowerStore>>) {
+        let stack = self
+            .stack
+            .as_ref()
+            .expect("the durability stack must be installed");
+        assert!(
+            stack.node_log_tasks.roots.is_empty(),
+            "node-log background tasks were already started"
+        );
+        if stack.fleet {
+            spawn_maintenance(
+                stack.manager.clone(),
+                stack.node_log_tasks.stop.clone(),
+                &stack.node_log_tasks.roots,
+            );
+        }
+        if let Some(follower) = follower {
+            assert!(
+                self.follower_tasks.store.is_none(),
+                "follower background tasks were already started"
+            );
+            self.follower_tasks.store = Some(follower.clone());
+            spawn_fragment_gc(
+                follower,
+                self.follower_tasks.follower_stop.clone(),
+                &self.follower_tasks.follower_tasks,
+            );
+        }
+    }
+
+    /// Stops the node-log roots, seals covered data, and joins the roots.
+    ///
+    /// This method has no deadline. Use [`Self::quiesce_and_seal_within`] during
+    /// a bounded process shutdown.
+    pub async fn quiesce_and_seal(&mut self) {
+        let Some(stack) = &self.stack else {
+            return;
+        };
+        stack.node_log_tasks.stop.request_stop();
+        stack.manager.close_gracefully().await;
+        stack.node_log_tasks.roots.join().await;
+    }
+
+    /// Quiesces the durability stack within the specified remaining time.
+    ///
+    /// The method returns `true` after a complete quiesce. It runs the local
+    /// fallback and returns `false` after a timeout.
+    #[must_use]
+    pub async fn quiesce_and_seal_within(&mut self, remaining: std::time::Duration) -> bool {
+        if crate::asyncrt::timeout(remaining, self.quiesce_and_seal())
+            .await
+            .is_ok()
+        {
+            true
+        } else {
+            // Cancellation can drop a join while it holds an admitted task
+            // handle. Publish the local stop state immediately, so no task or
+            // registration can recreate a durability resource after the
+            // process deadline. The process exits without requiring a join.
+            self.stop_local_now();
+            false
+        }
+    }
+
+    /// Stops local admission and joins all admitted durability tasks.
+    ///
+    /// The caller must await this method to prove that all tasks completed and
+    /// all registered managed replicas are closed. The caller must first stop
+    /// and join the runtime operations that can open a replica. This method has
+    /// no deadline. Use [`Self::shutdown_local_within`] during a bounded process
+    /// shutdown.
+    pub async fn shutdown_local(&mut self) {
+        self.follower_tasks.follower_stop.request_stop();
+        if let Some(stack) = &mut self.stack {
+            stack.node_log_tasks.stop.request_stop();
+            if let Some(tasks) = &stack.ltx_tasks {
+                tasks.request_stop();
+            }
+            stack.registration.take();
+            stack.manager.shutdown_local_fallback();
+            stack.ltx.shutdown_local_fallback();
+            stack.node_log_tasks.roots.join().await;
+            if let Some(tasks) = &stack.ltx_tasks {
+                tasks.join().await;
+            }
+            // Keep the owner installed until its join completes. A deadline
+            // can cancel this future while one handle is claimed, and the
+            // task group returns that handle for a later shutdown attempt.
+            stack.ltx_tasks.take();
+            stack.node_log_tasks.children.join().await;
+            // A direct durability pass is not in an owned task group and can
+            // still hold a replica mutex. Every admitted release close has
+            // joined now. Snapshot the remaining registered replicas, run the
+            // close loop off the executor, and retain its handle before await.
+            if stack.replica_close_task.is_none() {
+                stack.replica_close_task = stack.ltx.start_close_local_replicas();
+            }
+            if let Some(close) = &mut stack.replica_close_task {
+                if let Err(error) = close.await {
+                    warn!(%error, "managed replica close task stopped with an error");
+                }
+            }
+            stack.replica_close_task.take();
+        }
+        self.follower_tasks.follower_tasks.join().await;
+        self.follower_tasks.store.take();
+    }
+
+    /// Stops local admission and joins tasks within the specified remaining time.
+    ///
+    /// The method returns `true` after all admitted tasks complete and all
+    /// registered managed replicas are closed. The caller must first stop and
+    /// join the runtime operations that can open a replica. It runs the local
+    /// fallback and returns `false` after a timeout.
+    #[must_use]
+    pub async fn shutdown_local_within(&mut self, remaining: std::time::Duration) -> bool {
+        if crate::asyncrt::timeout(remaining, self.shutdown_local())
+            .await
+            .is_ok()
+        {
+            true
+        } else {
+            // A cancelled group join returns its claimed handle, and the owner
+            // retains every admitted release close plus the final snapshot
+            // close. Publish fallback without taking a replica mutex, so a
+            // blocked capture cannot extend the process deadline a second time.
+            self.stop_local_now();
+            false
+        }
+    }
+
+    /// Stops local admission and breaks component cycles without waiting.
+    ///
+    /// The daemon uses this fallback after its shutdown deadline. A completed
+    /// [`Self::shutdown_local`] call proves that all admitted tasks completed
+    /// and all registered managed replicas are closed. A `true` result from
+    /// [`Self::shutdown_local_within`] gives the same proof.
+    pub fn stop_local_now(&mut self) {
+        self.shutdown_local_fallback();
+    }
+
+    fn shutdown_local_fallback(&mut self) {
+        self.follower_tasks.follower_stop.request_stop();
+        self.follower_tasks.store.take();
+        if let Some(stack) = &mut self.stack {
+            stack.node_log_tasks.stop.request_stop();
+            stack.registration.take();
+            stack.manager.shutdown_local_fallback();
+            stack.ltx.shutdown_local_fallback();
+        }
+    }
+}
+
+impl Drop for DurabilityOwner {
+    fn drop(&mut self) {
+        self.shutdown_local_fallback();
+    }
 }
 
 impl crate::ltx_repl::Shipper for NodeLogManager {
-    fn ship<'a>(
-        &'a self,
-        batch: &'a [ShipEntry],
+    fn ship(
+        &self,
+        batch: Vec<ShipEntry>,
         covered_seq: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<u64>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::ltx_repl::ShipCompletion> + Send + 'static>,
+    > {
+        let epoch = self.epoch();
+        self.ship_at_epoch(epoch, batch, covered_seq)
+    }
+
+    fn ship_at_epoch(
+        &self,
+        expected_epoch: u64,
+        batch: Vec<ShipEntry>,
+        covered_seq: u64,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::ltx_repl::ShipCompletion> + Send + 'static>,
+    > {
+        // Select the delegate and reserve its round under the same manager
+        // lock that maintenance uses to replace it. A capture that finishes
+        // after an epoch swap cannot reach the new followers with the old
+        // epoch's truncation watermark.
+        let round = self
+            .inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|shipper| shipper.epoch == expected_epoch)
+            .map(|shipper| shipper.ship_batch(batch, covered_seq));
+        let suspect_self = self.suspect_self.clone();
         Box::pin(async move {
-            let inner = self.inner.lock().unwrap().clone();
-            let shipped = match inner {
-                Some(shipper) => shipper.ship_batch(batch, covered_seq).await,
-                None => None,
+            let shipped = match round {
+                Some(round) => round.await,
+                None => crate::ltx_repl::ShipCompletion::unreserved(None),
             };
-            if shipped.is_some() {
-                self.suspect_self.store(false, Ordering::SeqCst);
+            if shipped.last_seq().is_some() {
+                suspect_self.store(false, Ordering::SeqCst);
             }
             shipped
         })
+    }
+
+    fn pipeline(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(1, |shipper| shipper.pipeline)
     }
 
     fn active(&self) -> bool {
@@ -1419,13 +3028,12 @@ impl crate::ltx_repl::Shipper for NodeLogManager {
             .map_or(0, |shipper| shipper.epoch)
     }
 
-    fn batch_credited(&self) {
-        // The barrier (may_reconfigure) forbids a swap while the flag is
-        // up, so the inner shipper here is the one that shipped.
-        let inner = self.inner.lock().unwrap().clone();
-        if let Some(shipper) = inner {
-            crate::ltx_repl::Shipper::batch_credited(shipper.as_ref());
-        }
+    fn admit(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|shipper| shipper.stream.as_ref().is_none_or(|stream| stream.admit()))
     }
 }
 
@@ -1483,10 +3091,13 @@ impl NodeLogManager {
         policy: celld_logic::log_evict::EvictionPolicy,
     ) -> Self {
         let ownership = own_log.ownership.clone();
+        let live_log = Arc::new(LiveLogTransitions::new(own_log));
+        let task_stop = crate::ltx_repl::StopToken::new();
+        let child_tasks = crate::ltx_repl::TaskGroup::new(task_stop.clone());
         Self {
             node: session.split('/').next().unwrap_or(session).to_string(),
             session: session.to_string(),
-            own_log,
+            live_log,
             bucket,
             ownership,
             ltx,
@@ -1498,11 +3109,22 @@ impl NodeLogManager {
             bundle_cache: tokio::sync::Mutex::new(None),
             health: Arc::new(Mutex::new(celld_logic::log_evict::FollowerHealth::default())),
             policy: Arc::new(policy),
-            suspect_self: std::sync::atomic::AtomicBool::new(false),
+            suspect_self: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shortfall_logged_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             closing: std::sync::atomic::AtomicBool::new(false),
             flush_in_flight: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(test, celld_internal_tests))]
+            close_transition_pause: Mutex::new(None),
+            #[cfg(all(test, celld_internal_tests))]
+            maintenance_install_pause: Mutex::new(None),
+            #[cfg(all(test, celld_internal_tests))]
+            maintenance_publish_pause: Mutex::new(None),
             predecessors_clean: std::sync::atomic::AtomicBool::new(false),
+            recovery_locks: Mutex::new(BTreeMap::new()),
+            claimed_recoveries: Mutex::new(BTreeSet::new()),
             gc_confirmed_empty: Mutex::new(std::collections::HashSet::new()),
+            task_stop,
+            child_tasks,
         }
     }
 
@@ -1530,7 +3152,7 @@ impl NodeLogManager {
         }
         // The install about to follow erases the record's only pointer to
         // the predecessor generation, and no GC path can rediscover a
-        // sealed subtree with no pointer (third cold review): the boot is
+        // sealed subtree with no pointer: the boot is
         // the one moment that knows every stale generation, so it sweeps
         // them here. Non-fatal — the leak is storage cost, not safety,
         // and the next restart retries.
@@ -1618,8 +3240,30 @@ impl NodeLogManager {
             if health.verdict(&self.policy, member, &members, now)
                 == celld_logic::log_evict::Verdict::Evict
             {
+                // The evidence is a second, idempotent read of the same
+                // ledger at the same instant: the eviction path is rare,
+                // and the decision entry stays the one the DST drives.
+                let (_, detail) = health.verdict_detailed(&self.policy, member, &members, now);
                 health.evicted(&self.policy, member, now);
                 drop(health);
+                // The evidence, not just the sentence: which rule, and the
+                // numbers it saw. Reconstructing this after the fact from
+                // completed appends is impossible for the backstop, whose
+                // evidence is the append that never completed.
+                warn!(
+                    event = "log_evict_verdict",
+                    member,
+                    rule = detail.rule,
+                    outstanding_ms = detail.outstanding_ms,
+                    own_median_ms = detail.own_median_ms,
+                    samples = detail.samples,
+                    sibling_median_ms = detail.sibling_median_ms,
+                    threshold_ms = detail.threshold_ms,
+                    suspect_ms = detail.suspect_ms,
+                    backstop_ms = self.policy.backstop_ms,
+                    budget_ms = self.policy.budget_ms,
+                    "gray follower evicted"
+                );
                 shipper.degrade(&format!("gray follower {member} evicted"));
                 return true;
             }
@@ -1629,9 +3273,8 @@ impl NodeLogManager {
 
     /// Idle disk probes: an empty append still persists (and fsyncs) the
     /// follower's state file, so a quiet fleet finds a dying follower disk
-    /// before load does. One probe per quiet member per interval, spawned
-    /// detached — a hanging probe marks the member outstanding and the
-    /// backstop does the rest.
+    /// before load does. One owned probe runs per quiet member per interval.
+    /// A hanging probe marks the member outstanding and the backstop acts.
     pub fn probe_followers(self: &Arc<Self>) {
         const PROBE_QUIET_MS: u64 = 2_000;
         let inner = self.inner.lock().unwrap().clone();
@@ -1653,53 +3296,59 @@ impl NodeLogManager {
             let shipper = shipper.clone();
             let node = member.node.clone();
             let health = self.health.clone();
-            let manager = self.clone();
-            crate::asyncrt::spawn(async move {
-                let member = shipper
-                    .members
-                    .iter()
-                    .find(|member| member.node == node)
-                    .expect("probed member is in the ensemble");
-                let req = AppendReq {
-                    leader: shipper.node.clone(),
-                    epoch: shipper.epoch,
-                    truncate_to: 0,
-                    entries: Vec::new(),
-                };
-                let started = mono_ms();
-                health.lock().unwrap().append_started(&node, started);
-                let outcome = shipper.post_append(member, &req).await;
-                let done = mono_ms();
-                health
-                    .lock()
-                    .unwrap()
-                    .append_completed(&node, done, done.saturating_sub(started));
-                // ANY well-formed peer response — even an append refusal,
-                // which is still a signed HTTP 200 — proves connectivity
-                // and lifts self-suspicion. An incapable answer proves
-                // the peer is the wrong binary, not that we are cut off,
-                // and it quarantines here exactly as a shipped batch
-                // would — an idle ensemble must not keep a 0.2.x member
-                // recruit-eligible just because no writes arrive.
-                match outcome {
-                    AppendSend::Answered(_) => {
-                        manager.suspect_self.store(false, Ordering::SeqCst);
+            let suspect_self = self.suspect_self.clone();
+            let stop = self.task_stop.clone();
+            self.child_tasks
+                .spawn_owned("node_log_follower_probe", async move {
+                    let member = shipper
+                        .members
+                        .iter()
+                        .find(|member| member.node == node)
+                        .expect("probed member is in the ensemble");
+                    let req = AppendReq {
+                        leader: shipper.node.clone(),
+                        epoch: shipper.epoch,
+                        truncate_to: 0,
+                        entries: Vec::new(),
+                    };
+                    let started = mono_ms();
+                    health.lock().unwrap().append_started(&node, started);
+                    let outcome = crate::asyncrt::select_biased! {
+                        "a stop signal that ties a probe response prevents recording stale health";
+                        _ = stop.stopped() => return,
+                        outcome = shipper.post_append(member, &req) => outcome,
+                    };
+                    let done = mono_ms();
+                    health.lock().unwrap().append_completed(
+                        &node,
+                        done,
+                        done.saturating_sub(started),
+                    );
+                    // ANY well-formed peer response — even an append refusal,
+                    // which is still a signed HTTP 200 — proves connectivity
+                    // and lifts self-suspicion. An incapable answer proves
+                    // the peer is the wrong binary, not that we are cut off,
+                    // and it quarantines here exactly as a shipped batch
+                    // would — an idle ensemble must not keep a 0.2.x member
+                    // recruit-eligible just because no writes arrive.
+                    match outcome {
+                        AppendSend::Answered(_) => {
+                            suspect_self.store(false, Ordering::SeqCst);
+                        }
+                        AppendSend::Incapable(error) => {
+                            warn!(
+                                member = node,
+                                %error,
+                                "follower cannot serve log appends; quarantined from recruitment"
+                            );
+                            health
+                                .lock()
+                                .unwrap()
+                                .append_incapable(&shipper.policy, &node, done);
+                        }
+                        AppendSend::Failed(_) => {}
                     }
-                    AppendSend::Incapable(error) => {
-                        warn!(
-                            member = node,
-                            %error,
-                            "follower cannot serve log appends; quarantined from recruitment"
-                        );
-                        health
-                            .lock()
-                            .unwrap()
-                            .append_incapable(&shipper.policy, &node, done);
-                    }
-                    AppendSend::Failed(_) => {}
-                }
-            })
-            .detach();
+                });
         }
     }
 
@@ -1722,7 +3371,7 @@ impl NodeLogManager {
     async fn post_tail(&self, node: &str, addr: &str, req: &TailReq) -> anyhow::Result<TailResp> {
         let bytes = self
             .transport
-            .post(node, addr, "/__log/tail", serde_json::to_vec(req)?, None)
+            .post(node, addr, "/peer/log/tail", serde_json::to_vec(req)?, None)
             .await?;
         decode_tail_resp(&bytes)
     }
@@ -1817,6 +3466,27 @@ impl NodeLogManager {
 
     /// Recover one dead SESSION's log: `dead` is `<node>/<generation>`.
     pub async fn recover(&self, dead: &str) -> anyhow::Result<()> {
+        let recovery_lock = {
+            let mut locks = self.recovery_locks.lock().unwrap();
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(dead).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(dead.to_string(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        let _single_flight = recovery_lock.lock().await;
+        let result = self.recover_serial(dead).await;
+        if result.is_ok() {
+            self.claimed_recoveries.lock().unwrap().remove(dead);
+        }
+        result
+    }
+
+    async fn recover_serial(&self, dead: &str) -> anyhow::Result<()> {
         for _attempt in 0..5 {
             let Some(folded) = read_record(&self.bucket, dead).await? else {
                 return Ok(());
@@ -1827,8 +3497,8 @@ impl NodeLogManager {
                 token,
                 wire,
             } = folded;
-            // Re-judge deadness on the record actually being fenced (cold
-            // review, S1): the caller's verdict may be stale — an owner
+            // Re-judge deadness on the record actually being fenced: the
+            // caller's verdict may be stale — an owner
             // can restart between the read that justified this call and
             // now, and the spec's RecoverLog is enabled only past expiry
             // AT the step. A live lease is an error, not a skip: the
@@ -1856,6 +3526,48 @@ impl NodeLogManager {
                     {
                         continue; // lost the CAS; re-read
                     }
+                    self.claimed_recoveries
+                        .lock()
+                        .unwrap()
+                        .insert(dead.to_string());
+                }
+                LogState::Recovering if !self.claimed_recoveries.lock().unwrap().contains(dead) => {
+                    // The Open -> Recovering CAS elects one reader. Every
+                    // other process observes that reader instead of repeating
+                    // its GET/PUT/DELETE fan-out. If the elected process dies,
+                    // one contender wins an identical CAS after the bounded
+                    // observation window and resumes the idempotent work.
+                    let deadline_ms =
+                        mono_ms().saturating_add(RECOVERY_CLAIM_TTL.as_millis() as u64);
+                    loop {
+                        crate::asyncrt::sleep(RECOVERY_CLAIM_POLL).await;
+                        let Some(current) = read_record(&self.bucket, dead).await? else {
+                            return Ok(());
+                        };
+                        if current.record.state == LogState::Sealed {
+                            return Ok(());
+                        }
+                        if mono_ms() >= deadline_ms {
+                            if write_dead_record(
+                                &self.bucket,
+                                dead,
+                                &current.wire,
+                                &current.record,
+                                current.active,
+                                &current.token,
+                            )
+                            .await?
+                            .is_some()
+                            {
+                                self.claimed_recoveries
+                                    .lock()
+                                    .unwrap()
+                                    .insert(dead.to_string());
+                            }
+                            break;
+                        }
+                    }
+                    continue;
                 }
                 LogState::Recovering => {}
             }
@@ -1915,7 +3627,7 @@ impl NodeLogManager {
                     epoch: record.epoch,
                 };
                 let Ok::<SealResp, _>(sealed) =
-                    self.post(member, &addr, "/__log/seal", &seal).await
+                    self.post(member, &addr, "/peer/log/seal", &seal).await
                 else {
                     if lease_live || !lease_long_dead {
                         inconclusive += 1;
@@ -1963,50 +3675,30 @@ impl NodeLogManager {
                 .bucket
                 .list(&format!("log/{dead}/bundle/"))
                 .await
-                .unwrap_or_default();
-            #[cfg(all(test, celld_internal_tests))]
-            let filter_epoch = crate::asyncrt::sabotage_active(
-                crate::host_services::EngineSabotage::FilterRecoveryBundlesByRecordEpoch,
-            );
-            #[cfg(not(all(test, celld_internal_tests)))]
-            let filter_epoch = false;
-            let bundle_metas: Vec<_> = bundle_metas
-                .into_iter()
-                .filter(|meta| {
-                    !filter_epoch
-                        || meta
-                            .location
-                            .as_ref()
-                            .rsplit('/')
-                            .next()
-                            .is_some_and(|name| name.starts_with(&format!("e{}-", record.epoch)))
-                })
-                .collect();
+                .with_context(|| format!("list retained recovery bundles for {dead}"))?;
             let bundles_read = bundle_metas.len();
             let fetches = bundle_metas.into_iter().map(|meta| {
                 let bucket = self.bucket.clone();
                 async move {
                     let key = meta.location.as_ref().to_string();
-                    match bucket.get(&key).await {
-                        Ok(Some((bytes, _))) => Some((key, bytes)),
-                        _ => None,
-                    }
+                    let fetched = bucket
+                        .get(&key)
+                        .await
+                        .with_context(|| format!("read retained recovery bundle {key}"))?;
+                    let (bytes, _) = fetched
+                        .ok_or_else(|| anyhow!("listed recovery bundle {key} disappeared"))?;
+                    anyhow::Ok((key, bytes))
                 }
             });
-            let mut fetches = futures_util::stream::iter(fetches)
-                .buffer_unordered(RECOVERY_UPLOAD_CONCURRENCY * 2);
+            let mut fetches =
+                futures_util::stream::iter(fetches).buffer_unordered(RECOVERY_UPLOAD_CONCURRENCY);
             while let Some(fetched) = futures_util::StreamExt::next(&mut fetches).await {
-                let Some((key, bytes)) = fetched else {
-                    continue;
-                };
-                let Ok(rows) = celld_ltx::bundle::decode_rows(&bytes) else {
-                    warn!(key, "unreadable bundle skipped during recovery");
-                    continue;
-                };
+                let (key, bytes) = fetched?;
+                let rows = celld_ltx::bundle::decode_rows(&bytes)
+                    .with_context(|| format!("decode retained recovery bundle {key}"))?;
                 for row in rows {
-                    let Ok(payload) = celld_ltx::bundle::slice(&bytes, &row) else {
-                        continue;
-                    };
+                    let payload = celld_ltx::bundle::slice(&bytes, &row)
+                        .with_context(|| format!("read a row from recovery bundle {key}"))?;
                     gathered
                         .entry((row.cell.clone(), row.cell_epoch, row.txid))
                         .or_insert_with(|| payload.to_vec());
@@ -2043,20 +3735,12 @@ impl NodeLogManager {
                     "note": "no true witness survived; acked writes within the \
                              final flush window may be unrecovered",
                 });
-                #[cfg(all(test, celld_internal_tests))]
-                let skip_loss_record = crate::asyncrt::sabotage_active(
-                    crate::host_services::EngineSabotage::SealAmnesiacWithoutLossRecord,
-                );
-                #[cfg(not(all(test, celld_internal_tests)))]
-                let skip_loss_record = false;
-                if !skip_loss_record {
-                    self.bucket
-                        .put(
-                            &format!("log/{dead}.e{}.loss.json", record.epoch),
-                            serde_json::to_vec(&loss)?,
-                        )
-                        .await?;
-                }
+                self.bucket
+                    .put(
+                        &format!("log/{dead}.e{}.loss.json", record.epoch),
+                        serde_json::to_vec(&loss)?,
+                    )
+                    .await?;
                 warn!(
                     dead,
                     epoch = record.epoch,
@@ -2138,7 +3822,7 @@ impl NodeLogManager {
     }
 
     fn shipper_batch_in_flight(shipper: &FleetShipper) -> bool {
-        shipper.in_flight.load(Ordering::SeqCst)
+        shipper.outstanding.load(Ordering::SeqCst) > 0
     }
 
     /// The graceful-shutdown drain point: stop fleet acks, wait for the
@@ -2149,8 +3833,18 @@ impl NodeLogManager {
     /// Best-effort: any failure leaves the record Open, and recovery
     /// does what it always does.
     pub async fn close_gracefully(&self) {
-        let inner = self.inner.lock().unwrap().clone();
-        let Some(shipper) = inner else { return };
+        let shipper = {
+            let mut transition = self.live_log.lock().await;
+            if !transition.begin_quiescing() {
+                return;
+            }
+            // Quiesce the sink before degrading the shipper. The lifecycle
+            // guard makes both decisions visible before any maintenance or
+            // first-ack transition can enter its publication section.
+            self.closing.store(true, Ordering::SeqCst);
+            self.inner.lock().unwrap().clone()
+        };
+        let Some(shipper) = shipper else { return };
         shipper.degrade("graceful shutdown");
         for _ in 0..50 {
             if self.ltx.all_shipped_tiered() {
@@ -2158,9 +3852,26 @@ impl NodeLogManager {
             }
             crate::asyncrt::sleep(std::time::Duration::from_millis(200)).await;
         }
+        for _ in 0..30 {
+            if !self.flush_in_flight.load(Ordering::SeqCst) {
+                break;
+            }
+            crate::asyncrt::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        #[cfg(all(test, celld_internal_tests))]
+        {
+            // Capture the real folded record before the test pause. The
+            // final transition deliberately re-reads it under a fresh guard.
+            let transition = self.live_log.lock().await;
+            let _captured = transition.current();
+            drop(transition);
+            self.pause_close_transition_for_world().await;
+        }
+        let transition = self.live_log.lock().await;
+        debug_assert!(!transition.is_running());
         // eprintln, not tracing: this runs on the way out of the process,
         // and buffered stdout may never flush before exit.
-        let Some(current) = self.own_log.current() else {
+        let Some(current) = transition.current() else {
             eprintln!("node-log close: no folded log; nothing to seal");
             return;
         };
@@ -2169,17 +3880,6 @@ impl NodeLogManager {
             return;
         };
         let active = current.active;
-        // Quiesce the sink before the scan: without the latch, a flush
-        // crediting between the scan's LIST and the seal CAS re-creates
-        // the orphaned-seal class one layer down — the record CAS fences
-        // record writers, and bundle credits never write the record.
-        self.closing.store(true, Ordering::SeqCst);
-        for _ in 0..30 {
-            if !self.flush_in_flight.load(Ordering::SeqCst) {
-                break;
-            }
-            crate::asyncrt::sleep(std::time::Duration::from_millis(100)).await;
-        }
         // In bundle mode "tiered" includes bundle coverage, but a sealed
         // record tells every future recovery there is nothing to gather —
         // so the seal requires every acked row as a per-cell object. The
@@ -2190,15 +3890,8 @@ impl NodeLogManager {
         // hour sealed 1,300 acked rows into orphanhood behind epoch 156.
         // An Open record is always safe: the next incarnation's recovery
         // drains the bundles.
-        #[cfg(all(test, celld_internal_tests))]
-        let credited_only = crate::asyncrt::sabotage_active(
-            crate::host_services::EngineSabotage::GracefulSealUsesCreditedCoverage,
-        );
-        #[cfg(not(all(test, celld_internal_tests)))]
-        let credited_only = false;
         let per_cell_complete = self.ltx.all_shipped_tiered()
-            && (credited_only
-                || !self.bundle_mode
+            && (!self.bundle_mode
                 || match self.uncovered_bundle_rows().await {
                     Ok(uncovered) => uncovered.is_empty(),
                     Err(_) => false,
@@ -2219,7 +3912,7 @@ impl NodeLogManager {
             state: LogState::Sealed,
             ..record
         };
-        match self.own_log.write(Some(log_to_wire(&sealed, active))).await {
+        match transition.write(Some(log_to_wire(&sealed, active))).await {
             Ok(()) => eprintln!("node-log close: sealed epoch {}", sealed.epoch),
             Err(error) => eprintln!("node-log close: seal not durable: {error:#}"),
         }
@@ -2234,12 +3927,75 @@ impl NodeLogManager {
         self.ensure_predecessors_recovered().await
     }
 
+    /// Is the fleet tier serving acknowledgements?
+    ///
+    /// One follower is the floor, not two. Recruitment still takes two, so a
+    /// healthy fleet holds three copies; the floor is what the ensemble may
+    /// shrink to and keep acknowledging, which is the shape an in-sync replica
+    /// set has: Kafka recruits a replication factor and serves while at least
+    /// `min.insync.replicas` are in sync, canonically three and two.
+    ///
+    /// Two copies is where surviving the loss of the leader begins, and the
+    /// bucket upload races every fleet acknowledgement regardless. Requiring
+    /// two followers put the fast tier one node past the guarantee that
+    /// matters, and made a single eviction on a three-node fleet drop every
+    /// acknowledgement to the bucket, because the ensemble fell under the
+    /// floor with nothing left to recruit.
+    /// Say that the fleet posture is requested and not achieved, at most
+    /// once every five minutes.
+    ///
+    /// Silence is the failure that costs the most here. `log ensemble
+    /// degraded` fires only when an ensemble that existed was lost, so a node
+    /// that never formed one said nothing, and a single-node fleet ran the
+    /// default fleet posture on bucket acknowledgements forever with no line
+    /// explaining the latency or naming the fix.
+    ///
+    /// The two cases differ. No live peer is an ordinary single-node fleet and
+    /// the message is an invitation: a second node acknowledges from a
+    /// follower's disk instead of a storage round trip. Live peers that are
+    /// all ineligible is a fault the operator can act on.
+    fn report_fleet_shortfall(&self, live_peers: usize, now_ms: u64) {
+        const REPORT_INTERVAL_MS: u64 = 300_000;
+        let last = match self.shortfall_logged_ms.load(Ordering::SeqCst) {
+            0 => None,
+            stamp => Some(stamp),
+        };
+        let Some(shortfall) =
+            log_tier::fleet_shortfall(live_peers, now_ms, last, REPORT_INTERVAL_MS)
+        else {
+            return;
+        };
+        self.shortfall_logged_ms.store(now_ms, Ordering::SeqCst);
+        match shortfall {
+            log_tier::Shortfall::NoPeer => info!(
+                live_peers,
+                "fleet durability requested and no peer is available; writes \
+                 wait for the bucket. A second node acknowledges a write when \
+                 its follower holds it on disk, which is much faster"
+            ),
+            log_tier::Shortfall::NoEligiblePeer => warn!(
+                live_peers,
+                "fleet durability requested and no peer is eligible; writes \
+                 wait for the bucket. Every live peer is quarantined for \
+                 incapability or has not been recruited yet"
+            ),
+        }
+    }
+
     pub fn healthy(&self) -> bool {
         self.inner
             .lock()
             .unwrap()
             .as_ref()
-            .is_some_and(|shipper| shipper.is_active() && shipper.members.len() >= 2)
+            .is_some_and(|shipper| shipper.is_active() && !shipper.members.is_empty())
+    }
+
+    fn shutdown_local_fallback(&self) {
+        self.task_stop.request_stop();
+        self.closing.store(true, Ordering::SeqCst);
+        if let Some(shipper) = self.inner.lock().unwrap().take() {
+            shipper.degrade("local durability shutdown");
+        }
     }
 
     /// One ensemble-maintenance pass: if the shipper is absent, degraded,
@@ -2251,6 +4007,12 @@ impl NodeLogManager {
     /// new shipper. A lost CAS leaves us at bucket posture; the next pass
     /// re-reads and retries.
     pub async fn maintain(&self) -> anyhow::Result<()> {
+        // Avoid every remote read after local ownership has ended. Shutdown
+        // can still race a pass after this check, so publication has a second
+        // check under the lifecycle transition below.
+        if self.task_stop.is_stopped() {
+            return Ok(());
+        }
         if self.healthy() {
             return Ok(());
         }
@@ -2263,18 +4025,37 @@ impl NodeLogManager {
         let peers = self.ownership.read_capacity_peers().await?;
         let now = crate::ownership_store::now_ms();
         let mono = mono_ms();
+        // Kept before the filters consume the vector: a fleet with no peer at
+        // all is a different message from a fleet whose peers are all
+        // ineligible, and an operator needs to be told which one they have.
+        let live_peers = peers
+            .iter()
+            .filter(|peer| peer.node != self.node && peer.expires_ms > now)
+            .count();
         let members: Vec<Member> = peers
             .into_iter()
             .filter(|peer| peer.node != self.node && peer.expires_ms > now)
-            // An evicted follower sits out the quarantine: re-recruiting
-            // the disk that just cost an eviction is how flapping starts.
+            // Only a follower that cannot serve appends at all sits out a
+            // term. A gray one is recruitable again at once, because the
+            // latency rule can judge it again and the swap rate cap is what
+            // bounds flapping.
             .filter(|peer| !self.health.lock().unwrap().quarantined(&peer.node, mono))
+            // Recruit up to two followers — three copies — while the ensemble
+            // may serve on one. Replication factor and the in-sync floor are
+            // separate numbers.
             .take(2)
             .map(|peer| Member {
                 node: peer.node,
                 addr: peer.addr,
             })
             .collect();
+        // Peer discovery is intentionally outside the transition guard.
+        // Recheck the lifecycle after that await, then keep the snapshot,
+        // publication, and successor installation in one critical section.
+        let transition = self.live_log.lock().await;
+        if !transition.is_running() {
+            return Ok(());
+        }
         {
             let inner = self.inner.lock().unwrap().clone();
             if let Some(current) = inner {
@@ -2291,7 +4072,7 @@ impl NodeLogManager {
                 // bucket-covered before the old fragments become
                 // abandonable. Wait it out; the next tick retries.
                 if !log_tier::may_reconfigure(
-                    current.in_flight.load(Ordering::SeqCst),
+                    current.outstanding.load(Ordering::SeqCst) > 0,
                     self.ltx.all_shipped_tiered(),
                 ) {
                     return Ok(());
@@ -2299,6 +4080,7 @@ impl NodeLogManager {
             }
         }
         if members.is_empty() {
+            self.report_fleet_shortfall(live_peers, mono);
             return Ok(());
         }
         if !self.ltx.all_shipped_tiered() {
@@ -2309,8 +4091,7 @@ impl NodeLogManager {
         // no bucket read, and no CAS-lost re-read loop — the only
         // concurrent mutation is a peer's recovery of our EXPIRED lease,
         // and then our renewals stop applying and write_own_log fails.
-        let prior = self
-            .own_log
+        let prior = transition
             .current()
             .as_ref()
             .map(log_from_wire)
@@ -2340,32 +4121,108 @@ impl NodeLogManager {
         // the lease chain — before the first fleet ack of the epoch is
         // credited. The open itself rides an immediate renewal; a failure
         // means our lease is not applying and the posture stays bucket.
-        self.own_log
-            .write(Some(log_to_wire(&record, false)))
-            .await?;
+        #[cfg(all(test, celld_internal_tests))]
+        self.pause_maintenance_publish_for_world().await;
+        // Keep this check under the transition guard and immediately before
+        // the remote write. A pass stopped before this point cannot publish.
+        // A write admitted here can finish after fallback, so dead-session
+        // recovery remains responsible for that remote Open record.
+        if self.task_stop.is_stopped() {
+            return Ok(());
+        }
+        transition.write(Some(log_to_wire(&record, false))).await?;
+        #[cfg(all(test, celld_internal_tests))]
+        self.pause_maintenance_install_for_world().await;
         info!(
             epoch = record.epoch,
             members = ?record.ensemble,
             "log ensemble open; fleet acks enabled"
         );
         self.health.lock().unwrap().reset();
-        *self.inner.lock().unwrap() = Some(Arc::new(FleetShipper {
+        // An unset override selects the adaptive deadline; a set value is
+        // the lab's fixed override, and 0 disables hedging entirely.
+        let hedge = match crate::env_vars::optional::<u64>("CELLD_LOG_HEDGE_MS")
+            .ok()
+            .flatten()
+        {
+            Some(ms) => HedgeMode::Fixed(ms),
+            None => HedgeMode::Adaptive,
+        };
+        // Local shutdown publishes stop before it takes `inner`. Keep the
+        // stop recheck and successor installation under that same mutex: an
+        // install that wins is removed by shutdown, and an install that loses
+        // cannot resurrect a shipper or its member lanes afterward.
+        let mut installed = self.inner.lock().unwrap();
+        if self.task_stop.is_stopped() {
+            return Ok(());
+        }
+        // The stream window (the stream-window design): a nonzero
+        // CELLD_LOG_WINDOW is the appends-per-lane bound and takes over the
+        // ship loop's depth; zero keeps the round pipeline unchanged.
+        let window = crate::env_vars::optional::<u64>("CELLD_LOG_WINDOW")
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let byte_cap = crate::env_vars::optional::<u64>("CELLD_LOG_WINDOW_BYTES")
+            .ok()
+            .flatten()
+            .unwrap_or(8 * 1024 * 1024);
+        let stream = (window > 0)
+            .then(|| Arc::new(StreamWindow::new(window, byte_cap.max(1), members.len())));
+        // The ordered stream transport (the ordered-transport design)
+        // ships dark: an unset or "http" value keeps the one-shot lanes.
+        let stream_transport = crate::env_vars::value("CELLD_LOG_TRANSPORT")
+            .ok()
+            .flatten()
+            .is_some_and(|value| value == "stream");
+        let pipeline = if window > 0 {
+            window as usize
+        } else {
+            crate::env_vars::positive_or("CELLD_LOG_PIPELINE", 4_usize).unwrap_or(4)
+        };
+        let mut lanes = Vec::with_capacity(members.len());
+        for (index, member) in members.iter().enumerate() {
+            let (send, receive) = tokio::sync::mpsc::unbounded_channel();
+            self.child_tasks.spawn_owned(
+                "node_log_member_lane",
+                member_lane(
+                    member.clone(),
+                    self.transport.clone(),
+                    self.policy.clone(),
+                    self.health.clone(),
+                    LaneTuning {
+                        hedge,
+                        stream: stream.clone().map(|window| (window, index)),
+                        stream_transport,
+                    },
+                    receive,
+                    self.task_stop.clone(),
+                ),
+            );
+            lanes.push(send);
+        }
+        *installed = Some(Arc::new(FleetShipper {
             // The wire leader identity IS the session string: followers key
             // fragments and seal marks by it, so a restarted process's
             // appends can never collide with its predecessor's fragments.
             node: self.session.clone(),
             transport: self.transport.clone(),
             record: record.clone(),
-            own_log: self.own_log.clone(),
-            activated: std::sync::atomic::AtomicBool::new(false),
+            live_log: self.live_log.clone(),
+            activated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             epoch: record.epoch,
             members,
+            lanes,
+            pipeline,
             seq: std::sync::atomic::AtomicU64::new(0),
-            degraded: std::sync::atomic::AtomicBool::new(false),
-            in_flight: std::sync::atomic::AtomicBool::new(false),
-            health: self.health.clone(),
+            degraded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            outstanding: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             policy: self.policy.clone(),
+            stream,
         }));
+        // The successor record and its in-memory shipper form one state
+        // transition. Keep shutdown excluded until both values are visible.
+        drop(transition);
         Ok(())
     }
 }
@@ -2382,15 +4239,25 @@ impl NodeLogManager {
     /// Every retained bundle row above its (cell, epoch) per-cell
     /// covered watermark — the rows a sealed record would ORPHAN. The
     /// graceful seal refuses while any exist, and the reopen path folds
-    /// them per-cell first (the healing pass). The class-A-hour P0 was
-    /// exactly this set sealed over: `all_synced_per_cell` counted
+    /// them per-cell first (the healing pass). The previous barrier sealed
+    /// over exactly this set: `all_synced_per_cell` counted
     /// bundle credits (the gate's counter must), so the old barrier
     /// never actually demanded the per-cell layout.
     pub async fn uncovered_bundle_rows(
         &self,
     ) -> anyhow::Result<BTreeMap<(String, u64, u64), Vec<u8>>> {
+        self.uncovered_bundle_rows_for(None).await
+    }
+
+    /// The same scan bounded to one cell. The reactivation fold uses it:
+    /// the whole-session listing still runs (the in-memory index caps at
+    /// 512 bundles, below a churn-heavy tail), but watermark lookups and
+    /// payload GETs are paid only for the named cell's rows.
+    async fn uncovered_bundle_rows_for(
+        &self,
+        only_cell: Option<&str>,
+    ) -> anyhow::Result<BTreeMap<(String, u64, u64), Vec<u8>>> {
         let prefix = format!("log/{}/bundle/", self.session);
-        let mut covered: HashMap<(String, u64), u64> = HashMap::new();
         let mut uncovered: BTreeMap<(String, u64, u64), Vec<u8>> = BTreeMap::new();
         // The index first, GETs only for the misses, and those
         // concurrently: the first cut GET every retained bundle serially
@@ -2423,6 +4290,7 @@ impl NodeLogManager {
             }
         }
         drop(fetches);
+        let mut bundles = Vec::new();
         for (key, bytes) in fetched {
             let (rows, bytes) = match bytes {
                 Some(bytes) => match celld_ltx::bundle::decode_rows(&bytes) {
@@ -2437,16 +4305,41 @@ impl NodeLogManager {
                     (rows.clone(), None)
                 }
             };
+            bundles.push((key, rows, bytes));
+        }
+
+        // A coverage watermark costs one object-store listing for each LTX
+        // level. Awaiting every distinct cell here serialized hundreds of
+        // pairs on the process-exit path, after the handoff itself had
+        // completed. Collect the exact unique set first and overlap it under
+        // the same bound recovery uses. An unbounded fan-out would trade the
+        // shutdown delay for a store burst and recreate the recovery storm
+        // this barrier exists to avoid.
+        let cells = bundles
+            .iter()
+            .flat_map(|(_, rows, _)| rows.iter().map(|row| (row.cell.clone(), row.cell_epoch)))
+            .filter(|(cell, _)| only_cell.is_none_or(|only| only == cell))
+            .collect::<BTreeSet<_>>();
+        let ltx = &self.ltx;
+        let lookups = cells.into_iter().map(|(cell, epoch)| async move {
+            let watermark = ltx.covered_txid(&cell, epoch).await;
+            ((cell, epoch), watermark)
+        });
+        let mut lookups =
+            futures_util::stream::iter(lookups).buffer_unordered(RECOVERY_UPLOAD_CONCURRENCY * 2);
+        let mut covered: HashMap<(String, u64), u64> = HashMap::new();
+        while let Some((cell, watermark)) = lookups.next().await {
+            covered.insert(cell, watermark);
+        }
+        drop(lookups);
+
+        for (key, rows, mut bytes) in bundles {
             for row in rows {
+                if only_cell.is_some_and(|only| only != row.cell) {
+                    continue;
+                }
                 let cache_key = (row.cell.clone(), row.cell_epoch);
-                let watermark = match covered.get(&cache_key) {
-                    Some(watermark) => *watermark,
-                    None => {
-                        let watermark = self.ltx.covered_txid(&row.cell, row.cell_epoch).await;
-                        covered.insert(cache_key, watermark);
-                        watermark
-                    }
-                };
+                let watermark = covered.get(&cache_key).copied().unwrap_or_default();
                 // The twin-gated decision IS the predicate: a row the
                 // per-cell layout covers is deletable; anything else is
                 // exactly what a seal would orphan. Routing through
@@ -2455,14 +4348,16 @@ impl NodeLogManager {
                 if !log_tier::bundle_deletable([(row.txid, watermark)]) {
                     // Index-hit bundles were not fetched; an uncovered row
                     // forces the one lazy GET its payload needs.
-                    let bytes = match &bytes {
-                        Some(bytes) => bytes.clone(),
-                        None => match self.bucket.get(&key).await {
-                            Ok(Some((bytes, _))) => bytes,
-                            _ => continue,
-                        },
+                    if bytes.is_none() {
+                        bytes = match self.bucket.get(&key).await {
+                            Ok(Some((bytes, _))) => Some(bytes),
+                            _ => None,
+                        };
+                    }
+                    let Some(bytes) = bytes.as_ref() else {
+                        continue;
                     };
-                    if let Ok(payload) = celld_ltx::bundle::slice(&bytes, &row) {
+                    if let Ok(payload) = celld_ltx::bundle::slice(bytes, &row) {
                         uncovered
                             .entry((row.cell.clone(), row.cell_epoch, row.txid))
                             .or_insert_with(|| payload.to_vec());
@@ -2535,13 +4430,7 @@ impl NodeLogManager {
                 };
                 paired.push((row.txid, watermark));
             }
-            #[cfg(all(test, celld_internal_tests))]
-            let delete_uncovered = crate::asyncrt::sabotage_active(
-                crate::host_services::EngineSabotage::DeleteUncoveredBundle,
-            );
-            #[cfg(not(all(test, celld_internal_tests)))]
-            let delete_uncovered = false;
-            if !delete_uncovered && !log_tier::bundle_deletable(paired) {
+            if !log_tier::bundle_deletable(paired) {
                 continue;
             }
             deletable.push((key, rows.len()));
@@ -2680,33 +4569,79 @@ impl NodeLogManager {
 /// gray-follower detection cannot wait thirty seconds when one slow fsync
 /// tail is every ack's tail, so verdicts poll at a sub-second cadence and
 /// an eviction repairs the ensemble immediately.
-pub fn spawn_maintenance(manager: Arc<NodeLogManager>) {
-    let watcher = manager.clone();
-    crate::asyncrt::spawn(async move {
+fn spawn_maintenance(
+    manager: Arc<NodeLogManager>,
+    stop: crate::ltx_repl::StopToken,
+    roots: &crate::ltx_repl::TaskGroup,
+) {
+    let maintenance_manager = Arc::downgrade(&manager);
+    let watcher = Arc::downgrade(&manager);
+    let maintenance_stop = stop.clone();
+    roots.spawn_owned("node_log_maintenance", async move {
         let mut tick = crate::asyncrt::interval(std::time::Duration::from_secs(30));
         tick.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);
         loop {
-            tick.tick().await;
-            if let Err(error) = manager.maintain().await {
-                warn!(%error, "log ensemble maintenance failed");
+            crate::asyncrt::select_biased! {
+                "a stop signal that ties the maintenance tick prevents another maintenance pass";
+                _ = maintenance_stop.stopped() => break,
+                _ = tick.tick() => {},
             }
-            if let Err(error) = manager.sweep_dead_leaders().await {
-                warn!(%error, "dead-leader sweep failed");
-            }
-            if let Err(error) = manager.gc_bundles().await {
-                warn!(%error, "bundle GC failed");
+            let Some(manager) = maintenance_manager.upgrade() else {
+                break;
+            };
+            // The watchdog for #490: on the 2026-08-28 fleet this loop's
+            // heartbeat stopped mid-pass and never returned — no error, no
+            // panic, no recovery line — and the silence cost the diagnosis.
+            // Every phase must end; a phase that outlives the warning
+            // budget names itself while it is still stuck, so the next
+            // occurrence is a one-line diagnosis plus a stack, not an
+            // archaeology session. The pass still runs to completion —
+            // this observes, it does not cancel: an aborted maintenance
+            // phase could orphan a half-installed ensemble.
+            for (phase, work) in [
+                ("maintain", manager.maintain().boxed()),
+                ("dead-leader sweep", manager.sweep_dead_leaders().boxed()),
+                ("bundle GC", manager.gc_bundles().boxed()),
+            ] {
+                let started = mono_ms();
+                let mut work = work;
+                loop {
+                    match crate::asyncrt::timeout(std::time::Duration::from_secs(60), &mut work)
+                        .await
+                    {
+                        Ok(Ok(())) => break,
+                        Ok(Err(error)) => {
+                            warn!(%error, phase, "log maintenance phase failed");
+                            break;
+                        }
+                        Err(_) => {
+                            warn!(
+                                phase,
+                                stuck_ms = mono_ms().saturating_sub(started),
+                                "log maintenance phase has not returned; \
+                                 the ticker is blocked behind it (#490)"
+                            );
+                        }
+                    }
+                }
             }
         }
-    })
-    .detach();
-    crate::asyncrt::spawn(async move {
+    });
+    roots.spawn_owned("node_log_posture_watch", async move {
         let mut tick = crate::asyncrt::interval(std::time::Duration::from_millis(250));
         tick.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);
         let mut repair_since: Option<u64> = None;
         let mut last_repair_try = mono_ms().saturating_sub(2_000);
         let mut repair_interval = std::time::Duration::from_secs(1);
         loop {
-            tick.tick().await;
+            crate::asyncrt::select_biased! {
+                "a stop signal that ties the posture tick prevents another repair attempt";
+                _ = stop.stopped() => break,
+                _ = tick.tick() => {},
+            }
+            let Some(watcher) = watcher.upgrade() else {
+                break;
+            };
             watcher.probe_followers();
             watcher.evict_gray_followers();
             // Posture repair does not wait for the 30 s maintenance tick:
@@ -2747,8 +4682,7 @@ pub fn spawn_maintenance(manager: Arc<NodeLogManager>) {
                 };
             }
         }
-    })
-    .detach();
+    });
 }
 
 /// The follower-side fragment GC: a fragment whose epoch the record has
@@ -2759,16 +4693,23 @@ pub fn spawn_maintenance(manager: Arc<NodeLogManager>) {
 /// leader forever. The seal mark is preserved and extended: a closed
 /// epoch is refused from here on, which is also what makes the deletion
 /// safe against any straggling append.
-pub fn spawn_fragment_gc(store: Arc<FollowerStore>) {
-    crate::asyncrt::spawn(async move {
+fn spawn_fragment_gc(
+    store: Arc<FollowerStore>,
+    stop: crate::ltx_repl::StopToken,
+    tasks: &crate::ltx_repl::TaskGroup,
+) {
+    tasks.spawn_owned("follower_fragment_gc", async move {
         let mut tick = crate::asyncrt::interval(std::time::Duration::from_secs(600));
         tick.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);
         loop {
-            tick.tick().await;
+            crate::asyncrt::select_biased! {
+                "a stop signal that ties the fragment-GC tick prevents another deletion pass";
+                _ = stop.stopped() => break,
+                _ = tick.tick() => {},
+            }
             store.gc_fragments().await;
         }
-    })
-    .detach();
+    });
 }
 
 impl crate::ltx_repl::BundleSink for NodeLogManager {
@@ -2824,25 +4765,18 @@ impl crate::ltx_repl::BundleSink for NodeLogManager {
                     // record is still Open at this shipper's epoch AFTER
                     // the PUT: any recovery that fences later must list
                     // after this PUT completed and therefore gathers it.
-                    #[cfg(all(test, celld_internal_tests))]
-                    let skip_record_read = crate::asyncrt::sabotage_active(
-                        crate::host_services::EngineSabotage::SkipBundleCreditRecordRead,
-                    );
-                    #[cfg(not(all(test, celld_internal_tests)))]
-                    let skip_record_read = false;
                     // A BUCKET read on purpose: the hazard is a peer's
                     // recovery CAS fencing this record, which the
                     // in-process copy cannot see.
-                    let credit = skip_record_read
-                        || log_tier::bundle_credit_allowed(
-                            read_record(&self.bucket, &self.session)
-                                .await
-                                .ok()
-                                .flatten()
-                                .as_ref()
-                                .map(|folded| &folded.record),
-                            epoch,
-                        );
+                    let credit = log_tier::bundle_credit_allowed(
+                        read_record(&self.bucket, &self.session)
+                            .await
+                            .ok()
+                            .flatten()
+                            .as_ref()
+                            .map(|folded| &folded.record),
+                        epoch,
+                    );
                     if !credit {
                         // Degrade the shipper that OWNED this flush's
                         // epoch, not whichever is installed now: a flush
@@ -2927,14 +4861,67 @@ impl crate::ltx_repl::BundleSink for NodeLogManager {
             Ok(bytes)
         })
     }
+
+    /// Recovery's gather for one cell, run by the successor of a quiet
+    /// ending before its restore. The tail can live in two places: this
+    /// node's own retained bundles, and the live members' fragments — a
+    /// fleet ack proves follower fsync, not a bundle flush, so the member
+    /// gather is the one the field incident needed. No seal: the leader
+    /// is alive, the cell's epoch is closed, and rows at or below the ack
+    /// are immutable, so this reads exactly what a recovery of this
+    /// session would gather. A member that cannot answer fails the fold,
+    /// and the caller then fails the activation — restoring past a
+    /// partial gather would serve a truncated database as read-write.
+    /// `upload_gathered` skips rows the per-cell watermark covers and
+    /// merges the contiguous tail into one object, so a re-run after a
+    /// partial failure repeats no upload.
+    fn fold_cell<'a>(
+        &'a self,
+        cell: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut gathered = self.uncovered_bundle_rows_for(Some(cell)).await?;
+            let record = read_record(&self.bucket, &self.session)
+                .await?
+                .map(|folded| folded.record);
+            if let Some(record) = record {
+                for member in &record.ensemble {
+                    let lease = self.ownership.read_node_lease(member).await?;
+                    let addr = lease
+                        .map(|lease| lease.addr)
+                        .ok_or_else(|| anyhow!("fold member {member} has no lease"))?;
+                    let tail = self
+                        .post_tail(
+                            member,
+                            &addr,
+                            &TailReq {
+                                leader: self.session.clone(),
+                            },
+                        )
+                        .await
+                        .map_err(|error| anyhow!("fold tail from {member}: {error}"))?;
+                    for entry in tail.entries {
+                        if entry.cell != cell {
+                            continue;
+                        }
+                        gathered
+                            .entry((entry.cell, entry.cell_epoch, entry.txid))
+                            .or_insert(entry.bytes);
+                    }
+                }
+            }
+            if gathered.is_empty() {
+                return Ok(());
+            }
+            let uploaded = self.upload_gathered(gathered).await?;
+            info!(
+                cell,
+                uploaded, "folded a quietly stranded tail before reactivation"
+            );
+            Ok(())
+        })
+    }
 }
 
 #[cfg(all(test, celld_internal_tests))]
 include!(env!("CELLD_INTERNAL_NODE_LOG_OBSERVERS"));
-
-#[cfg(all(test, celld_internal_tests))]
-// The private durability test creates and inspects real directory fixtures.
-#[allow(clippy::disallowed_methods)]
-mod conformance_node_log_tests {
-    include!(env!("CELLD_CONFORMANCE_NODE_LOG_TESTS"));
-}

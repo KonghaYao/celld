@@ -92,7 +92,7 @@ struct Entry {
     /// A consume-delete for this exact key has been DECIDED but not yet
     /// handed to the executor. In that window an arm must not ride on an
     /// entry that is about to vanish — that race acked alarms with no
-    /// durable entry (the SIGKILL deep-gate failure). An arm during the
+    /// durable entry. An arm during the
     /// window cancels the delete instead.
     delete_pending: bool,
 }

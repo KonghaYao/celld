@@ -21,6 +21,10 @@ inherits = "release"
 lto = "thin"
 codegen-units = 16
 incremental = true
+# The lab image keeps symbols so `perf` on a node attributes CPU by function;
+# the shipped release profile stays stripped.
+strip = false
+debug = "line-tables-only"
 [profile.dev.package.sha2]
 opt-level = 3
 [profile.dev.package.rsa]
@@ -57,7 +61,12 @@ flate2 = "1"
 futures-util = "0.3"
 getrandom = "0.3"
 hex = "0.4"
+# The two node:crypto KDFs. Both crates already reach this build without a
+# line here -- `pbkdf2` through `pkcs5`, `hkdf` through `elliptic-curve` --
+# so declaring them costs no compile time and adds no supply-chain surface.
+hkdf = "0.12"
 hmac = "0.12"
+pbkdf2 = "0.12"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -65,7 +74,9 @@ libc = "0.2"
 lz4_flex = { version = "0.11", features = ["frame"] }
 md-5 = "0.10"
 nix = { version = "0.31", features = ["feature", "fs"] }
-object_store = { version = "0.11", default-features = false }
+notify = "8"
+nu-ansi-term = "0.50"
+object_store = { version = "0.12", default-features = false }
 # The native column-writer API only: no `arrow` feature, so the arrow
 # crate stack stays out of the binary. Revisit only if the telemetry
 # schema ever grows nested columns.

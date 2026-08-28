@@ -2,6 +2,8 @@
   "name": "asyncdo",
   "main": "index.js",
   "compatibility_date": "2026-01-01",
-  "durable_objects": { "bindings": [{ "name": "A", "class_name": "A" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["A"] }]
+  "durable_objects": {
+    "bindings": [{ "name": "COUNTER", "class_name": "Counter" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter"] }]
 }

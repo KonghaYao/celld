@@ -3,8 +3,8 @@
 //! Ported (behavior only) from litestream@v0.5.11 `s3/replica_client.go`. We do
 //! **not** use the Go AWS SDK; instead the five `ReplicaClient` operations are
 //! mapped onto `object_store::ObjectStore` (the `s3` cargo feature wires the
-//! `object_store::aws::AmazonS3Builder` backend). The behavioral invariants that
-//! let this client pass the T5 conformance suite against a real MinIO are kept:
+//! `object_store::aws::AmazonS3Builder` backend). The behavioral invariants from
+//! the upstream conformance suite are kept:
 //!
 //!   * key/path scheme `{path}/{level:04x}/{min}-{max}.ltx`
 //!     (s3/replica_client.go:629, 677, 1040-1042);
@@ -30,10 +30,10 @@ use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat};
 use futures_util::stream::{StreamExt, TryStreamExt};
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::path::Path as ObjPath;
 use object_store::{
-    Attribute, AttributeValue, Attributes, ClientOptions, ObjectStore, PutMultipartOpts,
+    Attribute, AttributeValue, Attributes, ClientOptions, ObjectStore, PutMultipartOptions,
     PutOptions, PutPayload, RetryConfig,
 };
 
@@ -277,6 +277,11 @@ impl ObjectStoreConfig {
     /// can build one store for a bucket and share it across many
     /// [`ObjectStoreClient::with_store`] clients that differ only by key prefix
     /// — one connection pool for every cell on a node.
+    ///
+    /// An empty `access_key_id` and `secret_access_key` select the ambient AWS
+    /// credential chain, which reads web identity, ECS task credentials, EKS
+    /// Pod Identity, and instance metadata from the process environment. Set
+    /// both fields to keep a caller's own credentials authoritative.
     pub fn build_store(&self) -> Result<Arc<dyn ObjectStore>> {
         if self.bucket.is_empty() {
             return Err(Error::Other("s3: bucket name is required".into()));
@@ -288,7 +293,47 @@ impl ObjectStoreConfig {
             self.region.clone()
         };
 
-        let mut builder = AmazonS3Builder::new()
+        // Forward the credential inputs that object_store reads. A bare
+        // `new()` reads no environment, so it falls through to IMDS on EKS,
+        // and `from_env()` would also import endpoint and request settings
+        // that belong to this explicit ObjectStoreConfig. So the allowlist
+        // stops at the credential boundary, and the config below stays
+        // authoritative.
+        //
+        // object_store 0.12.5 takes AWS_WEB_IDENTITY_TOKEN_FILE and
+        // AWS_ROLE_ARN from the process environment rather than from these
+        // builder fields, so that pair changes nothing today. It stays because
+        // the session name and the STS endpoint beside it *are* read from the
+        // builder, and a release that moves the pair to the builder must not
+        // drop this client back to IMDS.
+        let mut builder = AmazonS3Builder::new();
+        for (name, key) in [
+            (
+                "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                AmazonS3ConfigKey::ContainerCredentialsRelativeUri,
+            ),
+            (
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                AmazonS3ConfigKey::ContainerCredentialsFullUri,
+            ),
+            (
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+                AmazonS3ConfigKey::ContainerAuthorizationTokenFile,
+            ),
+            (
+                "AWS_WEB_IDENTITY_TOKEN_FILE",
+                AmazonS3ConfigKey::WebIdentityTokenFile,
+            ),
+            ("AWS_ROLE_ARN", AmazonS3ConfigKey::RoleArn),
+            ("AWS_ROLE_SESSION_NAME", AmazonS3ConfigKey::RoleSessionName),
+            ("AWS_ENDPOINT_URL_STS", AmazonS3ConfigKey::StsEndpoint),
+            ("AWS_METADATA_ENDPOINT", AmazonS3ConfigKey::MetadataEndpoint),
+        ] {
+            if let Some(value) = nonempty_env(name) {
+                builder = builder.with_config(key, value);
+            }
+        }
+        let mut builder = builder
             .with_bucket_name(&self.bucket)
             .with_region(region)
             .with_retry(replica_retry_config())
@@ -521,8 +566,8 @@ impl ObjectStoreClient {
         }
     }
 
-    /// Create a client directly from an already-built `ObjectStore` (e.g. an
-    /// in-memory store for tests, or a pre-configured backend).
+    /// Create a client directly from an already-built `ObjectStore`, such as an
+    /// in-memory store or a pre-configured backend.
     pub fn with_store(config: ObjectStoreConfig, store: Arc<dyn ObjectStore>) -> Self {
         let cell = tokio::sync::OnceCell::new();
         cell.set(store).ok();
@@ -537,6 +582,24 @@ impl ObjectStoreClient {
         self.store
             .get_or_try_init(|| async { self.config.build_store() })
             .await
+    }
+
+    /// Returns whether the replica epoch prefix contains an object.
+    ///
+    /// The caller needs only an existence proof, so it stops the recursive,
+    /// delimiter-less listing after the first object. An empty or non-empty
+    /// prefix therefore costs one list request instead of one request for each
+    /// compaction level.
+    pub async fn has_any_object(&self) -> Result<bool> {
+        let store = self.store().await?;
+        let prefix = ObjPath::from(self.root_prefix());
+        store
+            .list(Some(&prefix))
+            .next()
+            .await
+            .transpose()
+            .map(|object| object.is_some())
+            .map_err(map_os_error)
     }
 
     /// Build the S3 key for an LTX file: `{path}/{level:04x}/{min}-{max}.ltx`.
@@ -683,7 +746,7 @@ impl ReplicaClient for ObjectStoreClient {
                 .await
                 .map_err(|e| Error::Other(format!("replica: upload to {key}: {e}").into()))?;
         } else {
-            let options = PutMultipartOpts {
+            let options = PutMultipartOptions {
                 attributes,
                 ..Default::default()
             };
@@ -802,289 +865,30 @@ fn format_rfc3339_nano(unix_millis: i64) -> Result<String> {
     Ok(timestamp)
 }
 
-#[cfg(test)]
-mod tests {
+#[doc(hidden)]
+pub mod internal {
     use super::*;
-    use crate::replica_url::parse_replica_url_with_query;
 
-    #[test]
-    fn timestamp_metadata_matches_go_rfc3339_nano() {
-        assert_eq!(
-            format_rfc3339_nano(1_609_459_200_000).unwrap(),
-            "2021-01-01T00:00:00Z"
-        );
-        assert_eq!(
-            format_rfc3339_nano(1_609_459_200_500).unwrap(),
-            "2021-01-01T00:00:00.5Z"
-        );
-        assert_eq!(
-            format_rfc3339_nano(1_609_459_200_123).unwrap(),
-            "2021-01-01T00:00:00.123Z"
-        );
-        assert!(format_rfc3339_nano(i64::MAX).is_err());
+    pub const METADATA_KEY_TIMESTAMP: &str = super::METADATA_KEY_TIMESTAMP;
+    pub const METADATA_KEY_TIMESTAMP_UNDERSCORE: &str = super::METADATA_KEY_TIMESTAMP_UNDERSCORE;
+
+    pub fn format_rfc3339_nano(unix_millis: i64) -> Result<String> {
+        super::format_rfc3339_nano(unix_millis)
     }
 
-    /// Write one LTX object under `key` and answer the object's metadata.
-    async fn write_ltx_and_read_metadata(key: TimestampMetadataKey) -> Attributes {
-        let store = Arc::new(object_store::memory::InMemory::new());
-        let client = ObjectStoreClient::with_store(
-            ObjectStoreConfig {
-                bucket: "bucket".into(),
-                path: "replica".into(),
-                timestamp_metadata_key: key,
-                ..Default::default()
-            },
-            store.clone(),
-        );
-        let data = ltx::Header {
-            version: ltx::VERSION,
-            flags: ltx::HEADER_FLAG_NO_CHECKSUM,
-            page_size: 512,
-            commit: 1,
-            min_txid: TXID(1),
-            max_txid: TXID(1),
-            timestamp: 1_609_459_200_123,
-            pre_apply_checksum: 0,
-            wal_offset: 0,
-            wal_size: 0,
-            wal_salt1: 0,
-            wal_salt2: 0,
-            node_id: 0,
-        }
-        .marshal();
-
-        client
-            .write_ltx_file(0, TXID(1), TXID(1), &data)
-            .await
-            .expect("write LTX object");
-
-        let result = store
-            .get_opts(
-                &ObjPath::from("replica/0000/0000000000000001-0000000000000001.ltx"),
-                object_store::GetOptions {
-                    head: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("read object metadata");
-        result.attributes
+    pub fn ltx_key(client: &ObjectStoreClient, level: i32, min: TXID, max: TXID) -> String {
+        client.ltx_key(level, min, max)
     }
 
-    #[tokio::test]
-    async fn write_preserves_the_litestream_timestamp_metadata() {
-        let attributes = write_ltx_and_read_metadata(TimestampMetadataKey::Litestream).await;
-        let value = attributes
-            .get(&Attribute::Metadata(METADATA_KEY_TIMESTAMP.into()))
-            .expect("litestream timestamp metadata");
-        assert_eq!(value.as_ref(), "2021-01-01T00:00:00.123Z");
+    pub fn level_prefix(client: &ObjectStoreClient, level: i32) -> String {
+        client.level_prefix(level)
     }
 
-    // Azure Blob Storage refuses a hyphen in a metadata name, so an az://
-    // replica writes the same value under an underscored key. The hyphen
-    // key must then be absent — a reader that finds both cannot tell which
-    // write produced the object.
-    #[tokio::test]
-    async fn an_underscored_key_replaces_the_hyphenated_one() {
-        let attributes = write_ltx_and_read_metadata(TimestampMetadataKey::Underscore).await;
-        let value = attributes
-            .get(&Attribute::Metadata(
-                METADATA_KEY_TIMESTAMP_UNDERSCORE.into(),
-            ))
-            .expect("underscored timestamp metadata");
-        assert_eq!(value.as_ref(), "2021-01-01T00:00:00.123Z");
-        assert!(
-            attributes
-                .get(&Attribute::Metadata(METADATA_KEY_TIMESTAMP.into()))
-                .is_none(),
-            "the hyphenated key must not also be written"
-        );
+    pub fn root_prefix(client: &ObjectStoreClient) -> String {
+        client.root_prefix()
     }
 
-    // ── ParseHost (port of TestParseHost, s3/replica_client_test.go:1071) ──────
-    #[test]
-    fn parse_host_table() {
-        let cases: &[(&str, &str, &str, &str, bool)] = &[
-            (
-                "my-space.sgp1.digitaloceanspaces.com",
-                "my-space",
-                "sgp1",
-                "https://sgp1.digitaloceanspaces.com",
-                false,
-            ),
-            (
-                "test-bucket.nyc3.digitaloceanspaces.com",
-                "test-bucket",
-                "nyc3",
-                "https://nyc3.digitaloceanspaces.com",
-                false,
-            ),
-            (
-                "mybucket.s3.us-east-1.amazonaws.com",
-                "mybucket",
-                "us-east-1",
-                "",
-                false,
-            ),
-            ("mybucket.s3.amazonaws.com", "mybucket", "", "", false),
-            (
-                "mybucket.s3.us-west-004.backblazeb2.com",
-                "mybucket",
-                "us-west-004",
-                "https://s3.us-west-004.backblazeb2.com",
-                true,
-            ),
-            (
-                "mybucket.localhost:9000",
-                "mybucket",
-                "us-east-1",
-                "http://localhost:9000",
-                true,
-            ),
-        ];
-        for (host, b, r, e, fps) in cases {
-            let (bucket, region, endpoint, force) = parse_host(host);
-            assert_eq!(&bucket, b, "bucket for {host}");
-            assert_eq!(&region, r, "region for {host}");
-            assert_eq!(&endpoint, e, "endpoint for {host}");
-            assert_eq!(force, *fps, "force_path_style for {host}");
-        }
-    }
-
-    #[test]
-    fn parse_host_standard_s3_is_bucket() {
-        let (bucket, region, endpoint, force) = parse_host("mybucket");
-        assert_eq!(bucket, "mybucket");
-        assert_eq!(region, "");
-        assert_eq!(endpoint, "");
-        assert!(!force);
-    }
-
-    fn cfg_from_url(url: &str) -> ObjectStoreConfig {
-        let parsed = parse_replica_url_with_query(url).unwrap();
-        ObjectStoreConfig::from_url(&parsed).unwrap()
-    }
-
-    // ── URL query param aliases (port of
-    //    TestNewReplicaClientFromURL_QueryParamAliases, test:1940) ───────────────
-    #[test]
-    fn query_param_aliases() {
-        let c = cfg_from_url("s3://mybucket/path?forcePathStyle=true");
-        assert!(c.force_path_style);
-
-        let c = cfg_from_url("s3://mybucket/path?force-path-style=true");
-        assert!(c.force_path_style);
-
-        let c = cfg_from_url(
-            "s3://mybucket/path?endpoint=http://localhost:9000&force-path-style=false",
-        );
-        assert!(!c.force_path_style, "explicit force-path-style=false wins");
-
-        let c = cfg_from_url("s3://mybucket/path?skipVerify=true");
-        assert!(c.skip_verify);
-        let c = cfg_from_url("s3://mybucket/path?skip-verify=true");
-        assert!(c.skip_verify);
-
-        let c = cfg_from_url("s3://mybucket/path?part-size=10485760");
-        assert_eq!(c.part_size, 10_485_760);
-        let c = cfg_from_url("s3://mybucket/path?partSize=10485760");
-        assert_eq!(c.part_size, 10_485_760);
-
-        let c = cfg_from_url(
-            "s3://mybucket/path?force-path-style=true&skip-verify=true&part-size=8388608",
-        );
-        assert!(c.force_path_style);
-        assert!(c.skip_verify);
-        assert_eq!(c.part_size, 8_388_608);
-    }
-
-    // ── Endpoint env var (port of TestNewReplicaClientFromURL_EndpointEnvVar,
-    //    test:2023). These mutate a process-global env var, so they run
-    //    sequentially under one #[test] with save/restore to avoid cross-test
-    //    interference. ───────────────────────────────────────────────────────────
-    #[test]
-    fn endpoint_env_var() {
-        let saved = std::env::var("LITESTREAM_S3_ENDPOINT").ok();
-
-        let set = |v: &str| {
-            if v.is_empty() {
-                std::env::remove_var("LITESTREAM_S3_ENDPOINT");
-            } else {
-                std::env::set_var("LITESTREAM_S3_ENDPOINT", v);
-            }
-        };
-
-        set("http://localhost:9000");
-        let c = cfg_from_url("s3://mybucket/path");
-        assert_eq!(c.endpoint, "http://localhost:9000");
-        assert!(c.force_path_style, "env endpoint forces path-style");
-
-        set("s3.example.com");
-        let c = cfg_from_url("s3://mybucket/path");
-        assert_eq!(
-            c.endpoint, "https://s3.example.com",
-            "env endpoint gets https"
-        );
-        assert!(c.force_path_style);
-
-        set("http://localhost:9000");
-        let c = cfg_from_url("s3://mybucket/path?endpoint=http://other:9000");
-        assert_eq!(
-            c.endpoint, "http://other:9000",
-            "query endpoint overrides env"
-        );
-        assert!(c.force_path_style);
-
-        set("http://localhost:9000");
-        let c = cfg_from_url("s3://mybucket/path?force-path-style=false");
-        assert_eq!(c.endpoint, "http://localhost:9000");
-        assert!(
-            !c.force_path_style,
-            "explicit force-path-style=false respected with env endpoint"
-        );
-
-        set("");
-        let c = cfg_from_url("s3://mybucket/path");
-        assert_eq!(c.endpoint, "");
-        assert!(!c.force_path_style);
-
-        // Restore.
-        match saved {
-            Some(v) => std::env::set_var("LITESTREAM_S3_ENDPOINT", v),
-            None => std::env::remove_var("LITESTREAM_S3_ENDPOINT"),
-        }
-    }
-
-    // ── Key construction (wire-compat requirement D-1, test:629/677/1040) ─────
-    #[test]
-    fn ltx_key_scheme() {
-        let client = ObjectStoreClient::new(ObjectStoreConfig {
-            bucket: "b".into(),
-            path: "replica".into(),
-            ..Default::default()
-        });
-        assert_eq!(
-            client.ltx_key(0, TXID(1), TXID(1)),
-            "replica/0000/0000000000000001-0000000000000001.ltx"
-        );
-        assert_eq!(
-            client.ltx_key(0, TXID(1), TXID(6)),
-            "replica/0000/0000000000000001-0000000000000006.ltx"
-        );
-        assert_eq!(client.level_prefix(0), "replica/0000/");
-        assert_eq!(client.root_prefix(), "replica/");
-    }
-
-    // ── isNotExists mapping (port of TestIsNotExists, test:53) ────────────────
-    #[test]
-    fn not_found_maps_to_io_not_found() {
-        let e = map_os_error(object_store::Error::NotFound {
-            path: "k".into(),
-            source: "missing".into(),
-        });
-        match e {
-            Error::Io(io) => assert_eq!(io.kind(), std::io::ErrorKind::NotFound),
-            other => panic!("expected Io(NotFound), got {other:?}"),
-        }
+    pub fn map_os_error(error: object_store::Error) -> Error {
+        super::map_os_error(error)
     }
 }

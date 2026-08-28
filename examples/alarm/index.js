@@ -1,13 +1,21 @@
 export class Agent {
-  constructor(state, env) { this.state = state; }
+  constructor(state, env) {
+    this.state = state;
+  }
   async fetch(request) {
     const url = new URL(request.url);
     if (url.pathname === "/arm") {
       await this.state.storage.setAlarm(Date.now() + 2000);
-      return new Response(JSON.stringify({ armed: true, at: await this.state.storage.getAlarm() }));
+      return Response.json({
+        armed: true,
+        at: await this.state.storage.getAlarm(),
+      });
     }
     const fires = (await this.state.storage.get("fires")) ?? 0;
-    return new Response(JSON.stringify({ fires, pendingAlarm: await this.state.storage.getAlarm() }));
+    return Response.json({
+      fires,
+      pendingAlarm: await this.state.storage.getAlarm(),
+    });
   }
   async alarm(info) {
     const fires = (await this.state.storage.get("fires")) ?? 0;
@@ -19,5 +27,5 @@ export default {
   async fetch(request, env) {
     const id = env.AGENT.idFromName("a1");
     return env.AGENT.get(id).fetch(request);
-  }
+  },
 };

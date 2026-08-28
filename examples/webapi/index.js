@@ -5,14 +5,16 @@ export default {
     const b64 = btoa("hello");
     const h = new Headers({ "x-test": "1" });
     h.append("x-test", "2");
-    return new Response(JSON.stringify({
+    return Response.json({
       pathname: u.pathname,
       search: u.search,
       query_foo: u.searchParams.get("foo"),
       encoded_len: enc.length,
-      b64, back: atob(b64),
-      header: h.get("x-test"),        // spec: "1, 2"
-      protocol: u.protocol, host: u.host,
-    }), { status: 200 });
-  }
+      b64,
+      back: atob(b64),
+      header: h.get("x-test"),
+      protocol: u.protocol,
+      host: u.host,
+    });
+  },
 };

@@ -2,13 +2,15 @@
 
 // The D1 CLI reads operator input and migration files outside node storage.
 #![allow(clippy::disallowed_methods)]
+// Reaching stdout past `Output` is what mixed the result rows and the
+// summary onto one stream here in the first place.
 
 //! `celld d1` — run SQL and migrations against a deployed D1 database.
 //!
 //! A D1 database is a cell, so it is only reachable through the node that owns
 //! it. This command finds the fleet the way `celld diagnose` does — it walks
 //! the node leases in the bucket, and it reads the same shared secret — and
-//! then sends the SQL to a live node's `/__d1/` route, which forwards to the
+//! then sends the SQL to a live node's `/runtime/` route, which forwards to the
 //! owner. The CLI therefore holds no ownership logic and no SQLite: it reaches
 //! the database over the dispatch a Worker's `env.DB` reaches it over.
 //!
@@ -18,12 +20,61 @@
 //! refuses a D1 scope and sends the caller here.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use serde_json::Value;
 
-use crate::bucket::Bucket;
+use crate::cli_options::FleetFlags;
+use crate::cli_options::FLEET_HELP;
+use crate::cli_output::{align, Format, Output, Record};
+use crate::note;
+use crate::operator_cell::{Fleet, Reachable, Subject};
+use std::borrow::Cow;
+
+/// One row of a `d1 execute` result set.
+///
+/// The text is rendered when the set is laid out, because a column's width
+/// depends on every row in it. The JSON keeps the column names as keys, so
+/// `--json` output is self-describing without the header line.
+struct Row {
+    object: Value,
+    text: String,
+}
+
+impl Record for Row {
+    fn json(&self) -> Value {
+        self.object.clone()
+    }
+
+    fn text(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.text)
+    }
+}
+
+/// One migration, listed rather than applied.
+struct Pending {
+    name: String,
+}
+
+impl Record for Pending {
+    fn json(&self) -> Value {
+        serde_json::json!({ "migration": self.name })
+    }
+
+    fn text(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
+    }
+}
+
+/// A SQL value as a table cell. JSON keeps the real type; this is only the
+/// human rendering, so a string prints bare and a null prints as nothing.
+fn cell(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
 
 pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     let Some(command) = Command::parse(arguments)? else {
@@ -55,8 +106,30 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             )
         })?;
     let scope = crate::js::d1_cell_scope(&declaration.database_identity);
-    let database = Reachable::open(&command, scope).await?;
+    let storage = command.fleet.clone().resolve("celld d1")?;
+    let database = Reachable::open(
+        Fleet {
+            bucket: &storage.bucket,
+            endpoint: storage.endpoint.as_deref(),
+            region: &storage.region,
+            unsafe_public_advertise: command.unsafe_public_advertise,
+        },
+        Subject {
+            noun: "database",
+            source: "d1",
+            // A migration on a large table is not a diagnostic ping.
+            timeout: std::time::Duration::from_secs(120),
+        },
+        scope,
+        None,
+    )
+    .await?;
 
+    let mut out = Output::new(if command.json {
+        Format::Json
+    } else {
+        Format::Text
+    });
     match command.action {
         Action::Execute { command: sql, file } => {
             let source = match (sql, file) {
@@ -68,80 +141,96 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             let result = database.exec(&source).await?;
             // The rows, not only the count: an operator running a SELECT is
             // asking for its result, and `wrangler d1 execute` prints it.
-            for set in result
+            for (index, set) in result
                 .get("results")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
+                .enumerate()
             {
-                let columns: Vec<&str> = set
+                let columns: Vec<String> = set
                     .get("columns")
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
                     .filter_map(Value::as_str)
+                    .map(str::to_string)
                     .collect();
-                let shaped: Vec<Value> = set
+                let values: Vec<Vec<Value>> = set
                     .get("rows")
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
                     .filter_map(Value::as_array)
-                    .map(|row| {
-                        Value::Object(
-                            columns
-                                .iter()
-                                .zip(row)
-                                .map(|(column, value)| (column.to_string(), value.clone()))
-                                .collect(),
-                        )
-                    })
+                    .map(|row| row.to_vec())
                     .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&Value::Array(shaped))
-                        .context("encode the result rows")?
-                );
+                let cells: Vec<Vec<String>> = values
+                    .iter()
+                    .map(|row| row.iter().map(cell).collect())
+                    .collect();
+                let (header, rule, lines) = align(&columns, &cells);
+                // A blank line between result sets, so several statements
+                // read as several tables rather than one ragged one.
+                if index > 0 {
+                    out.header("")?;
+                }
+                out.header(&header)?;
+                out.header(&rule)?;
+                for (row, text) in values.iter().zip(lines) {
+                    let object =
+                        Value::Object(columns.iter().cloned().zip(row.iter().cloned()).collect());
+                    out.row(&Row { object, text })?;
+                }
             }
-            println!(
-                "Executed {} statement(s) in {:.2} sec",
-                result
-                    .get("count")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default(),
-                result
-                    .get("duration")
-                    .and_then(Value::as_f64)
-                    .unwrap_or_default()
-                    / 1000.0
-            );
+            // stderr, not stdout. This line used to follow the rows on the
+            // same stream, so `celld d1 execute | jq` parsed prose.
+            let count = result
+                .get("count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let milliseconds = result
+                .get("duration")
+                .and_then(Value::as_f64)
+                .unwrap_or_default();
+            // "0.00 sec" reads as a missing measurement rather than a fast
+            // statement, the same way "0.0s" did on a listing summary.
+            let took = if milliseconds < 1000.0 {
+                format!("{}ms", milliseconds.round() as u64)
+            } else {
+                format!("{:.2} sec", milliseconds / 1000.0)
+            };
+            note!("Executed {count} statement(s) in {took}");
         }
         Action::MigrationsList => {
             let pending = database.pending(declaration).await?;
             if pending.is_empty() {
-                println!("No migrations to apply.");
-                return Ok(());
+                note!("No migrations to apply.");
+                return out.finish();
             }
-            println!("Migrations to be applied:");
+            note!("Migrations to be applied:");
             for migration in &pending {
-                println!("  {}", migration.name);
+                out.row(&Pending {
+                    name: migration.name.clone(),
+                })?;
             }
         }
         Action::MigrationsApply => {
             let pending = database.pending(declaration).await?;
             if pending.is_empty() {
-                println!("No migrations to apply.");
-                return Ok(());
+                note!("No migrations to apply.");
+                return out.finish();
             }
             for migration in pending {
                 database
                     .apply(&migration, &declaration.migrations_table)
                     .await?;
-                println!("Applied {}", migration.name);
+                // Applying is an action, not data: its progress belongs on
+                // stderr so a redirect of the listing stays parseable.
+                note!("Applied {}", migration.name);
             }
         }
     }
-    Ok(())
+    out.finish()
 }
 
 struct Migration {
@@ -151,135 +240,7 @@ struct Migration {
 
 /// One entrance into the fleet: a node's address and the identity a request
 /// to it must be signed for.
-struct Entrance {
-    node: String,
-    url: String,
-    path: String,
-}
-
-/// A database resolved to the nodes that can carry SQL to it.
-struct Reachable {
-    http: reqwest::Client,
-    /// The fleet's shared peer secret, read from the bucket. `/__d1/` refuses
-    /// an unsigned request, because a D1 database holds application data and
-    /// answers arbitrary SQL.
-    auth: crate::peer_auth::PeerAuth,
-    /// Every node with a live lease. Any one of them forwards to the owner, so
-    /// the list is a set of equal entrances and not a route: it stays correct
-    /// even when the cell moves between calls.
-    entrances: Vec<Entrance>,
-}
-
 impl Reachable {
-    async fn open(command: &Command, scope: String) -> anyhow::Result<Self> {
-        let bucket = crate::fleet::bucket_client(
-            &command.bucket,
-            command.endpoint.as_deref(),
-            &command.region,
-        )?;
-        let nodes = live_nodes(&bucket, command.unsafe_public_advertise).await?;
-        // The same secret and the same source shape `celld diagnose` uses.
-        let auth =
-            crate::peer_auth::PeerAuth::new(crate::peer_auth::load_existing(&bucket).await?, "d1")?;
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            // A migration on a large table is not a diagnostic ping, so this
-            // budget is the handler budget's order rather than the probe's.
-            .timeout(Duration::from_secs(120))
-            .build()
-            .context("build the D1 client")?;
-        let path = format!("/__d1/{scope}");
-        Ok(Self {
-            http,
-            auth,
-            entrances: nodes
-                .into_iter()
-                .map(|(node, addr)| Entrance {
-                    node,
-                    url: format!("http://{addr}{path}"),
-                    path: path.clone(),
-                })
-                .collect(),
-        })
-    }
-
-    /// A lease outlives the node that wrote it, and a node that drains keeps
-    /// its lease while it refuses work, so the first entrance in the list is
-    /// not always usable. Move to the next one when a node cannot be reached
-    /// or is draining, because in both cases the request provably did not run.
-    /// Nothing else is retried: a timeout is not evidence that the work was
-    /// refused, and re-sending a migration that in fact ran would apply it
-    /// twice.
-    async fn call(&self, body: Value) -> anyhow::Result<Value> {
-        // Signed per entrance, because the signature binds the node it is
-        // addressed to: a signature for one node is not replayable at another.
-        let payload = serde_json::to_vec(&body).context("encode the request")?;
-        let mut refused = Vec::new();
-        for (index, entrance) in self.entrances.iter().enumerate() {
-            let last = index + 1 == self.entrances.len();
-            let url = &entrance.url;
-            let request = self
-                .auth
-                .sign(
-                    self.http.post(url).body(payload.clone()),
-                    "POST",
-                    &entrance.path,
-                    &payload,
-                    &entrance.node,
-                )
-                .with_context(|| format!("sign the request to {}", entrance.node))?;
-            let response = match request.send().await {
-                Ok(response) => response,
-                Err(error) if error.is_connect() && !last => {
-                    refused.push(format!("{url}: {error}"));
-                    continue;
-                }
-                Err(error) => {
-                    return Err(anyhow::Error::new(error)).with_context(|| {
-                        format!("reach the database at {url}{}", report(&refused))
-                    });
-                }
-            };
-            let status = response.status();
-            let text = response.text().await.context("read the database reply")?;
-            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                && text.contains("\"draining\"")
-                && !last
-            {
-                refused.push(format!("{url}: the node is draining"));
-                continue;
-            }
-            // The dispatcher refusing at the door is the doc comment's
-            // criterion exactly: the request provably did not run, so the
-            // next entrance is safe to try where a timeout would not be.
-            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                && text.contains("dispatcher unavailable")
-                && !last
-            {
-                refused.push(format!("{url}: the node's dispatcher is unavailable"));
-                continue;
-            }
-            let value: Value = serde_json::from_str(&text)
-                .with_context(|| format!("decode the database reply ({status}): {text}"))?;
-            if let Some(error) = value.get("error").and_then(Value::as_str) {
-                bail!("{error}{}", report(&refused));
-            }
-            if !status.is_success() {
-                bail!(
-                    "the database refused the request ({status}): {text}{}",
-                    report(&refused)
-                );
-            }
-            return value.get("result").cloned().ok_or_else(|| {
-                anyhow!(
-                    "the database reply carried no result: {text}{}",
-                    report(&refused)
-                )
-            });
-        }
-        bail!("no node in the fleet answered{}", report(&refused))
-    }
-
     async fn exec(&self, source: &str) -> anyhow::Result<Value> {
         // `rows: true` is the CLI's difference from the Worker binding's
         // exec(): the operator asked to see the result, not only the count.
@@ -347,7 +308,6 @@ impl Reachable {
         Ok(())
     }
 }
-
 fn read_migrations(directory: &std::path::Path) -> anyhow::Result<Vec<Migration>> {
     if !directory.exists() {
         bail!(
@@ -443,63 +403,6 @@ fn read_migrations(directory: &std::path::Path) -> anyhow::Result<Vec<Migration>
 /// works. They are all returned rather than only the first, because a lease
 /// outlives the node that wrote it and a draining node keeps its lease while
 /// it refuses work.
-async fn live_nodes(
-    bucket: &Bucket,
-    unsafe_public_advertise: bool,
-) -> anyhow::Result<Vec<(String, String)>> {
-    let nodes = crate::fleet::node_lease_ids(bucket).await?;
-    if nodes.is_empty() {
-        bail!("no node leases in the bucket; celld d1 needs a running fleet");
-    }
-    let mut reachable = Vec::new();
-    let mut refused = Vec::new();
-    for node in &nodes {
-        let lease = match crate::fleet::live_node_lease(bucket, node).await {
-            Ok(Some(lease)) => lease,
-            Ok(None) => continue,
-            Err(error) => {
-                refused.push(format!("{node}: {error}"));
-                continue;
-            }
-        };
-        let advertise = match crate::startup::parse_advertise(&lease.addr) {
-            Ok(advertise) => advertise,
-            Err(error) => {
-                refused.push(format!(
-                    "{node}: malformed address {:?}: {error}",
-                    lease.addr
-                ));
-                continue;
-            }
-        };
-        if advertise.is_public_ip() && !unsafe_public_advertise {
-            refused.push(format!(
-                "{node}: public advertise address {}; use a private overlay or \
-                 --unsafe-public-advertise",
-                lease.addr
-            ));
-            continue;
-        }
-        reachable.push((node.clone(), lease.addr.clone()));
-    }
-    if reachable.is_empty() {
-        bail!(
-            "no node in the fleet is reachable; every lease is expired or refused{}",
-            report(&refused)
-        );
-    }
-    Ok(reachable)
-}
-
-/// Indented detail under a refusal, or nothing when there is none to give.
-fn report(refused: &[String]) -> String {
-    if refused.is_empty() {
-        String::new()
-    } else {
-        format!("\n  {}", refused.join("\n  "))
-    }
-}
-
 enum Action {
     /// Exactly one of the two, enforced at parse.
     Execute {
@@ -514,9 +417,8 @@ struct Command {
     action: Action,
     database: String,
     project: Option<PathBuf>,
-    bucket: String,
-    endpoint: Option<String>,
-    region: String,
+    fleet: FleetFlags,
+    json: bool,
     unsafe_public_advertise: bool,
 }
 
@@ -548,17 +450,11 @@ impl Command {
             .filter(|value| !value.starts_with('-'))
             .ok_or_else(|| anyhow!("celld d1 needs a database name"))?;
 
-        let env = |name: &str| {
-            std::env::var(name)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        };
         let mut sql = None;
         let mut file = None;
         let mut project = None;
-        let mut bucket = env("CELLD_BUCKET");
-        let mut endpoint = env("S3_ENDPOINT");
-        let mut region = env("AWS_REGION").or_else(|| env("AWS_DEFAULT_REGION"));
+        let mut fleet = FleetFlags::default();
+        let mut json = false;
         let mut unsafe_public_advertise = false;
         while let Some(argument) = arguments.next() {
             let mut value = |flag: &str| {
@@ -569,17 +465,21 @@ impl Command {
             match argument.as_str() {
                 "--command" => sql = Some(value("--command")?),
                 "--file" => file = Some(PathBuf::from(value("--file")?)),
-                "--bucket" => {
-                    bucket = Some(value("--bucket")?.trim_start_matches("s3://").to_string());
-                }
-                "--endpoint" => endpoint = Some(value("--endpoint")?),
-                "--region" => region = Some(value("--region")?),
+                "--json" => json = true,
                 "--unsafe-public-advertise" => unsafe_public_advertise = true,
                 "--help" | "-h" => return Ok(None),
-                other if other.starts_with('-') => {
-                    bail!("unknown option: {other}; run `celld d1 --help` for usage")
+                other => {
+                    // The fleet flags are shared, so `--bucket gs://name`
+                    // resolves here exactly as it does for every other
+                    // command rather than through a second copy of the rule.
+                    if fleet.consume(other, &mut value)? {
+                        continue;
+                    }
+                    if other.starts_with('-') {
+                        bail!("unknown option: {other}; run `celld d1 --help` for usage")
+                    }
+                    project = Some(PathBuf::from(other));
                 }
-                other => project = Some(PathBuf::from(other)),
             }
         }
         let action = match action {
@@ -601,23 +501,21 @@ impl Command {
                 Action::Execute { command: sql, file }
             }
         };
-        let bucket = bucket.ok_or_else(|| {
-            anyhow!("celld d1 requires --bucket [s3://|gs://|az://]NAME (or CELLD_BUCKET)")
-        })?;
         Ok(Some(Self {
             action,
             database,
             project,
-            bucket,
-            endpoint,
-            region: region.unwrap_or_else(|| "us-east-1".to_string()),
+            // Resolution is deferred to `run`, so the missing-bucket message
+            // is the one every command shares.
+            fleet: fleet.with_environment(),
+            json,
             unsafe_public_advertise,
         }))
     }
 }
 
 pub fn print_help() {
-    println!(
+    let text = format!(
         r#"celld d1 — run SQL and migrations against a deployed D1 database
 
 USAGE:
@@ -643,15 +541,17 @@ bookkeeping table. celld records applied migrations in that table
 (`d1_migrations` by default), the same table and columns
 `wrangler d1 migrations` uses.
 
+`execute` prints a table, and every message goes to stderr, so its stdout
+carries only result rows. Pass --json for one JSON object per row.
+
 OPTIONS:
-  --command SQL    SQL to run; several statements are permitted
-  --file PATH      Read the SQL from a file instead
-  --bucket [s3://|gs://|az://]NAME[/PREFIX]
-                   Fleet bucket; same as CELLD_BUCKET
-  --endpoint URL   S3-compatible endpoint; same as S3_ENDPOINT
-  --region REGION  Storage region (default: AWS_REGION or us-east-1)
+  --command SQL       SQL to run; several statements are permitted
+  --file PATH         Read the SQL from a file instead
+  --json              Print one JSON object per row instead of a table
+{FLEET_HELP}
   --unsafe-public-advertise
-                   Permit a node whose advertised address is a public IP
-  -h, --help       Show this help"#
+                      Permit a node whose advertised address is a public IP
+  -h, --help          Show this help"#
     );
+    let _ = Output::new(Format::Text).help(&text);
 }

@@ -28,19 +28,26 @@ pub fn validate() -> anyhow::Result<()> {
 
     for name in [
         "CELLD_ACTIVATIONS",
+        "CELLD_DEPLOY_POLL_S",
         "CELLD_EVICTIONS",
         "CELLD_FETCH_TIMEOUT_S",
         "CELLD_HANDLER_BUDGET_S",
         "CELLD_IDLE_EVICT_S",
+        "CELLD_LOG_CAPTURE_WORKERS",
+        "CELLD_LOG_PIPELINE",
         "CELLD_LTX_COMPACTIONS",
         "CELLD_LTX_COMPACTION_MIN_TXIDS",
+        "CELLD_LTX_DURABILITY_TIMEOUT_SECS",
         "CELLD_MAX_LOADED_WORKERS",
+        "CELLD_MAX_CELL_REQUESTS",
         "CELLD_MAX_OUTBOUND_WEBSOCKETS",
+        "CELLD_MAX_REQUEST_BODY_BYTES",
         "CELLD_MAX_REQUESTS",
         "CELLD_MAX_STATELESS_ISOLATES",
         "CELLD_OPERATION_DEADLINE_MS",
         "CELLD_RELEASES",
         "CELLD_SHUTDOWN_DRAIN_MS",
+        "CELLD_SHUTDOWN_TOTAL_MS",
         "CELLD_TOKIO_THREADS",
         "CELLD_TTL_MS",
         "CELLD_WAKER_TICK_MS",
@@ -52,9 +59,16 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_ADMISSION_WAIT_MS",
         "CELLD_ALARM_RESIDENT_MS",
         "CELLD_ASSET_CACHE_BYTES",
+        "CELLD_DEPLOY_MAX_AGE_S",
+        "CELLD_DRAIN_TOKEN_WAIT_MS",
         "CELLD_LOCAL_CACHE_MAX_BYTES",
+        "CELLD_LTX_TRUNCATE_PAGES",
+        "CELLD_LOG_HEDGE_MS",
+        "CELLD_LOG_WINDOW",
+        "CELLD_LOG_WINDOW_BYTES",
         "CELLD_MAX_RESIDENT_CELLS",
         "CELLD_MAX_RSS_MB",
+        "CELLD_READY_FLEET_GATE_MS",
     ] {
         optional::<u64>(name)?;
     }
@@ -68,6 +82,12 @@ pub fn validate() -> anyhow::Result<()> {
     if let Some(megabytes) = positive::<usize>("CELLD_V8_HEAP_LIMIT_MB")? {
         if megabytes.checked_mul(1024 * 1024).is_none() {
             bail!("CELLD_V8_HEAP_LIMIT_MB is too large: {megabytes}");
+        }
+    }
+
+    if let Some(value) = value("CELLD_LOG_TRANSPORT")? {
+        if !matches!(value.as_str(), "http" | "stream") {
+            bail!("CELLD_LOG_TRANSPORT must be http or stream, not {value:?}");
         }
     }
 

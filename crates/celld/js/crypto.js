@@ -87,25 +87,39 @@
     return JSON.parse(__crypto_operation(operation, JSON.stringify(input)));
   }
 
-  // AES-CBC and AES-CTR run through the host ops. CBC is PKCS#7-padded and
-  // CTR is its own inverse, so `encrypting` only matters for CBC.
-  function _aesBlockMode(name, algorithm, key, data, encrypting) {
-    const bytes = Array.from(_toBuf(key.__celldMaterial.bytes));
-    const input = Array.from(_toBuf(data));
-    if (name === "AES-CTR") {
-      // The counter is copied on the way in -- it is the caller's, and
-      // incrementing it in place is the bug aesCounterOverflowTest pins.
-      return _extra("aes-ctr", {
-        key: bytes,
-        counter: Array.from(_toBuf(algorithm.counter)),
-        data: input,
-      }).bytes;
+  // The AES modes the host ops accept. `encrypt` and `decrypt` both test
+  // against this one set, so neither can grow a mode the other refuses.
+  const _AES_MODES = new Set(["AES-GCM", "AES-CBC", "AES-CTR"]);
+
+  // All three modes take the same typed-array host ops: the key, the IV or
+  // counter block, and the data are all bytes, so nothing here crosses as
+  // JSON. CBC is PKCS#7-padded and CTR is its own inverse, so `encrypting`
+  // only matters for CBC.
+  //
+  // AES-CTR names its IV `counter`, and that block belongs to the caller.
+  // The host copies every view it is given, so nothing on this path can
+  // increment the caller's block in place.
+  //
+  // AES-GCM reports a failure by returning nothing, and this turns that into
+  // the `OperationError` the Web Crypto specification names. The block modes
+  // throw from the host with the cause, so they never reach that branch.
+  function _aes(name, algorithm, key, data, encrypting) {
+    if (name === "AES-GCM" && _toBuf(algorithm.iv).byteLength === 0) {
+      throw new DOMException("AES-GCM IV must not be empty.", "OperationError");
     }
-    return _extra(encrypting ? "aes-cbc-encrypt" : "aes-cbc-decrypt", {
-      key: bytes,
-      iv: Array.from(_toBuf(algorithm.iv)),
-      data: input,
-    }).bytes;
+    const run = encrypting ? _aesEncrypt : _aesDecrypt;
+    const out = run(
+      name,
+      key.__celldMaterial.bytes,
+      _toBuf(name === "AES-CTR" ? algorithm.counter : algorithm.iv),
+      _toBuf(data),
+    );
+    if (!out) {
+      throw _operationError(
+        name + (encrypting ? " encrypt failed" : " decrypt failed"),
+      );
+    }
+    return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
   }
 
   class SubtleCrypto {
@@ -444,46 +458,16 @@
 
     async encrypt(algorithm, key, data) {
       const name = _algorithmName(algorithm);
-      if (name === "AES-GCM" && _toBuf(algorithm.iv).byteLength === 0) {
-        throw new DOMException(
-          "AES-GCM IV must not be empty.", "OperationError");
+      if (_AES_MODES.has(name)) {
+        return _aes(name, algorithm, key, data, true);
       }
-      if (name === "AES-CBC" || name === "AES-CTR") {
-        const out = Uint8Array.from(
-          _aesBlockMode(name, algorithm, key, data, true));
-        return out.buffer;
-      }
-      if (name !== "AES-GCM") {
-        throw _notSupported("unsupported encrypt algorithm: " + name);
-      }
-      const out = _aesEncrypt(
-        key.__celldMaterial.bytes,
-        _toBuf(algorithm.iv),
-        _toBuf(data),
-      );
-      if (!out) throw _operationError("AES-GCM encrypt failed");
-      return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
+      throw _notSupported("unsupported encrypt algorithm: " + name);
     }
 
     async decrypt(algorithm, key, data) {
       const name = _algorithmName(algorithm);
-      if (name === "AES-GCM" && _toBuf(algorithm.iv).byteLength === 0) {
-        throw new DOMException(
-          "AES-GCM IV must not be empty.", "OperationError");
-      }
-      if (name === "AES-CBC" || name === "AES-CTR") {
-        const out = Uint8Array.from(
-          _aesBlockMode(name, algorithm, key, data, false));
-        return out.buffer;
-      }
-      if (name === "AES-GCM") {
-        const out = _aesDecrypt(
-          key.__celldMaterial.bytes,
-          _toBuf(algorithm.iv),
-          _toBuf(data),
-        );
-        if (!out) throw _operationError("AES-GCM decrypt failed");
-        return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
+      if (_AES_MODES.has(name)) {
+        return _aes(name, algorithm, key, data, false);
       }
       if (name === "RSA-OAEP") {
         const result = _extra("rsa-oaep-decrypt", {

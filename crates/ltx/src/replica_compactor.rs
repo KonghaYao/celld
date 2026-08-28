@@ -176,22 +176,11 @@ impl<'a, C: ReplicaClient> ReplicaCompactor<'a, C> {
         // runtime worker: a restart drain runs rounds back-to-back, and on a
         // 4-vCPU node two pegged workers starved co-owned cells' durable
         // writes (2026-08-12 fleet roll).
-        #[cfg(celld_internal_tests)]
-        let drop_input = self.host.drop_compaction_input() && readers.len() >= 3;
-        #[cfg(celld_internal_tests)]
-        if drop_input {
-            let interior = readers.len() / 2;
-            readers.remove(interior);
-        }
         let (header, output) = self
             .host
             .run_blocking(move || {
                 let mut compactor = Compactor::new(Vec::new(), readers);
                 compactor.header_flags = HEADER_FLAG_NO_CHECKSUM;
-                #[cfg(celld_internal_tests)]
-                if drop_input {
-                    compactor.allow_non_contiguous_txids = true;
-                }
                 compactor.compact()?;
                 Ok::<_, Error>((compactor.header(), compactor.into_writer()))
             })
@@ -233,142 +222,4 @@ impl<'a, C: ReplicaClient> ReplicaCompactor<'a, C> {
 
 fn invalid(message: &'static str) -> Error {
     Error::Other(message.into())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::client::file::FileReplicaClient;
-    use crate::client::{make_test_ltx_file, ReplicaClient};
-    use crate::ltx::{decode_file, decode_file_pages, PAGE_HEADER_FLAG_SIZE};
-
-    async fn write_l0(client: &FileReplicaClient, txid: u64, seed: u8) {
-        let data = make_test_ltx_file(TXID(txid), TXID(txid), seed);
-        client
-            .write_ltx_file(0, TXID(txid), TXID(txid), &data)
-            .await
-            .expect("write L0");
-    }
-
-    #[tokio::test]
-    async fn compacts_only_the_uncovered_source_tail() {
-        let directory = tempfile::tempdir().unwrap();
-        let client = FileReplicaClient::new(directory.path().to_string_lossy().into_owned());
-        for txid in 1..=3 {
-            write_l0(&client, txid, txid as u8).await;
-        }
-
-        let compactor = ReplicaCompactor::new(&client).with_verification(true);
-        let first = compactor.compact(1).await.unwrap().expect("first output");
-        assert_eq!(
-            (first.info.min_txid, first.info.max_txid),
-            (TXID(1), TXID(3))
-        );
-        assert_eq!(first.input_files, 3);
-        assert_eq!(first.local_input_files, 0);
-
-        assert!(compactor.compact(1).await.unwrap().is_none());
-        for txid in 4..=5 {
-            write_l0(&client, txid, txid as u8).await;
-        }
-        let second = compactor.compact(1).await.unwrap().expect("second output");
-        assert_eq!(
-            (second.info.min_txid, second.info.max_txid),
-            (TXID(4), TXID(5))
-        );
-
-        let level = client.ltx_files(1, TXID(0)).await.unwrap();
-        assert_eq!(level.len(), 2);
-        assert_eq!(client.ltx_files(0, TXID(0)).await.unwrap().len(), 5);
-
-        let bytes = client.open_ltx_file(1, TXID(1), TXID(3)).await.unwrap();
-        let decoded = decode_file(&bytes).unwrap();
-        assert_eq!(decoded.header.flags, HEADER_FLAG_NO_CHECKSUM);
-        assert_eq!(
-            u16::from_be_bytes([bytes[104], bytes[105]]),
-            PAGE_HEADER_FLAG_SIZE
-        );
-        assert_eq!(decode_file_pages(&bytes).unwrap(), vec![(1, vec![3; 512])]);
-    }
-
-    #[tokio::test]
-    async fn rejects_invalid_destinations_and_inconsistent_levels() {
-        let directory = tempfile::tempdir().unwrap();
-        let client = FileReplicaClient::new(directory.path().to_string_lossy().into_owned());
-        let compactor = ReplicaCompactor::new(&client);
-        assert!(compactor.compact(0).await.is_err());
-        assert!(compactor.compact(SNAPSHOT_LEVEL).await.is_err());
-
-        let first = make_test_ltx_file(TXID(1), TXID(1), 1);
-        let third = make_test_ltx_file(TXID(3), TXID(3), 3);
-        client
-            .write_ltx_file(1, TXID(1), TXID(1), &first)
-            .await
-            .unwrap();
-        client
-            .write_ltx_file(1, TXID(3), TXID(3), &third)
-            .await
-            .unwrap();
-        assert!(compactor.verify_level(1).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn limits_each_attempt_to_a_contiguous_source_prefix() {
-        let directory = tempfile::tempdir().unwrap();
-        let client = FileReplicaClient::new(directory.path().to_string_lossy().into_owned());
-        for txid in 1..=5 {
-            write_l0(&client, txid, txid as u8).await;
-        }
-
-        let compactor = ReplicaCompactor::new(&client)
-            .with_limits(2, u64::MAX)
-            .with_verification(true);
-        let first = compactor.compact(1).await.unwrap().expect("first output");
-        let second = compactor.compact(1).await.unwrap().expect("second output");
-        let third = compactor.compact(1).await.unwrap().expect("third output");
-
-        assert_eq!(
-            (first.info.min_txid, first.info.max_txid),
-            (TXID(1), TXID(2))
-        );
-        assert_eq!(
-            (second.info.min_txid, second.info.max_txid),
-            (TXID(3), TXID(4))
-        );
-        assert_eq!(
-            (third.info.min_txid, third.info.max_txid),
-            (TXID(5), TXID(5))
-        );
-        assert!(compactor.compact(1).await.unwrap().is_none());
-        assert_eq!(client.ltx_files(0, TXID(0)).await.unwrap().len(), 5);
-    }
-
-    #[tokio::test]
-    async fn prefers_matching_local_inputs() {
-        let directory = tempfile::tempdir().unwrap();
-        let client = FileReplicaClient::new(directory.path().to_string_lossy().into_owned());
-        write_l0(&client, 1, 1).await;
-        write_l0(&client, 2, 2).await;
-
-        let output = ReplicaCompactor::new(&client)
-            .with_local_path(directory.path())
-            .compact(1)
-            .await
-            .unwrap()
-            .expect("output");
-        assert_eq!(output.local_input_files, 2);
-    }
-
-    #[tokio::test]
-    async fn refuses_to_publish_a_gap_after_the_destination_tail() {
-        let directory = tempfile::tempdir().unwrap();
-        let client = FileReplicaClient::new(directory.path().to_string_lossy().into_owned());
-        write_l0(&client, 1, 1).await;
-        let compactor = ReplicaCompactor::new(&client).with_verification(true);
-        compactor.compact(1).await.unwrap().expect("first output");
-
-        write_l0(&client, 3, 3).await;
-        assert!(compactor.compact(1).await.is_err());
-        assert_eq!(client.ltx_files(1, TXID(0)).await.unwrap().len(), 1);
-    }
 }

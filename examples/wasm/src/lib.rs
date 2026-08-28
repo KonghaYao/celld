@@ -1,7 +1,5 @@
 use worker::*;
 
-// One Counter cell per /c/<name> path, same contract as worker/index.js —
-// but the increment happens in Rust compiled to Wasm.
 #[durable_object(fetch)]
 pub struct Counter {
     state: State,

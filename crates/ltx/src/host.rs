@@ -39,6 +39,9 @@ pub trait HostFileIo: Send {
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()>;
     fn read_exact_at(&mut self, offset: u64, len: usize) -> io::Result<Vec<u8>>;
     fn sync_all(&mut self) -> io::Result<()>;
+    /// The file's current length, from the open handle (an `fstat`, not a
+    /// path walk).
+    fn file_len(&mut self) -> io::Result<u64>;
 }
 
 /// One open file owned by an injected filesystem.
@@ -57,6 +60,10 @@ impl HostFile {
 
     pub fn sync_all(&mut self) -> io::Result<()> {
         self.inner.sync_all()
+    }
+
+    pub fn file_len(&mut self) -> io::Result<u64> {
+        self.inner.file_len()
     }
 
     pub fn from_io(inner: impl HostFileIo + 'static) -> Self {
@@ -79,6 +86,21 @@ pub trait FileSystem: Send + Sync {
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
+}
+
+/// The telemetry-only microsecond clock for the capture ledger
+/// (`db::SyncTiming`). Nothing branches on these values — they exist so
+/// the closed-book attribution ledger can sum — so deterministic
+/// schedules are unchanged; the host owns the ambient primitive exactly
+/// as it owns the filesystem and the wall clock.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn telemetry_us() -> u64 {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros() as u64
 }
 
 /// The ordinary direct-filesystem backend.
@@ -105,6 +127,10 @@ impl HostFileIo for DirectFile {
 
     fn sync_all(&mut self) -> io::Result<()> {
         self.file.sync_all()
+    }
+
+    fn file_len(&mut self) -> io::Result<u64> {
+        Ok(self.file.metadata()?.len())
     }
 }
 
@@ -209,8 +235,6 @@ struct Inner {
     read_file: Arc<ReadFile>,
     run_blocking: Arc<RunBlocking>,
     filesystem: Arc<dyn FileSystem>,
-    #[cfg(celld_internal_tests)]
-    drop_compaction_input: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 /// The clock and executor facilities used by the LTX engine.
@@ -240,8 +264,6 @@ impl LtxHost {
                 read_file: Arc::new(move |path| Box::pin(read(path))),
                 run_blocking: Arc::new(move |job| Box::pin(blocking(job))),
                 filesystem: Arc::new(DirectFileSystem),
-                #[cfg(celld_internal_tests)]
-                drop_compaction_input: Arc::new(|| false),
             }),
         }
     }
@@ -302,24 +324,6 @@ impl LtxHost {
         self.inner.filesystem.create_dir_all(path)
     }
 
-    /// Install the S1 compaction tooth. The callback is absent from ordinary
-    /// builds and is queried only while a test compaction selects its inputs.
-    #[cfg(celld_internal_tests)]
-    pub fn with_compaction_input_drop(
-        mut self,
-        armed: impl Fn() -> bool + Send + Sync + 'static,
-    ) -> Self {
-        Arc::get_mut(&mut self.inner)
-            .expect("a fresh LtxHost has one owner")
-            .drop_compaction_input = Arc::new(armed);
-        self
-    }
-
-    #[cfg(celld_internal_tests)]
-    pub(crate) fn drop_compaction_input(&self) -> bool {
-        (self.inner.drop_compaction_input)()
-    }
-
     /// Returns the current wall time as Unix milliseconds.
     pub fn now_unix_millis(&self) -> i64 {
         (self.inner.now_unix_millis)()
@@ -354,8 +358,8 @@ impl LtxHost {
     }
 }
 
-// This is the lower crate's production and stand-alone-test backend. celld
-// injects an execution-domain-backed host on every engine path.
+// This is the lower crate's stand-alone production backend. celld injects an
+// execution-domain-backed host on every engine path.
 #[allow(clippy::disallowed_methods)]
 impl Default for LtxHost {
     fn default() -> Self {

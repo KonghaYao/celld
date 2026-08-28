@@ -1,7 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-#![warn(clippy::disallowed_macros)]
-
 //! Alarm wake for inactive cells (on by default).
 //!
 //! Committed alarm state is mirrored into the bucket as
@@ -37,7 +35,7 @@ pub fn resident_ms() -> i64 {
 }
 
 /// Scan the due wake buckets: used by the boot-time orphan scan and the
-/// Phase 3 waker tick. The whole `wake/` prefix is listed and filtered
+/// periodic waker tick. The whole `wake/` prefix is listed and filtered
 /// locally; entries are deleted as their alarms are consumed, so the listing
 /// stays O(armed entries) plus any entry that `parse_entry_key` rejects with
 /// the fleet-wide scope fence.
@@ -111,9 +109,7 @@ pub async fn try_hold_waker(bucket: &Bucket, node: &str, now_ms: i64, ttl_ms: i6
 /// `celld_logic::wake::WakeCore`; this facade adds the lock, the async bucket
 /// executor, and the shadow-pin log.
 pub struct WakeFlusher {
-    core: Mutex<WakeCore>,
-    #[cfg(all(test, celld_internal_tests))]
-    tracked_due: Mutex<std::collections::BTreeMap<String, i64>>,
+    pub core: Mutex<WakeCore>,
     /// Signals each settled delete, so the `await_quiesce` waiters -- an arm
     /// on its own key, a reconcile on the whole cell -- can re-check.
     quiesce: tokio::sync::Notify,
@@ -129,8 +125,6 @@ impl WakeFlusher {
     pub fn new() -> Self {
         WakeFlusher {
             core: Mutex::new(WakeCore::new()),
-            #[cfg(all(test, celld_internal_tests))]
-            tracked_due: Mutex::new(std::collections::BTreeMap::new()),
             quiesce: tokio::sync::Notify::new(),
         }
     }
@@ -147,12 +141,6 @@ impl WakeFlusher {
         let mut core = self.core.lock().unwrap();
         if celld_logic::wake::should_adopt_hint(core.tracks(cell), due_ms) {
             core.adopt(cell, due_ms);
-            #[cfg(all(test, celld_internal_tests))]
-            self.tracked_due
-                .lock()
-                .unwrap()
-                .entry(cell.to_string())
-                .or_insert(due_ms);
         }
     }
 
@@ -201,11 +189,6 @@ impl WakeFlusher {
                     match bucket.put(&key, body.into_bytes()).await {
                         Ok(()) => {
                             plan.put_done(&mut self.core.lock().unwrap(), key, due_ms);
-                            #[cfg(all(test, celld_internal_tests))]
-                            self.tracked_due
-                                .lock()
-                                .unwrap()
-                                .insert(cell.to_string(), due_ms);
                         }
                         Err(e) => {
                             warn!(%cell, %key, error = %e, "wake entry put failed");
@@ -215,8 +198,8 @@ impl WakeFlusher {
                 }
                 Step::Delete { key } => {
                     // A transient store error must not orphan the entry — a
-                    // dropped delete was one of the immortal-orphan producers
-                    // (the item-6 audit) — so retry briefly. A delete that
+                    // dropped delete can produce an immortal orphan, so retry
+                    // briefly. A delete that
                     // still fails drops the state anyway: a stale entry is
                     // one spurious wake, and keeping it would block the arm
                     // that replaces it.
@@ -244,14 +227,9 @@ impl WakeFlusher {
     /// forgot the wakeup would park every later arm for the cell behind a
     /// delete that is no longer on the wire, until some unrelated delete
     /// happened to settle and released it.
-    fn settle_delete(&self, plan: &mut celld_logic::wake::Reconcile, key: &str) {
+    #[doc(hidden)]
+    pub fn settle_delete(&self, plan: &mut celld_logic::wake::Reconcile, key: &str) {
         plan.delete_done(&mut self.core.lock().unwrap(), key);
-        #[cfg(all(test, celld_internal_tests))]
-        if let Some((_, cell)) = celld_logic::wake::parse_entry_key(key) {
-            if !self.core.lock().unwrap().tracks(&cell) {
-                self.tracked_due.lock().unwrap().remove(&cell);
-            }
-        }
         self.quiesce.notify_waiters();
     }
 
@@ -309,11 +287,6 @@ impl WakeFlusher {
     /// An arm-time PUT landed: record the proven entry.
     pub fn confirm_arm(&self, cell: &str, due_ms: i64, key: String) {
         self.core.lock().unwrap().confirm_put(cell, due_ms, key);
-        #[cfg(all(test, celld_internal_tests))]
-        self.tracked_due
-            .lock()
-            .unwrap()
-            .insert(cell.to_string(), due_ms);
     }
 
     /// Is this exact committed alarm durably covered by a proven entry? The
@@ -332,21 +305,10 @@ impl WakeFlusher {
     /// this node's to track.
     pub fn forget(&self, cell: &str) {
         self.core.lock().unwrap().forget(cell);
-        #[cfg(all(test, celld_internal_tests))]
-        self.tracked_due.lock().unwrap().remove(cell);
     }
 }
-
-#[cfg(all(test, celld_internal_tests))]
-include!(env!("CELLD_INTERNAL_WAKE_OBSERVERS"));
 
 // The arm gate's executor half: which wait a caller gets, and what releases
 // it. The core's predicates are pinned separately; these cover the wiring
 // on top of them, where an arm that asks the wrong question still answers
 // correctly and only answers late.
-#[cfg(all(test, celld_internal_tests))]
-#[allow(clippy::disallowed_methods)]
-mod wake_gate_private {
-    use super::*;
-    include!(env!("CELLD_CONFORMANCE_WAKE_GATE_TESTS"));
-}

@@ -549,73 +549,6 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             mac.update(&data);
             Ok(serde_json::json!({ "bytes": mac.finalize().into_bytes().to_vec() }))
         }
-        // AES-CBC with PKCS#7 padding, and AES-CTR. Both take 128- or
-        // 256-bit keys.
-        "aes-cbc-encrypt" | "aes-cbc-decrypt" => {
-            use cbc::cipher::block_padding::Pkcs7;
-            use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-            let key = crypto_bytes(args, "key")?;
-            let iv = crypto_bytes(args, "iv")?;
-            let data = crypto_bytes(args, "data")?;
-            if iv.len() != 16 {
-                return Err(anyhow!("AES-CBC requires a 16-byte IV"));
-            }
-            let encrypting = operation == "aes-cbc-encrypt";
-            macro_rules! run {
-                ($aes:ty) => {{
-                    if encrypting {
-                        cbc::Encryptor::<$aes>::new_from_slices(&key, &iv)
-                            .map_err(|_| anyhow!("invalid AES-CBC key or IV"))?
-                            .encrypt_padded_vec_mut::<Pkcs7>(&data)
-                    } else {
-                        cbc::Decryptor::<$aes>::new_from_slices(&key, &iv)
-                            .map_err(|_| anyhow!("invalid AES-CBC key or IV"))?
-                            .decrypt_padded_vec_mut::<Pkcs7>(&data)
-                            .map_err(|_| anyhow!("AES-CBC decryption failed"))?
-                    }
-                }};
-            }
-            let bytes = match key.len() {
-                16 => run!(aes::Aes128),
-                32 => run!(aes::Aes256),
-                other => {
-                    return Err(anyhow!(
-                        "AES-CBC requires a 128- or 256-bit key, got {other} bytes"
-                    ))
-                }
-            };
-            Ok(serde_json::json!({ "bytes": bytes }))
-        }
-        // CTR is its own inverse, so one arm serves both directions. The
-        // counter block is copied before use: it belongs to the caller, and
-        // `aesCounterOverflowTest` exists because incrementing it in place is
-        // an easy and invisible mistake.
-        "aes-ctr" => {
-            use ctr::cipher::{KeyIvInit, StreamCipher};
-            let key = crypto_bytes(args, "key")?;
-            let counter = crypto_bytes(args, "counter")?;
-            let mut data = crypto_bytes(args, "data")?;
-            if counter.len() != 16 {
-                return Err(anyhow!("AES-CTR requires a 16-byte counter block"));
-            }
-            macro_rules! run {
-                ($aes:ty) => {{
-                    let mut cipher = ctr::Ctr128BE::<$aes>::new_from_slices(&key, &counter)
-                        .map_err(|_| anyhow!("invalid AES-CTR key or counter"))?;
-                    cipher.apply_keystream(&mut data);
-                }};
-            }
-            match key.len() {
-                16 => run!(aes::Aes128),
-                32 => run!(aes::Aes256),
-                other => {
-                    return Err(anyhow!(
-                        "AES-CTR requires a 128- or 256-bit key, got {other} bytes"
-                    ))
-                }
-            }
-            Ok(serde_json::json!({ "bytes": data }))
-        }
         // ECDH. Web Crypto's deriveBits returns the raw shared secret -- the
         // x coordinate of the shared point -- with no KDF applied. Its length
         // is the curve's field size, which is why a null `length` is
@@ -1238,8 +1171,20 @@ pub(super) fn op_crypto_operation(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let operation = args.get(0).to_rust_string_lossy(scope);
+    // An undecodable argument used to become `Value::Null`, and the operation
+    // then ran against it. Every field lookup missed, so the caller was told
+    // its key bytes were invalid when the real fault was the argument object
+    // itself. Name the argument instead.
     let input: serde_json::Value =
-        serde_json::from_str(&args.get(1).to_rust_string_lossy(scope)).unwrap_or_default();
+        match serde_json::from_str(&args.get(1).to_rust_string_lossy(scope)) {
+            Ok(input) => input,
+            Err(error) => {
+                return loader_throw(
+                    scope,
+                    &format!("crypto: the argument object is not JSON: {error}"),
+                )
+            }
+        };
     match crypto_operation(&operation, &input) {
         Ok(value) => {
             let json = value.to_string();
@@ -1279,6 +1224,17 @@ pub(super) fn op_webcrypto_random(
     }
 }
 
+// `crc::Crc::new` builds a 256-entry lookup table by value — 1 KiB for a
+// `Crc<u32>`, 2 KiB for a `Crc<u64>`. Constructed inside `op_webcrypto_digest`,
+// that table is rebuilt for every chunk an S3-uploading Worker checksums
+// through `DigestStream`. `Crc::new` is a `const fn`, so a `static` initializer
+// is a const context and the table is built at compile time instead. A
+// `LazyLock` would also hoist the build out of the call, but it adds an atomic
+// guard check to every use that a plain `static` does not need.
+static CRC32: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
+static CRC32C: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
+static CRC64NVME: crc::Crc<u64> = crc::Crc::<u64>::new(&crc::CRC_64_NVME);
+
 /// WebCrypto digest: (algorithm, ArrayBufferView) -> Uint8Array.
 pub(super) fn op_webcrypto_digest(
     scope: &mut v8::PinScope,
@@ -1295,18 +1251,9 @@ pub(super) fn op_webcrypto_digest(
         // Not digests, but DigestStream accepts them: the AWS SDKs and S3
         // checksum with these, so a Worker computing an upload checksum
         // needs them. Big-endian, as the checksum headers carry them.
-        "CRC32" => crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC)
-            .checksum(&bytes)
-            .to_be_bytes()
-            .to_vec(),
-        "CRC32C" => crc::Crc::<u32>::new(&crc::CRC_32_ISCSI)
-            .checksum(&bytes)
-            .to_be_bytes()
-            .to_vec(),
-        "CRC64NVME" => crc::Crc::<u64>::new(&crc::CRC_64_NVME)
-            .checksum(&bytes)
-            .to_be_bytes()
-            .to_vec(),
+        "CRC32" => CRC32.checksum(&bytes).to_be_bytes().to_vec(),
+        "CRC32C" => CRC32C.checksum(&bytes).to_be_bytes().to_vec(),
+        "CRC64NVME" => CRC64NVME.checksum(&bytes).to_be_bytes().to_vec(),
         "SHA-1" => sha1::Sha1::digest(&bytes).to_vec(),
         "SHA-224" => sha2::Sha224::digest(&bytes).to_vec(),
         "SHA-256" => sha2::Sha256::digest(&bytes).to_vec(),
@@ -1351,61 +1298,109 @@ pub(super) fn op_webcrypto_hmac_sign(
     webcrypto_return_bytes(scope, rv, &signature);
 }
 
-/// HMAC-based KDF cores for node:crypto. Manual PBKDF2 (RFC 2898) and HKDF
-/// (RFC 5869) over the hmac crate — no extra dependencies. The JS layer has
-/// already validated the digest name and the 255×hashLen output cap.
-fn hmac_once<D>(key: &[u8], parts: &[&[u8]]) -> Vec<u8>
-where
-    D: hmac::digest::Digest + hmac::digest::core_api::BlockSizeUser,
-{
-    use hmac::Mac;
-    let mut mac = <hmac::SimpleHmac<D> as hmac::Mac>::new_from_slice(key)
-        .expect("HMAC accepts any key length");
-    for part in parts {
-        mac.update(part);
-    }
-    mac.finalize().into_bytes().to_vec()
+/// The digest bound `hmac::Hmac` carries: a digest whose core exposes the
+/// eager, block-level API. Naming it once keeps the two KDF signatures below
+/// readable, because `pbkdf2::pbkdf2_hmac` and `hkdf::Hkdf` both spell out the
+/// same eight lines. Every digest `dispatch_digest!` routes — MD5, SHA-1 and
+/// the four SHA-2 sizes — satisfies it, and a digest that did not would fail
+/// to compile at the macro rather than fall back to something slower.
+///
+/// `hmac::SimpleHmac` needs only `Digest + BlockSizeUser` and would let this
+/// bound go away, but it drives the digest through the generic `Digest`
+/// wrapper instead of the core, which is why it is the slower of the two.
+/// `op_webcrypto_hmac_sign` and `op_webcrypto_hmac_verify` in this file
+/// already use `Hmac`.
+///
+/// A bare `trait EagerDigest: CoreProxy where Self::Core: ...` does not work:
+/// a where-clause on a trait definition constrains implementors but is not
+/// elaborated for callers, so `D: EagerDigest` alone would not discharge the
+/// bound at the `pbkdf2_hmac` and `Hkdf` call sites. Carrying the two KDF
+/// entry points as trait methods discharges it inside the impl instead, which
+/// is the only reason this is a trait with methods rather than an alias.
+trait EagerDigest {
+    fn pbkdf2_into(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]);
+
+    /// `None` only when `out` is longer than the 255×hashLen of RFC 5869.
+    fn hkdf_into(ikm: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) -> Option<()>;
 }
 
-fn pbkdf2_kdf<D>(password: &[u8], salt: &[u8], iterations: u32, keylen: usize) -> Vec<u8>
+impl<D> EagerDigest for D
 where
-    D: hmac::digest::Digest + hmac::digest::core_api::BlockSizeUser,
+    D: hmac::digest::core_api::CoreProxy + hmac::digest::OutputSizeUser,
+    D::Core: hmac::digest::HashMarker
+        + hmac::digest::core_api::UpdateCore
+        + hmac::digest::core_api::FixedOutputCore
+        + hmac::digest::core_api::BufferKindUser<BufferKind = hmac::digest::block_buffer::Eager>
+        + Default
+        + Clone
+        + Sync,
+    <D::Core as hmac::digest::core_api::BlockSizeUser>::BlockSize:
+        hmac::digest::typenum::IsLess<hmac::digest::typenum::U256>,
+    hmac::digest::typenum::Le<
+        <D::Core as hmac::digest::core_api::BlockSizeUser>::BlockSize,
+        hmac::digest::typenum::U256,
+    >: hmac::digest::typenum::NonZero,
 {
-    let mut out = Vec::with_capacity(keylen);
-    let mut block: u32 = 1;
-    while out.len() < keylen {
-        let mut u = hmac_once::<D>(password, &[salt, &block.to_be_bytes()]);
-        let mut t = u.clone();
-        for _ in 1..iterations {
-            u = hmac_once::<D>(password, &[&u]);
-            for (t_, u_) in t.iter_mut().zip(&u) {
-                *t_ ^= u_;
-            }
-        }
-        out.extend_from_slice(&t);
-        block += 1;
+    fn pbkdf2_into(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
+        pbkdf2::pbkdf2_hmac::<D>(password, salt, iterations, out);
     }
-    out.truncate(keylen);
+
+    fn hkdf_into(ikm: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) -> Option<()> {
+        hkdf::Hkdf::<D>::new(Some(salt), ikm).expand(info, out).ok()
+    }
+}
+
+/// PBKDF2 (RFC 2898) for node:crypto, over the `pbkdf2` crate.
+///
+/// This was a hand-rolled loop, justified in its own comment as avoiding an
+/// extra dependency. That justification was false: `pbkdf2` already reaches
+/// this build through `pkcs5`, which this file uses for encrypted PKCS#8, so
+/// the crate was compiled either way and only the `Cargo.toml` line was
+/// missing. The loop re-derived the HMAC key schedule from the password and
+/// allocated a `Vec` on every one of the 100,000-plus iterations a real
+/// caller asks for; the crate primes one HMAC and clones the primed state per
+/// iteration, which is about twice as fast.
+fn pbkdf2_kdf<D: EagerDigest>(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    keylen: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; keylen];
+    D::pbkdf2_into(password, salt, iterations, &mut out);
     out
 }
 
-fn hkdf_kdf<D>(ikm: &[u8], salt: &[u8], info: &[u8], length: usize) -> Vec<u8>
-where
-    D: hmac::digest::Digest + hmac::digest::core_api::BlockSizeUser,
-{
-    let prk = hmac_once::<D>(salt, &[ikm]);
-    let mut out = Vec::with_capacity(length);
-    let mut t: Vec<u8> = Vec::new();
-    let mut counter: u8 = 1;
-    while out.len() < length {
-        t = hmac_once::<D>(&prk, &[&t, info, &[counter]]);
-        out.extend_from_slice(&t);
-        counter += 1;
-    }
-    out.truncate(length);
-    out
+/// HKDF (RFC 5869) for node:crypto, over the `hkdf` crate, which reaches this
+/// build through `elliptic-curve` for the same reason.
+///
+/// `None` means the caller asked for more than the 255×hashLen RFC 5869
+/// defines. The hand-rolled version counted output blocks in a `u8` starting
+/// at 1 and trusted a comment saying the JS layer capped the length. The cap
+/// is real — `getHkdf` in `node_crypto.js` throws a `RangeError` above
+/// 255×hashLen — but it admits exactly 255×hashLen, and the old loop
+/// incremented the counter once more after emitting block 255. So an ordinary
+/// `hkdfSync(hash, ikm, salt, info, 255 * hashLen)` overflowed the counter: a
+/// panic under `debug-assertions`, and a silent wrap without them. Returning
+/// the length check from the KDF instead of asserting it in a doc comment
+/// keeps the ops correct whatever JS does, which matters because the ops are
+/// own properties of the user's `globalThis` and only non-enumerable.
+fn hkdf_kdf<D: EagerDigest>(
+    ikm: &[u8],
+    salt: &[u8],
+    info: &[u8],
+    length: usize,
+) -> Option<Vec<u8>> {
+    let mut out = vec![0u8; length];
+    D::hkdf_into(ikm, salt, info, &mut out)?;
+    Some(out)
 }
 
+/// Routes a digest name to a KDF instantiated over that digest. `None` is an
+/// unknown name, which leaves the calling op's return value unset. This list
+/// must stay equal to `getHashes()` in `node_crypto.js`: that function is
+/// what the JS layer validates a caller's digest name against, so a name it
+/// advertises but this macro omits becomes an `undefined` return.
 macro_rules! dispatch_digest {
     ($name:expr, $fn:ident, ($($arg:expr),*)) => {
         match $name {
@@ -1462,8 +1457,11 @@ pub(super) fn op_node_hkdf(
         return;
     };
     let length = args.get(4).uint32_value(scope).unwrap_or(0) as usize;
+    // The outer `Option` is an unknown digest, the inner one is a length above
+    // 255xhashLen. Both leave the return value unset, which is what every
+    // other reject in these ops does.
     let out = dispatch_digest!(algorithm.as_str(), hkdf_kdf, (&ikm, &salt, &info, length));
-    if let Some(out) = out {
+    if let Some(Some(out)) = out {
         webcrypto_return_bytes(scope, rv, &out);
     }
 }
@@ -1557,22 +1555,160 @@ fn webcrypto_aes_gcm(key: &[u8], iv: &[u8], data: &[u8], encrypting: bool) -> Op
     })
 }
 
+/// The AES modes the ops accept. The set is closed here, so a mode name is
+/// checked once on the way in and every later `match` is exhaustive. The
+/// earlier shape compared the name against a string literal at each branch,
+/// which let the three places that knew the set drift apart.
+#[derive(Clone, Copy)]
+enum AesMode {
+    Gcm,
+    /// GCM reports a failure by returning nothing and the block modes report
+    /// a cause, so the two answer to different callers and cannot share one
+    /// branch.
+    Block(AesBlockMode),
+}
+
+#[derive(Clone, Copy)]
+enum AesBlockMode {
+    Cbc,
+    Ctr,
+}
+
+impl AesMode {
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "AES-GCM" => Self::Gcm,
+            "AES-CBC" => Self::Block(AesBlockMode::Cbc),
+            "AES-CTR" => Self::Block(AesBlockMode::Ctr),
+            _ => return None,
+        })
+    }
+}
+
+/// AES-CBC with PKCS#7 padding, and AES-CTR. Both take 128- or 256-bit keys,
+/// and CTR is its own inverse, so `encrypting` only matters for CBC.
+///
+/// The counter block belongs to the caller, and incrementing it in place is
+/// an easy and invisible mistake. This function cannot make it: `iv` is a
+/// copy the op already took out of V8, so the caller's block is not reachable
+/// from here.
+///
+/// `mode` cannot name AES-GCM, because `AesBlockMode` does not hold it. The
+/// GCM path therefore cannot arrive here by mistake, and this function needs
+/// no arm to refuse it.
+fn webcrypto_aes_block_mode(
+    mode: AesBlockMode,
+    key: &[u8],
+    iv: &[u8],
+    data: &[u8],
+    encrypting: bool,
+) -> Result<Vec<u8>> {
+    if let AesBlockMode::Ctr = mode {
+        use ctr::cipher::{KeyIvInit, StreamCipher};
+        if iv.len() != 16 {
+            return Err(anyhow!("AES-CTR requires a 16-byte counter block"));
+        }
+        let mut out = data.to_vec();
+        macro_rules! run {
+            ($aes:ty) => {{
+                let mut cipher = ctr::Ctr128BE::<$aes>::new_from_slices(key, iv)
+                    .map_err(|_| anyhow!("invalid AES-CTR key or counter"))?;
+                cipher.apply_keystream(&mut out);
+            }};
+        }
+        match key.len() {
+            16 => run!(aes::Aes128),
+            32 => run!(aes::Aes256),
+            other => {
+                return Err(anyhow!(
+                    "AES-CTR requires a 128- or 256-bit key, got {other} bytes"
+                ))
+            }
+        }
+        return Ok(out);
+    }
+    use cbc::cipher::block_padding::Pkcs7;
+    use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+    if iv.len() != 16 {
+        return Err(anyhow!("AES-CBC requires a 16-byte IV"));
+    }
+    macro_rules! run {
+        ($aes:ty) => {{
+            if encrypting {
+                cbc::Encryptor::<$aes>::new_from_slices(key, iv)
+                    .map_err(|_| anyhow!("invalid AES-CBC key or IV"))?
+                    .encrypt_padded_vec_mut::<Pkcs7>(data)
+            } else {
+                cbc::Decryptor::<$aes>::new_from_slices(key, iv)
+                    .map_err(|_| anyhow!("invalid AES-CBC key or IV"))?
+                    .decrypt_padded_vec_mut::<Pkcs7>(data)
+                    .map_err(|_| anyhow!("AES-CBC decryption failed"))?
+            }
+        }};
+    }
+    match key.len() {
+        16 => Ok(run!(aes::Aes128)),
+        32 => Ok(run!(aes::Aes256)),
+        other => Err(anyhow!(
+            "AES-CBC requires a 128- or 256-bit key, got {other} bytes"
+        )),
+    }
+}
+
+/// `$$aesEncrypt(mode, key, iv, data)` and `$$aesDecrypt(mode, key, iv, data)`
+/// -> Uint8Array. `mode` is the Web Crypto algorithm name, so one pair of ops
+/// serves AES-GCM, AES-CBC and AES-CTR. Every argument the three modes need is
+/// bytes, so none of them marshals through JSON.
+fn op_webcrypto_aes(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    rv: v8::ReturnValue<v8::Value>,
+    encrypting: bool,
+) {
+    let mode = args.get(0).to_rust_string_lossy(scope);
+    let (Some(key), Some(iv), Some(data)) = (
+        view_bytes(args.get(1)),
+        view_bytes(args.get(2)),
+        view_bytes(args.get(3)),
+    ) else {
+        return;
+    };
+    let throw = |scope: &mut v8::PinScope, error: anyhow::Error| {
+        let message = v8::String::new(scope, &format!("crypto: {error}")).unwrap();
+        let exception = v8::Exception::error(scope, message);
+        scope.throw_exception(exception);
+    };
+    let Some(parsed) = AesMode::parse(&mode) else {
+        throw(scope, anyhow!("unsupported AES mode: {mode}"));
+        return;
+    };
+    match parsed {
+        // AES-GCM keeps reporting a failure by returning nothing, because
+        // `crypto.js` turns that into the `OperationError` the Web Crypto
+        // specification names. A host `Error` thrown from here would replace a
+        // specified DOMException with an unspecified one. The block modes have
+        // no such JS-side error, so they report the cause instead of returning
+        // `undefined` for the JS layer to misread.
+        AesMode::Gcm => {
+            if let Some(out) = webcrypto_aes_gcm(&key, &iv, &data, encrypting) {
+                webcrypto_return_bytes(scope, rv, &out);
+            }
+        }
+        AesMode::Block(block) => {
+            match webcrypto_aes_block_mode(block, &key, &iv, &data, encrypting) {
+                Ok(out) => webcrypto_return_bytes(scope, rv, &out),
+                Err(error) => throw(scope, error),
+            }
+        }
+    }
+}
+
 pub(super) fn op_webcrypto_aes_encrypt(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     rv: v8::ReturnValue<v8::Value>,
 ) {
-    let (Some(key), Some(iv), Some(data)) = (
-        view_bytes(args.get(0)),
-        view_bytes(args.get(1)),
-        view_bytes(args.get(2)),
-    ) else {
-        return;
-    };
-    let Some(out) = webcrypto_aes_gcm(&key, &iv, &data, true) else {
-        return;
-    };
-    webcrypto_return_bytes(scope, rv, &out);
+    op_webcrypto_aes(scope, args, rv, true);
 }
 
 pub(super) fn op_webcrypto_aes_decrypt(
@@ -1580,15 +1716,5 @@ pub(super) fn op_webcrypto_aes_decrypt(
     args: v8::FunctionCallbackArguments,
     rv: v8::ReturnValue<v8::Value>,
 ) {
-    let (Some(key), Some(iv), Some(data)) = (
-        view_bytes(args.get(0)),
-        view_bytes(args.get(1)),
-        view_bytes(args.get(2)),
-    ) else {
-        return;
-    };
-    let Some(out) = webcrypto_aes_gcm(&key, &iv, &data, false) else {
-        return;
-    };
-    webcrypto_return_bytes(scope, rv, &out);
+    op_webcrypto_aes(scope, args, rv, false);
 }

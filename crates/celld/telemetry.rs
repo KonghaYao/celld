@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-// Telemetry is observational and explicitly excluded from the World trace.
+// Telemetry is observational and does not affect Actor decisions.
 #![allow(clippy::disallowed_methods)]
 
 //! Telemetry: wide events out of the shell, Parquet into the bucket.
@@ -35,7 +35,8 @@ pub const LOGS_PREFIX: &str = "telemetry/logs";
 /// A `console.log` body larger than this is truncated: log records are
 /// telemetry, not blob storage, and one runaway line must not dominate a
 /// batch.
-const LOG_BODY_CAP: usize = 8 * 1024;
+#[doc(hidden)]
+pub const LOG_BODY_CAP: usize = 8 * 1024;
 
 /// The schema is not frozen. Stamped on every object so a reader knows
 /// what contract the columns follow; the DuckDB page documents it.
@@ -64,8 +65,8 @@ impl Retention {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SinkChoice {
-    /// Parquet into the operator's bucket: zero configuration beyond
-    /// the flag, no vendor, DuckDB reads it (`otel.md`).
+    /// Parquet into the operator's bucket: zero configuration beyond the flag.
+    /// DuckDB reads the result as described in `docs/telemetry.md`.
     Bucket,
     /// OTLP/http-protobuf to a collector — the ClickHouse-class path.
     Otlp,
@@ -106,7 +107,8 @@ impl Config {
         Self::from_lookup(enabled, crate::env_vars::value)
     }
 
-    fn from_lookup(
+    #[doc(hidden)]
+    pub fn from_lookup(
         enabled: bool,
         get: impl Fn(&str) -> anyhow::Result<Option<String>>,
     ) -> anyhow::Result<Option<Config>> {
@@ -172,9 +174,8 @@ impl Config {
                 Retention::Days(days)
             }
         };
-        // The production cadence is policy, not operator configuration. The
-        // short override exists only so the black-box retention test does not
-        // wait six hours.
+        // The production cadence is policy, not operator configuration. A
+        // short override supports controlled retention validation.
         let sweep = crate::env_vars::parse_positive::<u64>(
             "CELLD_TEST_OTEL_SWEEP_MS",
             get("CELLD_TEST_OTEL_SWEEP_MS")?,
@@ -215,6 +216,7 @@ impl Config {
 pub const KIND_INTERNAL: u8 = 1;
 pub const KIND_SERVER: u8 = 2;
 pub const KIND_CLIENT: u8 = 3;
+pub const KIND_CONSUMER: u8 = 4;
 
 /// A sampled trace's identity. Existence means "record this one":
 /// `start_trace` answered the sampling question at creation, so a `None`
@@ -227,8 +229,7 @@ pub struct TraceIds {
 
 /// A caller's trace context, extracted from a W3C `traceparent` header.
 /// celld does not terminate TLS; whoever can reach its ingress is the
-/// operator's own edge, so honoring this is trusting infrastructure the
-/// operator already trusts (`otel.md`).
+/// operator's own edge, so honoring this trusts the same infrastructure.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ParentContext {
     pub trace_id: [u8; 16],
@@ -276,8 +277,8 @@ fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
     Some(out)
 }
 
-/// One wide event. Flat on purpose: every field is a Parquet column, and
-/// the column names are the schema contract (`otel.md`).
+/// One wide event. Flat on purpose: every field is a Parquet column, and the
+/// column names are the schema contract.
 pub struct Span {
     pub ids: TraceIds,
     pub parent_span_id: Option<[u8; 8]>,
@@ -398,7 +399,8 @@ pub fn start_trace_with_parent(parent: Option<&ParentContext>) -> Option<TraceId
 /// The sampling decision, pure so the semantics are testable: adopt the
 /// parent's trace id either way; `parent_based` defers to its sampled
 /// flag, everything else applies the threshold to the trace id itself.
-fn decide(
+#[doc(hidden)]
+pub fn decide(
     parent_based: bool,
     threshold: u64,
     parent: Option<&ParentContext>,
@@ -457,7 +459,8 @@ pub(crate) fn cap_error(mut error: String) -> String {
     error
 }
 
-fn cap_body(body: &mut String) {
+#[doc(hidden)]
+pub fn cap_body(body: &mut String) {
     if body.len() <= LOG_BODY_CAP {
         return;
     }
@@ -724,7 +727,8 @@ async fn pump(
 /// `<prefix>/<node>/<yyyy/mm/dd/hh>/<flush_us>-<rand>.parquet`.
 /// Partitioned by arrival at the flush, which is what retention prunes
 /// by; event timestamps stay exact inside the file.
-fn object_key(prefix: &str, node: &str, unix_us: i64) -> String {
+#[doc(hidden)]
+pub fn object_key(prefix: &str, node: &str, unix_us: i64) -> String {
     let seconds = unix_us / 1_000_000;
     let (y, m, d) = civil_from_days(seconds.div_euclid(86_400));
     let hour = seconds.rem_euclid(86_400) / 3_600;
@@ -734,7 +738,7 @@ fn object_key(prefix: &str, node: &str, unix_us: i64) -> String {
 
 /// The retention sweep: celld deletes its own old telemetry, because
 /// an S3 lifecycle rule needs bucket-level permissions the deliberately
-/// object-scoped credentials must not require (`otel.md`). Prefix
+/// object-scoped credentials must not require. Prefix
 /// deletes over the day-partitioned layout, idempotent and safe to
 /// race between nodes — every node sweeps the whole telemetry prefix,
 /// so a dead node's data expires too. The sweep enforces the *current*
@@ -773,7 +777,8 @@ async fn sweep_loop(bucket: Bucket, retention_days: u32, every: Duration) {
 
 /// The newest civil date old enough to delete: strictly before
 /// `retention_days` whole days ago.
-fn cutoff_date(now_unix_us: i64, retention_days: u32) -> (i64, u32, u32) {
+#[doc(hidden)]
+pub fn cutoff_date(now_unix_us: i64, retention_days: u32) -> (i64, u32, u32) {
     let today = (now_unix_us / 1_000_000).div_euclid(86_400);
     civil_from_days(today - retention_days as i64)
 }
@@ -782,7 +787,8 @@ fn cutoff_date(now_unix_us: i64, retention_days: u32) -> (i64, u32, u32) {
 /// cutoff. Keys that do not parse as
 /// `<prefix>/<node>/<yyyy>/<mm>/<dd>/...` are never touched: the sweep
 /// deletes only what the layout proves is telemetry with a date.
-fn expired(key: &str, prefix: &str, cutoff: (i64, u32, u32)) -> bool {
+#[doc(hidden)]
+pub fn expired(key: &str, prefix: &str, cutoff: (i64, u32, u32)) -> bool {
     let Some(rest) = key
         .strip_prefix(prefix)
         .and_then(|rest| rest.strip_prefix('/'))
@@ -805,7 +811,8 @@ fn expired(key: &str, prefix: &str, cutoff: (i64, u32, u32)) -> bool {
 
 /// Days since the Unix epoch to a civil date (Howard Hinnant's
 /// `civil_from_days`, public domain construction).
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+#[doc(hidden)]
+pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -826,9 +833,9 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// The Parquet schema, in message-type form because the text *is* the
-/// documentation: these column names are the contract the DuckDB page
-/// teaches, and changing one means changing that page (`otel.md`).
+/// The Parquet schema, in message-type form because the text is the
+/// documentation. These column names are the contract in `docs/telemetry.md`,
+/// so a schema change requires a documentation change.
 const MESSAGE_TYPE: &str = "
 message celld_span {
   required binary node (STRING);
@@ -867,7 +874,8 @@ message celld_log {
 /// The native column-writer API rather than the arrow one: the schema is
 /// flat primitives, and skipping the `arrow` feature keeps the whole
 /// arrow crate stack out of the binary.
-fn encode_spans(spans: &[Span], node: &str, region: &str) -> anyhow::Result<Vec<u8>> {
+#[doc(hidden)]
+pub fn encode_spans(spans: &[Span], node: &str, region: &str) -> anyhow::Result<Vec<u8>> {
     use parquet::basic::Compression;
     use parquet::basic::ZstdLevel;
     use parquet::data_type::BoolType;
@@ -942,7 +950,8 @@ fn encode_spans(spans: &[Span], node: &str, region: &str) -> anyhow::Result<Vec<
     Ok(writer.into_inner()?)
 }
 
-fn encode_logs(logs: &[Log], node: &str, region: &str) -> anyhow::Result<Vec<u8>> {
+#[doc(hidden)]
+pub fn encode_logs(logs: &[Log], node: &str, region: &str) -> anyhow::Result<Vec<u8>> {
     use parquet::basic::Compression;
     use parquet::basic::ZstdLevel;
     use parquet::data_type::ByteArray;
@@ -994,264 +1003,4 @@ fn encode_logs(logs: &[Log], node: &str, region: &str) -> anyhow::Result<Vec<u8>
 
     group.close()?;
     Ok(writer.into_inner()?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    fn config(vars: &[(&str, &str)]) -> anyhow::Result<Option<Config>> {
-        let map: HashMap<&str, &str> = vars.iter().copied().collect();
-        let enabled =
-            crate::env_vars::parse_flag("CELLD_OTEL", map.get("CELLD_OTEL").copied(), false)?;
-        Config::from_lookup(enabled, |name| {
-            Ok(map.get(name).map(|value| value.to_string()))
-        })
-    }
-
-    #[test]
-    fn off_by_default_and_zero_is_none() {
-        assert!(config(&[]).unwrap().is_none());
-        assert!(config(&[("CELLD_OTEL", "0")]).unwrap().is_none());
-        assert!(config(&[("CELLD_OTEL", "0"), ("CELLD_OTEL_FLUSH_MS", "bad")]).is_err());
-    }
-
-    #[test]
-    fn enabled_defaults_to_bucket_thirty_days_full_sampling() {
-        let config = config(&[("CELLD_OTEL", "1")]).unwrap().unwrap();
-        assert_eq!(config.retention, Retention::Days(30));
-        assert_eq!(config.sample_ratio, 1.0);
-        assert!(config.bucket_override.is_none());
-    }
-
-    #[test]
-    fn otlp_sink_parses_the_spec_env() {
-        let otlp = config(&[
-            ("CELLD_OTEL", "1"),
-            ("CELLD_OTEL_SINK", "otlp"),
-            ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector:4318/"),
-            ("OTEL_EXPORTER_OTLP_HEADERS", "x-api-key=abc, x-team=core"),
-            ("OTEL_EXPORTER_OTLP_TIMEOUT", "2500"),
-        ])
-        .unwrap()
-        .unwrap();
-        assert_eq!(otlp.sink, SinkChoice::Otlp);
-        assert_eq!(otlp.otlp_endpoint, "https://collector:4318");
-        assert_eq!(
-            otlp.otlp_headers,
-            vec![
-                ("x-api-key".to_string(), "abc".to_string()),
-                ("x-team".to_string(), "core".to_string()),
-            ],
-        );
-        assert_eq!(otlp.otlp_timeout, Duration::from_millis(2500));
-        // Defaults: bucket sink, the spec's localhost collector port.
-        let plain = config(&[("CELLD_OTEL", "1")]).unwrap().unwrap();
-        assert_eq!(plain.sink, SinkChoice::Bucket);
-        assert_eq!(plain.otlp_endpoint, "http://localhost:4318");
-        assert_eq!(plain.service, "celld");
-        assert!(config(&[
-            ("CELLD_OTEL", "1"),
-            ("OTEL_EXPORTER_OTLP_HEADERS", "no-equals-sign"),
-        ])
-        .is_err());
-    }
-
-    #[test]
-    fn retention_parses_days_and_none() {
-        let days = config(&[("CELLD_OTEL", "1"), ("CELLD_OTEL_RETENTION", "7d")]);
-        assert_eq!(days.unwrap().unwrap().retention, Retention::Days(7));
-        let none = config(&[("CELLD_OTEL", "1"), ("CELLD_OTEL_RETENTION", "none")]);
-        assert_eq!(none.unwrap().unwrap().retention, Retention::None);
-        assert!(config(&[("CELLD_OTEL", "1"), ("CELLD_OTEL_RETENTION", "0d")]).is_err());
-    }
-
-    #[test]
-    fn sampler_ratio_parses_and_bounds() {
-        let half = config(&[
-            ("CELLD_OTEL", "1"),
-            ("OTEL_TRACES_SAMPLER", "traceidratio"),
-            ("OTEL_TRACES_SAMPLER_ARG", "0.5"),
-        ]);
-        assert_eq!(half.unwrap().unwrap().sample_ratio, 0.5);
-        assert!(config(&[
-            ("CELLD_OTEL", "1"),
-            ("OTEL_TRACES_SAMPLER", "traceidratio"),
-            ("OTEL_TRACES_SAMPLER_ARG", "1.5"),
-        ])
-        .is_err());
-    }
-
-    #[test]
-    fn civil_dates_partition_correctly() {
-        // 2026-08-07 is day 20672 of the epoch.
-        assert_eq!(civil_from_days(20_672), (2026, 8, 7));
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        assert_eq!(civil_from_days(-1), (1969, 12, 31));
-    }
-
-    #[test]
-    fn parquet_roundtrips_the_schema() {
-        use parquet::file::reader::FileReader;
-        use parquet::file::reader::SerializedFileReader;
-
-        let ids = TraceIds {
-            trace_id: [0xab; 16],
-            span_id: [0xcd; 8],
-        };
-        let mut span = Span::new(ids, "celld.fetch", KIND_SERVER);
-        span.duration_us = 1_234;
-        span.request_id = Some("r-1".into());
-        span.queue_wait_us = Some(56);
-        let bytes = encode_spans(&[span], "n1", "lab").unwrap();
-
-        let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
-        assert_eq!(reader.metadata().file_metadata().num_rows(), 1);
-        let rows: Vec<_> = reader
-            .get_row_iter(None)
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        let row = rows[0].to_string();
-        assert!(row.contains(&"ab".repeat(16)), "{row}");
-        assert!(row.contains("duration_us: 1234"), "{row}");
-        assert!(row.contains("request_id: \"r-1\""), "{row}");
-        assert!(row.contains("parent_span_id: null"), "{row}");
-    }
-
-    #[test]
-    fn logs_roundtrip_with_trace_correlation() {
-        use parquet::file::reader::FileReader;
-        use parquet::file::reader::SerializedFileReader;
-
-        let log = Log {
-            trace_id: Some([0xab; 16]),
-            span_id: None,
-            time_unix_us: 42,
-            body: "otel-log-line".into(),
-        };
-        let bytes = encode_logs(&[log], "n1", "lab").unwrap();
-        let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
-        let rows: Vec<_> = reader
-            .get_row_iter(None)
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        let row = rows[0].to_string();
-        assert!(row.contains("otel-log-line"), "{row}");
-        assert!(row.contains(&"ab".repeat(16)), "{row}");
-        assert!(row.contains("span_id: null"), "{row}");
-    }
-
-    #[test]
-    fn log_bodies_are_capped_on_a_char_boundary() {
-        let mut body = "x".repeat(LOG_BODY_CAP + 100);
-        cap_body(&mut body);
-        assert_eq!(body.len(), LOG_BODY_CAP);
-        // A multi-byte char straddling the cap truncates short, not split.
-        let mut multibyte = "x".repeat(LOG_BODY_CAP - 1);
-        multibyte.push('é');
-        multibyte.push_str(&"y".repeat(50));
-        cap_body(&mut multibyte);
-        assert!(multibyte.len() < LOG_BODY_CAP);
-        assert!(multibyte.is_char_boundary(multibyte.len()));
-    }
-
-    #[test]
-    fn traceparent_roundtrips_and_rejects_malformed() {
-        let ids = TraceIds {
-            trace_id: [0xab; 16],
-            span_id: [0xcd; 8],
-        };
-        let header = traceparent(&ids);
-        assert_eq!(
-            header,
-            format!("00-{}-{}-01", "ab".repeat(16), "cd".repeat(8))
-        );
-        let parsed = parse_traceparent(&header).unwrap();
-        assert_eq!(parsed.trace_id, ids.trace_id);
-        assert_eq!(parsed.span_id, ids.span_id);
-        assert!(parsed.sampled);
-
-        let unsampled = format!("00-{}-{}-00", "ab".repeat(16), "cd".repeat(8));
-        assert!(!parse_traceparent(&unsampled).unwrap().sampled);
-        // A future version parses; the invalid version and zero ids do not.
-        let future = format!("cc-{}-{}-01", "ab".repeat(16), "cd".repeat(8));
-        assert!(parse_traceparent(&future).is_some());
-        for bad in [
-            format!("ff-{}-{}-01", "ab".repeat(16), "cd".repeat(8)),
-            format!("00-{}-{}-01", "00".repeat(16), "cd".repeat(8)),
-            format!("00-{}-{}-01", "ab".repeat(16), "00".repeat(8)),
-            format!("00-{}-{}", "ab".repeat(16), "cd".repeat(8)),
-            "garbage".to_string(),
-        ] {
-            assert!(parse_traceparent(&bad).is_none(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn sampling_adopts_parents_per_the_spec() {
-        let parent = |sampled| ParentContext {
-            trace_id: [0xff; 16], // heads above any ratio threshold
-            span_id: [0xcd; 8],
-            sampled,
-        };
-        let fresh = [0x00; 16]; // heads below any nonzero threshold
-                                // parentbased: the caller's flag decides, both ways.
-        assert!(decide(true, u64::MAX / 2, Some(&parent(true)), fresh).is_some());
-        assert!(decide(true, u64::MAX, Some(&parent(false)), fresh).is_none());
-        // Not parentbased: the ids are adopted for correlation, but the
-        // node's own threshold decides against the trace id — a public
-        // caller cannot force recording by setting one bit.
-        assert!(decide(false, u64::MAX / 2, Some(&parent(true)), fresh).is_none());
-        assert_eq!(
-            decide(false, u64::MAX, Some(&parent(false)), fresh),
-            Some([0xff; 16]),
-        );
-        // Roots decide against their own fresh id either way.
-        assert_eq!(decide(true, u64::MAX / 2, None, fresh), Some(fresh));
-    }
-
-    #[test]
-    fn the_sweep_expires_by_day_partition_and_touches_nothing_else() {
-        // 2026-08-07, retention 30 days: the cutoff is 2026-07-08.
-        let cutoff = cutoff_date(1_786_111_207_000_000, 30);
-        assert_eq!(cutoff, (2026, 7, 8));
-        let old = "telemetry/traces/n1/2026/07/07/23/1-aa.parquet";
-        let boundary = "telemetry/traces/n1/2026/07/08/00/1-aa.parquet";
-        let fresh = "telemetry/traces/n1/2026/08/07/14/1-aa.parquet";
-        assert!(expired(old, TRACES_PREFIX, cutoff));
-        assert!(!expired(boundary, TRACES_PREFIX, cutoff));
-        assert!(!expired(fresh, TRACES_PREFIX, cutoff));
-        // Unparseable keys are never deleted, whatever prefix they sit
-        // under; foreign prefixes never match at all.
-        assert!(!expired(
-            "telemetry/traces/n1/not/a/date/x.parquet",
-            TRACES_PREFIX,
-            cutoff
-        ));
-        assert!(!expired(
-            "telemetry/traces/manifest.json",
-            TRACES_PREFIX,
-            cutoff
-        ));
-        assert!(!expired("deploy/current.json", TRACES_PREFIX, cutoff));
-        assert!(expired(
-            "telemetry/logs/n2/2020/01/01/00/1-aa.parquet",
-            LOGS_PREFIX,
-            cutoff
-        ));
-    }
-
-    #[test]
-    fn object_keys_partition_by_hour() {
-        // 2026-08-07T14:00:07Z, in microseconds.
-        let key = object_key(TRACES_PREFIX, "n1", 1_786_111_207_000_000);
-        assert!(
-            key.starts_with("telemetry/traces/n1/2026/08/07/14/"),
-            "{key}"
-        );
-        assert!(key.ends_with(".parquet"));
-    }
 }

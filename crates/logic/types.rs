@@ -38,6 +38,11 @@ pub struct ActivitySnapshot {
     pub expired_owner_leases: u64,
     pub restored: u64,
     pub advanced_epochs: u64,
+    /// Shutdown handoffs acknowledged after a successor acquired authority.
+    pub handed_off: u64,
+    /// Handoff operations that the executor explicitly rejected. A process
+    /// deadline can terminate before this counter changes.
+    pub handoff_failed: u64,
 }
 
 /// Management-facing lifecycle state derived atomically from [`State`].
@@ -73,13 +78,12 @@ pub struct Config {
     /// concurrency is what makes the walk down finish in a time anyone can
     /// reason about.
     pub max_evictions: usize,
-    /// Evictions in flight at once during a shutdown handoff.
+    /// Complete cell handoffs in flight at once during shutdown.
     ///
     /// `max_evictions` is tuned for a background walk down beside live
-    /// traffic. A drain has no live traffic to protect and a stop grace to
-    /// beat, so it runs wider -- but still bounded, because a node handing
-    /// off thousands of cells at once is the same thundering herd against
-    /// the bucket that eviction bounding exists to prevent.
+    /// traffic. This permit remains held through durability, release, and
+    /// successor ownership acceptance. The successor's activation ceiling
+    /// bounds the asynchronous restore wave after acceptance.
     pub max_releases: usize,
     /// Concurrent outbound WebSockets one cell may hold.
     ///
@@ -112,7 +116,7 @@ pub struct Config {
     /// timer is watching, and the request waits forever while every piece of
     /// state remains perfectly consistent. celld shipped that and parked
     /// requests past ninety seconds. `None` restores the old behaviour, which
-    /// only a test that wants to observe an indefinite wait should ask for.
+    /// callers use only when they need to observe an indefinite wait.
     pub operation_deadline_ms: Option<u64>,
     /// How close an armed alarm may be before the cell stops being worth
     /// evicting. Inside this window the wake would cost more than the
@@ -175,10 +179,30 @@ pub struct CapacityPeer {
     pub resident_cells: usize,
     pub host_websockets: usize,
     pub rss_bytes: u64,
-    /// The memory this peer's cells hold, which is what it decides its own
-    /// pressure on. `None` from a peer that predates the field.
+    /// The allocator-adjusted RSS fallback for ordinary memory pressure.
+    /// `None` from a peer that predates the field.
     pub in_use_bytes: Option<u64>,
     pub pressured: bool,
+    /// Whether every configured memory measurement is below its low
+    /// watermark. `None` from a peer that predates this field.
+    pub memory_headroom: Option<bool>,
+    /// Cold routes that have not finished on this peer.
+    pub restoring: u64,
+    /// This process accepts a signed adoption request and acknowledges it
+    /// after it acquires the cell's next ownership epoch.
+    pub paced_handoff: bool,
+}
+
+/// A successor that has acquired a released cell.
+///
+/// The executor obtains this only from a signed peer acknowledgement. The
+/// successor can still be restoring the durable replica when it responds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdoptedCell {
+    pub node: NodeId,
+    pub addr: String,
+    pub epoch: Epoch,
+    pub peer_protocol: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -289,10 +313,65 @@ pub enum Timer {
     },
 }
 
+/// Every way a cell's state can leave this process.
+///
+/// This enum lists every external route. It is deliberately not
+/// `#[non_exhaustive]`, so every exhaustive shell match stops compiling until
+/// somebody decides how a new channel is held and how it is released.
+///
+/// The core stores a channel and hands it back. It never reads it. A `match`
+/// on `Channel` inside `celld-logic` would split one output invariant into a
+/// separate rule for each channel.
+///
+/// An alarm is missing here on purpose, and stays missing. Its consuming
+/// commit does open a barrier -- as `GateOwner::Alarm`, keyed by the cell and
+/// epoch the firing was dispatched against -- but a barrier is not a channel.
+/// The alarm's settlement is not an egress: it is replayed back into the core
+/// rather than released to the shell, it has no request to route by, and the
+/// output gate does not release it to the shell, and it has no request to route
+/// by. A variant here would force the core to match on `Channel` to tell a
+/// release from a replay, which is the one thing this enum exists to prevent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Channel {
+    /// The answer to the cell event itself: an HTTP response, a cell RPC
+    /// reply, or a peer-served reply.
+    Response,
+    /// `fetch()` from a handler to a third party.
+    Fetch,
+    /// A frame from a `webSocketMessage` handler, captured by the host and
+    /// released from the cell's barrier queue.
+    WsHibernatable,
+    /// A frame on a socket the isolate opened and polls itself. It cannot be
+    /// captured, because the handler may be awaiting the reply to the very
+    /// frame being held, so it waits on a durability ticket instead.
+    WsSelf,
+    /// A service-binding call, `env.NAME.fetch()` or its RPC form.
+    Service,
+    /// A call to another cell: its `fetch` or one of its RPC methods.
+    CellRpc,
+    /// A leased Queue batch leaving its broker for a consumer Worker.
+    Queue,
+}
+
+impl Channel {
+    /// Return the diagnostic name for this channel.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Channel::Response => "response",
+            Channel::Fetch => "fetch",
+            Channel::WsHibernatable => "ws_hibernatable",
+            Channel::WsSelf => "ws_self",
+            Channel::Service => "service",
+            Channel::CellRpc => "cellrpc",
+            Channel::Queue => "queue",
+        }
+    }
+}
+
 /// Which mechanism proved a gated write durable. The fences differ: the
 /// fleet's follower ensemble arbitrates (a takeover seals a member first),
 /// the bucket only stores — so bucket proofs verify ownership before any
-/// reveal and fleet proofs need not; a TLA+ spec checks the pair.
+/// reveal and fleet proofs do not need that extra read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProofSource {
     Fleet,
@@ -380,6 +459,26 @@ pub enum Event {
         cell: CellId,
         now_mono_ms: u64,
     },
+    /// A terminating peer asks this node to acquire an unowned cell. The
+    /// ownership record must move now, but the runtime stays dormant until
+    /// real traffic needs it. This avoids an eager fleet-wide restore wave.
+    HandoffRequestAt {
+        request: RequestId,
+        cell: CellId,
+        now_ms: u64,
+        now_mono_ms: u64,
+    },
+    /// An event from a WebSocket that this cell already owns. A regular or
+    /// outbound WebSocket pins its resident runtime, so its final events must
+    /// still run locally after a shutdown batch marks the cell as quiescing.
+    /// The exact WebSocket identity prevents new traffic from using this path.
+    WebSocketRequestAt {
+        request: RequestId,
+        cell: CellId,
+        websocket: WebSocketId,
+        now_ms: u64,
+        now_mono_ms: u64,
+    },
     /// Reserve an idle resident isolate for a top-level Worker request. The
     /// shell falls back to the stateless pool when no resident is available;
     /// choosing and pinning a resident is lifecycle policy and therefore
@@ -398,21 +497,26 @@ pub enum Event {
     ActivityFinished {
         request: RequestId,
     },
-    /// A request that ran locally advanced its cell's committed WAL to
-    /// `position`. Its response is withheld — the output gate — until that
-    /// position is replicated, so celld never acknowledges a write it could
-    /// still lose. Read-only requests emit [`Event::ActivityFinished`] instead
-    /// and pay no durability latency. The epoch is not carried: the core reads
-    /// it from the pinned cell's resident phase, which cannot change while the
-    /// request holds it.
-    Wrote {
+    /// An effect is ready to leave the process on `channel`, and it can reveal
+    /// this cell's state. The core withholds it until every write it can
+    /// reveal is proven durable. This is the output gate, and the whole of it:
+    /// every channel arrives here and the core does not branch on which.
+    ///
+    /// `position` is `Some` when the event that produced this output advanced
+    /// the cell's committed WAL to it — the output opens its own barrier and
+    /// waits for a proof that covers that position. `position` is `None` when
+    /// the event only read: the output trails the newest barrier already open
+    /// on the cell, because a reader can start after a write commits and
+    /// before its proof lands. Its own start and end positions therefore
+    /// decide nothing. A cell with nothing outstanding releases it at once,
+    /// so an ordinary read pays no durability latency.
+    ///
+    /// The epoch is not carried: the core reads it from the pinned cell's
+    /// resident phase, which cannot change while the request holds it.
+    Output {
         request: RequestId,
-        position: u64,
-    },
-    /// A read-only local response is ready. It can escape immediately only
-    /// when its cell has no outstanding write durability proof.
-    ReadOutput {
-        request: RequestId,
+        channel: Channel,
+        position: Option<u64>,
     },
     /// The shell finished proving a gated write durable. `Ok(position)` reports
     /// the committed-write position the replica has *actually* proved durable;
@@ -420,17 +524,17 @@ pub enum Event {
     /// a replicator that proves less than it was asked to cannot force an early
     /// ack. `Err` failed the proof outright.
     ///
-    /// `source` says which mechanism proved it, because the two carry
-    /// different ack fences (`CelldAckFence.tla`): a fleet proof is already
-    /// arbitrated — a takeover seals a follower before restoring, so a stale
-    /// owner's next ack-all fails closed — while a bucket proof needs C1's
-    /// ownership verification before anything is revealed.
+    /// `source` says which mechanism proved it, because the two carry different
+    /// acknowledgement fences. A fleet proof is already arbitrated: a takeover
+    /// seals a follower before restoring, so a stale owner's next ack-all fails
+    /// closed. A bucket proof needs ownership verification before anything
+    /// is revealed.
     DurableReached {
         op: OpId,
         result: Result<u64, Failure>,
         source: ProofSource,
     },
-    /// C1's answer: the ownership record still names this node at this epoch
+    /// The ownership record still names this node at this epoch
     /// (`Ok`), or does not, or could not be read.
     OwnershipVerified {
         op: OpId,
@@ -513,6 +617,12 @@ pub enum Event {
         op: OpId,
         result: Result<CasOutcome, Failure>,
     },
+    /// A released cell became authoritative on a successor. Its runtime can
+    /// still be warming when this event arrives.
+    SuccessorAdopted {
+        op: OpId,
+        result: Result<AdoptedCell, Failure>,
+    },
     RestoreCompleted {
         op: OpId,
         result: Result<RestoreOutcome, Failure>,
@@ -524,7 +634,24 @@ pub enum Event {
         /// empty a heap rather than scatter its cuts across every one. `None`
         /// when no runtime placed the cell.
         isolate: Option<crate::isolate::IsolateId>,
+        /// The application generation whose isolate took the cell. The shell
+        /// resolves the generation at placement, and a placement that
+        /// straddled an adoption lands on the previous one; the swap pump
+        /// compares this with the current generation. Zero means the cell
+        /// was never stamped, which the pump treats as stale.
+        generation: u64,
         result: Result<(), Failure>,
+    },
+    /// The node adopted a new application generation. Every resident cell on
+    /// an older generation moves to it at a safe point, or by force once
+    /// `max_age_ms` has passed since this event. A resident cell whose class
+    /// is in `eager_classes` — the engine's reserved classes, which hold no
+    /// application state worth waiting for — is forced at once.
+    GenerationChanged {
+        generation: u64,
+        now_mono_ms: u64,
+        max_age_ms: u64,
+        eager_classes: Vec<String>,
     },
     Published {
         op: OpId,
@@ -561,13 +688,11 @@ pub enum Event {
         epoch: Epoch,
     },
     NodeFenced,
-    /// The node is shutting down: hand every resident cell to a peer by
-    /// releasing its owner record, so a takeover is immediate rather than
-    /// waiting out the node lease. Unlike an on-demand evict this always
-    /// releases, whatever `ownership_on_evict` is set to. Releases run at
-    /// most `max_releases` at a time, and the pump takes the next resident
-    /// as each one completes -- a cell that is active when the drain begins
-    /// is picked up once its activity finishes.
+    /// The node is shutting down: release every resident cell and wait for a
+    /// successor to publish it. Unlike an on-demand evict this always
+    /// releases, whatever `ownership_on_evict` is set to. Complete handoffs
+    /// run at most `max_releases` at a time, and a cell that is active when
+    /// the drain begins is picked up once its activity finishes.
     ReleaseAll,
 }
 
@@ -683,6 +808,28 @@ pub enum Effect {
         cell: CellId,
         epoch: Epoch,
     },
+    /// Ask a compatible peer to acquire a cell whose owner record was just
+    /// released. The result acknowledges authority acquisition. Replica
+    /// restore and runtime publication continue outside the donor's shutdown
+    /// critical path.
+    AdoptReleased {
+        op: OpId,
+        cell: CellId,
+        released_epoch: Epoch,
+    },
+    /// Interrupt the activity which existed when a cell entered its shutdown
+    /// handoff batch. The shell maps core request IDs to handler/body aborts
+    /// and closes sockets with a restart status.
+    CancelCellActivity {
+        cell: CellId,
+        requests: Vec<RequestId>,
+        websockets: Vec<WebSocketId>,
+        /// A forced generation swap lists only the regular and outbound
+        /// sockets, and the cell stays on this node: its hibernatable sockets
+        /// and auto-response pair survive. A shutdown handoff lists every
+        /// socket and forgets the pair, because the cell is leaving.
+        keep_hibernatable: bool,
+    },
     Restore {
         op: OpId,
         cell: CellId,
@@ -715,7 +862,7 @@ pub enum Effect {
         epoch: Epoch,
         position: u64,
     },
-    /// C1 for bucket-proof acks: read `own.json` and answer whether it
+    /// For bucket-proof acknowledgements, read `own.json` and answer whether it
     /// still names this node at this epoch. The core holds the gated write
     /// until `Event::OwnershipVerified` returns. Fleet-proof acks never
     /// emit this — the ensemble seal is their fence.
@@ -740,12 +887,18 @@ pub enum Effect {
         request: RequestId,
         result: Result<Route, RequestError>,
     },
-    /// Release a withheld local write response now that its durability is
-    /// decided: `Ok` acknowledges the write, `Err` fails it. Emitted only for a
-    /// request the shell held open via [`Event::Wrote`] or
-    /// [`Event::ReadOutput`].
-    ReleaseResponse {
+    /// Release a withheld output now that the writes it can reveal are
+    /// decided: `Ok` lets it leave, `Err` refuses it. Emitted only for an
+    /// output the shell held open via [`Event::Output`].
+    ///
+    /// `channel` is the one the shell supplied, returned unchanged. It selects
+    /// which adapter holds this effect and is the only thing the shell needs
+    /// in order to route the release. No operation id rides along: the shell
+    /// never learns the one the core assigned, and `(request, channel)` is
+    /// unique by construction — `State::validate` enforces it.
+    Release {
         request: RequestId,
+        channel: Channel,
         result: Result<(), RequestError>,
     },
     /// Complete the synchronous resident-selection decision. `None` means
@@ -791,4 +944,10 @@ pub enum StopCause {
     /// divergence, not the failure. Stop, keep no local snapshot, and let the
     /// next activation restore from the bucket.
     Reset,
+    /// The cell moves to the current application generation. The runtime
+    /// leaves its isolate and is started again at the same epoch on an
+    /// isolate of the new generation: no ownership change, no restore, no
+    /// replication release. The stop reaches the shell as `Cleaning`, and the
+    /// core answers the stop with `StartRuntime` instead of a terminal phase.
+    Swap,
 }

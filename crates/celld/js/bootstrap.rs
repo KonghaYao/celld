@@ -95,8 +95,72 @@ pub(super) fn install_prelude(scope: &mut v8::PinScope) -> Result<()> {
 }
 
 pub(super) fn install_harness(scope: &mut v8::PinScope) -> Result<()> {
-    run_bootstrap_script(scope, "harness.js", include_str!("harness.js"))?;
-    run_bootstrap_script(scope, "crypto.js", include_str!("crypto.js"))
+    #[cfg(celld_internal_tests)]
+    let harness = include_str!("harness.js")
+        .replace(
+            "/*__CELLD_TEST_WORKFLOW_EVENT_CONSUMED__*/",
+            "__test_workflow_event_consumed();",
+        )
+        .replace(
+            "/*__CELLD_TEST_WORKFLOW_META_CREATED__*/",
+            "__test_workflow_meta_created();",
+        )
+        .replace(
+            "/*__CELLD_TEST_WORKFLOW_ALARM_DELETED__*/",
+            "__test_workflow_alarm_deleted();",
+        )
+        .replace(
+            "/*__CELLD_TEST_WORKFLOW_BEFORE_PAUSE_SETTLE__*/",
+            concat!(
+                "if (globalThis.__test_workflow_pause_settle_race === true) { ",
+                "await this.__wfResume(); ",
+                "globalThis.__test_workflow_pause_settle_race = false; }"
+            ),
+        )
+        .replace(
+            "/*__CELLD_TEST_WORKFLOW_AFTER_RUN_STARTED__*/",
+            concat!(
+                "if (globalThis.__test_workflow_pause_settle_race === true) { ",
+                "await globalThis.__test_workflow_callback_started(); ",
+                "await this.__wfPause(); globalThis.__test_workflow_release(); }"
+            ),
+        );
+    #[cfg(celld_internal_tests)]
+    let harness = harness.as_str();
+    #[cfg(not(celld_internal_tests))]
+    let harness = include_str!("harness.js");
+    run_bootstrap_script(scope, "harness.js", harness)?;
+    run_bootstrap_script(scope, "crypto.js", include_str!("crypto.js"))?;
+    // Resolving the event hooks belongs to installing the harness, not to the
+    // first event: the harness is what defines them, and a caller that
+    // installed the harness without them would silently fall back to nothing
+    // at all. `harness.js` has just run, so all three globals exist here.
+    install_event_hooks(scope)
+}
+
+/// Resolve the per-event harness hooks once and hold them for the isolate.
+/// See [`EventHooks`] for why all three resolve together.
+fn install_event_hooks(scope: &mut v8::PinScope) -> Result<()> {
+    let hooks = EventHooks {
+        begin_event: global_function(scope, "__beginEvent")?,
+        end_event: global_function(scope, "__endEvent")?,
+        abort_incoming_request: global_function(scope, "__abortIncomingRequest")?,
+    };
+    actor_runtime_state(scope)
+        .event_hooks
+        .set(hooks)
+        .map_err(|_| anyhow!("event hooks were already installed"))
+}
+
+fn global_function(scope: &mut v8::PinScope, name: &str) -> Result<v8::Global<v8::Function>> {
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, name).unwrap();
+    let function: v8::Local<v8::Function> = global
+        .get(scope, key.into())
+        .ok_or_else(|| anyhow!("no {name}"))?
+        .try_into()
+        .map_err(|_| anyhow!("{name} is not a function"))?;
+    Ok(v8::Global::new(scope, function))
 }
 
 pub(super) fn register_class(
@@ -106,7 +170,7 @@ pub(super) fn register_class(
 ) -> Result<()> {
     let ctx = scope.get_current_context();
     let global = ctx.global(scope);
-    let ck = v8::String::new(scope, "__cell").unwrap();
+    let ck = static_key(scope, &v8_strings::CELL);
     let cell = global
         .get(scope, ck.into())
         .unwrap()
@@ -142,8 +206,9 @@ pub(super) fn populate_cf_exports(
         .get(scope, v8::String::new(scope, "exports").unwrap().into())
         .and_then(|value| value.to_object(scope))
         .ok_or_else(|| anyhow!("missing __cf.exports"))?;
+    let cell_key = static_key(scope, &v8_strings::CELL);
     let cell = global
-        .get(scope, v8::String::new(scope, "__cell").unwrap().into())
+        .get(scope, cell_key.into())
         .and_then(|value| value.to_object(scope))
         .ok_or_else(|| anyhow!("missing __cell runtime state"))?;
     let make_ns: v8::Local<v8::Function> = cell
@@ -185,7 +250,7 @@ pub(super) fn inject_namespace_keys(
 ) -> Result<()> {
     let context = scope.get_current_context();
     let global = context.global(scope);
-    let cell_key = v8::String::new(scope, "__cell").unwrap();
+    let cell_key = static_key(scope, &v8_strings::CELL);
     let cell = global
         .get(scope, cell_key.into())
         .and_then(|value| value.to_object(scope))
@@ -220,8 +285,9 @@ pub(super) fn inject_namespace_keys(
 pub(super) fn inject_crons(scope: &mut v8::PinScope, crons: &[String]) -> Result<()> {
     let context = scope.get_current_context();
     let global = context.global(scope);
+    let cell_key = static_key(scope, &v8_strings::CELL);
     let cell = global
-        .get(scope, v8::String::new(scope, "__cell").unwrap().into())
+        .get(scope, cell_key.into())
         .and_then(|value| value.to_object(scope))
         .ok_or_else(|| anyhow!("missing __cell runtime state"))?;
     let list = v8::Array::new(scope, crons.len() as i32);
@@ -231,6 +297,183 @@ pub(super) fn inject_crons(scope: &mut v8::PinScope, crons: &[String]) -> Result
     }
     let key = v8::String::new(scope, "crons").unwrap();
     cell.set(scope, key.into(), list.into());
+    Ok(())
+}
+
+/// `__cell.workflows`: the deployment's workflow-name → class-name map. The
+/// reserved workflow cell resolves the user class from it at each replay, so
+/// a redeploy that renames the class takes effect on the next activation and
+/// nothing about a running instance's ledger has to move.
+pub(super) fn inject_workflows(
+    scope: &mut v8::PinScope,
+    script_name: &str,
+    workflow_bindings: &[WorkflowBinding],
+) -> Result<()> {
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let cell = global
+        .get(scope, v8::String::new(scope, "__cell").unwrap().into())
+        .and_then(|value| value.to_object(scope))
+        .ok_or_else(|| anyhow!("missing __cell runtime state"))?;
+    let map = v8::Object::new(scope);
+    for binding in workflow_bindings {
+        let key =
+            v8::String::new(scope, &binding.workflow).ok_or_else(|| anyhow!("workflow name"))?;
+        let value =
+            v8::String::new(scope, &binding.class).ok_or_else(|| anyhow!("workflow class"))?;
+        map.set(scope, key.into(), value.into());
+    }
+    let key = v8::String::new(scope, "workflows").unwrap();
+    cell.set(scope, key.into(), map.into());
+    // Only when the deployment declares a workflow. The harness registers
+    // `__WorkflowCell` in every isolate, so aliasing unconditionally would put
+    // a class in the registry that this deployment never declared. It would be
+    // inert -- `cell_configs` is built from the manifest's `do_classes` and
+    // would not name it -- but "the harness registers what the deployment
+    // declares" is worth keeping true rather than nearly true.
+    if !workflow_bindings.is_empty() {
+        alias_workflow_class(scope, cell, script_name)?;
+    }
+    Ok(())
+}
+
+/// Register the workflow cell class under its script-scoped name.
+///
+/// `harness.js` registers `__WorkflowCell` under the bare `__Workflow` at
+/// install time, which is before `__cell.script` exists, so the script-scoped
+/// name cannot be built there. This copies the registration across once the
+/// script is known.
+///
+/// The bare entry stays behind and is inert: `cell_configs` is built from the
+/// manifest's `do_classes`, which carries only the scoped name, so no cell can
+/// start under it. Removing it would buy nothing and would leave the harness
+/// and this function disagreeing about who owns the registration. Done through the V8 object API rather than a compiled
+/// snippet, because this runs on every isolate load and a `Script::compile`
+/// here cost ~100us per worker.
+fn alias_workflow_class(
+    scope: &mut v8::PinScope,
+    cell: v8::Local<v8::Object>,
+    script_name: &str,
+) -> Result<()> {
+    let alias = crate::deploy::workflow_class(script_name);
+    let alias = v8::String::new(scope, &alias).ok_or_else(|| anyhow!("workflow class name"))?;
+    let base = v8::String::new(scope, crate::deploy::WORKFLOW_CLASS).unwrap();
+    for registry in ["classes", "doExports"] {
+        let key = v8::String::new(scope, registry).unwrap();
+        let table = cell
+            .get(scope, key.into())
+            .and_then(|value| value.to_object(scope))
+            .ok_or_else(|| anyhow!("missing __cell.{registry}"))?;
+        let value = table
+            .get(scope, base.into())
+            .ok_or_else(|| anyhow!("harness registered no {registry} entry for a workflow"))?;
+        table.set(scope, alias.into(), value);
+    }
+    Ok(())
+}
+
+/// `__cell.kvLimits`: every bound `celld_logic::kv` declares, as data.
+///
+/// Injected rather than written in `harness.js` so the binding, `celld kv` and
+/// deploy-time validation cannot disagree about what a valid key is. No host
+/// op: a limit is data rather than a decision, so shipping the values is
+/// enough, and D1 set the bar at one op with Workflows coming in under it.
+///
+/// Built through the V8 object API rather than by compiling a snippet, because
+/// this runs on every isolate load.
+pub(super) fn inject_kv_limits(scope: &mut v8::PinScope) -> Result<()> {
+    use celld_logic::kv;
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let cell = global
+        .get(scope, v8::String::new(scope, "__cell").unwrap().into())
+        .and_then(|value| value.to_object(scope))
+        .ok_or_else(|| anyhow!("missing __cell runtime state"))?;
+    let limits = v8::Object::new(scope);
+    let set = |scope: &mut v8::PinScope, name: &str, value: f64| {
+        let key = v8::String::new(scope, name).unwrap();
+        let value = v8::Number::new(scope, value);
+        limits.set(scope, key.into(), value.into());
+    };
+    set(scope, "maxKeyBytes", kv::MAX_KEY_BYTES as f64);
+    set(scope, "maxValueBytes", kv::MAX_VALUE_BYTES as f64);
+    set(
+        scope,
+        "maxInlineValueBytes",
+        kv::MAX_INLINE_VALUE_BYTES as f64,
+    );
+    set(scope, "maxMetadataBytes", kv::MAX_METADATA_BYTES as f64);
+    set(scope, "maxBulkKeys", kv::MAX_BULK_KEYS as f64);
+    set(scope, "maxListLimit", kv::MAX_LIST_LIMIT as f64);
+    set(
+        scope,
+        "sweepBatchRows",
+        celld_logic::sweep::BATCH_ROWS as f64,
+    );
+    // One variable for every KV test knob, not one variable each.
+    //
+    //   CELLD_TEST_KV=no-sweep,fail-after-blob,min-ttl-ms=1000
+    //
+    // These are test-only and they read the production environment rather than
+    // sitting behind `cfg(celld_internal_tests)`, because the code they steer
+    // is JavaScript in the harness and a cfg cannot reach it.
+    // `CELLD_TEST_OTEL_SWEEP_MS` is the existing precedent for a
+    // controlled-timing override living in production code. Collapsing them
+    // into one name keeps that surface at a single documented variable however
+    // many knobs the feature grows, rather than a new `CELLD_TEST_KV_*` for
+    // each -- which is what this had already become.
+    //
+    // What each is for, and why a test cannot do without it:
+    //
+    // - `min-ttl-ms` shortens upstream's sixty-second expiry floor, because a
+    //   test cannot wait out a minute of wall clock. Nothing else about the
+    //   deadline arithmetic changes.
+    // - `no-sweep` stops reclamation, so a test that means to pin the *read
+    //   filter* can show the filter hid an expired key rather than the sweep
+    //   having deleted the row underneath it. The first expiry test passed
+    //   with the filter deleted until this existed.
+    // - `fail-after-blob` fails a put between the blob write and the row
+    //   commit. That window is one await wide, and a SIGKILL there would take
+    //   the assertion with it.
+    // - `race-sweep-put` holds a blob sweep after its mark snapshot until a
+    //   new large put starts. The put and the sweep then overlap, so a test
+    //   proves that collection authority is serialized with the put protocol.
+    // - `blob-sweep-ms` shortens the durable collector delay. A crash-orphan
+    //   test must observe the wake without waiting one production minute.
+    // - `legacy-schema` creates the inline-only table from the first KV
+    //   release, so the migration test proves an existing row survives.
+    let knobs = std::env::var("CELLD_TEST_KV").unwrap_or_default();
+    let knob = |name: &str| -> Option<String> {
+        knobs.split(',').map(str::trim).find_map(|entry| {
+            let rest = entry.strip_prefix(name)?;
+            match rest {
+                "" => Some(String::new()),
+                rest => rest.strip_prefix('=').map(str::to_string),
+            }
+        })
+    };
+    let min_ttl = knob("min-ttl-ms")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(kv::MIN_EXPIRATION_TTL_MS);
+    set(scope, "minExpirationTtlMs", min_ttl as f64);
+    let blob_sweep_ms = knob("blob-sweep-ms")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(60_000);
+    set(scope, "blobSweepMs", blob_sweep_ms as f64);
+    for (name, present) in [
+        ("sweepDisabled", knob("no-sweep").is_some()),
+        ("failAfterBlobWrite", knob("fail-after-blob").is_some()),
+        ("raceSweepPut", knob("race-sweep-put").is_some()),
+        ("legacySchema", knob("legacy-schema").is_some()),
+    ] {
+        let key = v8::String::new(scope, name).unwrap();
+        let value = v8::Boolean::new(scope, present);
+        limits.set(scope, key.into(), value.into());
+    }
+    let key = v8::String::new(scope, "kvLimits").unwrap();
+    cell.set(scope, key.into(), limits.into());
     Ok(())
 }
 
@@ -280,6 +523,9 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
     let bindings = config.bindings.as_slice();
     let r2_bindings = config.r2_bindings.as_slice();
     let d1_bindings = config.d1_bindings.as_slice();
+    let kv_bindings = config.kv_bindings.as_slice();
+    let queue_bindings = config.queue_bindings.as_slice();
+    let workflow_bindings = config.workflow_bindings.as_slice();
     let ai_binding = config.ai_binding.as_deref();
     let vars = config.vars.as_slice();
     let services = config.services.as_slice();
@@ -293,13 +539,46 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 bname, cname
             ));
         }
-        for name in r2_bindings {
-            lines.push_str(&format!("e[{:?}] = __makeR2Bucket({:?});\n", name, name));
+        for (name, bucket) in r2_bindings {
+            lines.push_str(&format!(
+                "e[{:?}] = __makeR2Bucket({:?}, {:?});\n",
+                name, name, bucket
+            ));
+        }
+        for (binding, id) in kv_bindings {
+            // The cell name comes from `celld_logic::kv::cell_name`, never from
+            // the harness. It carries the shard, and while there is one shard
+            // that is a constant the binding must not be trusted to reproduce:
+            // the name is hashed into the cell scope, so a formatting
+            // disagreement would silently address a second, empty namespace
+            // rather than fail. When shards outnumber one, this becomes a name
+            // per shard and the choice moves here too.
+            lines.push_str(&format!(
+                "e[{:?}] = __makeKvNamespace({:?}, {:?});\n",
+                binding,
+                id,
+                celld_logic::kv::cell_name(id, 0),
+            ));
+        }
+        for binding in queue_bindings {
+            lines.push_str(&format!(
+                "e[{:?}] = __makeQueue({:?}, {:?}, {});\n",
+                binding.environment,
+                binding.queue,
+                celld_logic::queue::cell_name(&binding.queue),
+                binding.delivery_delay,
+            ));
         }
         for (name, database) in d1_bindings {
             lines.push_str(&format!(
                 "e[{:?}] = __makeD1Database({:?});\n",
                 name, database
+            ));
+        }
+        for binding in workflow_bindings {
+            lines.push_str(&format!(
+                "e[{:?}] = __makeWorkflow({:?});\n",
+                binding.environment, binding.workflow
             ));
         }
         if let (Some(name), Ok(url)) = (ai_binding, std::env::var("CELLD_AI_URL")) {
@@ -341,6 +620,199 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
     Ok(())
 }
 
+#[cfg(celld_internal_tests)]
+thread_local! {
+    static QUEUE_LEASE_DURATION_FOR_TEST: std::cell::Cell<Option<i64>> = const {
+        std::cell::Cell::new(None)
+    };
+    static QUEUE_BATCH_TIMEOUT_FOR_TEST: std::cell::Cell<Option<i64>> = const {
+        std::cell::Cell::new(None)
+    };
+    static QUEUE_RETENTION_FOR_TEST: std::cell::Cell<Option<i64>> = const {
+        std::cell::Cell::new(None)
+    };
+    static QUEUE_SWEEP_BATCH_FOR_TEST: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Measure lease expiry without waiting through the production handler budget.
+/// The override is thread-local because the private runtime corpus builds
+/// unrelated Workers in parallel, and a process environment variable would
+/// silently shorten their leases too.
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn set_queue_lease_duration_for_test(duration: Option<i64>) {
+    QUEUE_LEASE_DURATION_FOR_TEST.set(duration);
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn set_queue_batch_timeout_for_test(duration: Option<i64>) {
+    QUEUE_BATCH_TIMEOUT_FOR_TEST.set(duration);
+}
+
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn set_queue_retention_for_test(duration: Option<i64>) {
+    QUEUE_RETENTION_FOR_TEST.set(duration);
+}
+
+#[cfg(celld_internal_tests)]
+pub fn set_queue_sweep_batch_for_test(rows: Option<usize>) {
+    QUEUE_SWEEP_BATCH_FOR_TEST.set(rows);
+}
+
+#[cfg(celld_internal_tests)]
+fn effective_queue_lease_duration(duration: i64) -> i64 {
+    QUEUE_LEASE_DURATION_FOR_TEST.get().unwrap_or(duration)
+}
+
+#[cfg(not(celld_internal_tests))]
+fn effective_queue_lease_duration(duration: i64) -> i64 {
+    duration
+}
+
+#[cfg(celld_internal_tests)]
+fn effective_queue_batch_timeout(duration: i64) -> i64 {
+    if duration == 0 {
+        0
+    } else {
+        QUEUE_BATCH_TIMEOUT_FOR_TEST.get().unwrap_or(duration)
+    }
+}
+
+#[cfg(celld_internal_tests)]
+fn effective_queue_retention(duration: i64) -> i64 {
+    QUEUE_RETENTION_FOR_TEST.get().unwrap_or(duration)
+}
+
+#[cfg(not(celld_internal_tests))]
+fn effective_queue_retention(duration: i64) -> i64 {
+    duration
+}
+
+#[cfg(celld_internal_tests)]
+fn effective_queue_sweep_batch(rows: usize) -> usize {
+    QUEUE_SWEEP_BATCH_FOR_TEST.get().unwrap_or(rows)
+}
+
+#[cfg(not(celld_internal_tests))]
+fn effective_queue_sweep_batch(rows: usize) -> usize {
+    rows
+}
+
+#[cfg(not(celld_internal_tests))]
+fn effective_queue_batch_timeout(duration: i64) -> i64 {
+    duration
+}
+
+/// Install the deployment-wide Queue consumer catalog and lease budget.
+///
+/// Every co-hosted config gets the same catalog before an isolate starts, so a
+/// shared `__Queue` class cannot dispatch according to whichever producer
+/// registered the class first.
+pub(super) fn inject_queue_config(scope: &mut v8::PinScope, config: &WorkerConfig) -> Result<()> {
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let cell = global
+        .get(scope, v8::String::new(scope, "__cell").unwrap().into())
+        .and_then(|value| value.to_object(scope))
+        .ok_or_else(|| anyhow!("missing __cell runtime state"))?;
+    let consumers = v8::Object::new(scope);
+    for registration in &config.queue_consumers {
+        let value = v8::Object::new(scope);
+        let set_string = |scope: &mut v8::PinScope, name: &str, text: &str| {
+            let key = v8::String::new(scope, name).unwrap();
+            let text = v8::String::new(scope, text).unwrap();
+            value.set(scope, key.into(), text.into());
+        };
+        let set_number = |scope: &mut v8::PinScope, name: &str, number: f64| {
+            let key = v8::String::new(scope, name).unwrap();
+            let number = v8::Number::new(scope, number);
+            value.set(scope, key.into(), number.into());
+        };
+        let config = &registration.config;
+        set_string(scope, "script", &registration.script);
+        set_number(scope, "maxBatchSize", f64::from(config.max_batch_size));
+        set_number(
+            scope,
+            "maxBatchTimeoutMs",
+            effective_queue_batch_timeout(i64::from(config.max_batch_timeout) * 1000) as f64,
+        );
+        set_number(scope, "maxRetries", f64::from(config.max_retries));
+        if let Some(dead_letter_queue) = &config.dead_letter_queue {
+            set_string(scope, "deadLetterQueue", dead_letter_queue);
+        }
+        if let Some(max_concurrency) = config.max_concurrency {
+            set_number(scope, "maxConcurrency", f64::from(max_concurrency));
+        }
+        if let Some(retry_delay) = config.retry_delay {
+            set_number(scope, "retryDelaySeconds", f64::from(retry_delay));
+        }
+        let key = v8::String::new(scope, &config.queue).unwrap();
+        consumers.set(scope, key.into(), value.into());
+    }
+    let key = v8::String::new(scope, "queueConsumers").unwrap();
+    cell.set(scope, key.into(), consumers.into());
+
+    let admission = crate::runtime::admission_wait()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    let handler = super::handler_budget().as_millis().min(i64::MAX as u128) as i64;
+    let settlement = i64::try_from(crate::actor::operation_deadline_ms()?).unwrap_or(i64::MAX);
+    let duration = effective_queue_lease_duration(celld_logic::queue::lease_duration_ms(
+        admission, handler, settlement,
+    ));
+    let key = v8::String::new(scope, "queueLeaseDurationMs").unwrap();
+    let duration = v8::Number::new(scope, duration as f64);
+    cell.set(scope, key.into(), duration.into());
+    let limits = v8::Object::new(scope);
+    let set_limit = |scope: &mut v8::PinScope, name: &str, number: f64| {
+        let key = v8::String::new(scope, name).unwrap();
+        let number = v8::Number::new(scope, number);
+        limits.set(scope, key.into(), number.into());
+    };
+    set_limit(
+        scope,
+        "maxMessageBytes",
+        celld_logic::queue::MAX_MESSAGE_BYTES as f64,
+    );
+    set_limit(
+        scope,
+        "maxBatchBytes",
+        celld_logic::queue::MAX_SEND_BATCH_BYTES as f64,
+    );
+    set_limit(
+        scope,
+        "maxBatchMessages",
+        celld_logic::queue::MAX_BATCH_MESSAGES as f64,
+    );
+    set_limit(
+        scope,
+        "maxConcurrency",
+        celld_logic::queue::MAX_CONCURRENCY as f64,
+    );
+    set_limit(
+        scope,
+        "maxDelaySeconds",
+        celld_logic::queue::MAX_DELAY_SECONDS as f64,
+    );
+    set_limit(
+        scope,
+        "retentionMs",
+        effective_queue_retention(celld_logic::queue::RETENTION_MS) as f64,
+    );
+    set_limit(
+        scope,
+        "sweepBatchRows",
+        effective_queue_sweep_batch(celld_logic::sweep::BATCH_ROWS) as f64,
+    );
+    let key = v8::String::new(scope, "queueLimits").unwrap();
+    cell.set(scope, key.into(), limits.into());
+    Ok(())
+}
+
 /// Record every exported class deriving from `WorkerEntrypoint` in
 /// `__cell.entrypoints`, so a service binding with `entrypoint = "Name"` can
 /// resolve it, and every export deriving from `DurableObject` in
@@ -353,7 +825,7 @@ pub(super) fn register_entrypoints(
 ) -> Result<()> {
     let context = scope.get_current_context();
     let global = context.global(scope);
-    let cell_key = v8::String::new(scope, "__cell").unwrap();
+    let cell_key = static_key(scope, &v8_strings::CELL);
     let cell = global
         .get(scope, cell_key.into())
         .and_then(|value| value.to_object(scope))
@@ -419,6 +891,51 @@ pub(super) fn register_entrypoints(
     Ok(())
 }
 
+/// Validate the deployment's workflow classes at load: each configured
+/// `class_name` must be a module export that extends `WorkflowEntrypoint`
+/// from `cloudflare:workers`, so a wrong class fails the load loudly,
+/// exactly as a Durable Object export does. The per-replay resolution off
+/// `__cell.workflows` and `__cf.exports` is unchanged; this checks the same
+/// names once, up front, instead of erroring the first instance at run time.
+pub(super) fn validate_workflow_classes(
+    scope: &mut v8::PinScope,
+    ns: v8::Local<v8::Object>,
+    workflow_bindings: &[WorkflowBinding],
+) -> Result<()> {
+    if workflow_bindings.is_empty() {
+        return Ok(());
+    }
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let cf_key = v8::String::new(scope, "__cf").unwrap();
+    let cf = global
+        .get(scope, cf_key.into())
+        .and_then(|value| value.to_object(scope))
+        .ok_or_else(|| anyhow!("missing __cf"))?;
+    let key = v8::String::new(scope, "WorkflowEntrypoint").unwrap();
+    let base = cf
+        .get(scope, key.into())
+        .ok_or_else(|| anyhow!("missing WorkflowEntrypoint base"))?;
+    let extends = compile_fn(scope, EXTENDS_SRC)?;
+    for binding in workflow_bindings {
+        let class_name = binding.class.as_str();
+        let key = v8::String::new(scope, class_name).unwrap();
+        let class = ns
+            .get(scope, key.into())
+            .filter(|value| !value.is_undefined())
+            .ok_or_else(|| {
+                anyhow!("workflow class {class_name} is not exported by the Worker module")
+            })?;
+        if !class.is_function() || !call_extends(scope, extends, class, base)? {
+            anyhow::bail!(
+                "workflow class {class_name} must extend WorkflowEntrypoint \
+                 from cloudflare:workers"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `(cls, base) => base is on cls's prototype chain`, via Reflect so Proxy
 /// wrappers report the prototype their handler exposes. A getPrototypeOf trap
 /// also makes the chain user-controlled (a cycle, or a fresh Proxy per hop,
@@ -451,53 +968,50 @@ fn call_extends(
     }
 }
 
-/// Mark which cell scopes are local to this node and record the node id. Every
-/// other scope routes cross-node via `__do_call`.
-pub(super) fn inject_routing(scope: &mut v8::PinScope, owned: &[String], node: &str) -> Result<()> {
-    let mut src = format!("(() => {{ __cell.node = {node:?};\n");
-    for s in owned {
-        src.push_str(&format!("__cell.owned[{s:?}] = true;\n"));
-    }
-    src.push_str("})();");
+/// Record the node id. Every cell scope routes through the host, whichever node
+/// owns it.
+pub(super) fn inject_routing(scope: &mut v8::PinScope, node: &str) -> Result<()> {
+    let src = format!("(() => {{ __cell.node = {node:?}; }})();");
     let code = v8::String::new(scope, &src).unwrap();
     let s = v8::Script::compile(scope, code, None).ok_or_else(|| anyhow!("routing compile"))?;
     s.run(scope).ok_or_else(|| anyhow!("routing run"))?;
     Ok(())
 }
 
-/// Amend `inject_routing` for one cell, release its instance, and restore its
-/// id name.
+/// Release a cell's instance and restore its id name.
 ///
-/// The isolate-side half of taking a cell in or giving it back. Kept beside
-/// `inject_routing` because it edits the table that function builds.
+/// The isolate-side half of taking a cell in or giving it back: taking it opens
+/// the cell's storage, giving it back releases what the isolate holds and closes
+/// the database, so state cannot span two epochs.
 pub(super) fn adopt_cell(
     tc: &mut v8::PinScope,
     cell: &str,
-    db_path: Option<&str>,
-    owned: bool,
+    cell_storage: Option<CellStorage<'_>>,
     compat: Compat,
 ) -> Result<Option<i64>> {
-    if owned {
-        if let Some(path) = db_path {
-            storage::open_with_compat(cell, path, compat.sqlite_vec)
-                .context("cell storage open failed")?;
-        }
+    let owned = cell_storage.is_some();
+    if let Some(cell_storage) = cell_storage {
+        storage::open_at_epoch(
+            cell,
+            cell_storage.path,
+            cell_storage.epoch,
+            compat.sqlite_vec,
+        )
+        .context("cell storage open failed")?;
     }
-    // NOT marked local, deliberately. `__cell.owned[scope]` turns a cell
-    // dispatch into an in-isolate call, and with one cell per isolate the
-    // only reachable case was a cell calling itself. Now that cells share an
-    // isolate the same flag makes A->B run B's handler *nested inside* A's,
-    // and a cycle back to A nests again on one thread — which times out
-    // (`actor lab self and cycle paths`).
+    // Every cell dispatch goes out through the host and arrives as an ordinary
+    // reentrant `CellJob::Fetch`. There is no same-isolate shortcut, and there
+    // will not be one.
     //
-    // So every cell dispatch goes back out through the host and arrives as
-    // an ordinary reentrant `CellJob::Fetch`, which the run loop already
-    // supports. That costs a round trip and is the behaviour cells had
-    // before they shared isolates. Re-enabling the fast path needs the
-    // target checked against what is already on the stack; correctness
-    // first.
+    // A dispatch that ran the callee's handler inside the caller's execution
+    // would skip the callee's IoContext, its input gate, and its request
+    // accounting: a `blockConcurrencyWhile` held by the callee would not hold
+    // off such a call. That is a different semantic, not an optimisation. The
+    // nesting deadlock that first disabled the shortcut -- A calls B, B calls
+    // back into A, and the stack never unwinds -- was the symptom of crossing
+    // that boundary rather than the reason to avoid it.
     //
-    // The script also releases everything the isolate holds for this cell's
+    // The script releases everything the isolate holds for this cell's
     // residency, on both edges: the give-back frees what the application left
     // behind — memory the node cannot shed, because the cell has left
     // residency — and the take-in stops state spanning two epochs, which
@@ -508,11 +1022,7 @@ pub(super) fn adopt_cell(
     // The release loses nothing the cell needs back: `register_actor_name`
     // persists the id name before writing it here, so the take-in below reads
     // it back.
-    let source = format!(
-        "(() => {{ const s = {cell:?}; \
-         delete __cell.owned[s]; \
-         __cell.release(s); }})();"
-    );
+    let source = format!("(() => {{ const s = {cell:?}; __cell.release(s); }})();");
     let code = v8::String::new(tc, &source).unwrap();
     let script = v8::Script::compile(tc, code, None).ok_or_else(|| anyhow!("adopt compile"))?;
     script.run(tc).ok_or_else(|| anyhow!("adopt run"))?;
@@ -530,11 +1040,13 @@ pub(super) fn inject_storage_compatibility(scope: &mut v8::PinScope, compat: Com
         "__cell.deleteAllDeletesAlarm = {};\n\
          __cell.compat.jsRpc = {};\n\
          __cell.compat.fetcherGetPutDelete = {};\n\
-         __cell.compat.websocketStandardBinaryType = {};",
+         __cell.compat.websocketStandardBinaryType = {};\n\
+         __cell.compat.queueJsonMessages = {};",
         compat.delete_all_deletes_alarm,
         compat.js_rpc,
         compat.fetcher_get_put_delete,
         compat.websocket_standard_binary_type,
+        compat.queue_json_messages,
     );
     let code = v8::String::new(scope, &source).unwrap();
     let script =
@@ -545,31 +1057,33 @@ pub(super) fn inject_storage_compatibility(scope: &mut v8::PinScope, compat: Com
     Ok(())
 }
 
+/// `__cell.env`, the bindings object every handler receives as its second
+/// argument.
+///
+/// This runs per request, so both keys come from the constant table. The
+/// *value* stays a live lookup: unlike the event hooks, `env` is an ordinary
+/// data property that a worker's own code can replace, and holding the object
+/// this returns would make the host ignore that. The saving there is one
+/// property read, so the correctness question decides it.
 pub(super) fn harness_env<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>> {
     let ctx = scope.get_current_context();
     let global = ctx.global(scope);
-    let ck = v8::String::new(scope, "__cell").unwrap();
+    let ck = static_key(scope, &v8_strings::CELL);
     let cell = global
         .get(scope, ck.into())
         .unwrap()
         .to_object(scope)
         .unwrap();
-    let ek = v8::String::new(scope, "env").unwrap();
+    let ek = static_key(scope, &v8_strings::ENV);
     Ok(cell.get(scope, ek.into()).unwrap())
 }
 
 pub(super) fn begin_event_context<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>> {
-    let global = scope.get_current_context().global(scope);
-    let key = v8::String::new(scope, "__beginEvent").unwrap();
-    let function: v8::Local<v8::Function> = global
-        .get(scope, key.into())
-        .ok_or_else(|| anyhow!("no __beginEvent"))?
-        .try_into()
-        .map_err(|_| anyhow!("__beginEvent is not a function"))?;
+    let function = event_hook(scope, |hooks| &hooks.begin_event)?;
     let recv = v8::undefined(scope).into();
     function
         .call(scope, recv, &[])
@@ -579,13 +1093,7 @@ pub(super) fn begin_event_context<'s>(
 pub(super) fn end_event_context<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<Option<v8::Local<'s, v8::Promise>>> {
-    let global = scope.get_current_context().global(scope);
-    let key = v8::String::new(scope, "__endEvent").unwrap();
-    let function: v8::Local<v8::Function> = global
-        .get(scope, key.into())
-        .ok_or_else(|| anyhow!("no __endEvent"))?
-        .try_into()
-        .map_err(|_| anyhow!("__endEvent is not a function"))?;
+    let function = event_hook(scope, |hooks| &hooks.end_event)?;
     let recv = v8::undefined(scope).into();
     let value = function
         .call(scope, recv, &[])

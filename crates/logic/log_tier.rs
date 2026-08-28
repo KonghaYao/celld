@@ -309,7 +309,7 @@ pub fn may_reconfigure(batch_in_flight: bool, all_shipped_covered: bool) -> bool
 /// and the covered watermark that rides the next append as the followers'
 /// `truncate_to`. Sequences restart with the epoch, so the ledger resets
 /// with it — a covered watermark surviving an epoch swap instructs fresh
-/// followers to delete entries they just fsync'd (review P0 #1). `Batch`
+/// followers to delete entries they just fsync'd. `Batch`
 /// is whatever the executor needs to decide coverage; the ledger decides
 /// only ordering, the watermark, and the reset.
 #[derive(Debug)]
@@ -362,4 +362,45 @@ impl<Batch> ShipLedger<Batch> {
     pub fn covered_seq(&self) -> Offset {
         self.covered_seq
     }
+}
+
+/// Why a node that wants the fleet posture is not serving fleet
+/// acknowledgements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shortfall {
+    /// No live peer exists. An ordinary single-node fleet: the write waits
+    /// for the bucket because there is nobody to replicate to.
+    NoPeer,
+    /// Live peers exist and none can be recruited. An operator can act on
+    /// this; a single-node fleet is not a fault.
+    NoEligiblePeer,
+}
+
+/// Should the node report its fleet shortfall now?
+///
+/// `maintain` runs on a ticker and returns as soon as it finds no member to
+/// recruit, so a fleet that never formed an ensemble reported nothing at all:
+/// `log ensemble degraded` fires only when an ensemble that existed was lost.
+/// A single-node fleet therefore ran the default fleet posture on bucket
+/// acknowledgements forever, with no line explaining the latency or naming
+/// the fix. Legible failure is the point; silence is the defect.
+///
+/// The interval bounds the repetition, and `last_ms` of `None` reports at
+/// once so the first tick after a start says what the node is doing.
+pub fn fleet_shortfall(
+    live_peers: usize,
+    now_ms: u64,
+    last_ms: Option<u64>,
+    interval_ms: u64,
+) -> Option<Shortfall> {
+    if let Some(last) = last_ms {
+        if now_ms.saturating_sub(last) < interval_ms {
+            return None;
+        }
+    }
+    Some(if live_peers == 0 {
+        Shortfall::NoPeer
+    } else {
+        Shortfall::NoEligiblePeer
+    })
 }

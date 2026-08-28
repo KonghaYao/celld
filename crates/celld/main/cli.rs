@@ -5,7 +5,7 @@
 //!
 //! Parsing answers one question — which `Action` to take — and refuses
 //! anything ambiguous rather than guessing. The help text is the public
-//! description of the configuration surface, so a test asserts on it.
+//! description of the configuration surface and remains stable across builds.
 pub(crate) struct Settings {
     pub(crate) control_plane: bool,
     pub(crate) bucket: Option<String>,
@@ -23,6 +23,9 @@ pub(crate) struct Settings {
     /// serves. On by default, because a store that accepts the
     /// precondition and ignores it makes the node self-fence in a loop.
     pub(crate) storage_probe: bool,
+    /// Set only by the `celld dev` supervisor for its child node. No fleet
+    /// flag or public environment variable selects the local backend.
+    pub(crate) dev_store: Option<std::path::PathBuf>,
 }
 
 pub(crate) enum Action {
@@ -33,9 +36,15 @@ pub(crate) enum Action {
         /// Skip the write probe, for an operator who diagnoses with a
         /// credential that cannot write.
         read_only: bool,
+        /// Print one JSON object per check instead of a text verdict line.
+        json: bool,
     },
     Deploy(Vec<String>),
+    Dev(Vec<String>),
+    Cell(Vec<String>),
     D1(Vec<String>),
+    Kv(Vec<String>),
+    Queue(Vec<String>),
     Connect(Vec<String>),
     Credentials(Vec<String>),
     Token(Vec<String>),
@@ -44,13 +53,34 @@ pub(crate) enum Action {
     Version,
 }
 
+impl Action {
+    /// Whether this invocation's stdout carries data rather than a log stream.
+    ///
+    /// A node's stdout *is* its log, and Docker and journald read it. A CLI
+    /// subcommand's stdout is its answer: `celld kv get KEY > value` must write
+    /// the value and nothing else, and `celld d1 execute` prints JSON a script
+    /// parses. Sharing one stream between the two prefixes an operator's data
+    /// with whatever the process happened to warn about at startup, which is
+    /// how this was found -- an allocator warning landed in front of a value.
+    pub(crate) fn stdout_is_data(&self) -> bool {
+        !matches!(
+            self,
+            Self::Run(_) | Self::Dev(_) | Self::Help | Self::Version
+        )
+    }
+}
+
 pub(crate) fn action_from_process() -> anyhow::Result<Action> {
     let mut arguments = std::env::args().skip(1).collect::<Vec<_>>();
     if let Some(action) = arguments.first().map(String::as_str) {
         let arguments = arguments[1..].to_vec();
         match action {
             "deploy" => return Ok(Action::Deploy(arguments)),
+            "dev" => return Ok(Action::Dev(arguments)),
+            "cell" => return Ok(Action::Cell(arguments)),
             "d1" => return Ok(Action::D1(arguments)),
+            "kv" => return Ok(Action::Kv(arguments)),
+            "queue" => return Ok(Action::Queue(arguments)),
             "connect" => return Ok(Action::Connect(arguments)),
             "credentials" => return Ok(Action::Credentials(arguments)),
             "token" => return Ok(Action::Token(arguments)),
@@ -100,6 +130,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
     let mut internal_listen_configured = configured_internal_listen.is_some();
     let mut peers = Vec::new();
     let mut read_only = false;
+    let mut json = false;
     let mut settings = Settings {
         control_plane,
         bucket: fixture_bucket
@@ -124,6 +155,11 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
         unsafe_public_advertise: celld::env_vars::flag("CELLD_UNSAFE_PUBLIC_ADVERTISE", false)?,
         trust_forwarded_headers: celld::env_vars::flag("CELLD_TRUST_FORWARDED_HEADERS", false)?,
         storage_probe: celld::env_vars::flag("CELLD_STORAGE_PROBE", true)?,
+        dev_store: if diagnose {
+            None
+        } else {
+            std::env::var_os("CELLD_INTERNAL_DEV_STORE").map(std::path::PathBuf::from)
+        },
     };
     let mut args = arguments.into_iter();
     while let Some(argument) = args.next() {
@@ -177,6 +213,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
                 peers.push(peer);
             }
             "--read-only" if diagnose => read_only = true,
+            "--json" if diagnose => json = true,
             "--no-control-plane" => settings.control_plane = false,
             other => {
                 anyhow::bail!("unknown command or option: {other}; run `celld --help` for usage")
@@ -208,26 +245,40 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
              CELLD_INTERNAL_ADDR; the default internal listener uses a random loopback port"
         );
     }
+    if settings.dev_store.is_some() {
+        anyhow::ensure!(
+            !settings.control_plane
+                && settings.bucket.as_deref() == Some("celld-dev")
+                && settings.endpoint.is_none()
+                && settings.advertise.is_none(),
+            "the internal development store requires the celld dev node configuration"
+        );
+    }
     Ok(if diagnose {
         Action::Diagnose {
             settings,
             peers,
             read_only,
+            json,
         }
     } else {
         Action::Run(settings)
     })
 }
 
-pub(crate) fn print_help() {
-    println!(
+pub(crate) fn print_help() -> anyhow::Result<()> {
+    celld::cli_output::Output::new(celld::cli_output::Format::Text).help(
         r#"celld — self-hosted, distributed Durable Objects
 
 USAGE:
   celld --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  celld dev [PROJECT] [--host IP] [--port PORT] [--logs]
+  celld cell list [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld d1 migrations apply DATABASE [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld d1 execute DATABASE --command SQL [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  celld kv get|put|delete|list|info NAMESPACE --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  celld queue info|peek|purge|pause|resume|redrive QUEUE --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld diagnose --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS] [--peer NODE_ID]...
 
 Production install: celld --bucket s3://NAME [OPTIONS]
@@ -253,6 +304,7 @@ OPTIONS:
   --advertise ADDR:PORT  Address peers can reach: IP:PORT or HOST:PORT
                          (requires --internal-listen or CELLD_INTERNAL_ADDR)
   --peer NODE_ID         Diagnose one node with a signed direct probe; repeatable
+  --json                 Print one JSON object per diagnostic check
   --read-only            Skip the bucket write probe. celld diagnose otherwise
                          tests the conditional write, which writes and deletes a
                          small object under the probe/ prefix
@@ -298,11 +350,19 @@ TUNING:
                                   (default: on)
   CELLD_TTL_MS                    Node lease lifetime (default: 10000)
   CELLD_OPERATION_DEADLINE_MS     Non-restore operation deadline (default: 15000)
+  CELLD_SHUTDOWN_DRAIN_MS         Shutdown handoff no-progress interval (default: 25000)
+  CELLD_SHUTDOWN_TOTAL_MS         Complete process stop bound (default: 40000)
+  CELLD_DRAIN_TOKEN_WAIT_MS       Drain-token wait before an unserialized
+                                  handoff (default: 30000; 0 disables)
+  CELLD_READY_FLEET_GATE_MS       First-readiness wait for fleet capacity
+                                  (default: 120000; 0 disables)
   CELLD_IDLE_EVICT_S              Idle-cell eviction age (disabled unless set)
   CELLD_LOCAL_CACHE_MAX_BYTES     Hibernated SQLite cache limit (default: 2 GiB; 0 disables)
   CELLD_MAX_RESIDENT_CELLS        Resident-cell hard cap, enforced at admission
+  CELLD_MAX_CELL_REQUESTS         Concurrent fetches per cell (default: 64)
+  CELLD_MAX_REQUEST_BODY_BYTES    Ingress request body limit (default: 1 GiB)
   CELLD_PRESSURE_OWNERSHIP        release to rebalance, sticky to cache locally
-  CELLD_MAX_RSS_MB                RSS shed threshold (default: 80% of memory; 0 disables)
+  CELLD_MAX_RSS_MB                Active-memory shed threshold (default: 80%; 0 disables)
   CELLD_ALARM_RESIDENT_MS         Near-alarm residency window
   CELLD_WAKER_TICK_MS             Orphan-alarm scan interval
   CELLD_V8_HEAP_LIMIT_MB          Per-isolate V8 heap limit
@@ -310,17 +370,24 @@ TUNING:
   CELLD_HANDLER_BUDGET_S          JavaScript handler budget
   CELLD_TOKIO_THREADS             Tokio runtime worker threads
   CELLD_OUTPUT_GATE               `0` removes the durability wait from writes
+  CELLD_DURABILITY                `fleet` acks when every follower holds the
+                                  write on disk, or when the bucket upload
+                                  wins, and uploads behind either way; needs
+                                  2+ nodes, else every ack waits for the
+                                  bucket and writes are much slower
+                                  (default: `fleet`; `bucket` always waits)
+  CELLD_LOG_CAPTURE_WORKERS       Concurrent log-capture workers (default: 8)
+  CELLD_LOG_PIPELINE              Fleet log rounds in flight (default: 4)
+  CELLD_LOG_HEDGE_MS              Duplicate a slow log append (default: adaptive; 0 disables)
+  CELLD_LTX_TRUNCATE_PAGES        WAL pages before a truncate checkpoint (default: 128; Queues never truncate; 0 disables)
   RUST_LOG                        Runtime log filter (default: info)
 
 EXPERIMENTAL:
-  CELLD_DURABILITY                `fleet` acks writes at follower-fsync
-                                  quorum and tiers to the bucket behind
-                                  (default: `fleet`; `bucket` waits for storage)
   CELLD_WORKER_LOADER             Worker Loader binding name for Code Mode
   CELLD_AI_BINDING, CELLD_AI_URL  AI binding name and endpoint
 
-Documentation: https://celld.dev/docs"#
-    );
+Documentation: https://celld.dev/docs"#,
+    )
 }
 
 pub(crate) fn worker_loader_binding() -> Option<String> {

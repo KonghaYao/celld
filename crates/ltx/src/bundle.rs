@@ -6,10 +6,9 @@
 //! u32, and a four-byte magic. A row is `u16 cell_len | cell utf-8 |
 //! u64 cell_epoch | u64 txid | u64 offset | u64 len`, all little-endian.
 //! Un-bundling is arithmetic. The inner bytes are exactly what the
-//! per-cell writer produces, so the LTX differential oracle keeps
-//! validating every byte that matters, and "at rest, the bucket is pure
-//! Litestream" stays checkable — a drained bundle leaves no trace this
-//! module ever existed. Nothing else in this crate depends on bundles;
+//! per-cell writer produces, so byte-level compatibility stays checkable.
+//! At rest, the bucket is pure Litestream. A drained bundle leaves no trace
+//! that this module ever existed. Nothing else in this crate depends on bundles;
 //! deleting this file returns the crate to its upstream shape.
 
 use crate::error::{Error, Result};
@@ -130,61 +129,4 @@ pub fn slice<'a>(bundle: &'a [u8], row: &BundleRow) -> Result<&'a [u8]> {
         return Err(malformed("row overruns the object"));
     }
     Ok(&bundle[start..end])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn round_trip_returns_byte_identical_segments() {
-        let entries = vec![
-            BundleEntry {
-                cell: "a".into(),
-                cell_epoch: 3,
-                txid: 7,
-                bytes: vec![1, 2, 3, 4],
-            },
-            BundleEntry {
-                cell: "b-with-a-longer-name".into(),
-                cell_epoch: 1,
-                txid: 9,
-                bytes: vec![0xde, 0xad],
-            },
-        ];
-        let bundle = encode(&entries).unwrap();
-        let rows = decode_rows(&bundle).unwrap();
-        assert_eq!(rows.len(), 2);
-        for (row, entry) in rows.iter().zip(&entries) {
-            assert_eq!(
-                slice(&bundle, row).unwrap(),
-                entry.bytes.as_slice(),
-                "the envelope rule: inner bytes verbatim"
-            );
-            assert_eq!(
-                (row.cell.as_str(), row.cell_epoch, row.txid),
-                (entry.cell.as_str(), entry.cell_epoch, entry.txid)
-            );
-        }
-    }
-
-    #[test]
-    fn a_lying_footer_is_refused() {
-        let bundle = encode(&[BundleEntry {
-            cell: "a".into(),
-            cell_epoch: 1,
-            txid: 1,
-            bytes: vec![9; 8],
-        }])
-        .unwrap();
-        let mut rows = decode_rows(&bundle).unwrap();
-        rows[0].len = 1 << 30;
-        assert!(slice(&bundle, &rows[0]).is_err());
-    }
-
-    #[test]
-    fn not_a_bundle_is_refused() {
-        assert!(decode_rows(b"just some sqlite bytes").is_err());
-        assert!(decode_rows(b"").is_err());
-    }
 }

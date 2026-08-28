@@ -1,7 +1,9 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-// Deployment is an operator control-plane path outside the engine World.
+// Deployment is an operator control-plane path outside the Actor execution
+// domain.
 #![allow(clippy::disallowed_methods)]
+// Deploy narrates progress; every line of it is for a person.
 
 //! `celld deploy` — build a Wrangler project and write it to the fleet bucket.
 //!
@@ -10,10 +12,13 @@
 //! Cloudflare-shaped API. Config keys are an allowlist: anything we do not
 //! model is refused, never silently dropped.
 use crate::bucket::Bucket;
+use crate::note;
 use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
-    ModuleKind, ModuleRef, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CRON_V1,
-    FEATURE_D1_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1,
+    ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig, QueueConsumerDeployment,
+    Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_KV_V1,
+    FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
+    QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -43,6 +48,10 @@ const SUPPORTED_KEYS: &[&str] = &[
     "triggers",
     "vars",
     "d1_databases",
+    "kv_namespaces",
+    "queues",
+    "workflows",
+    "r2_buckets",
     "no_bundle",
 ];
 
@@ -54,13 +63,115 @@ const SUPPORTED_KEYS: &[&str] = &[
 /// the loader skips it rather than let it shadow the built-in.
 pub const D1_CLASS: &str = "__D1Database";
 
-/// Whether a cell scope names a D1 database. The unauthenticated operator
-/// route uses this to refuse one: a D1 cell answers arbitrary SQL, and its
-/// scope is derivable from the project's config rather than secret.
-pub fn is_d1_scope(scope: &str) -> bool {
-    scope
-        .strip_prefix(D1_CLASS)
-        .is_some_and(|rest| rest.starts_with(':'))
+/// The Durable Object class every workflow instance runs as. Like `D1_CLASS`,
+/// it is supplied by the runtime and refused as a user class name.
+pub const WORKFLOW_CLASS: &str = "__Workflow";
+
+/// The Durable Object class every KV namespace runs as.
+///
+/// Fleet-wide, like `D1_CLASS` and unlike `workflow_class`: a namespace is a
+/// resource several Workers bind, so two scripts naming one namespace mean to
+/// reach one set of cells.
+pub const KV_CLASS: &str = celld_logic::kv::RESERVED_CLASS;
+
+/// The Durable Object class every Queue broker runs as.
+pub const QUEUE_CLASS: &str = celld_logic::queue::RESERVED_CLASS;
+
+/// Every runtime-supplied Durable Object class.
+pub const RESERVED_CLASSES: &[&str] = &[D1_CLASS, WORKFLOW_CLASS, KV_CLASS, QUEUE_CLASS];
+
+/// The Durable Object class a script's workflow instances run as.
+///
+/// Script-scoped, because a workflow instance already is. Its namespace key is
+/// `cells:v1:<len>:<script>:__Workflow`, so two co-hosted scripts address
+/// different cells — but both used to register the *same* class name, and a
+/// deployment's class registry is one flat map, so the second script collided
+/// with the first and the node refused to start at all. The name now says what
+/// the namespace key always said.
+///
+/// D1 deliberately does not get this treatment. Its namespace is fleet-wide so
+/// that several Workers can bind one database and a Worker rename cannot rename
+/// it, which means a D1 cell genuinely is shared and one entry is correct.
+///
+/// `.` is the separator for three reasons, and all three are constraints
+/// rather than taste. A JavaScript class name cannot contain one, so no user
+/// export can collide. It is not `:`, which is what the cell-scope parser
+/// splits a class from an id on. And it is inside
+/// `celld_logic::cell::valid_cell_scope`'s charset, which is a security fence
+/// on a name that becomes a path component and an object-store key — `@` is
+/// not, and a scope carrying one is refused before it reaches storage. Cron
+/// picked `.` for the first of those reasons already.
+pub fn workflow_class(script_name: &str) -> String {
+    format!("{WORKFLOW_CLASS}.{script_name}")
+}
+
+/// Whether a reserved class names cells that several scripts share on purpose.
+///
+/// Only D1. Its namespace key is fleet-wide precisely so that a database
+/// outlives the name of any one Worker that binds it, so two scripts declaring
+/// `d1_databases` mean to reach the same cells, and one registry entry serving
+/// both is correct rather than merely tolerated. A workflow class carries its
+/// script, so it is never shared and a collision there is a real one.
+pub fn is_shared_reserved_class(class: &str) -> bool {
+    class == D1_CLASS || class == KV_CLASS || class == QUEUE_CLASS
+}
+
+/// Whether a class name is a script-scoped workflow class.
+///
+/// One reading of the shape, because three call sites wanted it and three
+/// copies of `strip_prefix(WORKFLOW_CLASS)` is how the separator comes to mean
+/// two things.
+pub fn is_workflow_class(class: &str) -> bool {
+    class
+        .strip_prefix(WORKFLOW_CLASS)
+        .is_some_and(|rest| rest.starts_with('.'))
+}
+
+pub fn is_reserved_class(class: &str) -> bool {
+    RESERVED_CLASSES.contains(&class) || is_workflow_class(class)
+}
+
+/// The reserved class a cell scope names, or `None` for an ordinary Durable
+/// Object.
+///
+/// A scope is `<class>:<instance>` and the instance may itself contain a `:`,
+/// so the class is everything before the first one — the same split
+/// `Runtime::start_cell` makes when it resolves a cell to its Worker config.
+pub fn reserved_class_of(scope: &str) -> Option<&str> {
+    let (class, _) = scope.split_once(':')?;
+    is_reserved_class(class).then_some(class)
+}
+
+/// Whether a cell scope names any runtime-supplied class.
+///
+/// This is what the unauthenticated `/do/` route refuses, and it is deliberately
+/// one question rather than one question per class. `/do/` used to ask
+/// one predicate per class, so every reserved class added a
+/// third, a fourth, and a place to forget one — and a forgotten refusal is not
+/// a missing feature, it is an unauthenticated route onto a cell whose whole
+/// surface is an operator protocol. Adding a class to `RESERVED_CLASSES` now
+/// closes that door with no new code.
+pub fn is_reserved_scope(scope: &str) -> bool {
+    reserved_class_of(scope).is_some()
+}
+
+/// What to tell an operator who reached a reserved class on the wrong route.
+///
+/// A hint, never a gate. The refusal is `is_reserved_scope`, which cannot be
+/// forgotten; this only decides how helpful the message is, so a class with no
+/// entry here is still refused and simply gets the general answer.
+pub fn operator_hint(class: &str) -> &'static str {
+    if class == D1_CLASS {
+        "use `celld d1`"
+    } else if class == KV_CLASS {
+        "use `celld kv`"
+    } else if class == QUEUE_CLASS {
+        "use `celld queue`"
+    } else if is_workflow_class(class) {
+        "use the workflow binding"
+    } else {
+        "reach it through its binding"
+    }
 }
 
 const MAX_ASSET_FILES: usize = 20_000;
@@ -75,24 +186,25 @@ pub struct Options {
     pub endpoint: Option<String>,
     pub region: Option<String>,
     pub dry_run: bool,
+    pub json: bool,
 }
 
 pub fn print_help() {
-    println!(
-        "celld deploy — build a Worker with esbuild and write it to the fleet bucket\n\n\
+    let text = "celld deploy — build a Worker with esbuild and write it to the fleet bucket\n\n\
 USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  -h, --help             Show this help\n\n\
+OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
 Credentials come from the standard AWS credential chain, from Google\n\
 Application Default Credentials for a gs:// bucket, or from an Azure storage\n\
 account key, managed identity, or workload identity for an az:// bucket.\n\n\
 Worker projects require `esbuild` on PATH; asset-only projects do not. Static\n\
 assets, service bindings, and string vars are supported. Routes are not; use\n\
 Wrangler for route configuration.\n\
-Nodes load a deployment at startup, so an existing node keeps serving the old\n\
-version until it restarts."
-    );
+A running node polls the deployment pointer and adopts the new version in\n\
+place; nothing restarts."
+    ;
+    let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text).help(text);
 }
 
 pub fn options_from_arguments(
@@ -104,12 +216,14 @@ pub fn options_from_arguments(
         endpoint: None,
         region: None,
         dry_run: false,
+        json: false,
     };
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
             "--dry-run" => options.dry_run = true,
+            "--json" => options.json = true,
             "--config" => {
                 options.config = Some(PathBuf::from(
                     arguments.next().context("--config requires a value")?,
@@ -151,6 +265,11 @@ struct Project {
     do_classes: Vec<String>,
     sqlite_classes: Vec<String>,
     crons: Vec<String>,
+    has_workflows: bool,
+    has_kv: bool,
+    queue_consumers: Vec<QueueConsumerConfig>,
+    has_queues: bool,
+    has_r2: bool,
 }
 
 struct ProjectAssets {
@@ -186,15 +305,15 @@ impl Built {
     /// cannot stand behind: no URL, because celld routes nothing, and no
     /// startup time, because deploying does not start an isolate.
     pub fn report(&self) {
-        println!(" celld {}", env!("CARGO_PKG_VERSION"));
-        println!("{}", "─".repeat(47));
-        println!(
+        note!(" celld {}", env!("CARGO_PKG_VERSION"));
+        note!("{}", "─".repeat(47));
+        note!(
             "Total Upload: {} / gzip: {}",
             kib(self.bytes()),
             kib(gzipped(&self.modules)),
         );
         if let Some(assets) = &self.assets {
-            println!(
+            note!(
                 "Static Assets: {} files / {} ({} unique bodies)",
                 assets.file_count,
                 kib(assets.total_bytes as usize),
@@ -203,7 +322,7 @@ impl Built {
         }
         let bindings = self.bindings();
         if bindings.is_empty() {
-            println!("Your Worker has no bindings.");
+            note!("Your Worker has no bindings.");
         } else {
             let width = bindings
                 .iter()
@@ -212,13 +331,13 @@ impl Built {
                 .max()
                 .unwrap_or_default()
                 + 6;
-            println!("Your Worker has access to the following bindings:");
-            println!("{:width$}Resource", "Binding");
+            note!("Your Worker has access to the following bindings:");
+            note!("{:width$}Resource", "Binding");
             for (binding, resource) in bindings {
-                println!("{binding:width$}{resource}");
+                note!("{binding:width$}{resource}");
             }
         }
-        println!(
+        note!(
             "Bundled {} ({})",
             self.script_name,
             seconds(self.bundled_in)
@@ -266,6 +385,22 @@ impl Built {
                     Some("d1") => {
                         let database = binding.get("database_name").and_then(Value::as_str)?;
                         Some((format!("env.{name} (D1)"), database.to_string()))
+                    }
+                    Some("workflow") => {
+                        let workflow = binding.get("workflow_name").and_then(Value::as_str)?;
+                        Some((format!("env.{name} (Workflow)"), workflow.to_string()))
+                    }
+                    Some("kv") => {
+                        let id = binding.get("id").and_then(Value::as_str)?;
+                        Some((format!("env.{name} (KV)"), id.to_string()))
+                    }
+                    Some("queue") => {
+                        let queue = binding.get("queue").and_then(Value::as_str)?;
+                        Some((format!("env.{name} (Queue)"), queue.to_string()))
+                    }
+                    Some("r2_bucket") => {
+                        let bucket = binding.get("bucket_name").and_then(Value::as_str)?;
+                        Some((format!("env.{name} (R2)"), bucket.to_string()))
                     }
                     Some("plain_text") => Some((
                         format!("env.{name} (Text)"),
@@ -375,6 +510,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             .collect(),
         assets: asset_reference,
         crons: project.crons.clone(),
+        queue_consumers: project.queue_consumers,
         // Each capability the manifest depends on is named here, so a node
         // that predates it rejects the deployment up front instead of
         // partially deserializing the manifest and failing at worker load.
@@ -388,6 +524,18 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if uses_d1 {
                 features.push(FEATURE_D1_V1.to_string());
+            }
+            if project.has_workflows {
+                features.push(FEATURE_WORKFLOWS_V1.to_string());
+            }
+            if project.has_kv {
+                features.push(FEATURE_KV_V1.to_string());
+            }
+            if project.has_queues {
+                features.push(FEATURE_QUEUES_V1.to_string());
+            }
+            if project.has_r2 {
+                features.push(FEATURE_R2_V1.to_string());
             }
             if sqlite_vec {
                 features.push(FEATURE_SQLITE_VEC_V1.to_string());
@@ -411,6 +559,11 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
 }
 
 pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
+    // Read every attachment before uploading immutable deployment objects.
+    // A competing consumer is a deploy refusal, so it must not leave a new
+    // version in the bucket that an operator can mistake for a published one.
+    let queue_attachments = prepare_queue_attachments(bucket, &built.manifest).await?;
+
     // Asset bodies are fleet-wide and content-addressed. Finish every body
     // before publishing the deployment-local index or manifest so a reader
     // can never observe a pointer whose assets are incomplete.
@@ -440,6 +593,13 @@ pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
             serde_json::to_vec_pretty(&built.manifest)?,
         )
         .await?;
+
+    // An attachment names this exact immutable prefix. Publish it only after
+    // the prefix is complete, so a node can never resolve a consumer to a
+    // half-uploaded deployment. The named and fleet pointers can move later
+    // without tearing this queue-to-consumer relationship.
+    publish_queue_attachments(bucket, &built.manifest, &built.prefix, queue_attachments).await?;
+
     let pointer = DeployPointer {
         script_name: Some(built.script_name.clone()),
         version: built.version.clone(),
@@ -457,6 +617,152 @@ pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
     )
     .await?;
     put_pointer(bucket, "deploy/current.json", encoded).await?;
+    Ok(())
+}
+
+pub(crate) struct QueueAttachmentState {
+    queue: String,
+    key: String,
+    current: Option<QueueConsumerAttachment>,
+    token: Option<String>,
+    desired: bool,
+}
+
+pub(crate) async fn prepare_queue_attachments(
+    bucket: &Bucket,
+    manifest: &Manifest,
+) -> anyhow::Result<Vec<QueueAttachmentState>> {
+    let desired = manifest
+        .queue_consumers
+        .iter()
+        .map(|consumer| consumer.queue.clone())
+        .collect::<BTreeSet<_>>();
+    let previous = current_queue_consumers(bucket, &manifest.script_name).await?;
+    let queues = desired.union(&previous).cloned().collect::<Vec<_>>();
+    let mut states = Vec::with_capacity(queues.len());
+
+    for queue in queues {
+        let key = crate::protocol::queue_consumer_attachment_key(&queue)
+            .expect("deploy validated the queue name");
+        let (current, token) = match bucket.get(&key).await? {
+            Some((body, token)) => {
+                let attachment: QueueConsumerAttachment = serde_json::from_slice(&body)
+                    .with_context(|| format!("decode queue consumer attachment {key}"))?;
+                crate::protocol::validate_queue_consumer_attachment(&queue, &attachment)?;
+                (Some(attachment), Some(token))
+            }
+            None => (None, None),
+        };
+        let is_desired = desired.contains(&queue);
+        if is_desired {
+            if let Some(owner) = current
+                .as_ref()
+                .and_then(|attachment| attachment.consumer.as_ref())
+                .filter(|consumer| consumer.script_name != manifest.script_name)
+            {
+                bail!(
+                    "queue {:?} already has consumer script {:?}; remove that consumer before deploying {}",
+                    queue,
+                    owner.script_name,
+                    manifest.script_name
+                );
+            }
+        }
+        states.push(QueueAttachmentState {
+            queue,
+            key,
+            current,
+            token,
+            desired: is_desired,
+        });
+    }
+    Ok(states)
+}
+
+async fn current_queue_consumers(
+    bucket: &Bucket,
+    script_name: &str,
+) -> anyhow::Result<BTreeSet<String>> {
+    let pointer_key = format!("deploy/{script_name}/current.json");
+    let Some((pointer_body, _)) = bucket.get(&pointer_key).await? else {
+        return Ok(BTreeSet::new());
+    };
+    let pointer: DeployPointer =
+        serde_json::from_slice(&pointer_body).with_context(|| format!("decode {pointer_key}"))?;
+    anyhow::ensure!(
+        pointer.script_name.as_deref() == Some(script_name),
+        "named deployment pointer {pointer_key} does not identify script {script_name:?}"
+    );
+    let manifest_key = format!("{}/manifest.json", pointer.prefix);
+    let (manifest_body, _) = bucket
+        .get(&manifest_key)
+        .await?
+        .with_context(|| format!("read {manifest_key}"))?;
+    let manifest: Manifest =
+        serde_json::from_slice(&manifest_body).with_context(|| format!("decode {manifest_key}"))?;
+    anyhow::ensure!(
+        manifest.script_name == script_name,
+        "named deployment pointer {pointer_key} resolved script {:?}",
+        manifest.script_name
+    );
+    Ok(manifest
+        .queue_consumers
+        .into_iter()
+        .map(|consumer| consumer.queue)
+        .collect())
+}
+
+pub(crate) async fn publish_queue_attachments(
+    bucket: &Bucket,
+    manifest: &Manifest,
+    prefix: &str,
+    states: Vec<QueueAttachmentState>,
+) -> anyhow::Result<()> {
+    let consumer = QueueConsumerDeployment {
+        script_name: manifest.script_name.clone(),
+        version: manifest.version.clone(),
+        prefix: prefix.to_string(),
+    };
+    for state in states {
+        let next_consumer = if state.desired {
+            Some(consumer.clone())
+        } else if state
+            .current
+            .as_ref()
+            .and_then(|attachment| attachment.consumer.as_ref())
+            .is_some_and(|owner| owner.script_name == manifest.script_name)
+        {
+            None
+        } else {
+            continue;
+        };
+        let next = QueueConsumerAttachment {
+            schema_version: QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
+            queue: state.queue,
+            consumer: next_consumer,
+        };
+        if state.current.as_ref() == Some(&next) {
+            continue;
+        }
+        let body = serde_json::to_vec_pretty(&next)?;
+        match bucket
+            .put_cas(&state.key, body, state.token.as_deref())
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                bail!(
+                    "queue consumer attachment {} lost a race; another deploy may have landed first; re-run `celld deploy`",
+                    state.key
+                )
+            }
+            Err(error) => {
+                return Err(error.context(
+                    "a queue consumer attachment write may have committed; re-run `celld deploy`",
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -622,7 +928,7 @@ pub fn read_d1_project(given: Option<PathBuf>) -> anyhow::Result<D1Project> {
 
 /// A path may name the config itself or the directory holding it; with no
 /// path at all, the working directory.
-fn resolve_config(given: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_config(given: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     let directory = match given {
         Some(path) if path.is_dir() => path,
         Some(path) if path.exists() => return Ok(path),
@@ -718,8 +1024,8 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
     }
 
     let mut sqlite_classes = read_sqlite_classes(object)?;
-    if sqlite_classes.iter().any(|class| class == D1_CLASS) {
-        bail!("`{D1_CLASS}` is reserved for D1; remove it from `migrations`");
+    if let Some(class) = sqlite_classes.iter().find(|class| is_reserved_class(class)) {
+        bail!("`{class}` is a runtime class; remove it from `migrations`");
     }
     let crons = read_crons(object)?;
     if !crons.is_empty() && main.is_none() {
@@ -798,10 +1104,9 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
     // any `d1_databases`: the harness registers its own `__D1Database` class
     // in every isolate, so a durable_objects binding naming it would silently
     // resolve to the D1 database cell instead of the user's class.
-    if do_classes.iter().any(|class| class == D1_CLASS) {
-        bail!("`{D1_CLASS}` is reserved for D1; rename the Durable Object class");
+    if let Some(class) = do_classes.iter().find(|class| is_reserved_class(class)) {
+        bail!("`{class}` is a runtime class; rename the Durable Object class");
     }
-    let mut d1_binding_names = BTreeSet::new();
     for database in d1_databases {
         let binding = database
             .get("binding")
@@ -809,9 +1114,6 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
             .ok_or_else(|| anyhow!("d1 database has no `binding`"))?;
         if !valid_binding(binding) {
             bail!("invalid d1 binding name: {binding:?}");
-        }
-        if !d1_binding_names.insert(binding.to_string()) {
-            bail!("duplicate d1 binding name: {binding:?}");
         }
         let database_name = database
             .get("database_name")
@@ -843,6 +1145,331 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         do_classes.push(D1_CLASS.to_string());
         sqlite_classes.push(D1_CLASS.to_string());
     }
+    let kv_namespaces = match object.get("kv_namespaces") {
+        None => &[][..],
+        Some(Value::Array(namespaces)) => namespaces.as_slice(),
+        Some(_) => bail!("config `kv_namespaces` must be an array"),
+    };
+    let mut kv_ids = BTreeSet::new();
+    for namespace in kv_namespaces {
+        // Every key celld does not model stops the deploy, per the loud-gap
+        // rule. `preview_id` is the exception and is accepted below: it selects
+        // a different namespace under `wrangler dev`, which celld does not run,
+        // so ignoring it costs a developer nothing at deploy time.
+        let unsupported = namespace
+            .as_object()
+            .map(|object| {
+                object
+                    .keys()
+                    .filter(|key| !matches!(key.as_str(), "binding" | "id" | "preview_id"))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(key) = unsupported.first() {
+            bail!(
+                "kv namespace declares `{key}`, which celld does not model; \
+                 celld models `binding`, `id`, and `preview_id`"
+            );
+        }
+        let binding = namespace
+            .get("binding")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("kv namespace has no `binding`"))?;
+        if !valid_binding(binding) {
+            bail!("invalid kv binding name: {binding:?}");
+        }
+        // `id` is the namespace identity, verbatim, and celld invents no
+        // `namespace_name` key beside it. Upstream's `kv_namespaces` carries no
+        // human-readable name at all -- only `binding`, `id` and `preview_id` --
+        // and celld's accepted configuration is a strict subset of Wrangler's:
+        // a key celld accepts and Wrangler diagnoses would make the file
+        // unportable, which is the one property the deploy story rests on. A
+        // project ported from Cloudflare therefore keeps its hex id and works;
+        // a project that was never there writes a readable string.
+        let id = namespace.get("id").and_then(Value::as_str).ok_or_else(|| {
+            anyhow!(
+                "kv binding {binding} has no `id`; celld uses the id as the \
+                     namespace identity, so any stable string serves"
+            )
+        })?;
+        if id.is_empty() {
+            bail!("kv binding {binding} has an empty `id`");
+        }
+        // The id becomes a cell name and therefore a path component and an
+        // object-store key, so it answers to the same charset fence every cell
+        // scope does rather than to a looser one invented here.
+        if !celld_logic::cell::valid_cell_scope(id) {
+            bail!(
+                "kv binding {binding} has an `id` that cannot name a cell: {id:?}; \
+                 use ASCII letters, digits, and `_ - . : $`"
+            );
+        }
+        if !kv_ids.insert(id.to_string()) {
+            bail!("duplicate kv namespace id: {id:?}");
+        }
+        bindings.push(json!({
+            "type": "kv",
+            "name": binding,
+            "id": id,
+        }));
+    }
+    if !kv_namespaces.is_empty() {
+        // A KV namespace is a cell of a runtime-supplied class, declared here
+        // so its namespace key is minted and its cells are SQLite-backed. Like
+        // D1's, it is never a worker export and stays out of `ctx.exports`.
+        do_classes.push(KV_CLASS.to_string());
+        sqlite_classes.push(KV_CLASS.to_string());
+    }
+    let queues = match object.get("queues") {
+        None => None,
+        Some(Value::Object(queues)) => Some(queues),
+        Some(_) => bail!("config `queues` must be an object"),
+    };
+    if let Some(key) = queues
+        .into_iter()
+        .flat_map(|queues| queues.keys())
+        .find(|key| !matches!(key.as_str(), "producers" | "consumers"))
+    {
+        bail!("config `queues` declares `{key}`, which celld does not model");
+    }
+    let queue_producers = match queues.and_then(|queues| queues.get("producers")) {
+        None => &[][..],
+        Some(Value::Array(producers)) => producers.as_slice(),
+        Some(_) => bail!("config `queues.producers` must be an array"),
+    };
+    for producer in queue_producers {
+        reject_queue_keys(
+            producer,
+            &["binding", "queue", "delivery_delay"],
+            "producer",
+        )?;
+        let binding = producer
+            .get("binding")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("queue producer has no `binding`"))?;
+        if !valid_binding(binding) {
+            bail!("invalid queue binding name: {binding:?}");
+        }
+        let queue = queue_name(producer, "producer")?;
+        let delivery_delay = optional_queue_u32(producer, "delivery_delay")?.unwrap_or(0);
+        if delivery_delay > celld_logic::queue::MAX_DELAY_SECONDS {
+            bail!("queue producer delivery_delay must be between 0 and 86400 seconds");
+        }
+        let mut encoded = json!({
+            "type": "queue",
+            "name": binding,
+            "queue": queue,
+        });
+        if producer.get("delivery_delay").is_some() {
+            encoded["delivery_delay"] = json!(delivery_delay);
+        }
+        bindings.push(encoded);
+    }
+    let queue_consumers_raw = match queues.and_then(|queues| queues.get("consumers")) {
+        None => &[][..],
+        Some(Value::Array(consumers)) => consumers.as_slice(),
+        Some(_) => bail!("config `queues.consumers` must be an array"),
+    };
+    let mut queue_consumers = Vec::new();
+    let mut consumed_queues = BTreeSet::new();
+    for consumer in queue_consumers_raw {
+        if consumer.get("script_name").is_some() {
+            bail!("queue consumer declares `script_name`; celld attaches it to the current script");
+        }
+        reject_queue_keys(
+            consumer,
+            &[
+                "queue",
+                "max_batch_size",
+                "max_batch_timeout",
+                "max_retries",
+                "dead_letter_queue",
+                "max_concurrency",
+                "retry_delay",
+            ],
+            "consumer",
+        )?;
+        let queue = queue_name(consumer, "consumer")?.to_string();
+        if !consumed_queues.insert(queue.clone()) {
+            bail!("duplicate queue consumer: {queue:?}");
+        }
+        let dead_letter_queue = consumer
+            .get("dead_letter_queue")
+            .map(|value| {
+                let name = value
+                    .as_str()
+                    .ok_or_else(|| anyhow!("queue consumer dead_letter_queue must be a string"))?;
+                validate_queue_name(name, "dead-letter queue")?;
+                anyhow::ensure!(
+                    name != queue,
+                    "a queue cannot use itself as its dead-letter queue"
+                );
+                Ok::<_, anyhow::Error>(name.to_string())
+            })
+            .transpose()?;
+        let config = QueueConsumerConfig {
+            queue,
+            max_batch_size: optional_queue_u16(consumer, "max_batch_size")?
+                .unwrap_or(celld_logic::queue::DEFAULT_MAX_BATCH_SIZE),
+            max_batch_timeout: optional_queue_u16(consumer, "max_batch_timeout")?
+                .unwrap_or(celld_logic::queue::DEFAULT_MAX_BATCH_TIMEOUT_SECONDS),
+            max_retries: optional_queue_u16(consumer, "max_retries")?
+                .unwrap_or(celld_logic::queue::DEFAULT_MAX_RETRIES),
+            dead_letter_queue,
+            max_concurrency: optional_queue_u16(consumer, "max_concurrency")?,
+            retry_delay: optional_queue_u32(consumer, "retry_delay")?,
+        };
+        celld_logic::queue::validate_config(&celld_logic::queue::QueueConfig {
+            max_batch_size: config.max_batch_size,
+            max_batch_timeout_seconds: config.max_batch_timeout,
+            max_retries: config.max_retries,
+            max_concurrency: config.max_concurrency,
+            delivery_delay_seconds: 0,
+            retry_delay_seconds: config.retry_delay,
+        })
+        .map_err(anyhow::Error::new)?;
+        queue_consumers.push(config);
+    }
+    if !queue_producers.is_empty() || !queue_consumers.is_empty() {
+        if !queue_consumers.is_empty() && main.is_none() {
+            bail!("config declares a queue consumer without `main`; a consumer needs a Worker module with a queue handler");
+        }
+        do_classes.push(QUEUE_CLASS.to_string());
+        sqlite_classes.push(QUEUE_CLASS.to_string());
+    }
+    let workflows = match object.get("workflows") {
+        None => &[][..],
+        Some(Value::Array(workflows)) => workflows.as_slice(),
+        Some(_) => bail!("config `workflows` must be an array"),
+    };
+    let mut workflow_names = BTreeSet::new();
+    for workflow in workflows {
+        // Any key celld does not model stops the deploy, per the loud-gap
+        // rule: an unread knob (`schedules` is the notable one) must be a
+        // refusal, never a workflow that silently lacks the behavior it
+        // declares.
+        let unsupported = workflow
+            .as_object()
+            .map(|object| {
+                object
+                    .keys()
+                    .filter(|key| {
+                        !matches!(
+                            key.as_str(),
+                            "name" | "binding" | "class_name" | "script_name"
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !unsupported.is_empty() {
+            bail!(
+                "`celld deploy` does not support these workflow keys: {}.\n\
+                 celld models `name`, `binding`, `class_name`, and `script_name`; \
+                 remove the rest (`schedules` included).",
+                unsupported.join(", ")
+            );
+        }
+        let binding = workflow
+            .get("binding")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("workflow has no `binding`"))?;
+        if !valid_binding(binding) {
+            bail!("invalid workflow binding name: {binding:?}");
+        }
+        let workflow_name = workflow
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("workflow binding {binding} has no `name`"))?;
+        if !valid_resource_name(workflow_name) {
+            bail!(
+                "invalid workflow name {workflow_name:?}: use letters, digits, `-` and `_` \
+                 (not starting with `-`), at most 64 characters"
+            );
+        }
+        if !workflow_names.insert(workflow_name.to_string()) {
+            bail!("duplicate workflow name: {workflow_name:?}");
+        }
+        let class_name = workflow
+            .get("class_name")
+            .and_then(Value::as_str)
+            .filter(|class| !class.is_empty())
+            .ok_or_else(|| anyhow!("workflow binding {binding} has no `class_name`"))?;
+        if is_reserved_class(class_name) {
+            bail!(
+                "workflow {workflow_name:?} names the reserved class {class_name:?} as its \
+                 `class_name`; export a WorkflowEntrypoint subclass of your own"
+            );
+        }
+        if let Some(script) = workflow.get("script_name").and_then(Value::as_str) {
+            if script != script_name {
+                bail!(
+                    "workflow {workflow_name:?} sets `script_name` {script:?}; celld runs a \
+                     workflow only in the script that declares it"
+                );
+            }
+        }
+        bindings.push(json!({
+            "type": "workflow",
+            "name": binding,
+            "workflow_name": workflow_name,
+            "class_name": class_name,
+        }));
+    }
+    if !workflows.is_empty() {
+        if main.is_none() {
+            bail!("config declares `workflows` without `main`; a workflow needs a Worker module to export its class");
+        }
+        do_classes.push(workflow_class(&script_name));
+        sqlite_classes.push(workflow_class(&script_name));
+    }
+    let r2_buckets = match object.get("r2_buckets") {
+        None => &[][..],
+        Some(Value::Array(buckets)) => buckets.as_slice(),
+        Some(_) => bail!("config `r2_buckets` must be an array"),
+    };
+    let mut r2_binding_names = BTreeSet::new();
+    let mut r2_bucket_names = BTreeSet::new();
+    for bucket in r2_buckets {
+        let binding = bucket
+            .get("binding")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("r2 bucket has no `binding`"))?;
+        if !valid_binding(binding) {
+            bail!("invalid r2 binding name: {binding:?}");
+        }
+        if !r2_binding_names.insert(binding.to_string()) {
+            bail!("duplicate r2 binding name: {binding:?}");
+        }
+        let bucket_name = bucket
+            .get("bucket_name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                anyhow!("r2 binding {binding} has no `bucket_name`; celld uses the name to place the bucket's keys in the fleet bucket")
+            })?;
+        if !valid_resource_name(bucket_name) {
+            bail!(
+                "invalid r2 bucket name {bucket_name:?}: use letters, digits, `-` and `_` \
+                 (not starting with `-`), at most 64 characters"
+            );
+        }
+        if !r2_bucket_names.insert(bucket_name.to_string()) {
+            bail!("two r2 bindings name the same bucket: {bucket_name:?}");
+        }
+        // Cloudflare scopes a jurisdiction to an account's R2; celld has
+        // neither, and silently ignoring it would put the keys somewhere
+        // the operator did not ask for.
+        if bucket.get("jurisdiction").is_some() {
+            bail!("r2 binding {binding} sets `jurisdiction`, which celld does not have");
+        }
+        bindings.push(json!({
+            "type": "r2_bucket",
+            "name": binding,
+            "bucket_name": bucket_name,
+        }));
+    }
     let vars = match object.get("vars") {
         None => None,
         Some(Value::Object(vars)) => Some(vars),
@@ -867,7 +1494,8 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         && (!do_classes.is_empty()
             || !sqlite_classes.is_empty()
             || service_count > 0
-            || var_count > 0)
+            || var_count > 0
+            || !r2_binding_names.is_empty())
     {
         bail!("an asset-only project cannot declare Worker bindings");
     }
@@ -880,18 +1508,17 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
             "name": binding,
         }));
     }
-    // A name declared as a D1 binding and as anything else would deploy
-    // cleanly and then resolve to whichever `env` assignment ran last, so a
-    // Worker reading `env.DB` could get a service stub where it expected a
-    // database. Collisions between the other binding types are still not
-    // refused here — a known gap, left for a check over every binding type.
+    // build_env installs every binding into one JavaScript object. Validate
+    // that structural invariant once here, after every binding source has
+    // contributed, so a new binding kind cannot silently shadow an old one.
+    let mut binding_names = BTreeMap::new();
     for binding in &bindings {
         let name = binding.get("name").and_then(Value::as_str).unwrap_or("");
         let kind = binding.get("type").and_then(Value::as_str).unwrap_or("");
-        if kind != "d1" && d1_binding_names.contains(name) {
+        if let Some(previous) = binding_names.insert(name, kind) {
             bail!(
-                "binding name {name:?} is declared both in `d1_databases` and as a \
-                 {kind} binding; every binding needs its own name"
+                "binding name {name:?} is declared by both a {previous} and a {kind} \
+                 binding; every name in `env` must be unique"
             );
         }
     }
@@ -909,6 +1536,12 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         metadata.insert("compatibility_flags".into(), flags.clone());
     }
     metadata.insert("bindings".into(), Value::Array(bindings));
+    if !queue_consumers.is_empty() {
+        // Include consumer policy in deployment identity. The typed manifest
+        // field below is the runtime contract; this copy keeps a settings-only
+        // deploy from reusing the previous code-and-bindings version.
+        metadata.insert("queue_consumers".into(), json!(queue_consumers));
+    }
     if !sqlite_classes.is_empty() {
         metadata.insert(
             "migrations".into(),
@@ -925,7 +1558,85 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         do_classes,
         sqlite_classes,
         crons,
+        has_workflows: !workflows.is_empty(),
+        has_kv: !kv_namespaces.is_empty(),
+        has_queues: !queue_producers.is_empty() || !queue_consumers.is_empty(),
+        queue_consumers,
+        has_r2: !r2_buckets.is_empty(),
     })
+}
+
+fn reject_queue_keys(value: &Value, accepted: &[&str], kind: &str) -> anyhow::Result<()> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("queue {kind} must be an object"))?;
+    if let Some(key) = object.keys().find(|key| !accepted.contains(&key.as_str())) {
+        bail!("queue {kind} declares `{key}`, which celld does not model");
+    }
+    Ok(())
+}
+
+fn queue_name<'a>(value: &'a Value, kind: &str) -> anyhow::Result<&'a str> {
+    let name = value
+        .get("queue")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("queue {kind} has no `queue` name"))?;
+    validate_queue_name(name, kind)?;
+    Ok(name)
+}
+
+fn validate_queue_name(name: &str, kind: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!name.is_empty(), "queue {kind} has an empty queue name");
+    anyhow::ensure!(
+        celld_logic::cell::valid_cell_scope(name),
+        "queue {kind} has a name that cannot name a cell: {name:?}; use ASCII letters, digits, and `_ - . : $`"
+    );
+    Ok(())
+}
+
+fn optional_queue_u64(value: &Value, field: &str) -> anyhow::Result<Option<u64>> {
+    value
+        .get(field)
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| anyhow!("queue {field} must be a non-negative integer"))
+        })
+        .transpose()
+}
+
+fn optional_queue_u16(value: &Value, field: &str) -> anyhow::Result<Option<u16>> {
+    optional_queue_u64(value, field)?
+        .map(|value| {
+            u16::try_from(value).map_err(|_| anyhow!("queue {field} is too large: {value}"))
+        })
+        .transpose()
+}
+
+fn optional_queue_u32(value: &Value, field: &str) -> anyhow::Result<Option<u32>> {
+    optional_queue_u64(value, field)?
+        .map(|value| {
+            u32::try_from(value).map_err(|_| anyhow!("queue {field} is too large: {value}"))
+        })
+        .transpose()
+}
+
+/// The upstream workflow-name rule (`^[a-zA-Z0-9_][a-zA-Z0-9-_]*$`, at most 64
+/// characters). Instance ids follow the same rule; the harness validates those
+/// because they arrive at run time, not at deploy. An R2 `bucket_name` takes
+/// the same rule for a second reason: the name becomes a key prefix inside the
+/// fleet bucket, and this rule is what keeps it a single path segment, so a
+/// binding cannot address the fleet's own deployment, cell, or lease keys.
+fn valid_resource_name(name: &str) -> bool {
+    name.len() <= 64
+        && name
+            .chars()
+            .next()
+            .is_some_and(|first| first == '_' || first.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .skip(1)
+            .all(|value| value == '_' || value == '-' || value.is_ascii_alphanumeric())
 }
 
 /// `triggers.crons`, validated here so a malformed expression stops the deploy

@@ -53,9 +53,6 @@ fn modreg(scope: &mut v8::PinScope) -> Arc<ModuleRegistry> {
         .expect("isolate has no module registry")
 }
 
-/// Scan a bundle for its external (`cloudflare:*` / `node:*`) imports and the
-/// named/default bindings pulled from each. V8 static-links these, so a stub
-/// must provide exactly these names; namespace imports (`* as x`) need none.
 /// Is `spec` an external builtin (`node:*`, `cloudflare:*`, or a bare node
 /// builtin)? esbuild bundles every npm dep inline and leaves only builtins
 /// external, so a remaining bare specifier is a node builtin.
@@ -68,20 +65,57 @@ fn is_external(spec: &str) -> bool {
         || BARE_NODE_BUILTINS.contains(&spec.split('/').next().unwrap_or(""))
 }
 
-fn scan_external_imports(
-    src: &str,
-) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
-    let re = regex::Regex::new(r#"import\s+([^;]*?)\s*from\s*["']([^"']+)["']"#).unwrap();
-    let braces = regex::Regex::new(r"\{([^}]*)\}").unwrap();
-    let mut map: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
-        Default::default();
-    for cap in re.captures_iter(src) {
+/// The import statement, and the brace group inside its clause.
+///
+/// `Regex::new` compiles the pattern to a program and builds the matcher
+/// scaffolding around it, so it is far more expensive than the scan itself on
+/// a small bundle. Both patterns were function locals, so an isolate paid that
+/// cost once for the main module and once more for each sibling module of a
+/// Worker Loader bundle — on every isolate build.
+static IMPORT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"import\s+([^;]*?)\s*from\s*["']([^"']+)["']"#).unwrap()
+});
+static IMPORT_BRACES_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\{([^}]*)\}").unwrap());
+
+/// Counts scans of a source carrying [`SCAN_PROBE_MARKER`].
+///
+/// The counter is filtered by the marker rather than counting every scan, so a
+/// bare global counter cannot move under an unrelated worker build.
+#[cfg(celld_internal_tests)]
+static IMPORT_SCANS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A source puts this in a comment to have its scans counted.
+#[cfg(celld_internal_tests)]
+pub(super) const SCAN_PROBE_MARKER: &str = "celld-import-scan-probe";
+
+/// How many times a source carrying [`SCAN_PROBE_MARKER`] has been scanned.
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn import_scans() -> usize {
+    IMPORT_SCANS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// External specifier -> the bindings a bundle pulls from it.
+pub(super) type ExternalImports =
+    std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
+
+/// Scan a bundle for its external (`cloudflare:*` / `node:*`) imports and the
+/// named/default bindings pulled from each. V8 static-links these, so a stub
+/// must provide exactly these names; namespace imports (`* as x`) need none.
+pub(super) fn scan_external_imports(src: &str) -> ExternalImports {
+    #[cfg(celld_internal_tests)]
+    if src.contains(SCAN_PROBE_MARKER) {
+        IMPORT_SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let mut map = ExternalImports::default();
+    for cap in IMPORT_RE.captures_iter(src) {
         if !is_external(&cap[2]) {
             continue;
         }
         let clause = cap[1].trim();
         let set = map.entry(cap[2].to_string()).or_default();
-        if let Some(b) = braces.captures(clause) {
+        if let Some(b) = IMPORT_BRACES_RE.captures(clause) {
             for part in b[1].split(',') {
                 let name = part.split_whitespace().next().unwrap_or("");
                 // A commented-out binding inside the braces is not a name.
@@ -319,10 +353,17 @@ fn eager_module_global(spec: &str) -> Option<&'static str> {
 
 fn stub_source(spec: &str, names: &std::collections::BTreeSet<String>) -> String {
     let cf = spec == "cloudflare:workers";
+    // `cloudflare:workflows` is real, not a pass-through proxy: its one
+    // export is `NonRetryableError`, and a proxy standing in for an Error
+    // subclass would make `throw new NonRetryableError(...)` throw a value
+    // the retry policy cannot recognize — the step would retry, silently.
+    let cf_workflows = spec == "cloudflare:workflows";
     let lazy = LAZY_MODULES.iter().find(|m| m.specs.contains(&spec));
     let eager = eager_module_global(spec);
     let base = if cf {
         "globalThis.__cf".to_string()
+    } else if cf_workflows {
+        "globalThis.__cfWorkflows".to_string()
     } else if let Some(m) = lazy {
         format!("globalThis.{}", m.global)
     } else if let Some(global) = eager {
@@ -330,7 +371,7 @@ fn stub_source(spec: &str, names: &std::collections::BTreeSet<String>) -> String
     } else {
         "globalThis.__nodeStub".to_string()
     };
-    let real = cf || lazy.is_some() || eager.is_some();
+    let real = cf || cf_workflows || lazy.is_some() || eager.is_some();
     let mut out = String::new();
     if let Some(m) = lazy {
         out.push_str(&format!("if (!globalThis.{}) {{\n", m.global));
@@ -361,11 +402,7 @@ fn stub_source(spec: &str, names: &std::collections::BTreeSet<String>) -> String
 /// Compile one stub module per external specifier into the isolate's module
 /// registry. Run before
 /// instantiating a real bundle; `resolve_external` then serves them.
-pub(super) fn register_stubs(
-    scope: &mut v8::PinScope,
-    src: &str,
-    modules: &[(String, ModuleSource)],
-) {
+pub(super) fn register_stubs(scope: &mut v8::PinScope, config: &WorkerConfig) {
     modreg(scope).0.lock().unwrap().clear();
     let reg = |spec: String, source: String, scope: &mut v8::PinScope| {
         if let Some(m) = compile_module(scope, &spec, &source) {
@@ -375,19 +412,19 @@ pub(super) fn register_stubs(
             tracing::warn!(%spec, "module stub failed to compile");
         }
     };
-    for (spec, names) in scan_external_imports(src) {
+    for (spec, names) in &config.main_imports {
         // `import * as x` binds the whole namespace, so the stub's exports
         // must be the module's full surface — probed from the backing
         // object, like dynamic import() — not just the scanned names.
         let s = if names.contains("*") {
-            full_surface_source(scope, &spec, &names).unwrap_or_else(|| stub_source(&spec, &names))
+            full_surface_source(scope, spec, names).unwrap_or_else(|| stub_source(spec, names))
         } else {
-            stub_source(&spec, &names)
+            stub_source(spec, names)
         };
-        reg(spec, s, scope);
+        reg(spec.clone(), s, scope);
     }
     // sibling text modules (wrangler Text rule: `import md from './x.md'`)
-    for (spec, source) in modules {
+    for (spec, source) in &config.modules {
         let ModuleSource::Text(content) = source else {
             continue;
         };
@@ -562,34 +599,24 @@ pub(super) fn register_wasm_modules(scope: &mut v8::PinScope, modules: &[(String
 /// both bare and relative sibling imports resolve; the whole graph links when
 /// the main module instantiates. Any builtin a sibling imports (and the main
 /// module did not) is stubbed too.
-pub(super) fn register_loader_modules(
-    scope: &mut v8::PinScope,
-    modules: &[(String, ModuleSource)],
-) {
-    let es_modules = || {
-        modules.iter().filter_map(|(name, source)| match source {
-            ModuleSource::EsModule(source) => Some((name, source)),
-            _ => None,
-        })
-    };
-    for (_name, source) in es_modules() {
-        for (spec, names) in scan_external_imports(source) {
-            if modreg(scope).0.lock().unwrap().contains_key(&spec) {
+pub(super) fn register_loader_modules(scope: &mut v8::PinScope, config: &WorkerConfig) {
+    for (_name, _source, imports) in config.es_modules() {
+        for (spec, names) in imports {
+            if modreg(scope).0.lock().unwrap().contains_key(spec) {
                 continue;
             }
             let s = if names.contains("*") {
-                full_surface_source(scope, &spec, &names)
-                    .unwrap_or_else(|| stub_source(&spec, &names))
+                full_surface_source(scope, spec, names).unwrap_or_else(|| stub_source(spec, names))
             } else {
-                stub_source(&spec, &names)
+                stub_source(spec, names)
             };
-            if let Some(m) = compile_module(scope, &spec, &s) {
+            if let Some(m) = compile_module(scope, spec, &s) {
                 let g = v8::Global::new(scope, m);
-                modreg(scope).0.lock().unwrap().insert(spec, g);
+                modreg(scope).0.lock().unwrap().insert(spec.clone(), g);
             }
         }
     }
-    for (name, source) in es_modules() {
+    for (name, source, _imports) in config.es_modules() {
         register_sibling_module(scope, name, source);
     }
 }
@@ -623,6 +650,9 @@ pub(super) fn resolve_external<'s>(
 fn builtin_source(spec: &str) -> Option<(String, String)> {
     if spec == "cloudflare:workers" {
         return Some((String::new(), "globalThis.__cf".into()));
+    }
+    if spec == "cloudflare:workflows" {
+        return Some((String::new(), "globalThis.__cfWorkflows".into()));
     }
     if let Some(m) = LAZY_MODULES.iter().find(|m| m.specs.contains(&spec)) {
         return Some((

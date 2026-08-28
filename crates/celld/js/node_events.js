@@ -60,8 +60,7 @@
       throw errOutOfRange(name, "a non-negative number", n);
   };
 
-  // Minimal inspect for the unhandled-'error' message: enough to match
-  // Node's output for the values its own tests emit.
+  // Minimal inspect for the unhandled-'error' message and common error values.
   const inspect = (v, depth = 0) => {
     if (typeof v === "string")
       return depth === 0 ? `'${v}'` : `'${v.replace(/'/g, "\\'")}'`;
