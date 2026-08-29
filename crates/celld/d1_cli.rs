@@ -19,7 +19,8 @@
 //! rather than a secret, so the unauthenticated `/do/` route
 //! refuses a D1 scope and sends the caller here.
 
-use std::path::PathBuf;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
 use serde_json::Value;
@@ -30,6 +31,22 @@ use crate::cli_output::{align, Format, Output, Record};
 use crate::note;
 use crate::operator_cell::{Fleet, Reachable, Subject};
 use std::borrow::Cow;
+
+/// One import reply, as the owner returns it inside `result`.
+struct ImportReply(Value);
+
+impl Record for ImportReply {
+    fn json(&self) -> Value {
+        self.0.clone()
+    }
+
+    fn text(&self) -> Cow<'_, str> {
+        Cow::Owned(
+            serde_json::to_string_pretty(&self.0)
+                .expect("a serde_json::Value always serializes as JSON"),
+        )
+    }
+}
 
 /// One row of a `d1 execute` result set.
 ///
@@ -107,6 +124,18 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         })?;
     let scope = crate::js::d1_cell_scope(&declaration.database_identity);
     let storage = command.fleet.clone().resolve("celld d1")?;
+    let import_seed = match &command.action {
+        Action::Import { file } => Some(validate_import_seed(file)?),
+        _ => None,
+    };
+    let timeout = match &command.action {
+        Action::Import { .. } => import_seed
+            .as_ref()
+            .map(|(_, size)| crate::operator_cell::import_timeout(*size))
+            .unwrap_or_else(|| std::time::Duration::from_secs(120)),
+        Action::Branch { .. } => crate::operator_cell::branch_timeout(0),
+        _ => std::time::Duration::from_secs(120),
+    };
     let database = Reachable::open(
         Fleet {
             bucket: &storage.bucket,
@@ -117,8 +146,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         Subject {
             noun: "database",
             source: "d1",
-            // A migration on a large table is not a diagnostic ping.
-            timeout: std::time::Duration::from_secs(120),
+            timeout,
         },
         scope,
         None,
@@ -134,8 +162,11 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         Action::Execute { command: sql, file } => {
             let source = match (sql, file) {
                 (Some(sql), _) => sql,
-                (None, Some(file)) => std::fs::read_to_string(&file)
-                    .with_context(|| format!("read {}", file.display()))?,
+                (None, Some(file)) => {
+                    reject_sqlite_seed_for_execute(&file)?;
+                    std::fs::read_to_string(&file)
+                        .with_context(|| format!("read {}", file.display()))?
+                }
                 (None, None) => unreachable!("parse refuses neither --command nor --file"),
             };
             let result = database.exec(&source).await?;
@@ -200,6 +231,55 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                 format!("{:.2} sec", milliseconds / 1000.0)
             };
             note!("Executed {count} statement(s) in {took}");
+        }
+        Action::Import { .. } => {
+            let (absolute, _) = import_seed
+                .ok_or_else(|| anyhow!("internal error: import seed was not validated"))?;
+            let result = database.import(&absolute).await?;
+            if command.json {
+                out.row(&ImportReply(result.clone()))?;
+            } else {
+                let bytes = result.get("bytes").and_then(Value::as_u64).unwrap_or_default();
+                let duration_ms = result
+                    .get("duration_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let snapshot_txid = result
+                    .get("snapshot_txid")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                note!(
+                    "Imported {bytes} bytes in {duration_ms}ms (snapshot txid {snapshot_txid})"
+                );
+            }
+        }
+        Action::Branch { parent_bucket } => {
+            let project_id = crate::d1_branch::branch_cli_project_id(
+                &project.project_id,
+                Some(&storage.bucket),
+            );
+            crate::d1_branch::validate_parent_bucket(&parent_bucket, &project_id)
+                .map_err(|error| anyhow!("{error}"))?;
+            let result = database
+                .branch(&parent_bucket)
+                .await
+                .with_context(|| format!("branch from {parent_bucket}"))?;
+            if command.json {
+                out.row(&ImportReply(result.clone()))?;
+            } else {
+                let fork_txid = result.get("fork_txid").and_then(Value::as_u64).unwrap_or_default();
+                let bytes_parent = result
+                    .get("bytes_parent")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let duration_ms = result
+                    .get("duration_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                note!(
+                    "Branched at fork txid {fork_txid} ({bytes_parent} parent bytes) in {duration_ms}ms"
+                );
+            }
         }
         Action::MigrationsList => {
             let pending = database.pending(declaration).await?;
@@ -307,6 +387,16 @@ impl Reachable {
         .with_context(|| format!("apply {}", migration.name))?;
         Ok(())
     }
+
+    async fn import(&self, path: &Path) -> anyhow::Result<Value> {
+        self.call(serde_json::json!({ "import": { "path": path.display().to_string() } }))
+            .await
+    }
+
+    async fn branch(&self, parent_bucket: &str) -> anyhow::Result<Value> {
+        self.call(serde_json::json!({ "branch": { "parent_bucket": parent_bucket } }))
+            .await
+    }
 }
 fn read_migrations(directory: &std::path::Path) -> anyhow::Result<Vec<Migration>> {
     if !directory.exists() {
@@ -396,6 +486,92 @@ fn read_migrations(directory: &std::path::Path) -> anyhow::Result<Vec<Migration>
         .collect())
 }
 
+const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
+const DEFAULT_IMPORT_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+fn import_max_bytes() -> u64 {
+    std::env::var("CELLD_D1_IMPORT_MAX_MB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|megabytes| *megabytes > 0)
+        .map(|megabytes| megabytes * 1024 * 1024)
+        .unwrap_or(DEFAULT_IMPORT_MAX_BYTES)
+}
+
+fn sqlite_magic_at(path: &Path) -> anyhow::Result<bool> {
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut header = [0u8; 16];
+    let read = file.read(&mut header)?;
+    Ok(read >= SQLITE_MAGIC.len() && &header[..SQLITE_MAGIC.len()] == SQLITE_MAGIC)
+}
+
+fn reject_sqlite_seed_for_execute(path: &Path) -> anyhow::Result<()> {
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("db"))
+    {
+        bail!(
+            "{} is a SQLite database file; use `celld d1 import` instead of execute --file",
+            path.display()
+        );
+    }
+    if sqlite_magic_at(path)? {
+        bail!(
+            "{} is a SQLite database file; use `celld d1 import` instead of execute --file",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Local checks before the owner opens the seed on the same machine (AD-1).
+fn validate_import_seed(path: &Path) -> anyhow::Result<(PathBuf, u64)> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve the working directory")?
+            .join(path)
+    };
+    let metadata = std::fs::metadata(&path)
+        .with_context(|| format!("read {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{} is not a file", path.display());
+    }
+    let size = metadata.len();
+    let limit = import_max_bytes();
+    if size > limit {
+        bail!(
+            "sqlite seed {} bytes exceeds limit of {} bytes (CELLD_D1_IMPORT_MAX_MB)",
+            size,
+            limit
+        );
+    }
+    let wal = PathBuf::from(format!("{}-wal", path.display()));
+    let shm = PathBuf::from(format!("{}-shm", path.display()));
+    if wal.exists() {
+        bail!(
+            "refusing import with WAL sidecar {}; checkpoint the database and remove it first",
+            wal.display()
+        );
+    }
+    if shm.exists() {
+        bail!(
+            "refusing import with SHM sidecar {}; checkpoint the database and remove it first",
+            shm.display()
+        );
+    }
+    if !sqlite_magic_at(&path)? {
+        bail!(
+            "{} is not a SQLite database (missing SQLite format 3 header)",
+            path.display()
+        );
+    }
+    let absolute = std::fs::canonicalize(&path)
+        .with_context(|| format!("resolve {}", path.display()))?;
+    Ok((absolute, size))
+}
+
 /// Every node with an unexpired lease and a usable address, as (id, address).
 /// The id is not decoration: a peer signature binds the node it is addressed
 /// to. Any of them will do, because the route forwards to the owner, so the
@@ -408,6 +584,12 @@ enum Action {
     Execute {
         command: Option<String>,
         file: Option<PathBuf>,
+    },
+    Import {
+        file: PathBuf,
+    },
+    Branch {
+        parent_bucket: String,
     },
     MigrationsList,
     MigrationsApply,
@@ -428,9 +610,19 @@ impl Command {
         let Some(first) = arguments.next() else {
             return Ok(None);
         };
+        let mut import = false;
+        let mut branch = false;
         let action = match first.as_str() {
             "--help" | "-h" | "help" => return Ok(None),
             "execute" => None,
+            "import" => {
+                import = true;
+                None
+            }
+            "branch" => {
+                branch = true;
+                None
+            }
             // An option in the subcommand slot means the subcommand is
             // missing, not that the option names one. Reporting `--bucket` as
             // an unknown subcommand would send an operator looking for a
@@ -445,6 +637,12 @@ impl Command {
             },
             other => bail!("unknown `celld d1` subcommand: {other}"),
         };
+        if matches!(
+            arguments.peek().map(|value| value.as_str()),
+            Some("--help" | "-h")
+        ) {
+            return Ok(None);
+        }
         let database = arguments
             .next()
             .filter(|value| !value.starts_with('-'))
@@ -456,6 +654,7 @@ impl Command {
         let mut fleet = FleetFlags::default();
         let mut json = false;
         let mut unsafe_public_advertise = false;
+        let mut parent_bucket = None;
         while let Some(argument) = arguments.next() {
             let mut value = |flag: &str| {
                 arguments
@@ -465,6 +664,7 @@ impl Command {
             match argument.as_str() {
                 "--command" => sql = Some(value("--command")?),
                 "--file" => file = Some(PathBuf::from(value("--file")?)),
+                "--parent-bucket" => parent_bucket = Some(value("--parent-bucket")?),
                 "--json" => json = true,
                 "--unsafe-public-advertise" => unsafe_public_advertise = true,
                 "--help" | "-h" => return Ok(None),
@@ -482,23 +682,38 @@ impl Command {
                 }
             }
         }
-        let action = match action {
-            Some(action) => {
-                // Accepting the flag and ignoring it would tell an operator
-                // their SQL ran when nothing read it.
-                if sql.is_some() || file.is_some() {
-                    bail!(
-                        "`celld d1 migrations` takes no --command or --file; \
-                         migrations come from the migrations directory"
-                    );
-                }
-                action
+        let action = if branch {
+            if sql.is_some() || file.is_some() {
+                bail!("`celld d1 branch` takes no --command or --file");
             }
-            None => {
-                if sql.is_some() == file.is_some() {
-                    bail!("celld d1 execute requires exactly one of --command or --file");
+            let parent_bucket = parent_bucket
+                .ok_or_else(|| anyhow!("celld d1 branch requires --parent-bucket"))?;
+            Action::Branch { parent_bucket }
+        } else if import {
+            if sql.is_some() {
+                bail!("`celld d1 import` takes no --command");
+            }
+            let file = file.ok_or_else(|| anyhow!("celld d1 import requires --file"))?;
+            Action::Import { file }
+        } else {
+            match action {
+                Some(action) => {
+                    // Accepting the flag and ignoring it would tell an operator
+                    // their SQL ran when nothing read it.
+                    if sql.is_some() || file.is_some() {
+                        bail!(
+                            "`celld d1 migrations` takes no --command or --file; \
+                             migrations come from the migrations directory"
+                        );
+                    }
+                    action
                 }
-                Action::Execute { command: sql, file }
+                None => {
+                    if sql.is_some() == file.is_some() {
+                        bail!("celld d1 execute requires exactly one of --command or --file");
+                    }
+                    Action::Execute { command: sql, file }
+                }
             }
         };
         Ok(Some(Self {
@@ -520,6 +735,8 @@ pub fn print_help() {
 
 USAGE:
   celld d1 execute DATABASE (--command SQL | --file PATH) [PROJECT] --bucket NAME
+  celld d1 import   DATABASE --file PATH [PROJECT] --bucket NAME
+  celld d1 branch   DATABASE --parent-bucket URI [PROJECT] --bucket NAME
   celld d1 migrations apply DATABASE [PROJECT] --bucket NAME
   celld d1 migrations list  DATABASE [PROJECT] --bucket NAME
 
@@ -534,6 +751,11 @@ the database. It signs each request with the fleet's shared secret, which it
 reads from the bucket, so it needs the same bucket credentials celld deploy
 needs.
 
+`import` uploads a binary SQLite file from this machine. The seed must carry
+the SQLite format 3 header, must not have `-wal` or `-shm` sidecars, and must
+be at most 512 MiB (override with CELLD_D1_IMPORT_MAX_MB). `execute --file`
+accepts SQL text only; pass a `.db` file to `import` instead.
+
 Migration files are `NNNN_description.sql` in `migrations/`, applied in the
 order of their numeric prefixes as wrangler applies them. `migrations_dir` on
 the d1_databases entry moves the directory, and `migrations_table` renames the
@@ -542,16 +764,42 @@ bookkeeping table. celld records applied migrations in that table
 `wrangler d1 migrations` uses.
 
 `execute` prints a table, and every message goes to stderr, so its stdout
-carries only result rows. Pass --json for one JSON object per row.
+carries only result rows. Pass --json for one JSON object per row. `import`
+with --json prints one JSON object with bytes, duration_ms, and snapshot_txid.
 
 OPTIONS:
   --command SQL       SQL to run; several statements are permitted
-  --file PATH         Read the SQL from a file instead
-  --json              Print one JSON object per row instead of a table
+  --file PATH         For execute: read SQL from a file. For import: the SQLite seed
+  --json              JSON output instead of a table or summary line
 {FLEET_HELP}
   --unsafe-public-advertise
                       Permit a node whose advertised address is a public IP
   -h, --help          Show this help"#
     );
     let _ = Output::new(Format::Text).help(&text);
+}
+
+#[cfg(test)]
+mod import_parse_tests {
+    use super::*;
+
+    #[test]
+    fn branch_help_does_not_require_database() {
+        assert!(Command::parse(vec!["branch".into(), "--help".into()])
+            .unwrap()
+            .is_none());
+        assert!(Command::parse(vec!["branch".into(), "-h".into()])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn import_help_does_not_require_database() {
+        assert!(Command::parse(vec!["import".into(), "--help".into()])
+            .unwrap()
+            .is_none());
+        assert!(Command::parse(vec!["import".into(), "-h".into()])
+            .unwrap()
+            .is_none());
+    }
 }

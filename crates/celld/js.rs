@@ -1439,6 +1439,69 @@ fn cell_gate_abandon(scope: &str) {
     );
 }
 
+/// D1 binary imports that closed isolate storage and need a reopen on delivery.
+type D1ImportReopenMap = HashMap<u64, crate::d1_import::ReopenSpec>;
+
+/// D1 branches that closed isolate storage and need a reopen on delivery.
+type D1BranchReopenMap = HashMap<u64, crate::d1_branch::ReopenSpec>;
+
+/// Queue a reopen on this isolate, not this OS thread.
+///
+/// `prepare` closes SQLite on the isolate that owns the cell. The async
+/// import/branch finishes on whichever tokio worker `deliver` runs on; a
+/// thread-local map then misses the spec, import reports success, and every
+/// later D1 call fails with `no db for {scope}`. Same constraint as
+/// [`PromiseMap`].
+fn register_d1_import_reopen(
+    scope: &mut v8::PinScope,
+    op: u64,
+    spec: crate::d1_import::ReopenSpec,
+) {
+    actor_runtime_state(scope)
+        .d1_import_reopens
+        .lock()
+        .unwrap()
+        .insert(op, spec);
+}
+
+fn register_d1_branch_reopen(
+    scope: &mut v8::PinScope,
+    op: u64,
+    spec: crate::d1_branch::ReopenSpec,
+) {
+    actor_runtime_state(scope)
+        .d1_branch_reopens
+        .lock()
+        .unwrap()
+        .insert(op, spec);
+}
+
+fn finish_d1_import_reopen(scope: &mut v8::PinScope, op: u64) -> Option<String> {
+    let spec = actor_runtime_state(scope)
+        .d1_import_reopens
+        .lock()
+        .unwrap()
+        .remove(&op)?;
+    crate::d1_import::reopen(&spec)
+        .err()
+        .map(|failure| failure.message)
+}
+
+fn finish_d1_branch_reopen(scope: &mut v8::PinScope, op: u64) -> Option<String> {
+    let spec = actor_runtime_state(scope)
+        .d1_branch_reopens
+        .lock()
+        .unwrap()
+        .remove(&op)?;
+    crate::d1_branch::reopen(&spec)
+        .err()
+        .map(|failure| failure.message)
+}
+
+fn finish_d1_reopen(scope: &mut v8::PinScope, op: u64) -> Option<String> {
+    finish_d1_import_reopen(scope, op).or_else(|| finish_d1_branch_reopen(scope, op))
+}
+
 /// JS promise resolvers awaiting an async op, keyed by the op's id.
 ///
 /// **Per isolate, and shared across threads.** Under D1 a request's turns run
@@ -2193,6 +2256,8 @@ struct ActorRuntimeState {
     next_io_context_id: AtomicU64,
     egress: EgressPolicy,
     event_hooks: OnceLock<EventHooks>,
+    d1_import_reopens: std::sync::Mutex<D1ImportReopenMap>,
+    d1_branch_reopens: std::sync::Mutex<D1BranchReopenMap>,
 }
 
 /// The harness functions the host calls on the boundary of every cell event.
@@ -4229,6 +4294,10 @@ fn deliver(
 ) {
     entry.ops.remove(&op);
     let guard = CurrentGuard::enter(entry.context.clone());
+    let res = match finish_d1_reopen(tc, op) {
+        Some(error) => Err(error),
+        None => res,
+    };
     resolve_res(tc, op, res);
     tc.perform_microtask_checkpoint();
     drop(guard);
@@ -4847,6 +4916,8 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__sql_cursor_close" => storage_ops::op_sql_cursor_close,
         "__sql_database_size" => storage_ops::op_sql_database_size,
         "__d1_run" => storage_ops::op_d1_run,
+        "__d1_import" => op_d1_import,
+        "__d1_branch" => op_d1_branch,
         "__storage_transaction_control" => storage_ops::op_storage_transaction_control,
         "__log" => op_log,
         "__storage_put" => storage_ops::op_storage_put,
@@ -5125,6 +5196,91 @@ fn op_kv_blob(
         };
         Ok(asyncrt::OpOut::Str(reply.to_string()))
     });
+    rv.set(promise_for(scope, id));
+}
+
+/// `__d1_import(scope, path, sqliteVec)` -> Promise<string>.
+///
+/// Binary import is intentionally separate from [`storage_ops::op_d1_run`]:
+/// the SQL modes cannot quiesce replication or publish an LTX snapshot.
+fn op_d1_import(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let scope_name = args.get(0).to_rust_string_lossy(scope);
+    let path = args.get(1).to_rust_string_lossy(scope);
+    let sqlite_vec = args.get(2).boolean_value(scope);
+    let (prepared, reopen) = match crate::d1_import::prepare(&scope_name, &path, sqlite_vec) {
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            let reply = serde_json::json!({
+                "error": { "family": "D1_IMPORT_ERROR", "message": failure.message },
+            })
+            .to_string();
+            let id = asyncrt::enqueue(async move { Ok(asyncrt::OpOut::Str(reply)) });
+            rv.set(promise_for(scope, id));
+            return;
+        }
+    };
+    let id = asyncrt::enqueue(async move {
+        let reply = match crate::d1_import::import_prepared(prepared).await {
+            Ok(ok) => serde_json::json!({ "ok": ok }).to_string(),
+            Err(failure) => serde_json::json!({
+                "error": { "family": "D1_IMPORT_ERROR", "message": failure.message },
+            })
+            .to_string(),
+        };
+        Ok(asyncrt::OpOut::Str(reply))
+    });
+    register_d1_import_reopen(scope, id, reopen);
+    rv.set(promise_for(scope, id));
+}
+
+/// `__d1_branch(scope, requestJson, sqliteVec)` -> Promise<string>.
+fn op_d1_branch(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let scope_name = args.get(0).to_rust_string_lossy(scope);
+    let request_json = args.get(1).to_rust_string_lossy(scope);
+    let sqlite_vec = args.get(2).boolean_value(scope);
+    let request: crate::d1_branch::BranchRequest = match serde_json::from_str(&request_json) {
+        Ok(request) => request,
+        Err(error) => {
+            let reply = serde_json::json!({
+                "error": { "family": "D1_BRANCH_ERROR", "message": error.to_string() },
+            })
+            .to_string();
+            let id = asyncrt::enqueue(async move { Ok(asyncrt::OpOut::Str(reply)) });
+            rv.set(promise_for(scope, id));
+            return;
+        }
+    };
+    let (prepared, reopen) = match crate::d1_branch::prepare(&scope_name, request, sqlite_vec) {
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            let reply = serde_json::json!({
+                "error": { "family": "D1_BRANCH_ERROR", "message": failure.message },
+            })
+            .to_string();
+            let id = asyncrt::enqueue(async move { Ok(asyncrt::OpOut::Str(reply)) });
+            rv.set(promise_for(scope, id));
+            return;
+        }
+    };
+    let id = asyncrt::enqueue(async move {
+        let reply = match crate::d1_branch::branch_prepared(prepared).await {
+            Ok(ok) => serde_json::json!({ "ok": ok }).to_string(),
+            Err(failure) => serde_json::json!({
+                "error": { "family": "D1_BRANCH_ERROR", "message": failure.message },
+            })
+            .to_string(),
+        };
+        Ok(asyncrt::OpOut::Str(reply))
+    });
+    register_d1_branch_reopen(scope, id, reopen);
     rv.set(promise_for(scope, id));
 }
 

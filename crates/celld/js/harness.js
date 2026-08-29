@@ -6875,6 +6875,18 @@ const __d1Run = (scope, request) => {
   return response.ok;
 };
 
+const __d1Import = async (scope, path, sqliteVec) => {
+  const response = JSON.parse(await __d1_import(scope, String(path), !!sqliteVec));
+  if (response.error) throw __d1Failure(response.error);
+  return response.ok;
+};
+
+const __d1Branch = async (scope, requestJson, sqliteVec) => {
+  const response = JSON.parse(await __d1_branch(scope, String(requestJson), !!sqliteVec));
+  if (response.error) throw __d1Failure(response.error);
+  return response.ok;
+};
+
 class __D1DatabaseCell {
   constructor(ctx) {
     this.ctx = ctx;
@@ -6931,6 +6943,18 @@ class __D1DatabaseCell {
           sql: String(body.exec.sql),
           rows: !!body.exec.rows,
         });
+      } else if (body.import !== undefined) {
+        result = await __d1Import(
+          this.ctx.storage.sql._scope,
+          String(body.import.path),
+          __cell.compat.sqlite_vec,
+        );
+      } else if (body.branch !== undefined) {
+        result = await __d1Branch(
+          this.ctx.storage.sql._scope,
+          JSON.stringify(body.branch),
+          __cell.compat.sqlite_vec,
+        );
       } else {
         result = this.__d1Query(body.statements || []);
       }

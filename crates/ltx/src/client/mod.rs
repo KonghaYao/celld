@@ -14,6 +14,7 @@ use crate::TXID;
 use async_trait::async_trait;
 
 pub mod bundle;
+pub mod chained;
 pub mod file;
 pub mod object_store;
 

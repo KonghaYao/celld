@@ -799,6 +799,8 @@ async fn put_pointer(bucket: &Bucket, key: &str, body: Vec<u8>) -> anyhow::Resul
 /// What `celld d1` needs out of a project: the declared databases, so a name
 /// the project never declared fails here instead of creating an empty one.
 pub struct D1Project {
+    /// Wrangler `name` — the stable project id in fleet URLs.
+    pub project_id: String,
     /// One entry per declaration, in config order.
     pub databases: Vec<D1Declaration>,
 }
@@ -832,10 +834,11 @@ pub fn read_d1_project(given: Option<PathBuf>) -> anyhow::Result<D1Project> {
     let object = config
         .as_object()
         .ok_or_else(|| anyhow!("{} is not a JSON object", path.display()))?;
-    object
+    let project_id = object
         .get("name")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("{} has no `name`", path.display()))?;
+        .ok_or_else(|| anyhow!("{} has no `name`", path.display()))?
+        .to_string();
     let mut databases = Vec::new();
     if let Some(Value::Array(entries)) = object.get("d1_databases") {
         for entry in entries {
@@ -923,7 +926,10 @@ pub fn read_d1_project(given: Option<PathBuf>) -> anyhow::Result<D1Project> {
         }
         unique.push(declaration);
     }
-    Ok(D1Project { databases: unique })
+    Ok(D1Project {
+        project_id,
+        databases: unique,
+    })
 }
 
 /// A path may name the config itself or the directory holding it; with no

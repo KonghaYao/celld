@@ -651,14 +651,15 @@ impl ReplicaClient for ObjectStoreClient {
         }
         let store = self.store().await?;
         let prefix = ObjPath::from(self.level_prefix(level));
-        // The offset ends immediately before every filename with this minimum
-        // TXID. S3 and GCS can push it into the listing request, so an additive
-        // compaction does not scan the complete retained L0 history. The
-        // supported production stores return each page in lexical order. The
-        // compactor validates continuity and fails closed for an unordered
-        // custom store.
-        let offset = ObjPath::from(format!("{}{:016x}", self.level_prefix(level), seek.0));
-        let mut listed = store.list_with_offset(Some(&prefix), &offset);
+        // Seek 0/1 is restore and "is there an origin snapshot?". Offset
+        // listings on some S3-compatible stores (RustFS) return empty for a
+        // prefix this client did not just write; a full prefix list does not.
+        let mut listed = if seek.0 <= 1 {
+            store.list(Some(&prefix))
+        } else {
+            let offset = ObjPath::from(format!("{}{:016x}", self.level_prefix(level), seek.0));
+            store.list_with_offset(Some(&prefix), &offset)
+        };
         let mut infos = Vec::with_capacity(limit.min(256));
         while let Some(meta) = listed.try_next().await.map_err(map_os_error)? {
             let name = meta.location.filename().unwrap_or("");

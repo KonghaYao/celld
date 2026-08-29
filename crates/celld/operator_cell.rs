@@ -241,6 +241,20 @@ async fn live_nodes(
     Ok(reachable)
 }
 
+/// Branch `Reachable` budget: **max(600s, parent_snapshot_mb × 2s)** per D1-BRANCH-RPC.md.
+pub(crate) fn branch_timeout(parent_snapshot_bytes: u64) -> Duration {
+    import_timeout(parent_snapshot_bytes)
+}
+
+/// Import `Reachable` budget: **max(600s, size_mb × 2s)** per `D1-IMPORT-RPC.md`.
+pub(crate) fn import_timeout(size_bytes: u64) -> Duration {
+    let size_mb = size_bytes.div_ceil(1024 * 1024);
+    std::cmp::max(
+        Duration::from_secs(600),
+        Duration::from_secs(size_mb.saturating_mul(2)),
+    )
+}
+
 /// Indented detail under a refusal, or nothing when there is none to give.
 pub(crate) fn report(refused: &[String]) -> String {
     if refused.is_empty() {

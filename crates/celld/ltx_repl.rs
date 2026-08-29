@@ -30,7 +30,11 @@ use anyhow::anyhow;
 use celld_ltx::object_store::ObjectStore;
 use celld_ltx::replica;
 use celld_ltx::replica_compactor::ReplicaCompactor;
+use celld_ltx::base::{self, BasePointer};
+use celld_ltx::replica::calc_restore_plan;
+use celld_ltx::ChainedReplicaClient;
 use celld_ltx::Db;
+use celld_ltx::compaction_level::SNAPSHOT_LEVEL;
 use celld_ltx::HostTaskError;
 use celld_ltx::LtxHost;
 use celld_ltx::ObjectStoreClient;
@@ -38,6 +42,7 @@ use celld_ltx::ObjectStoreConfig;
 use celld_ltx::Pos;
 use celld_ltx::Replica;
 use celld_ltx::ReplicaClient;
+use celld_ltx::Checksum;
 use celld_ltx::TimestampMetadataKey;
 use celld_ltx::TXID;
 use tokio::sync::mpsc;
@@ -570,6 +575,33 @@ struct RemoteRestoreTiming {
 struct HandoffSnapshot {
     max_txid: TXID,
     data: Vec<u8>,
+}
+
+pub(crate) struct SqliteImportResult {
+    pub bytes: u64,
+    pub snapshot_txid: u64,
+}
+
+fn open_managed_db(
+    path: &Path,
+    ltx_host: &LtxHost,
+    vfs_name: Option<&str>,
+    truncate_pages: Option<u32>,
+) -> anyhow::Result<Db> {
+    #[cfg(celld_internal_tests)]
+    let mut db = crate::fault::with_connection_role("celld_ltx_db", || match vfs_name {
+        Some(vfs_name) => Db::open_with_host_and_vfs(path, ltx_host.clone(), vfs_name),
+        None => Db::open_with_host(path, ltx_host.clone()),
+    })?;
+    #[cfg(not(celld_internal_tests))]
+    let mut db = {
+        debug_assert!(vfs_name.is_none());
+        Db::open_with_host(path, ltx_host.clone())?
+    };
+    if let Some(pages) = truncate_pages {
+        db.truncate_page_n = pages;
+    }
+    Ok(db)
 }
 
 /// One resident cell's replication state: the `celld_ltx::Db` shadowing its WAL
@@ -1153,6 +1185,15 @@ impl LtxRepl {
     }
 
     fn db_path(&self, cell: &str, epoch: u64) -> PathBuf {
+        self.cell_db_path(cell, epoch)
+    }
+
+    /// Local root for resident cell databases (`watch/<cell>/ltx/...`).
+    pub(crate) fn data_root(&self) -> &Path {
+        &self.watch
+    }
+
+    pub(crate) fn cell_db_path(&self, cell: &str, epoch: u64) -> PathBuf {
         self.watch
             .join(cell)
             .join("ltx")
@@ -1177,20 +1218,320 @@ impl LtxRepl {
         }
     }
 
-    /// A per-cell client over the shared store, keyed to the cell's epoch
-    /// prefix. `cells/<cell>/ltx/e<epoch>` matches [`Self::db_path`]'s remote
-    /// twin so the same coordinates address local and replica state.
     fn client_for(&self, cell: &str, epoch: u64) -> ObjectStoreClient {
+        self.client_for_bucket_prefix(&self.prefix, cell, epoch)
+    }
+
+    fn client_for_bucket_prefix(
+        &self,
+        bucket_prefix: &str,
+        cell: &str,
+        epoch: u64,
+    ) -> ObjectStoreClient {
         let mut config = node_config(
             &self.bucket,
             self.endpoint.as_deref(),
             &self.region,
             self.credentials.as_ref(),
         );
-        config.path = format!("{}cells/{cell}/ltx/e{epoch}", self.prefix);
+        config.path = format!("{bucket_prefix}cells/{cell}/ltx/e{epoch}");
         config.timestamp_metadata_key = self.timestamp_metadata_key;
         ObjectStoreClient::with_store(config, self.store.clone())
     }
+
+    async fn highest_nonempty_epoch_in_prefix(
+        &self,
+        bucket_prefix: &str,
+        cell: &str,
+    ) -> anyhow::Result<Option<u64>> {
+        let epochs = self.ltx_epochs_in_prefix(bucket_prefix, cell).await?;
+        Ok(epochs.into_iter().max())
+    }
+
+    /// Epochs under `{prefix}cells/{cell}/ltx/` that actually hold `.ltx` objects.
+    /// Uses a flat object listing rather than delimiter prefixes: RustFS/S3
+    /// delimiter listing on a sibling version prefix can return empty or a
+    /// directory with no LTX, which then fails restore as TxNotAvailable.
+    async fn ltx_epochs_in_prefix(
+        &self,
+        bucket_prefix: &str,
+        cell: &str,
+    ) -> anyhow::Result<Vec<u64>> {
+        use celld_ltx::object_store::path::Path as ObjPath;
+        use futures_util::StreamExt;
+        let base = format!("{bucket_prefix}cells/{cell}/ltx/");
+        let mut listing = self.store.list(Some(&ObjPath::from(base.as_str())));
+        let mut epochs = BTreeSet::new();
+        while let Some(item) = listing.next().await {
+            let meta = item.map_err(|error| anyhow!("list {base}: {error}"))?;
+            let key = meta.location.to_string();
+            if !key.contains(".ltx") {
+                continue;
+            }
+            if let Some(epoch) = key.split("/ltx/e").nth(1).and_then(|rest| {
+                rest.split('/').next()?.parse::<u64>().ok()
+            }) {
+                epochs.insert(epoch);
+            }
+        }
+        Ok(epochs.into_iter().collect())
+    }
+
+    async fn restorable_parent_epoch(
+        &self,
+        bucket_prefix: &str,
+        cell: &str,
+        hint: u64,
+    ) -> anyhow::Result<u64> {
+        if hint > 0 {
+            let client = self.client_for_bucket_prefix(bucket_prefix, cell, hint);
+            if self.prefix_has_min_txid_one_anchor(&client).await? {
+                return Ok(hint);
+            }
+            anyhow::bail!(
+                "parent epoch {hint} for {cell} has no MinTXID==1 LTX (L0 or L9)"
+            );
+        }
+        let epochs = self.ltx_epochs_in_prefix(bucket_prefix, cell).await?;
+        for epoch in epochs.iter().copied().rev() {
+            let client = self.client_for_bucket_prefix(bucket_prefix, cell, epoch);
+            if self.prefix_has_min_txid_one_anchor(&client).await? {
+                return Ok(epoch);
+            }
+        }
+        // RustFS list of a sibling version prefix can be empty even when the
+        // parent import snapshot exists. Fresh parents write epoch 1; probe it
+        // (and an explicit hint) by opening that epoch path directly.
+        let mut fallback = vec![1_u64];
+        if hint > 0 && hint != 1 {
+            fallback.push(hint);
+        }
+        for epoch in fallback {
+            if epochs.contains(&epoch) {
+                continue;
+            }
+            let client = self.client_for_bucket_prefix(bucket_prefix, cell, epoch);
+            if self.prefix_has_min_txid_one_anchor(&client).await? {
+                return Ok(epoch);
+            }
+        }
+        anyhow::bail!("parent prefix has no restorable LTX for {cell}")
+    }
+
+    pub(crate) async fn child_has_base_json(
+        &self,
+        cell: &str,
+        epoch: u64,
+    ) -> anyhow::Result<bool> {
+        crate::d1_branch::read_base_json(self.store.as_ref(), &self.prefix, cell, epoch)
+            .await
+            .map(|value| value.is_some())
+    }
+
+    async fn prefix_has_min_txid_one_anchor(
+        &self,
+        client: &ObjectStoreClient,
+    ) -> anyhow::Result<bool> {
+        for level in [SNAPSHOT_LEVEL, 0] {
+            let files = client.ltx_files(level, TXID(1)).await?;
+            if files.iter().any(|info| info.min_txid == TXID(1)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Branch this cell from a parent version bucket (D1-BRANCH owner path).
+    pub async fn branch_from_parent(
+        &self,
+        cell: &str,
+        epoch: u64,
+        parent: &crate::d1_branch::ValidatedParentBucket,
+        parent_epoch_hint: u64,
+    ) -> anyhow::Result<crate::d1_branch::BranchResult> {
+        let key = (cell.to_string(), epoch);
+        let handle = self
+            .cells
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow!("no managed replica for {cell} epoch {epoch}"))?;
+        if handle.syncing.swap(true, Ordering::SeqCst) {
+            anyhow::bail!("cell {cell} epoch {epoch} sync already in progress");
+        }
+        struct SyncingGuard<'a>(&'a Cell);
+        impl Drop for SyncingGuard<'_> {
+            fn drop(&mut self) {
+                self.0.syncing.store(false, Ordering::SeqCst);
+            }
+        }
+        let _sync_guard = SyncingGuard(&handle.clone());
+        cancel_compaction(&handle);
+
+        let child_client = self.client_for(cell, epoch);
+        if crate::d1_branch::read_base_json(
+            self.store.as_ref(),
+            &self.prefix,
+            cell,
+            epoch,
+        )
+        .await?
+        .is_some()
+        {
+            anyhow::bail!("child prefix already has base.json");
+        }
+
+        let parent_epoch = self
+            .restorable_parent_epoch(&parent.key_prefix, cell, parent_epoch_hint)
+            .await?;
+
+        if crate::d1_branch::read_base_json(
+            self.store.as_ref(),
+            &parent.key_prefix,
+            cell,
+            parent_epoch,
+        )
+        .await?
+        .is_some()
+        {
+            anyhow::bail!("parent is already a branch; compact first");
+        }
+
+        let parent_client =
+            self.client_for_bucket_prefix(&parent.key_prefix, cell, parent_epoch);
+        let parent_plan = calc_restore_plan(&parent_client, TXID(0))
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "parent {} epoch {parent_epoch} is not restorable: {error}",
+                    parent.uri
+                )
+            })?;
+        let terminal = parent_plan
+            .last()
+            .ok_or_else(|| anyhow!("parent prefix has no restorable LTX"))?;
+        let fork_txid = terminal.max_txid;
+        calc_restore_plan(&parent_client, fork_txid).await.map_err(|error| {
+            anyhow!("parent cannot restore to fork txid {fork_txid}: {error}")
+        })?;
+        let terminal_bytes = parent_client
+            .open_ltx_file(terminal.level, terminal.min_txid, terminal.max_txid)
+            .await
+            .map_err(|error| anyhow!("read parent terminal LTX: {error}"))?;
+        let fork_checksum = base::post_apply_checksum_from_ltx(&terminal_bytes)?;
+        let bytes_parent = parent_plan
+            .iter()
+            .find(|info| info.level == SNAPSHOT_LEVEL && info.min_txid == TXID(1))
+            .map(|info| info.size.max(0) as u64)
+            .unwrap_or_else(|| terminal.size.max(0) as u64);
+
+        let pointer = BasePointer {
+            parent_bucket: parent.uri.clone(),
+            parent_cell: cell.to_string(),
+            parent_epoch,
+            fork_txid: fork_txid.0,
+            fork_checksum: base::checksum_hex(fork_checksum),
+        };
+        child_client
+            .delete_all()
+            .await
+            .map_err(|error| anyhow!("clear child prefix before branch: {error}"))?;
+
+        crate::d1_branch::put_base_json_cas(
+            self.store.as_ref(),
+            &self.prefix,
+            cell,
+            epoch,
+            &pointer,
+        )
+        .await?;
+
+        let chained = ChainedReplicaClient::new(
+            self.client_for_bucket_prefix(&parent.key_prefix, cell, parent_epoch),
+            self.client_for(cell, epoch),
+            fork_txid,
+        );
+        let dst = self.db_path(cell, epoch);
+        let ltx_host = self.ltx_host.clone();
+        let vfs_name = self.vfs_name.clone();
+        let truncate_pages = self.truncate_pages_for_cell(cell);
+        let handle_ = handle.clone();
+        let restore_slots = self.restore_slots.clone();
+        asyncrt::blocking(move || -> anyhow::Result<()> {
+            let mut replica_slot = handle_.replica.lock().unwrap();
+            let replica = replica_slot
+                .take()
+                .ok_or_else(|| anyhow!("managed replica is closed"))?;
+            let db = replica
+                .into_db()
+                .ok_or_else(|| anyhow!("managed database is unavailable"))?;
+            db.close().map_err(|error| anyhow!("{error}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| anyhow!("join branch close task: {error}"))??;
+
+        let _ = self.ltx_host.remove_file(&dst);
+        replica::restore_with_host_and_download_slots(
+            &chained,
+            &dst,
+            fork_txid,
+            self.ltx_host.clone(),
+            restore_slots,
+        )
+        .await
+        .map_err(|error| anyhow!("branch restore {cell} e{epoch}: {error}"))?;
+
+        let handle_ = handle.clone();
+        let seed_pos = asyncrt::blocking(move || -> anyhow::Result<Pos> {
+            let mut replica_slot = handle_.replica.lock().unwrap();
+            let mut db = open_managed_db(&dst, &ltx_host, vfs_name.as_deref(), truncate_pages)?;
+            db.seed_fork_catchup(fork_txid, fork_checksum)
+                .map_err(|error| anyhow!("seed branch L0 catchup: {error}"))?;
+            let pos = db
+                .pos()
+                .map_err(|error| anyhow!("read branch position: {error}"))?;
+            anyhow::ensure!(
+                pos.txid == fork_txid,
+                "branch baseline txid mismatch: expected {fork_txid}, got {}",
+                pos.txid
+            );
+
+            let mut replica = Replica::new(db, child_client);
+            replica.seed_pos(pos);
+            *replica_slot = Some(replica);
+            Ok(pos)
+        })
+        .await
+        .map_err(|error| anyhow!("join branch task: {error}"))??;
+
+        handle.req_seq.store(0, Ordering::SeqCst);
+        handle.synced_seq.store(0, Ordering::SeqCst);
+        handle.submitted_seq.store(0, Ordering::SeqCst);
+        handle.shipped_seq.store(0, Ordering::SeqCst);
+        handle.submitted_txid.store(seed_pos.txid.0, Ordering::SeqCst);
+        handle.shipped_txid.store(seed_pos.txid.0, Ordering::SeqCst);
+        handle.durable_txid.store(seed_pos.txid.0, Ordering::SeqCst);
+        handle.percell_txid.store(0, Ordering::SeqCst);
+        handle.last_sync_ms.store(0, Ordering::SeqCst);
+
+        info!(
+            event = "d1_branch_restore",
+            cell,
+            epoch,
+            fork_txid = fork_txid.0,
+            parent_bucket = %parent.uri,
+            "branched D1 cell from parent prefix"
+        );
+
+        Ok(crate::d1_branch::BranchResult {
+            fork_txid: fork_txid.0,
+            bytes_parent,
+        })
+    }
+
+    /// A per-cell client over the shared store, keyed to the cell's epoch
 
     /// Highest epoch under `cells/<cell>/ltx/` that holds any LTX — the newest
     /// durable copy to restore on takeover.
@@ -1290,6 +1631,7 @@ impl LtxRepl {
 
         let mut restored = resume_local;
         let mut remote_restore = None;
+        let mut branch_baseline: Option<(TXID, Checksum)> = None;
         if resume_local {
             anyhow::ensure!(
                 is_file(&dst),
@@ -1346,37 +1688,136 @@ impl LtxRepl {
                     from < epoch,
                     "refusing to restore {cell} from used epoch {from} into writer epoch {epoch}"
                 );
-                let client = self.client_for(cell, from);
+                let child_client = self.client_for(cell, from);
                 let _ = self.ltx_host.remove_file(&dst);
-                let stats = replica::restore_timed_with_host_and_download_slots(
-                    &client,
-                    &dst,
-                    TXID(0),
-                    self.ltx_host.clone(),
-                    self.restore_slots.clone(),
-                )
-                .await
-                .map_err(|error| anyhow!("restore {cell} e{from}: {error}"))?;
-                let levels = stats
-                    .plan
-                    .by_level
-                    .iter()
-                    .map(|(level, count)| format!("L{level}:{count}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                remote_restore = Some(RemoteRestoreTiming {
-                    started_mono_ms: remote_started_mono_ms,
+                if let Some(base) = crate::d1_branch::read_base_json(
+                    self.store.as_ref(),
+                    &self.prefix,
+                    cell,
                     from,
-                    source_lookup_us,
-                    plan_us: stats.plan_us,
-                    download_us: stats.download_us,
-                    apply_us: stats.apply_us,
-                    objects: stats.plan.objects,
-                    bytes: stats.plan.bytes,
-                    levels,
-                });
-                info!(cell, from, to = epoch, "restored remote replica");
-                restored = true;
+                )
+                .await?
+                {
+                    anyhow::ensure!(
+                        base.parent_cell == cell,
+                        "base.json parent_cell {:?} does not match {cell}",
+                        base.parent_cell
+                    );
+                    let project_id = crate::d1_branch::runtime_project_id()
+                        .map_err(|error| anyhow!("{error}"))?;
+                    let parent = crate::d1_branch::validate_parent_bucket(
+                        &base.parent_bucket,
+                        &project_id,
+                    )
+                    .map_err(|error| anyhow!("{error}"))?;
+                    let parent_epoch = if base.parent_epoch > 0 {
+                        base.parent_epoch
+                    } else {
+                        self.highest_nonempty_epoch_in_prefix(&parent.key_prefix, cell)
+                            .await?
+                            .ok_or_else(|| {
+                                anyhow!("parent prefix has no LTX epoch for {cell}")
+                            })?
+                    };
+                    let parent_client = self.client_for_bucket_prefix(
+                        &parent.key_prefix,
+                        cell,
+                        parent_epoch,
+                    );
+                    let parent_plan =
+                        calc_restore_plan(&parent_client, base.fork_txid()).await?;
+                    let terminal = parent_plan
+                        .last()
+                        .ok_or_else(|| anyhow!("parent plan missing terminal LTX"))?;
+                    let terminal_bytes = parent_client
+                        .open_ltx_file(terminal.level, terminal.min_txid, terminal.max_txid)
+                        .await
+                        .map_err(|error| anyhow!("read parent terminal LTX: {error}"))?;
+                    crate::d1_branch::verify_fork_checksum(&terminal_bytes, &base.fork_checksum)
+                        .map_err(|error| anyhow!("{error}"))?;
+                    let fork_checksum = base::post_apply_checksum_from_ltx(&terminal_bytes)?;
+                    branch_baseline = Some((base.fork_txid(), fork_checksum));
+                    let chained = ChainedReplicaClient::new(
+                        self.client_for_bucket_prefix(
+                            &parent.key_prefix,
+                            cell,
+                            parent_epoch,
+                        ),
+                        self.client_for(cell, from),
+                        base.fork_txid(),
+                    );
+                    let stats = replica::restore_timed_with_host_and_download_slots(
+                        &chained,
+                        &dst,
+                        TXID(0),
+                        self.ltx_host.clone(),
+                        self.restore_slots.clone(),
+                    )
+                    .await
+                    .map_err(|error| anyhow!("restore branched {cell} e{from}: {error}"))?;
+                    info!(
+                        event = "d1_branch_restore",
+                        cell,
+                        epoch = from,
+                        fork_txid = base.fork_txid,
+                        parent_bucket = %base.parent_bucket,
+                        child_objects = stats.plan.objects,
+                        parent_objects = stats.plan.objects,
+                        "restored branched remote replica"
+                    );
+                    remote_restore = Some(RemoteRestoreTiming {
+                        started_mono_ms: remote_started_mono_ms,
+                        from,
+                        source_lookup_us,
+                        plan_us: stats.plan_us,
+                        download_us: stats.download_us,
+                        apply_us: stats.apply_us,
+                        objects: stats.plan.objects,
+                        bytes: stats.plan.bytes,
+                        levels: stats
+                            .plan
+                            .by_level
+                            .iter()
+                            .map(|(level, count)| format!("L{level}:{count}"))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    });
+                    restored = true;
+                } else if self.prefix_has_min_txid_one_anchor(&child_client).await? {
+                    let stats = replica::restore_timed_with_host_and_download_slots(
+                        &child_client,
+                        &dst,
+                        TXID(0),
+                        self.ltx_host.clone(),
+                        self.restore_slots.clone(),
+                    )
+                    .await
+                    .map_err(|error| anyhow!("restore {cell} e{from}: {error}"))?;
+                    let levels = stats
+                        .plan
+                        .by_level
+                        .iter()
+                        .map(|(level, count)| format!("L{level}:{count}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    remote_restore = Some(RemoteRestoreTiming {
+                        started_mono_ms: remote_started_mono_ms,
+                        from,
+                        source_lookup_us,
+                        plan_us: stats.plan_us,
+                        download_us: stats.download_us,
+                        apply_us: stats.apply_us,
+                        objects: stats.plan.objects,
+                        bytes: stats.plan.bytes,
+                        levels,
+                    });
+                    info!(cell, from, to = epoch, "restored remote replica");
+                    restored = true;
+                } else if child_client.has_any_object().await? {
+                    return Err(anyhow!(
+                        "restore {cell} e{from}: remote prefix has objects but no LTX anchor or base.json"
+                    ));
+                }
             }
         }
 
@@ -1393,20 +1834,25 @@ impl LtxRepl {
         let ltx_host = self.ltx_host.clone();
         let vfs_name = self.vfs_name.clone();
         let truncate_pages = self.truncate_pages_for_cell(cell);
+        let branch_baseline = branch_baseline;
         let (db, seed) = asyncrt::blocking(move || {
             #[cfg(celld_internal_tests)]
             let mut db =
                 crate::fault::with_connection_role("celld_ltx_db", || match vfs_name.as_deref() {
-                    Some(vfs_name) => Db::open_with_host_and_vfs(&dst_, ltx_host, vfs_name),
-                    None => Db::open_with_host(&dst_, ltx_host),
+                    Some(vfs_name) => Db::open_with_host_and_vfs(&dst_, ltx_host.clone(), vfs_name),
+                    None => Db::open_with_host(&dst_, ltx_host.clone()),
                 })?;
             #[cfg(not(celld_internal_tests))]
             let mut db = {
                 debug_assert!(vfs_name.is_none());
-                Db::open_with_host(&dst_, ltx_host)?
+                Db::open_with_host(&dst_, ltx_host.clone())?
             };
             if let Some(pages) = truncate_pages {
                 db.truncate_page_n = pages;
+            }
+            if let Some((fork_txid, checksum)) = branch_baseline {
+                db.seed_fork_catchup(fork_txid, checksum)
+                    .map_err(|error| anyhow!("seed branch L0 catchup: {error}"))?;
             }
             let seed = db.pos().ok();
             anyhow::Ok((db, seed))
@@ -1783,13 +2229,26 @@ impl LtxRepl {
             .get(&(cell.to_string(), epoch))
             .cloned()
             .ok_or_else(|| anyhow!("ltx cell not resident: {cell} epoch {epoch}"))?;
-        let snapshot = self.prepare_handoff_snapshot(&handle).await?;
-        let artifact = match snapshot {
-            Some(snapshot) => {
-                self.publish_handoff_snapshot_with_retry(cell, epoch, &snapshot)
-                    .await
+        // A branch child already restores from the parent L9 via base.json.
+        // Publishing MinTXID==1 here would copy the full SQLite image onto the
+        // child prefix and undo the object-store sharing contract.
+        let artifact = if self.child_has_base_json(cell, epoch).await? {
+            info!(
+                event = "ltx_handoff_snapshot_skipped_branch",
+                cell,
+                epoch,
+                "skipping MinTXID=1 handoff snapshot on branched cell"
+            );
+            EvictionRestoreArtifact::L0Chain
+        } else {
+            let snapshot = self.prepare_handoff_snapshot(&handle).await?;
+            match snapshot {
+                Some(snapshot) => {
+                    self.publish_handoff_snapshot_with_retry(cell, epoch, &snapshot)
+                        .await
+                }
+                None => EvictionRestoreArtifact::L0Chain,
             }
-            None => EvictionRestoreArtifact::L0Chain,
         };
 
         // Keep the local Db until the snapshot succeeds or its retry window
@@ -2024,6 +2483,10 @@ impl LtxRepl {
         epoch: u64,
         snapshot: &HandoffSnapshot,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.child_has_base_json(cell, epoch).await?,
+            "refusing MinTXID=1 handoff snapshot on branched cell {cell} e{epoch}"
+        );
         let started_mono_ms = asyncrt::mono_ms();
         let info = self
             .client_for(cell, epoch)
@@ -2051,6 +2514,129 @@ impl LtxRepl {
             "published authoritative handoff snapshot"
         );
         Ok(())
+    }
+
+    /// Replace a resident cell database from an on-node SQLite seed file.
+    ///
+    /// The caller must already have closed the isolate connection
+    /// ([`crate::storage::close`]). This path uses SQLite's backup API, resets
+    /// local LTX state, captures a MinTXID==1 snapshot, and uploads it.
+    pub async fn import_sqlite_seed(
+        &self,
+        cell: &str,
+        epoch: u64,
+        seed_path: &Path,
+    ) -> anyhow::Result<SqliteImportResult> {
+        let key = (cell.to_string(), epoch);
+        let handle = self
+            .cells
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow!("no managed replica for {cell} epoch {epoch}"))?;
+        if handle.syncing.swap(true, Ordering::SeqCst) {
+            anyhow::bail!("cell {cell} epoch {epoch} sync already in progress");
+        }
+        struct SyncingGuard<'a>(&'a Cell);
+        impl Drop for SyncingGuard<'_> {
+            fn drop(&mut self) {
+                self.0.syncing.store(false, Ordering::SeqCst);
+            }
+        }
+        let _sync_guard = SyncingGuard(&handle.clone());
+        cancel_compaction(&handle);
+
+        let seed_path = seed_path.to_path_buf();
+        let dst = self.db_path(cell, epoch);
+        let ltx_host = self.ltx_host.clone();
+        let vfs_name = self.vfs_name.clone();
+        let truncate_pages = self.truncate_pages_for_cell(cell);
+        let client = self.client_for(cell, epoch);
+        let handle_ = handle.clone();
+        let (bytes, snapshot_txid, snapshot_ltx, pos) = asyncrt::blocking(
+            move || -> anyhow::Result<(u64, u64, Vec<u8>, Pos)> {
+                let mut replica_slot = handle_.replica.lock().unwrap();
+                let replica = replica_slot
+                    .take()
+                    .ok_or_else(|| anyhow!("managed replica is closed"))?;
+                let db = replica
+                    .into_db()
+                    .ok_or_else(|| anyhow!("managed database is unavailable"))?;
+                db.close().map_err(|error| anyhow!("{error}"))?;
+
+                sqlite_snapshot(&seed_path, &dst, vfs_name.as_deref())?;
+                let bytes = std::fs::metadata(&dst)
+                    .map_err(|error| anyhow!("read imported database size: {error}"))?
+                    .len();
+
+                let mut db = open_managed_db(&dst, &ltx_host, vfs_name.as_deref(), truncate_pages)?;
+                db.reset_local_state()
+                    .map_err(|error| anyhow!("reset local LTX state: {error}"))?;
+                db.sync()
+                    .map_err(|error| anyhow!("capture import snapshot: {error}"))?;
+                let pos = db.pos().map_err(|error| anyhow!("read import position: {error}"))?;
+                anyhow::ensure!(
+                    pos.txid >= TXID(1),
+                    "import produced no durable snapshot"
+                );
+                let snapshot_ltx = db.read_ltx_file(0, TXID(1), pos.txid).map_err(|error| {
+                    anyhow!("import snapshot MinTXID==1 missing: {error}")
+                })?;
+                let snapshot_txid = pos.txid.0;
+
+                // Do not seed_pos until the snapshot is in the bucket.
+                // seed_pos(pos) made sync_cell start at pos+1 and skip the
+                // upload, so a child branch listed an empty parent prefix.
+                *replica_slot = Some(Replica::new(db, client));
+                Ok((bytes, snapshot_txid, snapshot_ltx, pos))
+            },
+        )
+        .await
+        .map_err(|error| anyhow!("join sqlite import task: {error}"))??;
+
+        let uploaded = handle
+            .client
+            .write_ltx_file(0, TXID(1), TXID(snapshot_txid), &snapshot_ltx)
+            .await
+            .map_err(|error| anyhow!("upload import snapshot: {error}"))?;
+        anyhow::ensure!(
+            uploaded.level == 0
+                && uploaded.min_txid == TXID(1)
+                && uploaded.max_txid == TXID(snapshot_txid),
+            "import snapshot metadata does not match the captured LTX"
+        );
+        {
+            let mut replica_slot = handle.replica.lock().unwrap();
+            let replica = replica_slot
+                .as_mut()
+                .ok_or_else(|| anyhow!("replica lost during sqlite import upload"))?;
+            replica.seed_pos(pos);
+        }
+
+        handle.req_seq.store(0, Ordering::SeqCst);
+        handle.synced_seq.store(0, Ordering::SeqCst);
+        handle.submitted_seq.store(0, Ordering::SeqCst);
+        handle.shipped_seq.store(0, Ordering::SeqCst);
+        handle.submitted_txid.store(snapshot_txid, Ordering::SeqCst);
+        handle.shipped_txid.store(snapshot_txid, Ordering::SeqCst);
+        handle.durable_txid.store(snapshot_txid, Ordering::SeqCst);
+        handle.percell_txid.store(snapshot_txid, Ordering::SeqCst);
+        handle.last_sync_ms.store(asyncrt::wall_ms().max(0) as u64, Ordering::SeqCst);
+
+        info!(
+            event = "d1_import_snapshot",
+            cell,
+            epoch,
+            snapshot_txid,
+            bytes = snapshot_ltx.len(),
+            "published MinTXID==1 import snapshot"
+        );
+
+        Ok(SqliteImportResult {
+            bytes,
+            snapshot_txid,
+        })
     }
 
     /// Copy the live epoch into a private read-only snapshot for inspection.

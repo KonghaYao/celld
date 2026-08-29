@@ -323,6 +323,8 @@ pub mod cell_cli;
 pub mod cli_options;
 pub mod cli_output;
 pub mod control_plane;
+pub(crate) mod d1_branch;
+pub(crate) mod d1_import;
 pub mod d1_cli;
 pub mod dead_node_gc;
 pub mod deploy;

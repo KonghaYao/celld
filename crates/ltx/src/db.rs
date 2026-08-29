@@ -776,8 +776,86 @@ impl Db {
         let local_path = self.ltx_path(0, min_txid, max_txid);
         let tmp_path = format!("{local_path}.tmp");
         let _ = write_file_atomic(&self.host, &tmp_path, &local_path, data)?;
-        self.last_l0_header = None;
+        // `verify` always opens `{pos}-{pos}.ltx`, not a spanning `{min}-{max}`
+        // name. A parent terminal of 1-N (or compacted L1) would otherwise
+        // leave the next sync looking for a file that was never written.
+        if min_txid != max_txid {
+            let verify_path = self.ltx_path(0, max_txid, max_txid);
+            let verify_tmp = format!("{verify_path}.tmp");
+            let _ = write_file_atomic(&self.host, &verify_tmp, &verify_path, data)?;
+        }
+        let parsed = match ltx::Header::parse(data) {
+            Ok(header) => header,
+            Err(_) => {
+                return Err(Error::Ltx(Box::new(new_ltx_error(
+                    "decode",
+                    &local_path,
+                    0,
+                    min_txid.0,
+                    max_txid.0,
+                    Error::LTXCorrupted,
+                ))));
+            }
+        };
+        self.last_l0_header = Some((
+            max_txid,
+            LastL0Header {
+                wal_offset: parsed.wal_offset,
+                wal_size: parsed.wal_size,
+                wal_salt1: parsed.wal_salt1,
+                wal_salt2: parsed.wal_salt2,
+                commit: parsed.commit,
+                final_pgno: 0,
+                final_page: Vec::new(),
+            },
+        ));
         self.invalidate_pos_cache();
+        Ok(())
+    }
+
+    /// After a branch restore, mark the restored image as already captured at
+    /// `fork_txid` without uploading a new snapshot.
+    ///
+    /// Restore writes a SQLite image; opening it in WAL mode plus control-table
+    /// DDL leaves a WAL whose salts do not match the parent's terminal LTX.
+    /// The next [`Db::sync`] would then snapshot every page (an 8 MB child
+    /// prefix after an 8 MB parent). This writes a local L0 whose WAL cursor
+    /// is the current file end, so that sync is a no-op until the child
+    /// actually writes.
+    pub fn seed_fork_catchup(
+        &mut self,
+        fork_txid: TXID,
+        post_apply_checksum: crate::Checksum,
+    ) -> Result<()> {
+        self.ensure_wal_exists()?;
+        let wal_hdr = self.wal_header_bytes()?;
+        let wal_size = self.wal_file_size()?;
+        let wal_offset = WAL_HEADER_SIZE as i64;
+        let captured = (wal_size - wal_offset).max(0);
+        let page_count: i64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .map_err(sql_err)?;
+        let header = ltx::Header {
+            version: ltx::VERSION,
+            flags: ltx::HEADER_FLAG_NO_CHECKSUM,
+            page_size: self.page_size,
+            commit: page_count as u32,
+            min_txid: fork_txid,
+            max_txid: fork_txid,
+            timestamp: self.host.now_unix_millis(),
+            pre_apply_checksum: 0,
+            wal_offset,
+            wal_size: captured,
+            wal_salt1: be_u32(&wal_hdr[16..]),
+            wal_salt2: be_u32(&wal_hdr[20..]),
+            node_id: 0,
+        };
+        let encoded = ltx::encode_file(&header, &[], 0)?;
+        self.seed_l0_baseline(fork_txid, fork_txid, &encoded)?;
+        self.pos_cache = Some(Pos::new(fork_txid, post_apply_checksum));
+        self.synced_to_wal_end = true;
+        self.last_synced_wal_offset = wal_size.max(wal_offset);
         Ok(())
     }
 

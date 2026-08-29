@@ -44,3 +44,12 @@ tracing.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
 lz4_flex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[test]]
+name = "chained_restore"
+path = "tests/chained_restore.rs"

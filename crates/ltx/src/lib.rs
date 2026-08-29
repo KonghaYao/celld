@@ -12,6 +12,7 @@
 //! Ported from litestream@v0.5.11 litestream.go:18-203 and
 //! ltx@v0.5.2 ltx.go:66-145.
 
+pub mod base;
 pub mod bundle;
 pub mod client;
 mod codec;
@@ -79,6 +80,8 @@ pub use ltx::FileInfo;
 
 /// A [`ReplicaClient`] that stores LTX files on the local filesystem.
 /// Re-exported from [`crate::client::file::FileReplicaClient`].
+pub use base::BasePointer;
+pub use client::chained::ChainedReplicaClient;
 pub use client::file::FileReplicaClient;
 
 /// The bundle overlay (celld-original, self-contained).

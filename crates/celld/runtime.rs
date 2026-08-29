@@ -673,17 +673,18 @@ impl Replication {
         region: String,
         credentials: Option<StorageCredentials>,
     ) -> anyhow::Result<Self> {
-        Ok(Self {
-            ltx: Arc::new(LtxRepl::start(
-                watch,
-                bucket.backend(),
-                bucket.name,
-                bucket.prefix,
-                endpoint,
-                region,
-                credentials,
-            )?),
-        })
+        let ltx = Arc::new(LtxRepl::start(
+            watch,
+            bucket.backend(),
+            bucket.name,
+            bucket.prefix,
+            endpoint,
+            region,
+            credentials,
+        )?);
+        crate::d1_import::set_ltx(ltx.clone());
+        crate::d1_branch::set_ltx(ltx.clone());
+        Ok(Self { ltx })
     }
 
     /// The log tier installs its shipper and takeover interlock here.

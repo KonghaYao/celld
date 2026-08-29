@@ -358,6 +358,8 @@ dependencies = [
  "lz4_flex",
  "object_store",
  "rusqlite",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
