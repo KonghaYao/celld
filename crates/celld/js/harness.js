@@ -5010,6 +5010,13 @@ class __KvNamespaceCell {
     const now = Date.now();
     try {
       let result;
+      if (body.branch !== undefined) {
+        result = await __cellBranch(
+          this.ctx.storage.sql._scope,
+          JSON.stringify(body.branch),
+          "KV_BRANCH_ERROR",
+        );
+      } else {
       switch (body.op) {
         case "get": {
           // Awaited: `__kvGet` resolves a bucket-backed value, so it is
@@ -5091,6 +5098,7 @@ class __KvNamespaceCell {
             { error: `KV_ERROR: unknown operation ${JSON.stringify(body.op)}` },
             { status: 400 },
           );
+      }
       }
       return Response.json({ result });
     } catch (error) {
@@ -6726,6 +6734,14 @@ class __QueueCell {
           ? new Response(null, { status: 204 })
           : new Response("stale Queue settlement", { status: 409 });
       }
+      if (body.branch !== undefined) {
+        const result = await __cellBranch(
+          this.ctx.storage.sql._scope,
+          JSON.stringify(body.branch),
+          "QUEUE_BRANCH_ERROR",
+        );
+        return Response.json({ result });
+      }
       if (body.op === "info") {
         const metrics = this._metrics();
         const stored = this._open().exec(
@@ -6884,6 +6900,18 @@ const __d1Import = async (scope, path, sqliteVec) => {
 const __d1Branch = async (scope, requestJson, sqliteVec) => {
   const response = JSON.parse(await __d1_branch(scope, String(requestJson), !!sqliteVec));
   if (response.error) throw __d1Failure(response.error);
+  return response.ok;
+};
+
+const __cellBranch = async (scope, requestJson, family) => {
+  const response = JSON.parse(
+    await __cell_branch(scope, String(requestJson), String(family), scope),
+  );
+  if (response.error) {
+    const error = new Error(response.error.family + ": " + response.error.message);
+    error.cause = new Error(response.error.message);
+    throw error;
+  }
   return response.ok;
 };
 

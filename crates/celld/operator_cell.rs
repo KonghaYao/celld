@@ -190,6 +190,11 @@ impl Reachable {
         }
         bail!("no node in the fleet answered{}", report(&refused))
     }
+
+    pub(crate) async fn branch(&self, parent_bucket: &str) -> anyhow::Result<Value> {
+        self.call(serde_json::json!({ "branch": { "parent_bucket": parent_bucket } }))
+            .await
+    }
 }
 
 async fn live_nodes(

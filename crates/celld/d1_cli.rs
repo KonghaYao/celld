@@ -392,11 +392,6 @@ impl Reachable {
         self.call(serde_json::json!({ "import": { "path": path.display().to_string() } }))
             .await
     }
-
-    async fn branch(&self, parent_bucket: &str) -> anyhow::Result<Value> {
-        self.call(serde_json::json!({ "branch": { "parent_bucket": parent_bucket } }))
-            .await
-    }
 }
 fn read_migrations(directory: &std::path::Path) -> anyhow::Result<Vec<Migration>> {
     if !directory.exists() {

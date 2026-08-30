@@ -80,6 +80,21 @@ fn store() -> Result<&'static Bucket, String> {
     })
 }
 
+async fn ensure_overlay(bucket_name: &str) -> Result<(), String> {
+    let child = store()?;
+    crate::r2_overlay::load_overlay(child, bucket_name)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn overlay_active(bucket_name: &str) -> Result<bool, String> {
+    ensure_overlay(bucket_name).await?;
+    Ok(crate::r2_overlay::parent_store(bucket_name)
+        .await
+        .is_some())
+}
+
 // ---- the object record ---------------------------------------------------
 
 /// R2's `httpMetadata`. Five of the six are ordinary HTTP headers that
@@ -418,10 +433,18 @@ pub(super) fn op_r2_head(
     let bucket_name = args.get(0).to_rust_string_lossy(scope);
     let key = args.get(1).to_rust_string_lossy(scope);
     let id = asyncrt::enqueue(async move {
-        let meta = store()?
-            .head_blob(&blob_key(&bucket_name, &key))
-            .await
-            .map_err(|error| error.to_string())?;
+        let store = store()?;
+        ensure_overlay(&bucket_name).await?;
+        let meta = if overlay_active(&bucket_name).await? {
+            crate::r2_overlay::overlay_head_blob(store, &bucket_name, &key)
+                .await
+                .map_err(|error| error.to_string())?
+        } else {
+            store
+                .head_blob(&blob_key(&bucket_name, &key))
+                .await
+                .map_err(|error| error.to_string())?
+        };
         Ok(match meta {
             None => serde_json::json!({ "state": "miss" }).to_string(),
             Some(meta) => serde_json::json!({
@@ -455,10 +478,22 @@ pub(super) fn op_r2_get(
             .map(BlobRange::from)
             .unwrap_or(BlobRange::Whole);
         let conditions = BlobConditions::from(request.only_if.unwrap_or_default());
-        let read = store()?
-            .get_blob(&blob_key(&bucket_name, &key), range, &conditions)
+        let read = if overlay_active(&bucket_name).await? {
+            crate::r2_overlay::overlay_get_blob(
+                store()?,
+                &bucket_name,
+                &key,
+                range,
+                &conditions,
+            )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?
+        } else {
+            store()?
+                .get_blob(&blob_key(&bucket_name, &key), range, &conditions)
+                .await
+                .map_err(|error| error.to_string())?
+        };
         Ok(match read {
             BlobRead::Missing => serde_json::json!({ "state": "miss" }).to_string(),
             BlobRead::Unmet(meta) => serde_json::json!({
@@ -494,6 +529,15 @@ pub(super) fn op_r2_delete(
     let id = asyncrt::enqueue(async move {
         let keys = keys?;
         let store = store()?;
+        ensure_overlay(&bucket_name).await?;
+        if overlay_active(&bucket_name).await? {
+            for key in &keys {
+                crate::r2_overlay::write_tombstone(store, &bucket_name, key)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            return Ok(String::new());
+        }
         let keys = keys
             .iter()
             .map(|key| blob_key(&bucket_name, key))
@@ -526,28 +570,39 @@ pub(super) fn op_r2_list(
     let id = asyncrt::enqueue(async move {
         let request = request?;
         let store = store()?;
+        ensure_overlay(&bucket_name).await?;
         let limit = match request.limit.unwrap_or(0) {
             limit if limit > 0 => (limit as usize).min(LIST_LIMIT),
             _ => LIST_LIMIT,
         };
         let scoped = blob_key(&bucket_name, &request.prefix);
-        // R2 resumes from the cursor when it has one and ignores
-        // `startAfter`, which is the same knob for a first page.
         let after = request
             .cursor
             .filter(|cursor| !cursor.is_empty())
             .or(request.start_after)
             .filter(|after| !after.is_empty())
             .map(|after| blob_key(&bucket_name, &after));
-        let page = store
-            .list_page(
+        let page = if overlay_active(&bucket_name).await? {
+            crate::r2_overlay::list_overlay_page(
+                store,
+                &bucket_name,
                 &scoped,
                 after.as_deref(),
                 limit,
-                request.delimiter.as_deref(),
             )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?
+        } else {
+            store
+                .list_page(
+                    &scoped,
+                    after.as_deref(),
+                    limit,
+                    request.delimiter.as_deref(),
+                )
+                .await
+                .map_err(|error| error.to_string())?
+        };
         // The binding's key space is the caller's: strip the reserved
         // prefix back off, so a listed key is one the caller can `get`.
         let strip = blob_key(&bucket_name, "");

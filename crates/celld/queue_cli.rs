@@ -41,6 +41,10 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         return Ok(());
     };
     let storage = command.fleet.resolve("celld queue")?;
+    let timeout = match &command.action {
+        Action::Branch { .. } => crate::operator_cell::branch_timeout(0),
+        _ => Duration::from_secs(60),
+    };
     let queue = Reachable::open(
         Fleet {
             bucket: &storage.bucket,
@@ -51,7 +55,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         Subject {
             noun: "queue",
             source: "queue",
-            timeout: Duration::from_secs(60),
+            timeout,
         },
         crate::js::queue_cell_scope(&command.queue),
         Some(&command.queue),
@@ -68,6 +72,18 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             queue
                 .call(json!({ "op": "redrive", "limit": limit }))
                 .await?
+        }
+        Action::Branch { parent_bucket } => {
+            let project_id = crate::cell_branch::branch_cli_project_id(
+                "",
+                Some(&storage.bucket),
+            );
+            crate::cell_branch::validate_parent_bucket(&parent_bucket, &project_id)
+                .map_err(|error| anyhow!("{error}"))?;
+            queue
+                .branch(&parent_bucket)
+                .await
+                .with_context(|| format!("branch from {parent_bucket}"))?
         }
     };
     let mut output = Output::new(if command.json {
@@ -86,6 +102,7 @@ enum Action {
     Resume,
     Peek { limit: Option<i64> },
     Redrive { limit: Option<i64> },
+    Branch { parent_bucket: String },
 }
 
 struct Command {
@@ -104,7 +121,7 @@ impl Command {
         };
         let verb = match verb.as_str() {
             "--help" | "-h" | "help" => return Ok(None),
-            verb @ ("info" | "purge" | "pause" | "resume" | "peek" | "redrive") => verb,
+            verb @ ("info" | "purge" | "pause" | "resume" | "peek" | "redrive" | "branch") => verb,
             other => bail!("unknown `celld queue` subcommand: {other}"),
         };
         let queue = arguments
@@ -122,6 +139,7 @@ impl Command {
         let mut unsafe_public_advertise = false;
         let mut force = false;
         let mut limit = None;
+        let mut parent_bucket = None;
         while let Some(argument) = arguments.next() {
             let mut value = |flag: &str| {
                 arguments
@@ -139,6 +157,7 @@ impl Command {
                             .with_context(|| format!("--limit takes an integer, got {raw:?}"))?,
                     );
                 }
+                "--parent-bucket" => parent_bucket = Some(value("--parent-bucket")?),
                 // These flags select a Cloudflare account API or a Miniflare
                 // store. A celld queue belongs to exactly one named fleet.
                 flag @ ("--local" | "--remote") => bail!(
@@ -168,6 +187,9 @@ impl Command {
         if !matches!(verb, "peek" | "redrive") && limit.is_some() {
             bail!("`celld queue {verb}` takes no --limit");
         }
+        if verb != "branch" && parent_bucket.is_some() {
+            bail!("`celld queue {verb}` takes no --parent-bucket");
+        }
         let action = match verb {
             "info" => Action::Info,
             "purge" => Action::Purge,
@@ -175,6 +197,14 @@ impl Command {
             "resume" => Action::Resume,
             "peek" => Action::Peek { limit },
             "redrive" => Action::Redrive { limit },
+            "branch" => {
+                if force {
+                    bail!("`celld queue branch` takes no --force");
+                }
+                let parent_bucket = parent_bucket
+                    .ok_or_else(|| anyhow!("celld queue branch requires --parent-bucket"))?;
+                Action::Branch { parent_bucket }
+            }
             _ => unreachable!("the verb was matched above"),
         };
         Ok(Some(Self {
@@ -198,6 +228,7 @@ USAGE
   celld queue pause   QUEUE                  [fleet options]
   celld queue resume  QUEUE                  [fleet options]
   celld queue redrive QUEUE [--limit N]      [fleet options]
+  celld queue branch QUEUE --parent-bucket URI --bucket CHILD [fleet options]
 
 QUEUE OPERATIONS
   info       report the backlog, stored rows, and delivery state

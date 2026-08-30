@@ -1445,6 +1445,9 @@ type D1ImportReopenMap = HashMap<u64, crate::d1_import::ReopenSpec>;
 /// D1 branches that closed isolate storage and need a reopen on delivery.
 type D1BranchReopenMap = HashMap<u64, crate::d1_branch::ReopenSpec>;
 
+/// KV / Queue branches that closed isolate storage and need a reopen on delivery.
+type BindingBranchReopenMap = HashMap<u64, crate::cell_branch::ReopenSpec>;
+
 /// Queue a reopen on this isolate, not this OS thread.
 ///
 /// `prepare` closes SQLite on the isolate that owns the cell. The async
@@ -1498,8 +1501,33 @@ fn finish_d1_branch_reopen(scope: &mut v8::PinScope, op: u64) -> Option<String> 
         .map(|failure| failure.message)
 }
 
+fn register_binding_branch_reopen(
+    scope: &mut v8::PinScope,
+    op: u64,
+    spec: crate::cell_branch::ReopenSpec,
+) {
+    actor_runtime_state(scope)
+        .binding_branch_reopens
+        .lock()
+        .unwrap()
+        .insert(op, spec);
+}
+
+fn finish_binding_branch_reopen(scope: &mut v8::PinScope, op: u64) -> Option<String> {
+    let spec = actor_runtime_state(scope)
+        .binding_branch_reopens
+        .lock()
+        .unwrap()
+        .remove(&op)?;
+    crate::binding_branch::reopen(&spec)
+        .err()
+        .map(|failure| format!("{}: {}", failure.family, failure.message))
+}
+
 fn finish_d1_reopen(scope: &mut v8::PinScope, op: u64) -> Option<String> {
-    finish_d1_import_reopen(scope, op).or_else(|| finish_d1_branch_reopen(scope, op))
+    finish_d1_import_reopen(scope, op)
+        .or_else(|| finish_d1_branch_reopen(scope, op))
+        .or_else(|| finish_binding_branch_reopen(scope, op))
 }
 
 /// JS promise resolvers awaiting an async op, keyed by the op's id.
@@ -2258,6 +2286,7 @@ struct ActorRuntimeState {
     event_hooks: OnceLock<EventHooks>,
     d1_import_reopens: std::sync::Mutex<D1ImportReopenMap>,
     d1_branch_reopens: std::sync::Mutex<D1BranchReopenMap>,
+    binding_branch_reopens: std::sync::Mutex<BindingBranchReopenMap>,
 }
 
 /// The harness functions the host calls on the boundary of every cell event.
@@ -4918,6 +4947,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__d1_run" => storage_ops::op_d1_run,
         "__d1_import" => op_d1_import,
         "__d1_branch" => op_d1_branch,
+        "__cell_branch" => op_cell_branch,
         "__storage_transaction_control" => storage_ops::op_storage_transaction_control,
         "__log" => op_log,
         "__storage_put" => storage_ops::op_storage_put,
@@ -5108,14 +5138,11 @@ fn op_kv_blob(
                     return Err("a KV row references a later ownership epoch".to_string());
                 }
                 let key = reference.object_key(&cell);
-                match kv_blob_store()?
-                    .get(&key)
+                match crate::kv_blob_branch::get_blob(kv_blob_store()?, &cell, &key)
                     .await
                     .map_err(|error| error.to_string())?
                 {
-                    Some((bytes, _etag)) => {
-                        return Ok(asyncrt::OpOut::Bytes(bytes.to_vec()));
-                    }
+                    Some(bytes) => return Ok(asyncrt::OpOut::Bytes(bytes.to_vec())),
                     None => serde_json::json!({ "found": false }),
                 }
             }
@@ -5281,6 +5308,65 @@ fn op_d1_branch(
         Ok(asyncrt::OpOut::Str(reply))
     });
     register_d1_branch_reopen(scope, id, reopen);
+    rv.set(promise_for(scope, id));
+}
+
+/// `__cell_branch(scope, requestJson, errorFamily, expectedScope)` -> Promise<string>.
+fn op_cell_branch(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let scope_name = args.get(0).to_rust_string_lossy(scope);
+    let request_json = args.get(1).to_rust_string_lossy(scope);
+    let family = args.get(2).to_rust_string_lossy(scope);
+    let expected_scope = args.get(3).to_rust_string_lossy(scope);
+    let request: crate::cell_branch::BranchRequest = match serde_json::from_str(&request_json) {
+        Ok(request) => request,
+        Err(error) => {
+            let reply = serde_json::json!({
+                "error": { "family": family, "message": error.to_string() },
+            })
+            .to_string();
+            let id = asyncrt::enqueue(async move { Ok(asyncrt::OpOut::Str(reply)) });
+            rv.set(promise_for(scope, id));
+            return;
+        }
+    };
+    let (prepared, reopen) = match if family == crate::binding_branch::QUEUE_BRANCH_FAMILY {
+        crate::binding_branch::prepare_queue_binding(&scope_name, request, &expected_scope)
+    } else {
+        crate::binding_branch::prepare_binding(&scope_name, request, &expected_scope)
+    } {
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            let reply = serde_json::json!({
+                "error": { "family": failure.family, "message": failure.message },
+            })
+            .to_string();
+            let id = asyncrt::enqueue(async move { Ok(asyncrt::OpOut::Str(reply)) });
+            rv.set(promise_for(scope, id));
+            return;
+        }
+    };
+    let family_static: &'static str = if family == crate::binding_branch::QUEUE_BRANCH_FAMILY {
+        crate::binding_branch::QUEUE_BRANCH_FAMILY
+    } else {
+        crate::binding_branch::KV_BRANCH_FAMILY
+    };
+    let id = asyncrt::enqueue(async move {
+        let reply = match crate::binding_branch::branch_binding_prepared(prepared, family_static)
+            .await
+        {
+            Ok(ok) => serde_json::json!({ "ok": ok }).to_string(),
+            Err(failure) => serde_json::json!({
+                "error": { "family": failure.family, "message": failure.message },
+            })
+            .to_string(),
+        };
+        Ok(asyncrt::OpOut::Str(reply))
+    });
+    register_binding_branch_reopen(scope, id, reopen);
     rv.set(promise_for(scope, id));
 }
 

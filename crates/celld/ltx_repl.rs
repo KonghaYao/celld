@@ -1323,9 +1323,18 @@ impl LtxRepl {
         cell: &str,
         epoch: u64,
     ) -> anyhow::Result<bool> {
-        crate::d1_branch::read_base_json(self.store.as_ref(), &self.prefix, cell, epoch)
+        crate::cell_branch::read_base_json(self.store.as_ref(), &self.prefix, cell, epoch)
             .await
             .map(|value| value.is_some())
+    }
+
+    pub async fn active_base_pointer(
+        &self,
+        cell: &str,
+    ) -> anyhow::Result<Option<BasePointer>> {
+        let epoch = crate::storage::activation_epoch(cell)
+            .ok_or_else(|| anyhow!("no active database for {cell}"))?;
+        crate::cell_branch::read_base_json(self.store.as_ref(), &self.prefix, cell, epoch).await
     }
 
     async fn prefix_has_min_txid_one_anchor(
@@ -1341,14 +1350,14 @@ impl LtxRepl {
         Ok(false)
     }
 
-    /// Branch this cell from a parent version bucket (D1-BRANCH owner path).
+    /// Branch this cell from a parent version bucket (LTX base.json + chained restore).
     pub async fn branch_from_parent(
         &self,
         cell: &str,
         epoch: u64,
-        parent: &crate::d1_branch::ValidatedParentBucket,
+        parent: &crate::cell_branch::ValidatedParentBucket,
         parent_epoch_hint: u64,
-    ) -> anyhow::Result<crate::d1_branch::BranchResult> {
+    ) -> anyhow::Result<crate::cell_branch::BranchResult> {
         let key = (cell.to_string(), epoch);
         let handle = self
             .cells
@@ -1370,7 +1379,7 @@ impl LtxRepl {
         cancel_compaction(&handle);
 
         let child_client = self.client_for(cell, epoch);
-        if crate::d1_branch::read_base_json(
+        if crate::cell_branch::read_base_json(
             self.store.as_ref(),
             &self.prefix,
             cell,
@@ -1386,7 +1395,7 @@ impl LtxRepl {
             .restorable_parent_epoch(&parent.key_prefix, cell, parent_epoch_hint)
             .await?;
 
-        if crate::d1_branch::read_base_json(
+        if crate::cell_branch::read_base_json(
             self.store.as_ref(),
             &parent.key_prefix,
             cell,
@@ -1438,7 +1447,7 @@ impl LtxRepl {
             .await
             .map_err(|error| anyhow!("clear child prefix before branch: {error}"))?;
 
-        crate::d1_branch::put_base_json_cas(
+        crate::cell_branch::put_base_json_cas(
             self.store.as_ref(),
             &self.prefix,
             cell,
@@ -1525,7 +1534,7 @@ impl LtxRepl {
             "branched D1 cell from parent prefix"
         );
 
-        Ok(crate::d1_branch::BranchResult {
+        Ok(crate::cell_branch::BranchResult {
             fork_txid: fork_txid.0,
             bytes_parent,
         })
@@ -1690,7 +1699,7 @@ impl LtxRepl {
                 );
                 let child_client = self.client_for(cell, from);
                 let _ = self.ltx_host.remove_file(&dst);
-                if let Some(base) = crate::d1_branch::read_base_json(
+                if let Some(base) = crate::cell_branch::read_base_json(
                     self.store.as_ref(),
                     &self.prefix,
                     cell,
@@ -1703,9 +1712,9 @@ impl LtxRepl {
                         "base.json parent_cell {:?} does not match {cell}",
                         base.parent_cell
                     );
-                    let project_id = crate::d1_branch::runtime_project_id()
+                    let project_id = crate::cell_branch::runtime_project_id()
                         .map_err(|error| anyhow!("{error}"))?;
-                    let parent = crate::d1_branch::validate_parent_bucket(
+                    let parent = crate::cell_branch::validate_parent_bucket(
                         &base.parent_bucket,
                         &project_id,
                     )
@@ -1733,7 +1742,7 @@ impl LtxRepl {
                         .open_ltx_file(terminal.level, terminal.min_txid, terminal.max_txid)
                         .await
                         .map_err(|error| anyhow!("read parent terminal LTX: {error}"))?;
-                    crate::d1_branch::verify_fork_checksum(&terminal_bytes, &base.fork_checksum)
+                    crate::cell_branch::verify_fork_checksum(&terminal_bytes, &base.fork_checksum)
                         .map_err(|error| anyhow!("{error}"))?;
                     let fork_checksum = base::post_apply_checksum_from_ltx(&terminal_bytes)?;
                     branch_baseline = Some((base.fork_txid(), fork_checksum));

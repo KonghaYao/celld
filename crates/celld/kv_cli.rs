@@ -90,6 +90,21 @@ impl Record for Totals {
         ))
     }
 }
+
+struct BranchReply(Value);
+
+impl Record for BranchReply {
+    fn json(&self) -> Value {
+        self.0.clone()
+    }
+
+    fn text(&self) -> Cow<'_, str> {
+        Cow::Owned(
+            serde_json::to_string_pretty(&self.0)
+                .expect("a serde_json::Value always serializes as JSON"),
+        )
+    }
+}
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -114,6 +129,10 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     };
     let scope = crate::js::kv_cell_scope(&command.namespace, shard);
     let storage = command.fleet.clone().resolve("celld kv")?;
+    let timeout = match &command.action {
+        Action::Branch { .. } => crate::operator_cell::branch_timeout(0),
+        _ => Duration::from_secs(60),
+    };
     let namespace = Reachable::open(
         Fleet {
             bucket: &storage.bucket,
@@ -124,9 +143,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         Subject {
             noun: "namespace",
             source: "kv",
-            // A bulk seed is not a diagnostic ping, and a namespace read is not
-            // a migration: between the two.
-            timeout: Duration::from_secs(60),
+            timeout,
         },
         scope,
         None,
@@ -399,6 +416,36 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             })?;
             out.finish()?;
         }
+        Action::Branch { parent_bucket } => {
+            let project_id = crate::cell_branch::branch_cli_project_id(
+                "",
+                Some(&storage.bucket),
+            );
+            crate::cell_branch::validate_parent_bucket(&parent_bucket, &project_id)
+                .map_err(|error| anyhow!("{error}"))?;
+            let result = namespace
+                .branch(&parent_bucket)
+                .await
+                .with_context(|| format!("branch from {parent_bucket}"))?;
+            if command.json {
+                let mut out = Output::new(Format::Json);
+                out.row(&BranchReply(result))?;
+                out.finish()?;
+            } else {
+                let fork_txid = result.get("fork_txid").and_then(Value::as_u64).unwrap_or_default();
+                let bytes_parent = result
+                    .get("bytes_parent")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let duration_ms = result
+                    .get("duration_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                note!(
+                    "Branched at fork txid {fork_txid} ({bytes_parent} parent bytes) in {duration_ms}ms"
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -492,6 +539,7 @@ impl Action {
             // A bulk operation spans a namespace, so with more than one shard
             // it splits by key rather than addressing one cell.
             Self::BulkGet { .. } | Self::BulkPut { .. } | Self::BulkDelete { .. } => None,
+            Self::Branch { .. } => None,
         }
     }
 }
@@ -531,6 +579,9 @@ enum Action {
     BulkDelete {
         file: PathBuf,
     },
+    Branch {
+        parent_bucket: String,
+    },
 }
 
 struct Command {
@@ -549,6 +600,7 @@ impl Command {
         };
         let verb = match first.as_str() {
             "--help" | "-h" | "help" => return Ok(None),
+            "branch" => "branch".to_string(),
             verb @ ("get" | "put" | "delete" | "list" | "info") => verb.to_string(),
             // `bulk get|put|delete`, mirroring `wrangler kv bulk`.
             "bulk" => match arguments.next().as_deref() {
@@ -577,6 +629,7 @@ impl Command {
         let mut expiration_ttl = None;
         let mut expiration = None;
         let mut metadata = None;
+        let mut parent_bucket = None;
         let mut prefix = String::new();
         let mut fleet = crate::cli_options::FleetFlags::default();
         let mut bounds = Bounds::default();
@@ -603,6 +656,7 @@ impl Command {
                     expiration = Some(number("--expiration", raw)?);
                 }
                 "--metadata" => metadata = Some(value("--metadata")?),
+                "--parent-bucket" => parent_bucket = Some(value("--parent-bucket")?),
                 "--prefix" => prefix = value("--prefix")?,
                 "--json" => json = true,
                 "--unsafe-public-advertise" => unsafe_public_advertise = true,
@@ -640,7 +694,18 @@ impl Command {
             }
             Ok(())
         };
-        let action = match verb.as_str() {
+        let action = if verb == "branch" {
+            refuse("--path", file.is_some())?;
+            refuse("--ttl", expiration_ttl.is_some())?;
+            refuse("--metadata", metadata.is_some())?;
+            if !positional.is_empty() {
+                bail!("celld kv branch takes no positional arguments besides the namespace id");
+            }
+            let parent_bucket = parent_bucket
+                .ok_or_else(|| anyhow!("celld kv branch requires --parent-bucket"))?;
+            Action::Branch { parent_bucket }
+        } else {
+            match verb.as_str() {
             "get" => {
                 refuse("--path", file.is_some())?;
                 refuse("--ttl", expiration_ttl.is_some())?;
@@ -709,6 +774,7 @@ impl Command {
                 }
             }
             _ => unreachable!("the verb was matched above"),
+            }
         };
         bounds.validate()?;
         Ok(Some(Self {
@@ -734,6 +800,7 @@ USAGE
   celld kv delete <namespace-id> <key>...       [fleet options]
   celld kv list   <namespace-id>                [--prefix P] [listing options]
   celld kv info   <namespace-id>                [fleet options]
+  celld kv branch <namespace-id> --parent-bucket URI --bucket CHILD [fleet options]
   celld kv bulk get    <namespace-id> [FILE]    [fleet options]
   celld kv bulk put    <namespace-id> FILE      [fleet options]
   celld kv bulk delete <namespace-id> FILE      [fleet options]
