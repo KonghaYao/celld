@@ -1231,12 +1231,18 @@ pub(super) fn op_r2_mp_part(
                 ));
             }
             entry.held = held;
+            // S3-style part etag (MD5 hex, quoted) for Worker-side multipart verification.
+            use md5::Digest as _;
+            let etag = format!(
+                "\"{:x}\"",
+                md5::Md5::digest(&bytes)
+            );
             entry.pending.insert(part_number, bytes);
-            entry.drain().await
+            entry.drain().await?;
+            Ok(serde_json::json!({ "partNumber": part_number, "etag": etag }).to_string())
         }
         .await;
-        result?;
-        Ok(serde_json::json!({ "partNumber": part_number }).to_string())
+        result
     });
     rv.set(promise_for(scope, id));
 }

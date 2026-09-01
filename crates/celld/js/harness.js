@@ -984,9 +984,7 @@ const __r2Multipart = (binding, bucketName, key, id) => ({
     const body = await __r2Value(binding, value);
     const bytes = body instanceof Uint8Array ? body : await __r2Drain(body);
     const r = JSON.parse(await __r2_mp_part(await id.host, partNumber | 0, bytes));
-    // The object store owns the part list this completion acts on, so it
-    // never hands back a part etag to name one with.
-    return { partNumber: r.partNumber, etag: "" };
+    return { partNumber: r.partNumber, etag: r.etag ?? "" };
   },
   async complete(parts) {
     const numbers = (parts ?? []).map((part) => part.partNumber | 0);
