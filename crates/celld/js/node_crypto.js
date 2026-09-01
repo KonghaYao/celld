@@ -13,7 +13,7 @@
 //   src/node/internal/validators.ts, internal_errors.ts (subsets)
 //
 // Types are stripped; the C++ `node-internal:crypto` builtin maps onto the
-// $$digest / $$hmacSign / $$pbkdf2 / $$hkdf / $$randomValues /
+// $$digest / $$hmacSign / $$pbkdf2 / $$scrypt / $$hkdf / $$randomValues /
 // $$timingSafeEqual host ops, with hash state buffered on the JS side (digest
 // runs once, at finalization).
 // checkPrime/generatePrime are pure-JS BigInt Miller–Rabin, mirroring
@@ -156,6 +156,9 @@
   const ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH = () =>
     nodeErr(RangeError, "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH",
       "Input buffers must have the same byte length");
+  const ERR_CRYPTO_INVALID_SCRYPT_PARAMS = () =>
+    nodeErr(TypeError, "ERR_CRYPTO_INVALID_SCRYPT_PARAMS",
+      "Invalid scrypt params");
 
   function validateString(value, name) {
     if (typeof value !== "string")
@@ -1077,6 +1080,55 @@
     );
   }
 
+  // ---- scrypt --------------------------------------------------------------
+  function scryptOptions(options) {
+    if (options == null || typeof options !== "object") options = {};
+    const N = options.N ?? options.cost ?? 16384;
+    const r = options.r ?? options.blockSize ?? 8;
+    const p = options.p ?? options.parallelization ?? 1;
+    validateInt32(N, "N", 1);
+    validateInt32(r, "r", 1);
+    validateInt32(p, "p", 1);
+    return { N, r, p };
+  }
+  function getScrypt(password, salt, keylen, options) {
+    const { N, r, p } = scryptOptions(options);
+    validateInt32(keylen, "keylen", 0);
+    password = getArrayBufferOrView(password, "password");
+    salt = getArrayBufferOrView(salt, "salt");
+    const out = $$scrypt(asU8(password), asU8(salt), keylen, N, r, p);
+    if (!out) {
+      throw new ERR_CRYPTO_INVALID_SCRYPT_PARAMS();
+    }
+    return out;
+  }
+  function scryptSync(password, salt, keylen, options) {
+    if (options !== undefined && typeof options !== "object") {
+      throw ERR_INVALID_ARG_TYPE("options", "object", options);
+    }
+    return Buffer.from(getScrypt(password, salt, keylen, options));
+  }
+  function scrypt(password, salt, keylen, options, callback) {
+    if (typeof options === "function") {
+      callback = options;
+      options = {};
+    }
+    validateFunction(callback, "callback");
+    if (options !== undefined && typeof options !== "object") {
+      throw ERR_INVALID_ARG_TYPE("options", "object", options);
+    }
+    new Promise((resolve, reject) => {
+      try {
+        resolve(getScrypt(password, salt, keylen, options));
+      } catch (err) {
+        reject(err);
+      }
+    }).then(
+      (val) => callback(null, Buffer.from(val)),
+      (err) => callback(err),
+    );
+  }
+
   // ---- hkdf ----------------------------------------------------------------
   function hkdfPrepareKey(key) {
     key = toBuf(key);
@@ -1557,7 +1609,7 @@
     // Hash and Hmac
     Hash, Hmac, createHash, createHmac, getHashes, hash,
     // KDF
-    hkdf, hkdfSync, pbkdf2, pbkdf2Sync,
+    hkdf, hkdfSync, pbkdf2, pbkdf2Sync, scrypt, scryptSync,
     // Keys
     KeyObject, SecretKeyObject, PublicKeyObject, PrivateKeyObject,
     createSecretKey, createPrivateKey, createPublicKey,
@@ -1572,8 +1624,6 @@
     publicDecrypt: notImplemented("publicDecrypt"),
     privateEncrypt: notImplemented("privateEncrypt"),
     privateDecrypt: notImplemented("privateDecrypt"),
-    scrypt: notImplemented("scrypt"),
-    scryptSync: notImplemented("scryptSync"),
     createDiffieHellman: notImplemented("createDiffieHellman"),
     createDiffieHellmanGroup: notImplemented("createDiffieHellmanGroup"),
     getDiffieHellman: notImplemented("getDiffieHellman"),

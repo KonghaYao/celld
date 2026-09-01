@@ -1415,6 +1415,52 @@ macro_rules! dispatch_digest {
     };
 }
 
+fn scrypt_kdf(
+    password: &[u8],
+    salt: &[u8],
+    keylen: usize,
+    n: u32,
+    r: u32,
+    p: u32,
+) -> Option<Vec<u8>> {
+    if n < 2 || n & (n - 1) != 0 {
+        return None;
+    }
+    let log_n = n.trailing_zeros();
+    if log_n > 63 {
+        return None;
+    }
+    let len_param = keylen.clamp(10, 64);
+    let params = scrypt::Params::new(log_n as u8, r, p, len_param).ok()?;
+    let mut out = vec![0u8; keylen];
+    scrypt::scrypt(password, salt, &params, &mut out).ok()?;
+    Some(out)
+}
+
+/// `$$scrypt(password, salt, keylen, N, r, p)` -> Uint8Array
+pub(super) fn op_node_scrypt(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(password) = view_bytes(args.get(0)) else {
+        return;
+    };
+    let Some(salt) = view_bytes(args.get(1)) else {
+        return;
+    };
+    let keylen = args.get(2).uint32_value(scope).unwrap_or(0) as usize;
+    let n = args.get(3).uint32_value(scope).unwrap_or(0);
+    let r = args.get(4).uint32_value(scope).unwrap_or(0);
+    let p = args.get(5).uint32_value(scope).unwrap_or(0);
+    if keylen == 0 {
+        return;
+    }
+    if let Some(out) = scrypt_kdf(&password, &salt, keylen, n, r, p) {
+        webcrypto_return_bytes(scope, rv, &out);
+    }
+}
+
 /// `$$pbkdf2(algorithm, password, salt, iterations, keylen)` -> Uint8Array
 pub(super) fn op_node_pbkdf2(
     scope: &mut v8::PinScope,

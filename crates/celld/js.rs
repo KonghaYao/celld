@@ -5033,6 +5033,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "$$aesEncrypt" => crypto::op_webcrypto_aes_encrypt,
         "$$aesDecrypt" => crypto::op_webcrypto_aes_decrypt,
         "$$pbkdf2" => crypto::op_node_pbkdf2,
+        "$$scrypt" => crypto::op_node_scrypt,
         "$$hkdf" => crypto::op_node_hkdf,
         "$$timingSafeEqual" => crypto::op_timing_safe_equal,
         "__event_begin" => op_event_begin,

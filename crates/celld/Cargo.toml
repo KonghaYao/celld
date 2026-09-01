@@ -50,6 +50,7 @@ nu-ansi-term.workspace = true
 object_store = { workspace = true, features = ["aws", "azure", "gcp"] }
 parquet.workspace = true
 pbkdf2.workspace = true
+scrypt.workspace = true
 percent-encoding.workspace = true
 p256.workspace = true
 p384.workspace = true
