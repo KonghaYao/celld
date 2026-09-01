@@ -26,7 +26,8 @@
 // imports node:crypto pays nothing.
 (() => {
   "use strict";
-  const Buffer = globalThis.Buffer; // lazy global; forces node_buffer
+  // Touch the lazy `Buffer` global before this module captures it.
+  const Buffer = globalThis.Buffer;
   const kMaxLength = 2147483647;
 
   // ---- errors / validators (Workerd's internal_errors.ts subset) -----------

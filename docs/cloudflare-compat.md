@@ -250,8 +250,9 @@ identifies each known exception.
 
 - `wrapKey()` and `unwrapKey()` are not available.
 - RSA-PSS signing is not available.
-- Web Crypto does not provide HKDF or PBKDF2 through `deriveBits()`. Use
-  `node:crypto` for these algorithms.
+- Web Crypto **PBKDF2** and **HKDF** are available through `deriveBits()` (same
+  host KDF ops as `node:crypto`). For Node-style `pbkdf2Sync` / `scrypt`, use
+  `node:crypto`.
 
 ### [Web standards](https://developers.cloudflare.com/workers/runtime-apis/web-standards/)
 

@@ -10,6 +10,8 @@
   const _hmacVerify = $$hmacVerify;
   const _aesEncrypt = $$aesEncrypt;
   const _aesDecrypt = $$aesDecrypt;
+  const _pbkdf2 = $$pbkdf2;
+  const _hkdf = $$hkdf;
 
   // MD5 is not in the Web Crypto spec; Cloudflare accepts it for `digest`
   // and DigestStream, and the host op has always implemented it.
@@ -37,6 +39,32 @@
     "RSASSA-PKCS1-V1_5", "RSA-OAEP", "RSA-PSS", "ECDSA", "ECDH",
     "ED25519", "X25519",
   ]);
+  const _KDF_KEY_ALGS = new Set(["PBKDF2", "HKDF"]);
+
+  function _requireKeyUsage(key, usage) {
+    if (!key?.usages?.includes(usage)) {
+      throw new DOMException(
+        `'baseKey' usages does not contain '${usage}'`,
+        "InvalidAccessError",
+      );
+    }
+  }
+
+  function _deriveBitsLength(length) {
+    if (length === null || length === undefined) {
+      throw new DOMException("length is required", "OperationError");
+    }
+    const bits = Number(length);
+    if (!Number.isFinite(bits) || bits < 0 || !Number.isInteger(bits) || bits % 8 !== 0) {
+      throw new DOMException("length must be a multiple of 8", "OperationError");
+    }
+    return bits;
+  }
+
+  function _returnArrayBuffer(bytes) {
+    const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+  }
 
   function _toBuf(data) {
     if (data instanceof ArrayBuffer) return new Uint8Array(data);
@@ -136,6 +164,19 @@
 
     async importKey(format, keyData, algorithm, extractable, usages) {
       const name = _algorithmName(algorithm);
+      if (format === "raw" && _KDF_KEY_ALGS.has(name)) {
+        if (extractable) {
+          throw new DOMException("key is not extractable", "InvalidAccessError");
+        }
+        const raw = _toBuf(keyData).slice();
+        return _makeKey(
+          "secret",
+          { name },
+          false,
+          usages,
+          { bytes: raw },
+        );
+      }
       if (format === "raw" && _SECRET_KEY_ALGS.has(name)) {
         const raw = _toBuf(keyData).slice();
         const normalized = name === "HMAC"
@@ -252,6 +293,44 @@
     // without being told one. A shorter length truncates, as the spec says.
     async deriveBits(algorithm, baseKey, length) {
       const name = _algorithmName(algorithm);
+      if (name === "PBKDF2") {
+        _requireKeyUsage(baseKey, "deriveBits");
+        if (_algorithmName(baseKey?.algorithm) !== "PBKDF2") {
+          throw new DOMException("key algorithm mismatch", "InvalidAccessError");
+        }
+        const bits = _deriveBitsLength(length);
+        const iterations = Number(algorithm?.iterations);
+        if (!Number.isInteger(iterations) || iterations < 1) {
+          throw new TypeError("PBKDF2 iterations must be a positive integer");
+        }
+        const salt = _toBuf(algorithm?.salt);
+        if (salt.byteLength === 0) {
+          throw _operationError("PBKDF2 salt must not be empty");
+        }
+        const hash = _hashName(algorithm?.hash);
+        const password = _toBuf(baseKey.__celldMaterial.bytes);
+        const out = _pbkdf2(hash, password, salt, iterations, bits / 8);
+        if (!out) throw _operationError("PBKDF2 deriveBits failed");
+        return _returnArrayBuffer(out);
+      }
+      if (name === "HKDF") {
+        _requireKeyUsage(baseKey, "deriveBits");
+        if (_algorithmName(baseKey?.algorithm) !== "HKDF") {
+          throw new DOMException("key algorithm mismatch", "InvalidAccessError");
+        }
+        const bits = _deriveBitsLength(length);
+        const hash = _hashName(algorithm?.hash);
+        const ikm = _toBuf(baseKey.__celldMaterial.bytes);
+        const salt = algorithm?.salt === undefined
+          ? new Uint8Array(0)
+          : _toBuf(algorithm.salt);
+        const info = algorithm?.info === undefined
+          ? new Uint8Array(0)
+          : _toBuf(algorithm.info);
+        const out = _hkdf(hash, ikm, salt, info, bits / 8);
+        if (!out) throw _operationError("HKDF deriveBits failed");
+        return _returnArrayBuffer(out);
+      }
       if (name !== "ECDH") {
         throw _notSupported("unsupported derive algorithm: " + name);
       }
@@ -412,11 +491,13 @@
         if (!sig) throw _operationError("HMAC sign failed");
         return sig.buffer.slice(sig.byteOffset, sig.byteOffset + sig.byteLength);
       }
-      const operation = name === "ED25519"
+      const operation = name === "ED25519" || name === "NODE-ED25519"
         ? "ed25519-sign"
         : name === "ECDSA"
           ? "p256-sign"
-          : null;
+          : name === "RSASSA-PKCS1-V1_5"
+            ? "rsa-pkcs1-sign"
+            : null;
       if (!operation) throw _notSupported("unsupported sign algorithm: " + name);
       const result = _extra(operation, {
         key: Array.from(key?.__celldMaterial?.bytes || []),
@@ -435,7 +516,9 @@
           _toBuf(data),
         );
       }
-      const operation = name === "ECDSA"
+      const operation = name === "ED25519" || name === "NODE-ED25519"
+        ? "ed25519-verify"
+        : name === "ECDSA"
         ? "p256-verify"
         : name === "RSASSA-PKCS1-V1_5"
         ? "rsa-pkcs1-verify"
