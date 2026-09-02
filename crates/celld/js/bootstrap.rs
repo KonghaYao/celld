@@ -970,6 +970,24 @@ fn call_extends(
 
 /// Record the node id. Every cell scope routes through the host, whichever node
 /// owns it.
+pub(super) fn inject_loopback_config(
+    scope: &mut v8::PinScope,
+    config: &crate::fetch_loopback::LoopbackConfig,
+) -> Result<()> {
+    let src = format!(
+        "(() => {{ __cell.canonicalInboundUrl = {:?}; __cell.loopbackEnabled = {}; }})();",
+        config.canonical_inbound_url,
+        config.loopback_enabled,
+    );
+    let code = v8::String::new(scope, &src).unwrap();
+    let script = v8::Script::compile(scope, code, None)
+        .ok_or_else(|| anyhow!("loopback config compile"))?;
+    script
+        .run(scope)
+        .ok_or_else(|| anyhow!("loopback config run"))?;
+    Ok(())
+}
+
 pub(super) fn inject_routing(scope: &mut v8::PinScope, node: &str) -> Result<()> {
     let src = format!("(() => {{ __cell.node = {node:?}; }})();");
     let code = v8::String::new(scope, &src).unwrap();

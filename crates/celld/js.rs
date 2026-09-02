@@ -2283,6 +2283,7 @@ struct ActorRuntimeState {
     io_contexts: std::sync::Mutex<HashMap<u64, Weak<IoContext>>>,
     next_io_context_id: AtomicU64,
     egress: EgressPolicy,
+    loopback_config: Option<crate::fetch_loopback::LoopbackConfig>,
     event_hooks: OnceLock<EventHooks>,
     d1_import_reopens: std::sync::Mutex<D1ImportReopenMap>,
     d1_branch_reopens: std::sync::Mutex<D1BranchReopenMap>,
@@ -4431,6 +4432,7 @@ fn start_fetch<'s>(
     headers: &[(String, String)],
     request_id: Option<RequestId>,
 ) -> Result<Started<'s>> {
+    pin_inbound_request_url(tc, url);
     let req = match request_id {
         Some(_) => make_incoming_request(tc, url, method, body, headers),
         None => make_request(tc, url, method, body, headers),
@@ -4515,6 +4517,7 @@ impl Worker {
         let runtime_state = Arc::new(ActorRuntimeState {
             promises: std::sync::Mutex::new(PromiseMap::new()),
             egress: config.egress,
+            loopback_config: crate::fetch_loopback::config_from_vars(&config.vars),
             ..Default::default()
         });
         let loader_owner = LoaderOwner::fresh();
@@ -4613,6 +4616,9 @@ impl Worker {
             validate_workflow_classes(scope, ns, &config.workflow_bindings)?;
             // build env from bindings and stash it in the harness
             build_env(scope, &config)?;
+            if let Some(loopback) = crate::fetch_loopback::config_from_vars(&config.vars) {
+                inject_loopback_config(scope, &loopback)?;
+            }
             // tell the harness which cells are local (route the rest cross-node)
             inject_routing(scope, node)?;
 
@@ -4998,6 +5004,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__sc_encode" => storage_ops::op_sc_encode,
         "__sc_decode" => storage_ops::op_sc_decode,
         "__op_fetch" => op_fetch,
+        "__op_fetch_plan" => op_fetch_plan,
         "__r2_head" => r2_ops::op_r2_head,
         "__r2_get" => r2_ops::op_r2_get,
         "__r2_put" => r2_ops::op_r2_put,
@@ -6497,6 +6504,59 @@ fn op_rpc_call(
     rv.set(p);
 }
 
+fn pin_inbound_request_url(scope: &mut v8::PinScope, url: &str) {
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let cell_key = static_key(scope, &v8_strings::CELL);
+    let cell = global
+        .get(scope, cell_key.into())
+        .and_then(|value| value.to_object(scope));
+    if let Some(cell) = cell {
+        let key = v8::String::new(scope, "inboundRequestUrl").unwrap();
+        let value = v8::String::new(scope, url).unwrap();
+        cell.set(scope, key.into(), value.into());
+    }
+}
+
+/// Relative URL resolution must match harness `globalThis.fetch` (§5.2).
+fn loopback_inbound_base(scope: &mut v8::PinScope) -> String {
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let cell_key = static_key(scope, &v8_strings::CELL);
+    let inbound = global
+        .get(scope, cell_key.into())
+        .and_then(|value| value.to_object(scope))
+        .and_then(|cell| {
+            let key = v8::String::new(scope, "inboundRequestUrl").unwrap();
+            cell.get(scope, key.into())
+        })
+        .filter(|value| value.is_string())
+        .map(|value| value.to_rust_string_lossy(scope))
+        .filter(|value| !value.is_empty());
+    if let Some(inbound) = inbound {
+        return inbound;
+    }
+    actor_runtime_state(scope)
+        .loopback_config
+        .as_ref()
+        .map(|config| config.canonical_inbound_url.clone())
+        .unwrap_or_default()
+}
+
+/// Synchronous URL plan for harness `fetch` (loopback vs egress vs reject).
+fn op_fetch_plan(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let url = args.get(0).to_rust_string_lossy(scope);
+    let inbound = args.get(1).to_rust_string_lossy(scope);
+    let config = actor_runtime_state(scope).loopback_config.clone();
+    let plan = crate::fetch_loopback::plan_fetch(&url, &inbound, config.as_ref());
+    let json = crate::fetch_loopback::plan_to_json(&plan);
+    rv.set(v8::String::new(scope, &json).unwrap().into());
+}
+
 /// Outbound `fetch` — the op behind the harness's `fetch()`. Resolves to a JSON
 /// `{status, body, headers}` string.
 fn op_fetch(
@@ -6516,6 +6576,19 @@ fn op_fetch(
     }
     let method = args.get(0).to_rust_string_lossy(scope);
     let url = args.get(1).to_rust_string_lossy(scope);
+    let inbound = loopback_inbound_base(scope);
+    let egress_plan =
+        crate::fetch_loopback::plan_fetch(&url, &inbound, actor_runtime_state(scope).loopback_config.as_ref());
+    if !matches!(egress_plan, crate::fetch_loopback::FetchPlan::Egress) {
+        let message = match egress_plan {
+            crate::fetch_loopback::FetchPlan::Reject(error) => error,
+            crate::fetch_loopback::FetchPlan::Loopback { .. } => {
+                "fetch: same-origin requests must use in-process loopback".into()
+            }
+            crate::fetch_loopback::FetchPlan::Egress => unreachable!(),
+        };
+        return loader_throw(scope, &message);
+    }
     // A body is a typed array, as it is for `__svc_call`, `__do_call` and
     // `__loader_fetch`. `None` and an empty body are different requests — one
     // carries no `Content-Length` — so the absent case stays distinct.
@@ -9068,7 +9141,8 @@ pub mod modules;
 mod v8_strings;
 use bootstrap::{
     adopt_cell, begin_event_context, build_env, end_event_context, harness_env,
-    inject_compatibility_flags, inject_crons, inject_kv_limits, inject_namespace_keys,
+    inject_compatibility_flags, inject_crons, inject_kv_limits, inject_loopback_config,
+    inject_namespace_keys,
     inject_queue_config, inject_routing, inject_storage_compatibility, inject_workflows,
     install_harness, install_prelude, populate_cf_exports, register_class, register_entrypoints,
     validate_workflow_classes,

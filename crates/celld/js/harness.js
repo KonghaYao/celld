@@ -562,6 +562,15 @@ const __subrequestBody = async (req, absent = false) => {
   req.body.getReader();
   return { body: new Uint8Array(), streamId };
 };
+const __FETCH_HOP_BY_HOP = new Set([
+  "connection", "keep-alive", "transfer-encoding", "te", "trailer",
+  "upgrade", "proxy-connection",
+]);
+const __stripFetchHopByHop = (headers) => {
+  for (const [name] of headers.__celldHeaderList)
+    if (__FETCH_HOP_BY_HOP.has(name.toLowerCase()))
+      headers.delete(name);
+};
 globalThis.fetch = async (input, init) => {
   const req = new Request(input, init);
   // `fetch(url, { headers: { Upgrade: "websocket" } })` is the other way
@@ -569,6 +578,25 @@ globalThis.fetch = async (input, init) => {
   if ((req.headers.get("upgrade") ?? "").toLowerCase() === "websocket") {
     return await __fetchWebSocketUpgrade(req);
   }
+  const inbound =
+    __cell.inboundRequestUrl || __cell.canonicalInboundUrl || "";
+  const plan = JSON.parse(__op_fetch_plan(req.url, inbound));
+  if (plan.action === "loopback" && __cell.loopbackEnabled) {
+    const headers = new Headers(req.headers);
+    __stripFetchHopByHop(headers);
+    headers.set("host", plan.host);
+    const loopReq = new Request(plan.url, {
+      method: req.method,
+      headers,
+      body: req.body,
+      redirect: req.redirect,
+      signal: req.signal,
+      __celldIncomingSignal: req.__celldIncomingSignal,
+    });
+    return await __invokeSelfFetch(loopReq, plan.url);
+  }
+  if (plan.action === "reject")
+    throw new TypeError(plan.error);
   // The bytes go to the host as a typed array, the same way every other
   // subrequest op takes a body. Encoding them as a JSON number array cost
   // roughly ten times the body in transient allocation, and it corrupted
@@ -2066,6 +2094,31 @@ const __wrapServiceResponse = (res, url) => {
   }
   return wrapped;
 };
+// Same-origin `globalThis.fetch` and service-binding self targets share this
+// in-isolate path (__beginEvent → selfFetch → __endEvent).
+const __invokeSelfFetch = async (req, responseUrl) => {
+  if (typeof __cell.selfFetch !== "function")
+    throw new TypeError("fetch: in-process loopback is not available");
+  if (__cell.svcDepth >= 8)
+    throw new Error("Service binding recursion limit exceeded (8)");
+  const signal = req._signalForSubrequests;
+  if (signal?.aborted) throw signal.reason;
+  __cell.svcDepth = (__cell.svcDepth || 0) + 1;
+  const ctx = __beginEvent();
+  try {
+    const dispatch = __ctxRun(undefined,
+      () => __cell.selfFetch(req, __cell.env, ctx));
+    const response = signal
+      ? await __raceCallerAbort(dispatch, signal, () => {
+          throw new Error("The client has disconnected");
+        })
+      : await dispatch;
+    return __wrapServiceResponse(response, responseUrl);
+  } finally {
+    __cell.svcDepth--;
+    __endEvent();
+  }
+};
 // `[[services]]` binding: a Fetcher pointed at another Worker in this
 // process. No identity to resolve, so it goes straight to __svc_call.
 // Worker Loader (Code Mode): spawn a fresh isolate from supplied code and
@@ -2234,20 +2287,9 @@ globalThis.__makeServiceBinding = (script, entrypoint = null) => {
         "Cross-script service bindings with an entrypoint do not " +
         "support fetch() yet; only same-script targets do.");
     if (script === __cell.script && typeof __cell.selfFetch === "function") {
-      if (__cell.svcDepth >= 8)
-        throw new Error(
-          "Service binding recursion limit exceeded (8)");
-      __cell.svcDepth = (__cell.svcDepth || 0) + 1;
-      const ctx = __beginEvent();
-      try {
-        return __wrapServiceResponse(
-          await __ctxRun(undefined,
-            () => __cell.selfFetch(req, __cell.env, ctx)),
-          req.url);
-      } finally {
-        __cell.svcDepth--;
-        __endEvent();
-      }
+      const signal = req._signalForSubrequests;
+      if (signal?.aborted) throw signal.reason;
+      return await __invokeSelfFetch(req, req.url);
     }
     // The verbatim header list; see the note on the outbound `fetch`. The
     // target isolate rebuilds a `Headers` from these pairs, so a repeat and
@@ -4394,6 +4436,7 @@ globalThis.__cell = {
   idNames: {},
   namespaceKeys: {},
   node: "",
+  loopbackEnabled: false,
   deleteAllDeletesAlarm: false,
   compat: { jsRpc: false, fetcherGetPutDelete: false, queueJsonMessages: false },
   makeNamespace,
