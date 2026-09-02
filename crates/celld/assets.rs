@@ -91,6 +91,8 @@ struct AssetResolverInner {
     cleanup_lock: Mutex<()>,
     header_rules: Vec<HeaderRule>,
     redirect_rules: Vec<RedirectRule>,
+    /// `_routes.json` `exclude` patterns — asset-only, no Worker fallback on miss.
+    route_excludes: Vec<String>,
 }
 
 enum Route {
@@ -161,6 +163,12 @@ impl AssetResolver {
         validate_index(&index, reference)?;
         let header_rules = parse_header_rules(index.config.headers.as_deref().unwrap_or(""))?;
         let redirect_rules = parse_redirect_rules(index.config.redirects.as_deref().unwrap_or(""))?;
+        let route_excludes = index
+            .config
+            .routes
+            .as_ref()
+            .map(|routes| routes.exclude.clone())
+            .unwrap_or_default();
         let cache_root = std::env::var_os("CELLD_ASSET_CACHE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("celld").join("asset-cache"));
@@ -181,6 +189,7 @@ impl AssetResolver {
                 cleanup_lock: Mutex::new(()),
                 header_rules,
                 redirect_rules,
+                route_excludes,
             }),
         })
     }
@@ -199,18 +208,19 @@ impl AssetResolver {
         };
         match &self.inner.index.config.run_worker_first {
             RunWorkerFirst::Bool(value) => *value,
-            RunWorkerFirst::Routes(rules) => {
-                let excluded = rules
-                    .iter()
-                    .filter_map(|rule| rule.strip_prefix('!'))
-                    .any(|rule| route_pattern_matches(rule, &path));
-                !excluded
-                    && rules
-                        .iter()
-                        .filter(|rule| !rule.starts_with('!'))
-                        .any(|rule| route_pattern_matches(rule, &path))
-            }
+            RunWorkerFirst::Routes(rules) => worker_first_for_routes(rules, &path),
         }
+    }
+
+    /// Path is served from static assets only (`_routes.json` `exclude`).
+    pub fn is_asset_exclusive(&self, encoded_path: &str) -> bool {
+        let Some(path) = decode_path(encoded_path) else {
+            return false;
+        };
+        self.inner
+            .route_excludes
+            .iter()
+            .any(|rule| route_pattern_matches(rule, &path))
     }
 
     pub async fn ingress_response(
@@ -219,9 +229,10 @@ impl AssetResolver {
         query: Option<&str>,
         head: bool,
         request_headers: &HeaderMap,
+        asset_exclusive: bool,
     ) -> anyhow::Result<Option<Response>> {
-        let include_not_found =
-            self.inner.asset_only || self.navigation_prefers_asset_serving(request_headers);
+        let include_not_found = !asset_exclusive
+            && (self.inner.asset_only || self.navigation_prefers_asset_serving(request_headers));
         let host = request_headers
             .get("host")
             .and_then(|value| value.to_str().ok())
@@ -1364,6 +1375,23 @@ fn validate_index(index: &AssetIndex, reference: &AssetManifestRef) -> anyhow::R
             return Err(anyhow!("asset worker-first routes require a positive rule"));
         }
     }
+    if let Some(routes) = &config.routes {
+        if routes.version != 1 {
+            return Err(anyhow!("unsupported asset routes version"));
+        }
+        if routes.include.len() + routes.exclude.len() > 100 {
+            return Err(anyhow!("invalid asset routes pattern count"));
+        }
+        for pattern in routes.include.iter().chain(routes.exclude.iter()) {
+            if pattern.is_empty()
+                || pattern.len() > 100
+                || !pattern.starts_with('/')
+                || pattern.contains(['\\', '\0'])
+            {
+                return Err(anyhow!("invalid asset routes pattern: {pattern:?}"));
+            }
+        }
+    }
     let mut total = 0_u64;
     for (path, entry) in &index.entries {
         if decode_path(path).as_deref() != Some(path.as_str())
@@ -1398,15 +1426,40 @@ fn decode_path(path: &str) -> Option<String> {
         return None;
     }
     let decoded = percent_decode_str(path).decode_utf8().ok()?.into_owned();
-    if decoded.contains('\\')
-        || decoded.contains('\0')
-        || decoded.split('/').skip(1).any(|segment| {
-            segment.is_empty() && decoded != "/" || segment == "." || segment == ".."
-        })
-    {
+    if decoded.contains('\\') || decoded.contains('\0') {
+        return None;
+    }
+    if decoded == "/" {
+        return Some(decoded);
+    }
+    let segments: Vec<&str> = decoded.split('/').skip(1).collect();
+    for segment in &segments {
+        if *segment == "." || *segment == ".." {
+            return None;
+        }
+    }
+    let trailing = segments.last() == Some(&"");
+    let non_trailing = if trailing {
+        &segments[..segments.len().saturating_sub(1)]
+    } else {
+        segments.as_slice()
+    };
+    if non_trailing.iter().any(|segment| segment.is_empty()) {
         return None;
     }
     Some(decoded)
+}
+
+fn worker_first_for_routes(rules: &[String], path: &str) -> bool {
+    let excluded = rules
+        .iter()
+        .filter_map(|rule| rule.strip_prefix('!'))
+        .any(|rule| route_pattern_matches(rule, path));
+    !excluded
+        && rules
+            .iter()
+            .filter(|rule| !rule.starts_with('!'))
+            .any(|rule| route_pattern_matches(rule, path))
 }
 
 fn route_pattern_matches(pattern: &str, path: &str) -> bool {
@@ -1420,4 +1473,60 @@ fn route_pattern_matches(pattern: &str, path: &str) -> bool {
         expression.push('$');
     }
     regex::Regex::new(&expression).is_ok_and(|pattern| pattern.is_match(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::AssetConfig;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn decode_path_allows_trailing_slash() {
+        assert_eq!(decode_path("/blog/").as_deref(), Some("/blog/"));
+        assert_eq!(decode_path("/about/").as_deref(), Some("/about/"));
+        assert_eq!(decode_path("/").as_deref(), Some("/"));
+        assert!(decode_path("/blog//post").is_none());
+    }
+
+    #[test]
+    fn route_pattern_wildcards() {
+        assert!(route_pattern_matches("/blog/*", "/blog/"));
+        assert!(route_pattern_matches("/blog/*", "/blog/first-post/"));
+        assert!(!route_pattern_matches("/blog/*", "/about"));
+        assert!(route_pattern_matches("/about", "/about"));
+    }
+
+    #[test]
+    fn worker_first_routes_respect_exclude() {
+        let rules = vec!["/*".to_string(), "!/blog/*".to_string()];
+        assert!(worker_first_for_routes(&rules, "/api/x"));
+        assert!(!worker_first_for_routes(&rules, "/blog/"));
+        assert!(!worker_first_for_routes(&rules, "/blog/post"));
+    }
+
+    #[test]
+    fn asset_exclusive_matches_exclude_only() {
+        let index = AssetIndex {
+            schema_version: 1,
+            entries: BTreeMap::new(),
+            config: AssetConfig {
+                routes: Some(crate::protocol::AssetRoutesConfig {
+                    version: 1,
+                    include: vec!["/*".to_string()],
+                    exclude: vec!["/blog/*".to_string()],
+                }),
+                ..Default::default()
+            },
+        };
+        let excludes = index
+            .config
+            .routes
+            .as_ref()
+            .map(|routes| routes.exclude.clone())
+            .unwrap_or_default();
+        assert!(excludes
+            .iter()
+            .any(|rule| route_pattern_matches(rule, "/blog/")));
+    }
 }

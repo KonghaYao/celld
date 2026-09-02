@@ -14,7 +14,8 @@
 use crate::bucket::Bucket;
 use crate::note;
 use crate::protocol::{
-    asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
+    asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, AssetRoutesConfig,
+    DeployPointer, Manifest,
     ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig, QueueConsumerDeployment,
     Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_KV_V1,
     FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
@@ -1802,7 +1803,7 @@ fn read_asset_project(
         "none",
         &["none", "single-page-application", "404-page"],
     )?;
-    let run_worker_first = object
+    let mut run_worker_first = object
         .get("run_worker_first")
         .map(|value| {
             serde_json::from_value::<RunWorkerFirst>(value.clone())
@@ -1810,10 +1811,14 @@ fn read_asset_project(
         })
         .transpose()?
         .unwrap_or_default();
-    validate_worker_first(&run_worker_first)?;
 
     let headers = read_asset_directive(&directory, "_headers")?;
     let redirects = read_asset_directive(&directory, "_redirects")?;
+    let routes = read_routes_json(&directory)?;
+    if let Some(routes) = &routes {
+        run_worker_first = run_worker_first_from_routes(routes)?;
+    }
+    validate_worker_first(&run_worker_first)?;
     let compatibility_date = project
         .get("compatibility_date")
         .map(|value| {
@@ -1855,6 +1860,12 @@ fn read_asset_project(
     if let Some(redirects) = &redirects {
         upload_config.insert("_redirects".to_string(), Value::String(redirects.clone()));
     }
+    if let Some(routes) = &routes {
+        upload_config.insert(
+            "_routes.json".to_string(),
+            serde_json::to_value(routes).context("encode _routes.json metadata")?,
+        );
+    }
 
     Ok(ProjectAssets {
         directory,
@@ -1865,6 +1876,7 @@ fn read_asset_project(
             run_worker_first,
             headers,
             redirects,
+            routes,
             compatibility_date,
             compatibility_flags,
         },
@@ -1939,6 +1951,88 @@ fn validate_worker_first(value: &RunWorkerFirst) -> anyhow::Result<()> {
         bail!("asset worker-first routes require a positive rule");
     }
     Ok(())
+}
+
+fn validate_route_pattern(pattern: &str) -> anyhow::Result<()> {
+    if pattern.is_empty()
+        || pattern.len() > 100
+        || !pattern.starts_with('/')
+        || pattern.contains(['\\', '\0'])
+    {
+        bail!("invalid asset route pattern: {pattern:?}");
+    }
+    Ok(())
+}
+
+fn read_routes_json(directory: &Path) -> anyhow::Result<Option<AssetRoutesConfig>> {
+    let path = directory.join("_routes.json");
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("asset directive {} is not a regular file", path.display());
+    }
+    if metadata.len() > MAX_ASSET_DIRECTIVE_BYTES {
+        bail!("asset directive {} exceeds 100 KiB", path.display());
+    }
+    let contents =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let object: Map<String, Value> =
+        serde_json::from_str(&contents).context("parse _routes.json")?;
+    let version = object
+        .get("version")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    if version != 1 {
+        bail!("unsupported _routes.json version: {version}");
+    }
+    let include = parse_routes_array(object.get("include"), "include")?;
+    let exclude = parse_routes_array(object.get("exclude"), "exclude")?;
+    if include.is_empty() && exclude.is_empty() {
+        bail!("_routes.json must declare at least one include or exclude pattern");
+    }
+    for pattern in include.iter().chain(exclude.iter()) {
+        validate_route_pattern(pattern)?;
+    }
+    Ok(Some(AssetRoutesConfig {
+        version: 1,
+        include,
+        exclude,
+    }))
+}
+
+fn parse_routes_array(value: Option<&Value>, key: &str) -> anyhow::Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let array = value
+        .as_array()
+        .ok_or_else(|| anyhow!("_routes.json `{key}` must be an array"))?;
+    array
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("_routes.json `{key}` entries must be strings"))
+        })
+        .collect()
+}
+
+fn run_worker_first_from_routes(routes: &AssetRoutesConfig) -> anyhow::Result<RunWorkerFirst> {
+    let mut compiled = routes.include.clone();
+    if compiled.is_empty() {
+        compiled.push("/*".to_string());
+    }
+    for pattern in &routes.exclude {
+        compiled.push(format!("!{pattern}"));
+    }
+    if compiled.len() > 100 {
+        bail!("_routes.json exceeds the 100-route limit after compilation");
+    }
+    Ok(RunWorkerFirst::Routes(compiled))
 }
 
 fn read_asset_directive(directory: &Path, name: &str) -> anyhow::Result<Option<String>> {
@@ -2042,7 +2136,7 @@ fn collect_asset_files(
                 entry.path().display()
             );
         }
-        if relative.is_empty() && matches!(name.as_str(), "_headers" | "_redirects") {
+        if relative.is_empty() && matches!(name.as_str(), "_headers" | "_redirects" | "_routes.json") {
             continue;
         }
         if name.contains(['\\', '\0']) {

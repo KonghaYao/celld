@@ -362,6 +362,9 @@ pub struct AssetConfig {
     pub headers: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redirects: Option<String>,
+    /// Cloudflare `_routes.json` (`include` / `exclude`) captured at deploy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routes: Option<AssetRoutesConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compatibility_date: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -379,6 +382,16 @@ impl Default for RunWorkerFirst {
     fn default() -> Self {
         Self::Bool(false)
     }
+}
+
+/// Workers static-assets `_routes.json` (version 1).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AssetRoutesConfig {
+    pub version: u32,
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 /// A fleet-wide immutable asset body key. The digest is validated before this

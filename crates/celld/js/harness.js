@@ -8725,6 +8725,50 @@ globalThis.__cf = {
   exports: {},
   get env() { return globalThis.__cell.env; },
 };
+// Workers Cache API (Astro SSR / adapter-cloudflare). In-memory per isolate.
+if (!globalThis.caches) {
+  const __cacheStores = new Map();
+  const __reqKey = (request) => {
+    if (typeof request === "string") return request;
+    if (request && typeof request.url === "string") return request.url;
+    return String(request);
+  };
+  const __makeCache = (name) => {
+    if (!__cacheStores.has(name)) __cacheStores.set(name, new Map());
+    const store = __cacheStores.get(name);
+    return {
+      async match(request, _options) {
+        const key = __reqKey(request);
+        const ent = store.get(key);
+        return ent ? ent.clone() : undefined;
+      },
+      async matchAll(request, _options) {
+        const key = request === undefined ? undefined : __reqKey(request);
+        const out = [];
+        for (const [k, res] of store) {
+          if (key === undefined || k === key) out.push(res.clone());
+        }
+        return out;
+      },
+      async put(request, response) {
+        store.set(__reqKey(request), response.clone());
+      },
+      async delete(request, _options) {
+        return store.delete(__reqKey(request));
+      },
+      async keys(_query, _options) {
+        return [...store.keys()];
+      },
+    };
+  };
+  globalThis.caches = {
+    get default() { return __makeCache("default"); },
+    async open(name) { return __makeCache(String(name)); },
+    async delete(name) { return __cacheStores.delete(String(name)); },
+    async has(name) { return __cacheStores.has(String(name)); },
+    async keys() { return [...__cacheStores.keys()]; },
+  };
+}
 // Pass-through proxy standing in for unsupported node:* builtins: callable,
 // constructable, and every property returns itself — so bundle evaluation
 // never crashes on a builtin the fetch path doesn't actually exercise.

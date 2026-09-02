@@ -76,6 +76,20 @@ identifies each known exception.
 - A loaded Worker cannot receive a capability stub in `env`.
 - Awaitable and pipelined properties are not available.
 
+### [Static assets](https://developers.cloudflare.com/workers/static-assets/)
+
+**Yes**
+
+- `celld deploy` reads `_routes.json` from the asset directory (version `1`
+  only). `include` patterns may invoke the Worker first; `exclude` patterns
+  serve from assets only and return `404` on a miss instead of falling through
+  to the Worker. Wildcards use `*`, matching ingress and
+  `assets.run_worker_first` route lists.
+- `_routes.json` is deployment metadata like `_headers` and `_redirects`; it is
+  not published as a static file.
+- `html_handling: auto-trailing-slash` resolves directory URLs such as
+  `/blog/` to `/blog/index.html` in the asset index.
+
 ### [KV](https://developers.cloudflare.com/kv/api/)
 
 **Partial**

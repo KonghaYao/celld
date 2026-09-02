@@ -2099,14 +2099,21 @@ async fn handle_ingress(
         let generation = app.runtime.as_ref().map(RuntimeManager::generation);
         if let Some(resolver) = generation.as_deref().and_then(Generation::ingress_assets) {
             let path = request.uri().path();
-            if !resolver.should_run_worker_first(path) {
+            let asset_exclusive = resolver.is_asset_exclusive(path);
+            if asset_exclusive || !resolver.should_run_worker_first(path) {
                 let head = request.method() == hyper::Method::HEAD;
                 match resolver
-                    .ingress_response(path, request.uri().query(), head, request.headers())
+                    .ingress_response(
+                        path,
+                        request.uri().query(),
+                        head,
+                        request.headers(),
+                        asset_exclusive,
+                    )
                     .await
                 {
                     Ok(Some(response)) => return asset_response(response),
-                    Ok(None) if resolver.asset_only() => {
+                    Ok(None) if asset_exclusive || resolver.asset_only() => {
                         return response(StatusCode::NOT_FOUND, "Not found");
                     }
                     Ok(None) => {}

@@ -237,7 +237,7 @@ bindings, variables, cron triggers, D1 databases, KV namespaces, Workflows,
 WebAssembly modules, and static assets. An asset project can include a
 Worker or be asset-only, and the asset functions include the assets
 binding, HTML handling, not-found handling, worker-first routes,
-`_headers`, and `_redirects`. If the Wrangler configuration contains an
+`_headers`, `_redirects`, and `_routes.json`. If the Wrangler configuration contains an
 unknown key, the deploy stops with an error. See the
 [Cloudflare compatibility](cloudflare-compat.md) page for the complete
 deployment boundary.

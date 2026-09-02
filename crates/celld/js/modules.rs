@@ -77,6 +77,10 @@ static IMPORT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|
 });
 static IMPORT_BRACES_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"\{([^}]*)\}").unwrap());
+static SIDE_EFFECT_IMPORT_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"import\s+["']([^"']+)["']\s*;"#).unwrap()
+    });
 
 /// Counts scans of a source carrying [`SCAN_PROBE_MARKER`].
 ///
@@ -139,6 +143,14 @@ pub(super) fn scan_external_imports(src: &str) -> ExternalImports {
         if clause.contains('*') {
             set.insert("*".into());
         }
+    }
+    for cap in SIDE_EFFECT_IMPORT_RE.captures_iter(src) {
+        if !is_external(&cap[1]) {
+            continue;
+        }
+        map.entry(cap[1].to_string())
+            .or_default()
+            .insert("*".into());
     }
     map
 }
@@ -621,8 +633,34 @@ pub(super) fn register_loader_modules(scope: &mut v8::PinScope, config: &WorkerC
     }
 }
 
+/// Register a single external builtin stub on first resolve (sibling chunks may
+/// import `cloudflare:workers` without the main module listing it).
+fn ensure_external_stub(scope: &mut v8::PinScope, spec: &str) {
+    if !is_external(spec) {
+        return;
+    }
+    let registry = modreg(scope);
+    {
+        let reg = registry.0.lock().unwrap();
+        if reg.contains_key(spec) {
+            return;
+        }
+    }
+    let mut names = std::collections::BTreeSet::new();
+    names.insert("*".into());
+    let s = full_surface_source(scope, spec, &names)
+        .unwrap_or_else(|| stub_source(spec, &names));
+    if let Some(m) = compile_module(scope, spec, &s) {
+        let g = v8::Global::new(scope, m);
+        registry.0.lock().unwrap().insert(spec.to_string(), g);
+    } else {
+        tracing::warn!(%spec, "on-demand external stub failed to compile");
+    }
+}
+
 /// Module resolve callback: serve a registered stub for `cloudflare:*`/`node:*`.
-/// celld bundles are single-file, so anything else is genuinely unresolvable.
+/// Missing builtins are registered on demand via [`ensure_external_stub`] (sibling
+/// chunks may import them without the main module listing them).
 pub(super) fn resolve_external<'s>(
     context: v8::Local<'s, v8::Context>,
     specifier: v8::Local<'s, v8::String>,
@@ -632,13 +670,16 @@ pub(super) fn resolve_external<'s>(
     v8::callback_scope!(unsafe scope, context);
     let spec = specifier.to_rust_string_lossy(scope);
     let registry = modreg(scope);
+    if !registry.0.lock().unwrap().contains_key(&spec) {
+        ensure_external_stub(scope, &spec);
+    }
     let m = registry
         .0
         .lock()
         .unwrap()
         .get(&spec)
         .map(|g| v8::Local::new(scope, g));
-    if m.is_none() {
+    if m.is_none() && is_external(&spec) {
         tracing::warn!(%spec, "resolve: no stub for specifier");
     }
     m
@@ -792,4 +833,25 @@ pub(super) fn host_import_module_dynamically<'s>(
         }
     }
     Some(promise)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scan_external_imports;
+
+    #[test]
+    fn scan_external_imports_side_effect_cloudflare_workers() {
+        let src = r#"import 'cloudflare:workers';
+export const ok = 1;
+"#;
+        let map = scan_external_imports(src);
+        let names = map.get("cloudflare:workers").expect("specifier scanned");
+        assert!(names.contains("*"));
+    }
+
+    #[test]
+    fn scan_external_imports_ignores_non_external_side_effect() {
+        let src = r#"import './chunk.mjs';"#;
+        assert!(scan_external_imports(src).is_empty());
+    }
 }
