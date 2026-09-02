@@ -30,6 +30,91 @@ fn rsa_jwk_encode(value: &rsa::BigUint) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_bytes_be())
 }
 
+fn crypto_hash_name(args: &serde_json::Value) -> String {
+    args.get("hash")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("SHA-256")
+        .to_string()
+}
+
+fn crypto_optional_bytes(args: &serde_json::Value, name: &str) -> Result<Option<Vec<u8>>> {
+    match args.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(_) => Ok(Some(crypto_bytes(args, name)?)),
+    }
+}
+
+fn rsa_oaep_padding(hash: &str, label: Option<&[u8]>) -> Result<rsa::Oaep> {
+    let label = match label {
+        None | Some([]) => None,
+        Some(bytes) => Some(
+            std::str::from_utf8(bytes)
+                .map_err(|_| anyhow!("RSA-OAEP label must be UTF-8"))?
+                .to_string(),
+        ),
+    };
+    Ok(match (hash, label) {
+        ("SHA-1", None) => rsa::Oaep::new::<sha1::Sha1>(),
+        ("SHA-1", Some(label)) => rsa::Oaep::new_with_label::<sha1::Sha1, _>(label),
+        ("SHA-256", None) => rsa::Oaep::new::<sha2::Sha256>(),
+        ("SHA-256", Some(label)) => rsa::Oaep::new_with_label::<sha2::Sha256, _>(label),
+        ("SHA-384", None) => rsa::Oaep::new::<sha2::Sha384>(),
+        ("SHA-384", Some(label)) => rsa::Oaep::new_with_label::<sha2::Sha384, _>(label),
+        ("SHA-512", None) => rsa::Oaep::new::<sha2::Sha512>(),
+        ("SHA-512", Some(label)) => rsa::Oaep::new_with_label::<sha2::Sha512, _>(label),
+        (other, _) => return Err(anyhow!("unsupported RSA-OAEP hash {other}")),
+    })
+}
+
+fn rsa_jwk_object(args: &serde_json::Value) -> Option<&serde_json::Value> {
+    args.get("jwk").filter(|value| value.is_object())
+}
+
+fn rsa_public_from_args(args: &serde_json::Value) -> Result<rsa::RsaPublicKey> {
+    if let Some(jwk) = rsa_jwk_object(args) {
+        return rsa::RsaPublicKey::new(rsa_jwk_uint(jwk, "n")?, rsa_jwk_uint(jwk, "e")?)
+            .map_err(|error| anyhow!("invalid RSA public JWK: {error}"));
+    }
+    let key = crypto_bytes(args, "key")?;
+    use rsa::pkcs8::DecodePublicKey;
+    rsa::RsaPublicKey::from_public_key_der(&key)
+        .map_err(|_| anyhow!("invalid RSA SPKI public key"))
+}
+
+fn rsa_private_from_args(args: &serde_json::Value) -> Result<rsa::RsaPrivateKey> {
+    if let Some(jwk) = rsa_jwk_object(args) {
+        let n = rsa_jwk_uint(jwk, "n")?;
+        let e = rsa_jwk_uint(jwk, "e")?;
+        let d = rsa_jwk_uint(jwk, "d")?;
+        let p = rsa_jwk_uint(jwk, "p")?;
+        let q = rsa_jwk_uint(jwk, "q")?;
+        let mut key = rsa::RsaPrivateKey::from_components(n, e, d, vec![p, q])?;
+        key.precompute()?;
+        return Ok(key);
+    }
+    let key = crypto_bytes(args, "key")?;
+    use rsa::pkcs8::DecodePrivateKey;
+    rsa::RsaPrivateKey::from_pkcs8_der(&key).map_err(|_| anyhow!("invalid RSA PKCS#8 private key"))
+}
+
+fn rsa_salt_len(args: &serde_json::Value, hash: &str) -> Result<usize> {
+    if let Some(value) = args.get("saltLength") {
+        if !value.is_null() {
+            let n = value
+                .as_u64()
+                .ok_or_else(|| anyhow!("RSA-PSS saltLength must be an integer"))?;
+            return Ok(n as usize);
+        }
+    }
+    Ok(match hash {
+        "SHA-1" => 20,
+        "SHA-256" => 32,
+        "SHA-384" => 48,
+        "SHA-512" => 64,
+        other => return Err(anyhow!("unsupported RSA-PSS hash {other}")),
+    })
+}
+
 /// Algorithm OIDs, so a parsed key can say what it is. Same constants as
 /// Node's, via deno's `ext/node_crypto/keys.rs`.
 const RSA_ENCRYPTION_OID: rsa::pkcs8::ObjectIdentifier =
@@ -621,10 +706,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             use rsa::signature::{SignatureEncoding, Signer};
             let key = crypto_bytes(args, "key")?;
             let data = crypto_bytes(args, "data")?;
-            let hash = args
-                .get("hash")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("SHA-256");
+            let hash = crypto_hash_name(args);
             let key = rsa::RsaPrivateKey::from_pkcs8_der(&key)
                 .map_err(|_| anyhow!("invalid RSA private key"))?;
             macro_rules! sign {
@@ -634,7 +716,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                         .to_vec()
                 };
             }
-            let bytes = match hash {
+            let bytes = match hash.as_str() {
                 "SHA-256" => sign!(sha2::Sha256),
                 "SHA-384" => sign!(sha2::Sha384),
                 "SHA-512" => sign!(sha2::Sha512),
@@ -687,11 +769,7 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             let key = crypto_bytes(args, "key")?;
             let data = crypto_bytes(args, "data")?;
             let signature = crypto_bytes(args, "signature")?;
-            let hash = args
-                .get("hash")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("SHA-256")
-                .to_string();
+            let hash = crypto_hash_name(args);
             let key = rsa::RsaPublicKey::from_public_key_der(&key)
                 .map_err(|_| anyhow!("invalid RSA SPKI key"))?;
             macro_rules! verify {
@@ -737,18 +815,81 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             });
             Ok(serde_json::json!({ "publicKey": public_jwk, "privateKey": private_jwk }))
         }
-        "rsa-oaep-decrypt" => {
-            let jwk = args.get("jwk").ok_or_else(|| anyhow!("missing RSA JWK"))?;
-            let n = rsa_jwk_uint(jwk, "n")?;
-            let e = rsa_jwk_uint(jwk, "e")?;
-            let d = rsa_jwk_uint(jwk, "d")?;
-            let p = rsa_jwk_uint(jwk, "p")?;
-            let q = rsa_jwk_uint(jwk, "q")?;
-            let mut key = rsa::RsaPrivateKey::from_components(n, e, d, vec![p, q])?;
-            key.precompute()?;
+        "rsa-oaep-encrypt" => {
+            let hash = crypto_hash_name(args);
+            let label = crypto_optional_bytes(args, "label")?;
+            let padding = rsa_oaep_padding(&hash, label.as_deref())?;
+            let key = rsa_public_from_args(args)?;
             let data = crypto_bytes(args, "data")?;
-            let bytes = key.decrypt(rsa::Oaep::new::<sha2::Sha256>(), &data)?;
+            let mut rng = rand::rngs::OsRng;
+            let bytes = key.encrypt(&mut rng, padding, &data)?;
             Ok(serde_json::json!({ "bytes": bytes }))
+        }
+        "rsa-oaep-decrypt" => {
+            let hash = crypto_hash_name(args);
+            let label = crypto_optional_bytes(args, "label")?;
+            let padding = rsa_oaep_padding(&hash, label.as_deref())?;
+            let key = rsa_private_from_args(args)?;
+            let data = crypto_bytes(args, "data")?;
+            let bytes = key.decrypt(padding, &data)?;
+            Ok(serde_json::json!({ "bytes": bytes }))
+        }
+        // RSA-PSS: saltLength defaults to the digest output size (Web Crypto /
+        // workerd). SHA-1 is accepted because CF's matrix lists it.
+        "rsa-pss-sign" => {
+            use rsa::pkcs8::DecodePrivateKey;
+            use rsa::pss::SigningKey;
+            use rsa::signature::{RandomizedSigner, SignatureEncoding};
+            let key = crypto_bytes(args, "key")?;
+            let data = crypto_bytes(args, "data")?;
+            let hash = crypto_hash_name(args);
+            let salt_len = rsa_salt_len(args, &hash)?;
+            let key = rsa::RsaPrivateKey::from_pkcs8_der(&key)
+                .map_err(|_| anyhow!("invalid RSA private key"))?;
+            let mut rng = rand::rngs::OsRng;
+            macro_rules! sign {
+                ($hash:ty) => {
+                    SigningKey::<$hash>::new_with_salt_len(key, salt_len)
+                        .sign_with_rng(&mut rng, &data)
+                        .to_vec()
+                };
+            }
+            let bytes = match hash.as_str() {
+                "SHA-1" => sign!(sha1::Sha1),
+                "SHA-256" => sign!(sha2::Sha256),
+                "SHA-384" => sign!(sha2::Sha384),
+                "SHA-512" => sign!(sha2::Sha512),
+                other => return Err(anyhow!("unsupported RSA-PSS sign hash {other}")),
+            };
+            Ok(serde_json::json!({ "bytes": bytes }))
+        }
+        "rsa-pss-verify" => {
+            use rsa::pkcs8::DecodePublicKey;
+            use rsa::pss::VerifyingKey;
+            use rsa::signature::Verifier;
+            let key = crypto_bytes(args, "key")?;
+            let data = crypto_bytes(args, "data")?;
+            let signature = crypto_bytes(args, "signature")?;
+            let hash = crypto_hash_name(args);
+            let salt_len = rsa_salt_len(args, &hash)?;
+            let key = rsa::RsaPublicKey::from_public_key_der(&key)
+                .map_err(|_| anyhow!("invalid RSA SPKI key"))?;
+            macro_rules! verify {
+                ($hash:ty) => {{
+                    let key = VerifyingKey::<$hash>::new_with_salt_len(key, salt_len);
+                    rsa::pss::Signature::try_from(signature.as_slice())
+                        .map(|signature| key.verify(&data, &signature).is_ok())
+                        .unwrap_or(false)
+                }};
+            }
+            let ok = match hash.as_str() {
+                "SHA-1" => verify!(sha1::Sha1),
+                "SHA-256" => verify!(sha2::Sha256),
+                "SHA-384" => verify!(sha2::Sha384),
+                "SHA-512" => verify!(sha2::Sha512),
+                other => return Err(anyhow!("unsupported RSA-PSS verify hash {other}")),
+            };
+            Ok(serde_json::json!({ "ok": ok }))
         }
         // `createPublicKey` / `createPrivateKey`. Accepts every input shape
         // Node does — PEM, bare DER with a stated structure, or a JWK — and
@@ -1763,4 +1904,122 @@ pub(super) fn op_webcrypto_aes_decrypt(
     rv: v8::ReturnValue<v8::Value>,
 ) {
     op_webcrypto_aes(scope, args, rv, false);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::crypto_operation;
+    use serde_json::json;
+
+    fn json_bytes(value: &serde_json::Value, name: &str) -> Vec<u8> {
+        value[name]
+            .as_array()
+            .expect(name)
+            .iter()
+            .map(|n| n.as_u64().unwrap() as u8)
+            .collect()
+    }
+
+    #[test]
+    fn rsa_oaep_encrypt_decrypt_roundtrip() {
+        let pair = crypto_operation("rsa-generate", &json!({})).unwrap();
+        let plaintext: Vec<u8> = b"celld-oaep".to_vec();
+        let encrypted = crypto_operation(
+            "rsa-oaep-encrypt",
+            &json!({
+                "jwk": pair["publicKey"],
+                "data": plaintext,
+                "hash": "SHA-256",
+            }),
+        )
+        .unwrap();
+        let recovered = crypto_operation(
+            "rsa-oaep-decrypt",
+            &json!({
+                "jwk": pair["privateKey"],
+                "data": encrypted["bytes"],
+                "hash": "SHA-256",
+            }),
+        )
+        .unwrap();
+        assert_eq!(json_bytes(&recovered, "bytes"), plaintext);
+    }
+
+    #[test]
+    fn rsa_pss_sign_verify_roundtrip() {
+        let pair = crypto_operation("asym-key-generate", &json!({"type": "rsa", "modulusLength": 2048}))
+            .unwrap();
+        let data: Vec<u8> = b"celld-pss".to_vec();
+        let signed = crypto_operation(
+            "rsa-pss-sign",
+            &json!({
+                "key": pair["privateDer"],
+                "data": data,
+                "hash": "SHA-256",
+            }),
+        )
+        .unwrap();
+        let verified = crypto_operation(
+            "rsa-pss-verify",
+            &json!({
+                "key": pair["publicDer"],
+                "data": data,
+                "signature": signed["bytes"],
+                "hash": "SHA-256",
+            }),
+        )
+        .unwrap();
+        assert_eq!(verified["ok"], true);
+    }
+
+    #[test]
+    fn ed25519_sign_verify_roundtrip() {
+        let pair = crypto_operation("asym-key-generate", &json!({"type": "ed25519"})).unwrap();
+        let data: Vec<u8> = b"celld-ed25519".to_vec();
+        let signed = crypto_operation(
+            "ed25519-sign",
+            &json!({
+                "key": pair["privateDer"],
+                "data": data,
+            }),
+        )
+        .unwrap();
+        let verified = crypto_operation(
+            "ed25519-verify",
+            &json!({
+                "key": pair["publicDer"],
+                "data": data,
+                "signature": signed["bytes"],
+            }),
+        )
+        .unwrap();
+        assert_eq!(verified["ok"], true);
+    }
+
+    #[test]
+    fn rsa_pkcs1_sign_verify_roundtrip() {
+        let pair = crypto_operation("asym-key-generate", &json!({"type": "rsa", "modulusLength": 2048}))
+            .unwrap();
+        let data: Vec<u8> = b"celld-pkcs1".to_vec();
+        let signed = crypto_operation(
+            "rsa-pkcs1-sign",
+            &json!({
+                "key": pair["privateDer"],
+                "data": data,
+                "hash": "SHA-256",
+            }),
+        )
+        .unwrap();
+        let verified = crypto_operation(
+            "rsa-pkcs1-verify",
+            &json!({
+                "key": pair["publicDer"],
+                "data": data,
+                "signature": signed["bytes"],
+                "hash": "SHA-256",
+            }),
+        )
+        .unwrap();
+        assert_eq!(verified["ok"], true);
+    }
 }

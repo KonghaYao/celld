@@ -246,14 +246,31 @@ identifies each known exception.
 
 ### [Web Crypto](https://developers.cloudflare.com/workers/runtime-apis/web-crypto/)
 
-**Partial**
+**Partial** (Phase 0 of `docs/plans/CF-WEB-CRYPTO-100.md`; not Full)
 
-- `wrapKey()` and `unwrapKey()` are not available.
-- RSA-PSS signing is not available.
-- Web Crypto **PBKDF2** and **HKDF** are available through `deriveBits()` (same
-  host KDF ops as `node:crypto`). For Node-style `pbkdf2Sync` / `scrypt`, use
-  `node:crypto`.
+Progress vs the CF “Supported algorithms” matrix:
 
+- **digest**: SHA-1 / SHA-256 / SHA-384 / SHA-512 / MD5 (CF extension).
+- **AES-GCM / AES-CBC / AES-CTR**: `encrypt` / `decrypt` / `generateKey` / `importKey` (`raw`) / `exportKey` (`raw`).
+- **HMAC**: `sign` / `verify` / `generateKey` / `importKey`.
+- **PBKDF2 / HKDF**: `deriveBits` (same host KDF ops as `node:crypto`). Node-style `pbkdf2Sync` / `scrypt` stay on `node:crypto`.
+- **Ed25519** / **NODE-ED25519**: `sign` / `verify` / `generateKey` / `importKey` (C1).
+- **RSASSA-PKCS1-v1_5**: `sign` / `verify` (C2; hash from the key, including SHA-1).
+- **RSA-OAEP**: `encrypt` / `decrypt` / `generateKey` / JWK import (C3). Hash + optional `label` forwarded to the host. Ciphertext is OAEP-randomized (not golden-stable).
+- **RSA-PSS**: `sign` / `verify` via host ops `rsa-pss-sign` / `rsa-pss-verify` (C4). `saltLength` defaults to the digest size (workerd-aligned). `generateKey` already issued RSA key material.
+
+Still open (matrix stays Partial):
+
+- `wrapKey()` / `unwrapKey()` (C5) and **AES-KW** (C6).
+- ECDSA **P-384 / P-521** sign/verify (C7; parse/JWK exist, signing is still P-256).
+- X25519 derive alignment (C8) and remaining **NODE-ED25519** footnotes (C9).
+- Error-type / WPT boundary suite (C10).
+- Differential gate: `scripts/crypto-conformance.sh` needs `workerd` on PATH.
+
+Known host notes:
+
+- RSA-OAEP `generateKey` still emits JWK material (`rsa-generate`); imported RSA-OAEP keys may be SPKI/PKCS#8 or JWK. Both shapes work for encrypt/decrypt.
+- RSA-PSS is Web Crypto only; `node:crypto` still does not expose PSS (see Node.js compatibility).
 ### [Web standards](https://developers.cloudflare.com/workers/runtime-apis/web-standards/)
 
 **Partial**

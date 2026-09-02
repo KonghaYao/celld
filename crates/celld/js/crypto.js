@@ -150,6 +150,21 @@
     return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
   }
 
+  // RSA-OAEP keys generated in-process keep a JWK; imported keys keep SPKI /
+  // PKCS#8 bytes. The host op accepts either so encrypt and decrypt share one
+  // payload shape (hash + optional label).
+  function _rsaOaep(operation, algorithm, key, data) {
+    const material = key?.__celldMaterial || {};
+    const result = _extra(operation, {
+      jwk: material.jwk || null,
+      key: material.bytes ? Array.from(material.bytes) : [],
+      data: Array.from(_toBuf(data)),
+      hash: _hashName(key?.algorithm?.hash || algorithm?.hash),
+      label: algorithm?.label ? Array.from(_toBuf(algorithm.label)) : null,
+    });
+    return Uint8Array.from(result.bytes).buffer;
+  }
+
   class SubtleCrypto {
     get [Symbol.toStringTag]() { return "SubtleCrypto"; }
 
@@ -213,7 +228,7 @@
           details: imported.details,
         });
       }
-      // An RSA-OAEP JWK keeps its JWK form: `rsa-oaep-decrypt` reads the
+      // An RSA-OAEP JWK keeps its JWK form: encrypt/decrypt read the
       // components directly rather than re-deriving them from DER.
       // A JWK's `alg` names the algorithm it was made for. Anything that is
       // not a string is not an algorithm name, and importing it would leave
@@ -497,11 +512,15 @@
           ? "p256-sign"
           : name === "RSASSA-PKCS1-V1_5"
             ? "rsa-pkcs1-sign"
-            : null;
+            : name === "RSA-PSS"
+              ? "rsa-pss-sign"
+              : null;
       if (!operation) throw _notSupported("unsupported sign algorithm: " + name);
       const result = _extra(operation, {
         key: Array.from(key?.__celldMaterial?.bytes || []),
         data: Array.from(bytes),
+        hash: _hashName(key?.algorithm?.hash),
+        saltLength: algorithm?.saltLength,
       });
       return Uint8Array.from(result.bytes).buffer;
     }
@@ -522,6 +541,8 @@
         ? "p256-verify"
         : name === "RSASSA-PKCS1-V1_5"
         ? "rsa-pkcs1-verify"
+        : name === "RSA-PSS"
+        ? "rsa-pss-verify"
         : null;
       if (!operation) {
         throw _notSupported("unsupported verify algorithm: " + name);
@@ -532,10 +553,11 @@
         key: Array.from(material),
         data: Array.from(_toBuf(data)),
         signature: Array.from(_toBuf(signature)),
-        // ECDSA carries its hash on the call, RSASSA on the key.
+        // ECDSA carries its hash on the call, RSASSA / RSA-PSS on the key.
         hash: _hashName(
           name === "ECDSA" ? algorithm?.hash : key?.algorithm?.hash,
         ),
+        saltLength: algorithm?.saltLength,
       }).ok;
     }
 
@@ -543,6 +565,9 @@
       const name = _algorithmName(algorithm);
       if (_AES_MODES.has(name)) {
         return _aes(name, algorithm, key, data, true);
+      }
+      if (name === "RSA-OAEP") {
+        return _rsaOaep("rsa-oaep-encrypt", algorithm, key, data);
       }
       throw _notSupported("unsupported encrypt algorithm: " + name);
     }
@@ -553,11 +578,7 @@
         return _aes(name, algorithm, key, data, false);
       }
       if (name === "RSA-OAEP") {
-        const result = _extra("rsa-oaep-decrypt", {
-          jwk: key?.__celldMaterial?.jwk,
-          data: Array.from(_toBuf(data)),
-        });
-        return Uint8Array.from(result.bytes).buffer;
+        return _rsaOaep("rsa-oaep-decrypt", algorithm, key, data);
       }
       throw _notSupported("unsupported decrypt algorithm: " + name);
     }
