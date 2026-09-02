@@ -181,6 +181,11 @@ const LAZY_MODULES: &[LazyModule] = &[
         source: include_str!("node_assert.js"),
     },
     LazyModule {
+        specs: &["timers", "node:timers"],
+        global: "__timersModule",
+        source: include_str!("node_timers_callback.js"),
+    },
+    LazyModule {
         specs: &["timers/promises", "node:timers/promises"],
         global: "__timersPromises",
         source: include_str!("node_timers.js"),
@@ -853,5 +858,46 @@ export const ok = 1;
     fn scan_external_imports_ignores_non_external_side_effect() {
         let src = r#"import './chunk.mjs';"#;
         assert!(scan_external_imports(src).is_empty());
+    }
+
+    #[test]
+    fn scan_external_imports_node_timers_named() {
+        let src = r#"import { setImmediate as a2, clearImmediate as c } from "node:timers";"#;
+        let map = scan_external_imports(src);
+        let names = map.get("node:timers").expect("specifier scanned");
+        assert!(names.contains("setImmediate"));
+        assert!(names.contains("clearImmediate"));
+    }
+
+    #[test]
+    fn stub_source_node_timers_is_not_node_stub() {
+        let mut names = std::collections::BTreeSet::new();
+        names.insert("setImmediate".into());
+        names.insert("clearImmediate".into());
+        let src = super::stub_source("node:timers", &names);
+        assert!(
+            src.contains("__timersModule"),
+            "node:timers must bind the real timer module, got {src}"
+        );
+        assert!(
+            !src.contains("= globalThis.__nodeStub"),
+            "node:timers must not export the pass-through stub, got {src}"
+        );
+        assert!(src.contains("export const setImmediate"));
+        assert!(src.contains("export const clearImmediate"));
+    }
+
+    /// Minimal h3 `send()` shape: schedule `res.end` on `setImmediate`.
+    /// The generated stub must export a callable that is not `__nodeStub`.
+    #[test]
+    fn stub_source_node_timers_set_immediate_is_module_export() {
+        let mut names = std::collections::BTreeSet::new();
+        names.insert("setImmediate".into());
+        let src = super::stub_source("node:timers", &names);
+        assert_eq!(
+            src.matches("export const setImmediate = globalThis.__timersModule.setImmediate;")
+                .count(),
+            1
+        );
     }
 }
