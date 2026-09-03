@@ -278,6 +278,16 @@ const LAZY_MODULES: &[LazyModule] = &[
         global: "__streamConsumers",
         source: include_str!("node_stream.js"),
     },
+    LazyModule {
+        specs: &["http", "node:http"],
+        global: "__httpModule",
+        source: include_str!("node_http.js"),
+    },
+    LazyModule {
+        specs: &["https", "node:https"],
+        global: "__httpsModule",
+        source: include_str!("node_http.js"),
+    },
 ];
 
 /// A global whose definition only compiles when something reads the name.
@@ -888,22 +898,70 @@ fn dynamic_namespace<'s>(
     Ok(module.get_module_namespace())
 }
 
+fn referrer_module_name(scope: &mut v8::PinScope, resource: v8::Local<v8::Value>) -> String {
+    if resource.is_string() {
+        return resource.to_rust_string_lossy(scope);
+    }
+    "worker.js".to_string()
+}
+
+/// Load a pre-registered sibling ES module (Wrangler `no_bundle` outdirs) for
+/// `import()`. Static imports link through `resolve_external`; Nitro/SolidStart
+/// lazy routes use dynamic `import("./chunk.mjs")` against the same registry.
+fn load_sibling_dynamic<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    spec: &str,
+    referrer: &str,
+) -> Result<v8::Local<'s, v8::Value>> {
+    let registry = modreg(scope);
+    for candidate in module_lookup_candidates(referrer, spec) {
+        let Some(global) = registry.0.lock().unwrap().get(&candidate).cloned() else {
+            continue;
+        };
+        let module = v8::Local::new(scope, global);
+        if module.get_status() == v8::ModuleStatus::Uninstantiated {
+            module
+                .instantiate_module(scope, resolve_external)
+                .ok_or_else(|| anyhow!("instantiate sibling module {candidate}"))?;
+        }
+        if module.get_status() == v8::ModuleStatus::Instantiated {
+            module
+                .evaluate(scope)
+                .ok_or_else(|| anyhow!("evaluate sibling module {candidate}"))?;
+        }
+        if module.get_status() == v8::ModuleStatus::Evaluated {
+            return Ok(module.get_module_namespace());
+        }
+        return Err(anyhow!(
+            "sibling module {candidate} failed to evaluate (status {:?})",
+            module.get_status()
+        ));
+    }
+    Err(anyhow!("dynamic import of \"{spec}\" is not supported"))
+}
+
 /// Dynamic `import()` host hook. Builtin specifiers resolve through the same
-/// table static imports use; anything else rejects — celld bundles are
-/// single-file, so there is nothing else to load.
+/// table static imports use; relative/bare specifiers resolve to sibling modules
+/// registered for `no_bundle` multi-chunk workers.
 pub(super) fn host_import_module_dynamically<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     _host_defined_options: v8::Local<'s, v8::Data>,
-    _resource_name: v8::Local<'s, v8::Value>,
+    resource_name: v8::Local<'s, v8::Value>,
     specifier: v8::Local<'s, v8::String>,
     _import_attributes: v8::Local<'s, v8::FixedArray>,
 ) -> Option<v8::Local<'s, v8::Promise>> {
     let resolver = v8::PromiseResolver::new(scope)?;
     let promise = resolver.get_promise(scope);
     let spec = specifier.to_rust_string_lossy(scope);
+    let referrer = referrer_module_name(scope, resource_name);
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let tc = &mut tc.init();
-    match dynamic_namespace(tc, &spec) {
+    let result = if is_external(&spec) {
+        dynamic_namespace(tc, &spec)
+    } else {
+        load_sibling_dynamic(tc, &spec, &referrer)
+    };
+    match result {
         Ok(namespace) => {
             resolver.resolve(tc, namespace);
         }
