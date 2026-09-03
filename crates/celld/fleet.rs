@@ -827,6 +827,9 @@ async fn load_worker_at_pointer(
         bindings(&manifest, "ai")
             .find_map(|binding| binding.get("name")?.as_str().map(str::to_string)),
     );
+    let images_bindings = bindings(&manifest, "images")
+        .filter_map(|binding| binding.get("name")?.as_str().map(str::to_string))
+        .collect();
     let services = service_bindings(&manifest);
     let vars = worker_vars(&manifest)?;
     let compat = crate::worker_compat(&manifest.raw_metadata);
@@ -872,6 +875,7 @@ async fn load_worker_at_pointer(
             queue_consumers: manifest.queue_consumers,
             workflow_bindings,
             ai_binding,
+            images_bindings,
             vars,
             node,
             modules,

@@ -1855,6 +1855,7 @@ pub struct WorkerConfig {
     declares_queue_consumer: bool,
     workflow_bindings: Vec<WorkflowBinding>,
     ai_binding: Option<String>,
+    images_bindings: Vec<String>,
     vars: Vec<(String, String)>,
     node: String,
     /// The worker's non-main modules, so the main module can import siblings.
@@ -1918,6 +1919,7 @@ pub struct WorkerConfigOptions {
     pub queue_consumers: Vec<crate::protocol::QueueConsumerConfig>,
     pub workflow_bindings: Vec<WorkflowBinding>,
     pub ai_binding: Option<String>,
+    pub images_bindings: Vec<String>,
     pub vars: Vec<(String, String)>,
     pub node: String,
     pub modules: Vec<(String, ModuleSource)>,
@@ -1938,6 +1940,7 @@ impl WorkerConfig {
             queue_consumers,
             workflow_bindings,
             ai_binding,
+            images_bindings,
             vars,
             node,
             modules,
@@ -1968,6 +1971,7 @@ impl WorkerConfig {
             declares_queue_consumer,
             workflow_bindings,
             ai_binding,
+            images_bindings,
             vars,
             node,
             modules,
@@ -4432,7 +4436,8 @@ fn start_fetch<'s>(
     headers: &[(String, String)],
     request_id: Option<RequestId>,
 ) -> Result<Started<'s>> {
-    let fetch_url = normalize_inbound_fetch_url(url);
+    let inbound_base = loopback_inbound_base(tc);
+    let fetch_url = normalize_inbound_fetch_url(url, &inbound_base);
     pin_inbound_request_url(tc, &fetch_url);
     let req = match request_id {
         Some(_) => make_incoming_request(tc, &fetch_url, method, body, headers),
@@ -5019,6 +5024,8 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__r2_mp_part" => r2_ops::op_r2_mp_part,
         "__r2_mp_complete" => r2_ops::op_r2_mp_complete,
         "__r2_mp_abort" => r2_ops::op_r2_mp_abort,
+        "__images_process" => op_images_process,
+        "__images_info" => op_images_info,
         "__asset_fetch" => op_asset_fetch,
         "__http_stream_read" => op_http_stream_read,
         "__http_stream_cancel" => op_http_stream_cancel,
@@ -5376,6 +5383,40 @@ fn op_cell_branch(
         Ok(asyncrt::OpOut::Str(reply))
     });
     register_binding_branch_reopen(scope, id, reopen);
+    rv.set(promise_for(scope, id));
+}
+
+fn op_images_process(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let bytes = view_bytes(args.get(0)).unwrap_or_default();
+    let transforms = args.get(1).to_rust_string_lossy(scope);
+    let output = args.get(2).to_rust_string_lossy(scope);
+    let id = asyncrt::enqueue(async move {
+        let transforms: Vec<serde_json::Value> = serde_json::from_str(&transforms)
+            .map_err(|error| format!("Images.transform() is not supported: {error}"))?;
+        let output: serde_json::Value = serde_json::from_str(&output)
+            .map_err(|error| format!("Images.output() is not supported: {error}"))?;
+        crate::images::process(&bytes, &transforms, &output)
+            .map(asyncrt::OpOut::Bytes)
+            .map_err(|error| error.to_string())
+    });
+    rv.set(promise_for(scope, id));
+}
+
+fn op_images_info(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let bytes = view_bytes(args.get(0)).unwrap_or_default();
+    let id = asyncrt::enqueue(async move {
+        crate::images::info(&bytes)
+            .map(|value| asyncrt::OpOut::Str(value.to_string()))
+            .map_err(|error| error.to_string())
+    });
     rv.set(promise_for(scope, id));
 }
 
@@ -6149,6 +6190,7 @@ fn op_loader_load(
             queue_consumers: Vec::new(),
             workflow_bindings: Vec::new(),
             ai_binding: None,
+            images_bindings: Vec::new(),
             vars: Vec::new(),
             node: String::new(),
             modules,
@@ -6506,13 +6548,30 @@ fn op_rpc_call(
 }
 
 /// OpenNext/Next 308-loop when `new URL(request.url).pathname` is `//` (see S30).
-fn normalize_inbound_fetch_url(url: &str) -> String {
-    let Ok(parsed) = url::Url::parse(url) else {
-        return url.to_string();
+/// Protocol-relative fetch targets (`//host/path`) are resolved like Workers loopback fetch.
+fn normalize_inbound_fetch_url(url: &str, inbound_base: &str) -> String {
+    let url = if url.starts_with("//") {
+        let base = inbound_base.trim_end_matches('/');
+        let base = if base.is_empty() {
+            "http://celld.local"
+        } else {
+            base
+        };
+        url::Url::parse(&format!("http:{url}"))
+            .or_else(|_| {
+                url::Url::parse(base).and_then(|b| b.join(url.trim_start_matches('/')))
+            })
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| url.to_string())
+    } else {
+        url.to_string()
+    };
+    let Ok(parsed) = url::Url::parse(&url) else {
+        return url;
     };
     let path = parsed.path();
     if !path.starts_with("//") {
-        return url.to_string();
+        return url;
     }
     let collapsed = format!("/{}", path.trim_start_matches('/'));
     let mut out = parsed;

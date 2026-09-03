@@ -18,7 +18,8 @@ use crate::protocol::{
     DeployPointer, Manifest,
     ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig, QueueConsumerDeployment,
     Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_KV_V1,
-    FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
+    FEATURE_IMAGES_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1,
+    FEATURE_WORKFLOWS_V1,
     QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
@@ -53,6 +54,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "queues",
     "workflows",
     "r2_buckets",
+    "images",
     "no_bundle",
 ];
 
@@ -271,6 +273,7 @@ struct Project {
     queue_consumers: Vec<QueueConsumerConfig>,
     has_queues: bool,
     has_r2: bool,
+    has_images: bool,
 }
 
 struct ProjectAssets {
@@ -403,6 +406,7 @@ impl Built {
                         let bucket = binding.get("bucket_name").and_then(Value::as_str)?;
                         Some((format!("env.{name} (R2)"), bucket.to_string()))
                     }
+                    Some("images") => Some((format!("env.{name} (Images)"), "Images".to_string())),
                     Some("plain_text") => Some((
                         format!("env.{name} (Text)"),
                         "Environment Variable".to_string(),
@@ -549,6 +553,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if project.has_r2 {
                 features.push(FEATURE_R2_V1.to_string());
+            }
+            if project.has_images {
+                features.push(FEATURE_IMAGES_V1.to_string());
             }
             if sqlite_vec {
                 features.push(FEATURE_SQLITE_VEC_V1.to_string());
@@ -1489,6 +1496,36 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
             "bucket_name": bucket_name,
         }));
     }
+    let images_binding = match object.get("images") {
+        None => None,
+        Some(Value::Object(images)) => {
+            let unknown: Vec<&String> = images
+                .keys()
+                .filter(|key| key.as_str() != "binding")
+                .collect();
+            if !unknown.is_empty() {
+                bail!(
+                    "images declares `{}`, which celld does not model",
+                    unknown[0]
+                );
+            }
+            let binding = images
+                .get("binding")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("images has no `binding`"))?;
+            if !valid_binding(binding) {
+                bail!("invalid images binding name: {binding:?}");
+            }
+            Some(binding.to_string())
+        }
+        Some(_) => bail!("config `images` must be an object"),
+    };
+    if let Some(binding) = &images_binding {
+        bindings.push(json!({
+            "type": "images",
+            "name": binding,
+        }));
+    }
     let vars = match object.get("vars") {
         None => None,
         Some(Value::Object(vars)) => Some(vars),
@@ -1514,7 +1551,8 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
             || !sqlite_classes.is_empty()
             || service_count > 0
             || var_count > 0
-            || !r2_binding_names.is_empty())
+            || !r2_binding_names.is_empty()
+            || images_binding.is_some())
     {
         bail!("an asset-only project cannot declare Worker bindings");
     }
@@ -1582,6 +1620,7 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         has_queues: !queue_producers.is_empty() || !queue_consumers.is_empty(),
         queue_consumers,
         has_r2: !r2_buckets.is_empty(),
+        has_images: images_binding.is_some(),
     })
 }
 
@@ -2496,5 +2535,72 @@ mod no_bundle_wasm_tests {
         let names: Vec<_> = built.modules.iter().map(|(name, _)| name.as_str()).collect();
         assert!(names.contains(&"index.js"));
         assert!(names.contains(&"lib/helper.js"));
+    }
+
+    #[test]
+    fn images_binding_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("wrangler.jsonc"),
+            r#"{
+            "name": "images-fixture",
+            "main": "index.js",
+            "compatibility_date": "2024-01-01",
+            "images": { "binding": "IMAGES" }
+        }"#,
+        )
+        .unwrap();
+        fs::write(root.join("index.js"), "export default { fetch() {} }").unwrap();
+
+        let built = build(&Options {
+            config: Some(root.join("wrangler.jsonc")),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            dry_run: false,
+            json: false,
+        })
+        .unwrap();
+
+        assert!(built
+            .manifest
+            .required_features
+            .iter()
+            .any(|feature| feature == crate::protocol::FEATURE_IMAGES_V1));
+        let bindings = built.manifest.raw_metadata["bindings"].as_array().unwrap();
+        assert!(bindings.iter().any(|binding| {
+            binding.get("type").and_then(Value::as_str) == Some("images")
+                && binding.get("name").and_then(Value::as_str) == Some("IMAGES")
+        }));
+    }
+
+    #[test]
+    fn images_unknown_key_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("wrangler.jsonc"),
+            r#"{
+            "name": "images-bad",
+            "main": "index.js",
+            "images": { "binding": "IMAGES", "remote": true }
+        }"#,
+        )
+        .unwrap();
+        fs::write(root.join("index.js"), "export default { fetch() {} }").unwrap();
+
+        let error = match build(&Options {
+            config: Some(root.join("wrangler.jsonc")),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            dry_run: false,
+            json: false,
+        }) {
+            Ok(_) => panic!("expected images remote key to be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("remote"), "{error}");
     }
 }

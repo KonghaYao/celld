@@ -527,6 +527,7 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
     let queue_bindings = config.queue_bindings.as_slice();
     let workflow_bindings = config.workflow_bindings.as_slice();
     let ai_binding = config.ai_binding.as_deref();
+    let images_bindings = config.images_bindings.as_slice();
     let vars = config.vars.as_slice();
     let services = config.services.as_slice();
     let asset_binding = config.asset_binding.as_deref();
@@ -583,6 +584,9 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         }
         if let (Some(name), Ok(url)) = (ai_binding, std::env::var("CELLD_AI_URL")) {
             lines.push_str(&format!("e[{:?}] = __makeAiBinding({:?});\n", name, url));
+        }
+        for name in images_bindings {
+            lines.push_str(&format!("e[{:?}] = __makeImagesBinding();\n", name));
         }
         for (binding, script, entrypoint) in services {
             let entrypoint = match entrypoint {

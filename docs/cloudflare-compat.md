@@ -26,6 +26,7 @@ identifies each known exception.
 | [D1](https://developers.cloudflare.com/d1/worker-api/d1-database/) | **Partial** |
 | [Workflows](https://developers.cloudflare.com/workflows/build/workers-api/) | **Partial** |
 | [R2](https://developers.cloudflare.com/r2/api/workers/workers-api-reference/) | **Partial** |
+| [Images](https://developers.cloudflare.com/images/transform-images/bindings/) | **Partial** |
 | [Workers AI](https://developers.cloudflare.com/workers-ai/) | **No** |
 | [Vectorize](https://developers.cloudflare.com/vectorize/) | **No** |
 | [Hyperdrive](https://developers.cloudflare.com/hyperdrive/) | **No** |
@@ -170,6 +171,38 @@ identifies each known exception.
   change the order of stored parts.
 - `jurisdiction` is not available.
 
+### [Images](https://developers.cloudflare.com/images/transform-images/bindings/)
+
+**Partial**
+
+celld implements a local `IMAGES` binding. Transforms run in the node process
+with the Rust `image` crate. celld does not call Cloudflare Images.
+
+`@img/sharp-wasm32` is not loaded into the isolate. The wasm/WASI payload is
+several megabytes and would sit in every worker heap. The JavaScript surface
+still matches `env.IMAGES.input(stream|bytes|Response)`.
+
+| method | status |
+| --- | --- |
+| `input(ReadableStream)` | **Yes** |
+| `input(ArrayBuffer \| ArrayBufferView)` | **Yes** |
+| `input(Response)` | **Yes** |
+| `input(Blob)` | **Yes** |
+| `transform({ width, height, fit, gravity, background, rotate, flip, flop })` | **Yes** |
+| `transform` other options (`blur`, `sharpen`, `trim`, `border`, `trim`, …) | **No** — fail closed |
+| `draw()` / overlays | **No** — fail closed |
+| `output({ format, quality })` jpeg / png / webp / avif | **Yes** |
+| `output` other options (`anim`, `background`, `imageOrder`, …) | **No** — fail closed |
+| `output().response()` | **Yes** |
+| `info()` | **Yes** (`format`, `width`, `height`) |
+| Remote Images / billed CF API | **No** |
+
+- `fit` accepts `scale-down`, `contain`, `cover`, `crop`, `pad`, and `squeeze`.
+- `gravity` accepts the named compass values and `{ x, y }` in `[0, 1]`.
+- `rotate` must be a multiple of 90.
+- An input larger than 32 MiB is refused.
+- `quality` applies only to jpeg and webp.
+
 ## Runtime APIs
 
 | API | status |
@@ -213,7 +246,7 @@ identifies each known exception.
 
 - The [services table](#services) lists the available binding types.
 - celld supports Durable Objects, services, variables, assets, D1, KV, Queues,
-  Workflows, and R2 bindings. Each other binding type is not available.
+  Workflows, R2, and Images bindings. Each other binding type is not available.
 
 ### [Context](https://developers.cloudflare.com/workers/runtime-apis/context/)
 
@@ -357,8 +390,8 @@ accept `wrangler.toml`. The deployment accepts these top-level keys:
 - `compatibility_date` and `compatibility_flags`
 - `durable_objects` and `migrations`
 - `assets`, `services`, `triggers`, and `vars`
-- `d1_databases`, `kv_namespaces`, `queues`, `workflows`, and
-  `r2_buckets`
+- `d1_databases`, `kv_namespaces`, `queues`, `workflows`,
+  `r2_buckets`, and `images`
 
 Each other top-level key, including `routes`, stops the deployment.
 An asset-only project can omit `main`. celld refuses a symlink or special file

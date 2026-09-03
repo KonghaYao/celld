@@ -59,6 +59,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_QUEUES_V1,
     FEATURE_SQLITE_VEC_V1,
     FEATURE_R2_V1,
+    FEATURE_IMAGES_V1,
     FEATURE_WASM_V1,
     FEATURE_WORKFLOWS_V1,
 ];
@@ -78,6 +79,10 @@ pub const FEATURE_CRON_V1: &str = "cron-v1";
 /// application calls, at request time, on a node the developer is not
 /// watching — the gate moves that failure to the deploy.
 pub const FEATURE_R2_V1: &str = "r2-v1";
+/// A deployment with an `images` binding. Required because a build without
+/// the host transform would load the manifest and then throw on the first
+/// `env.IMAGES.input()` call, at request time.
+pub const FEATURE_IMAGES_V1: &str = "images-v1";
 pub const FEATURE_SQLITE_VEC_V1: &str = "sqlite-vec-v1";
 pub const FEATURE_WASM_V1: &str = "wasm-v1";
 /// A deployment with `workflows` bindings. Required because a build without

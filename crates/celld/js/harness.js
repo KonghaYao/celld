@@ -1146,6 +1146,88 @@ globalThis.__makeAiBinding = (url) => ({
     return response.json();
   },
 });
+const __imagesBytes = async (value) => {
+  if (value === undefined || value === null) {
+    throw new TypeError("IMAGES.input() requires a stream, bytes, or Response");
+  }
+  if (typeof Response !== "undefined" && value instanceof Response) {
+    return new Uint8Array(await value.arrayBuffer());
+  }
+  if (typeof Blob !== "undefined" && value instanceof Blob) {
+    return new Uint8Array(await value.arrayBuffer());
+  }
+  if (value instanceof Uint8Array) return value;
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (value && typeof value.getReader === "function") {
+    const reader = value.getReader();
+    const chunks = [];
+    for (;;) {
+      const { done, value: chunk } = await reader.read();
+      if (done) break;
+      if (chunk instanceof Uint8Array) chunks.push(chunk);
+      else if (ArrayBuffer.isView(chunk)) {
+        chunks.push(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+      } else if (chunk instanceof ArrayBuffer) chunks.push(new Uint8Array(chunk));
+      else throw new TypeError("IMAGES.input() stream must yield bytes");
+    }
+    let size = 0;
+    for (const chunk of chunks) size += chunk.byteLength;
+    const out = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return out;
+  }
+  throw new TypeError("IMAGES.input() requires a stream, bytes, or Response");
+};
+const __imagesTransformer = (source) => {
+  const transforms = [];
+  const transformer = {
+    transform(options) {
+      if (options == null || typeof options !== "object") {
+        throw new TypeError("IMAGES.transform() requires an object");
+      }
+      transforms.push(options);
+      return transformer;
+    },
+    draw() {
+      throw new Error("IMAGES.draw() is not supported");
+    },
+    output(options) {
+      if (options == null || typeof options !== "object") {
+        throw new TypeError("IMAGES.output() requires an object");
+      }
+      return {
+        async response() {
+          const bytes = await __imagesBytes(await source);
+          const out = await __images_process(
+            bytes,
+            JSON.stringify(transforms),
+            JSON.stringify(options),
+          );
+          const format = options.format == null ? "image/jpeg" : String(options.format);
+          const type = format.includes("/") ? format : `image/${format}`;
+          return new Response(out, { headers: { "content-type": type } });
+        },
+      };
+    },
+    async info() {
+      const bytes = await __imagesBytes(await source);
+      return JSON.parse(await __images_info(bytes));
+    },
+  };
+  return transformer;
+};
+globalThis.__makeImagesBinding = () => ({
+  input(value) {
+    return __imagesTransformer(value);
+  },
+});
 // A host timer op resolves once, so an interval arms a new one after every
 // round. `__timers` maps the id the caller holds to the op that is armed
 // right now: for a timeout that is the same id, and for an interval it is a

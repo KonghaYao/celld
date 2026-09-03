@@ -3501,6 +3501,13 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 .map(|(name, bucket)| (name.trim().to_string(), bucket.trim().to_string()))
                 .filter(|(name, bucket)| !name.is_empty() && !bucket.is_empty())
                 .collect();
+            let images_bindings: Vec<String> = std::env::var("CELLD_TEST_IMAGES_BINDINGS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect();
             let mut do_classes: Vec<String> = do_classes;
             if !d1_bindings.is_empty() {
                 do_classes.push(celld::deploy::D1_CLASS.to_string());
@@ -3556,6 +3563,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 queue_consumers: Vec::new(),
                 workflow_bindings,
                 ai_binding: fleet::configured_ai_binding(None),
+                images_bindings,
                 vars: Vec::new(),
                 node: node.clone(),
                 modules: Vec::new(),

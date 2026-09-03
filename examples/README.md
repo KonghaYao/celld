@@ -9,6 +9,7 @@ Durable Object surface supported by `celld`:
 - `vectordb/` — nearest-color search with a per-object `vec0` index
 - `d1/` — a guestbook on a D1 database
 - `r2/` — object reads, writes, and deletes on an R2 bucket
+- `images/` — Cloudflare Images binding: resize and `info()` locally
 - `kv/` — key reads, writes, and deletes in a KV namespace
 - `async/` — a timer and asynchronous Durable Object storage
 - `body/` — request and response bodies

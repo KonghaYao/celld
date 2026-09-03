@@ -343,6 +343,7 @@ pub mod fault {
 pub mod fleet;
 pub mod generation;
 pub mod host_services;
+pub(crate) mod images;
 pub mod js;
 pub mod kv_cli;
 pub(crate) mod kv_blob_branch;
