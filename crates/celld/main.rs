@@ -1663,11 +1663,27 @@ fn request_url(parts: &hyper::http::request::Parts, trust_forwarded_headers: boo
     let scheme = forwarded("x-forwarded-proto")
         .and_then(canonical)
         .unwrap_or("http");
-    let path_and_query = parts
-        .uri
-        .path_and_query()
-        .map_or("/", hyper::http::uri::PathAndQuery::as_str);
+    let path_and_query = collapse_request_path_and_query(
+        parts
+            .uri
+            .path_and_query()
+            .map_or("/", hyper::http::uri::PathAndQuery::as_str),
+    );
     format!("{scheme}://{host}{path_and_query}")
+}
+
+/// Collapse duplicate leading slashes in the request target path (not `http://`).
+/// OpenNext treats `pathname === "//"` as a 308 redirect source; some proxies
+/// forward `GET //` or merge prefixes into `//`.
+fn collapse_request_path_and_query(path_and_query: &str) -> String {
+    let (path, suffix) = match path_and_query.split_once('?') {
+        Some((path, query)) => (path, format!("?{query}")),
+        None => (path_and_query, String::new()),
+    };
+    if !path.starts_with("//") {
+        return path_and_query.to_string();
+    }
+    format!("/{}{suffix}", path.trim_start_matches('/'))
 }
 
 /// Send a fetch to a cell through the dispatcher a Durable Object call from

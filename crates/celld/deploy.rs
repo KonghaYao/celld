@@ -457,7 +457,12 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                     .filter(|dir| !dir.as_os_str().is_empty())
                     .unwrap_or(&root);
                 let wasm = read_wasm_modules_from_dir(wasm_dir)?;
-                Ok(BundleOutput { bundle, wasm })
+                let sibling_js = read_js_modules_from_dir(wasm_dir, &path)?;
+                Ok(BundleOutput {
+                    bundle,
+                    wasm,
+                    sibling_js,
+                })
             } else {
                 run_esbuild(&root, entry)
             }
@@ -468,11 +473,16 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     // esbuild emits one JS module plus a copy of every wasm file the bundle
     // imports; the copies ship as sibling modules.
     let module_name = "index.js".to_string();
-    let (mut modules, wasm_modules) = match bundle {
-        Some(output) => (vec![(module_name.clone(), output.bundle)], output.wasm),
-        None => (Vec::new(), Vec::new()),
+    let (mut modules, wasm_modules, sibling_js) = match bundle {
+        Some(output) => (
+            vec![(module_name.clone(), output.bundle)],
+            output.wasm,
+            output.sibling_js,
+        ),
+        None => (Vec::new(), Vec::new(), Vec::new()),
     };
     let wasm_names: BTreeSet<String> = wasm_modules.iter().map(|(name, _)| name.clone()).collect();
+    modules.extend(sibling_js);
     modules.extend(wasm_modules);
     // Identity is over the exact metadata bytes the manifest retains, so the
     // serialization happens once and is reused for both.
@@ -2214,6 +2224,8 @@ fn asset_content_type(path: &Path) -> Option<&'static str> {
 struct BundleOutput {
     bundle: Vec<u8>,
     wasm: Vec<(String, Vec<u8>)>,
+    /// Extra ESM modules beside the entry (wrangler `no_bundle` outdir).
+    sibling_js: Vec<(String, Vec<u8>)>,
 }
 
 fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
@@ -2267,7 +2279,11 @@ fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
     let bundle =
         std::fs::read(outdir.path().join("index.js")).context("read esbuild output bundle")?;
     let wasm = read_wasm_modules_from_dir(outdir.path())?;
-    Ok(BundleOutput { bundle, wasm })
+    Ok(BundleOutput {
+        bundle,
+        wasm,
+        sibling_js: Vec::new(),
+    })
 }
 
 /// Sibling `*.wasm` files in `dir`, keyed by basename — the name esbuild's
@@ -2294,6 +2310,51 @@ fn read_wasm_modules_from_dir(dir: &Path) -> anyhow::Result<Vec<(String, Vec<u8>
     // module list, so keep it stable.
     wasm.sort();
     Ok(wasm)
+}
+
+/// Wrangler `no_bundle` outdirs ship many ESM files (e.g. Waku `assets/*.js`).
+/// Module names are paths relative to `dir`, using `/` separators.
+fn read_js_modules_from_dir(dir: &Path, entry: &Path) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let mut modules = Vec::new();
+    let entry_canon = entry.canonicalize().ok();
+    collect_js_modules(dir, dir, entry_canon.as_ref(), &mut modules)?;
+    modules.sort();
+    Ok(modules)
+}
+
+fn collect_js_modules(
+    root: &Path,
+    current: &Path,
+    entry_canon: Option<&std::path::PathBuf>,
+    out: &mut Vec<(String, Vec<u8>)>,
+) -> anyhow::Result<()> {
+    for dirent in std::fs::read_dir(current)
+        .with_context(|| format!("read module directory {}", current.display()))?
+    {
+        let dirent = dirent?;
+        let path = dirent.path();
+        if path.is_dir() {
+            collect_js_modules(root, &path, entry_canon, out)?;
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|extension| extension.to_str()) else {
+            continue;
+        };
+        if ext != "js" && ext != "mjs" && ext != "cjs" {
+            continue;
+        }
+        if entry_canon.is_some_and(|entry| path.canonicalize().ok().as_ref() == Some(entry)) {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .with_context(|| format!("module {} outside {}", path.display(), root.display()))?;
+        let name = rel.to_string_lossy().replace('\\', "/");
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("read module {}", path.display()))?;
+        out.push((name, bytes));
+    }
+    Ok(())
 }
 
 /// Minimal JSONC support: line and block comments, and trailing commas.
@@ -2398,5 +2459,42 @@ mod no_bundle_wasm_tests {
             .find(|module| module.name == "one.wasm")
             .unwrap();
         assert_eq!(wasm_module.kind, Some(ModuleKind::Wasm));
+    }
+
+    #[test]
+    fn no_bundle_includes_sibling_esm_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("wrangler.jsonc"),
+            r#"{
+            "name": "esm-fixture",
+            "main": "index.js",
+            "no_bundle": true,
+            "compatibility_date": "2024-01-01"
+        }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("index.js"),
+            r#"import x from "./lib/helper.js"; export default x;"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("lib")).unwrap();
+        fs::write(root.join("lib/helper.js"), r#"export default 42;"#).unwrap();
+
+        let built = build(&Options {
+            config: Some(root.join("wrangler.jsonc")),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            dry_run: false,
+            json: false,
+        })
+        .unwrap();
+
+        let names: Vec<_> = built.modules.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(names.contains(&"index.js"));
+        assert!(names.contains(&"lib/helper.js"));
     }
 }
