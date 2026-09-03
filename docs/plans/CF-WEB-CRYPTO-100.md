@@ -117,8 +117,6 @@
 | Fix | `coder` | review 项 |
 | Verify | `verification` | 跑 conformance + `cargo test` |
 
-脚本：`.claude/workflows/cf-web-crypto-ultracode.mjs`（cellp 仓库）。
-
 ---
 
 ## 风险
