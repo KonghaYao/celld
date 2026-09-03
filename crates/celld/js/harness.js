@@ -210,6 +210,65 @@ class CelldBodyStream extends ReadableStream {
     return super._cancel(reason);
   }
 }
+// BYOB read result shape (shadow `then`; see byte_streams.js).
+function __celldByobReadResult(value, done) {
+  const r = { value, done };
+  Object.defineProperty(r, "then", {
+    value: undefined, enumerable: false, writable: true, configurable: true,
+  });
+  return r;
+}
+// Host-backed response bodies: BYOB/`readAtLeast` pull via __http_stream_read.
+class HttpBodyInternalController {
+  _pendingPullIntos = [];
+  _remainder = null;
+  constructor(streamId) { this.__celldStreamId = streamId; }
+  _invalidate() {}
+  _view(d) {
+    return new d.ctor(d.buffer, d.byteOffset, (d.filled / d.elementSize) | 0);
+  }
+  _pullInto(view, min) {
+    const elementSize = view.BYTES_PER_ELEMENT ?? 1;
+    const minFill = Math.min(min * elementSize, view.byteLength);
+    let buffer;
+    try { buffer = view.buffer.transfer(); }
+    catch (e) { return Promise.reject(e); }
+    const d = {
+      buffer, byteOffset: view.byteOffset, byteLength: view.byteLength,
+      filled: 0, elementSize, minFill, ctor: view.constructor,
+    };
+    return this._fillFromHost(d);
+  }
+  async _fillFromHost(d) {
+    const max = d.byteLength - (d.byteLength % d.elementSize);
+    while (d.filled < d.minFill && d.filled < max) {
+      let chunk = this._remainder;
+      if (chunk === null) {
+        const read = await __http_stream_read(this.__celldStreamId);
+        if (typeof read === "string") {
+          const n = (d.filled / d.elementSize) | 0;
+          return __celldByobReadResult(
+            new d.ctor(d.buffer, d.byteOffset, n), d.filled === 0);
+        }
+        chunk = read;
+      } else {
+        this._remainder = null;
+      }
+      const space = max - d.filled;
+      const take = Math.min(space, chunk.byteLength);
+      if (take > 0) {
+        new Uint8Array(d.buffer, d.byteOffset + d.filled, take)
+          .set(chunk.subarray(0, take));
+        d.filled += take;
+      }
+      if (take < chunk.byteLength)
+        this._remainder = chunk.subarray(take);
+    }
+    const n = (d.filled / d.elementSize) | 0;
+    return __celldByobReadResult(
+      new d.ctor(d.buffer, d.byteOffset, n), false);
+  }
+}
 class CelldHttpBodyStream extends ReadableStream {
   constructor(streamId) {
     const id = Number(streamId);
@@ -224,6 +283,17 @@ class CelldHttpBodyStream extends ReadableStream {
       cancel() { __http_stream_cancel(id); },
     }, { highWaterMark: 0 });
     this.__celldStreamId = id;
+  }
+  getReader(options) {
+    if (options !== undefined && options !== null &&
+        options.mode !== undefined) {
+      if (String(options.mode) !== "byob")
+        throw new TypeError(`Invalid reader mode '${options.mode}'`);
+      if (this._ictl === undefined)
+        this._ictl = new HttpBodyInternalController(this.__celldStreamId);
+      return new ReadableStreamBYOBReader(this);
+    }
+    return super.getReader(options);
   }
   tee() {
     if (this.locked) throw new TypeError("ReadableStream is locked");
@@ -352,8 +422,25 @@ globalThis.Response = class Response {
   }
   clone() {
     if (this.bodyUsed) throw new TypeError("Body has already been consumed");
-    if (this._bodyBytes === null)
-      throw new TypeError("Cannot clone a streaming response before consumption");
+    if (this._bodyBytes === null) {
+      if (this.body === null) {
+        const empty = new Response(null, {
+          status: this.status, statusText: this.statusText, headers: this.headers,
+          webSocket: this.webSocket, __wsTarget: this._wsTarget, cf: this.cf,
+        });
+        empty.type = this.type;
+        return empty;
+      }
+      // Streaming body: tee so caches.default.put() can clone cacheable GETs.
+      const [left, right] = this.body.tee();
+      this.body = left;
+      const response = new Response(right, {
+        status: this.status, statusText: this.statusText, headers: this.headers,
+        webSocket: this.webSocket, __wsTarget: this._wsTarget, cf: this.cf,
+      });
+      response.type = this.type;
+      return response;
+    }
     const response = new Response(
       this.body === null ? null : this._bodyBytes,
       {
@@ -582,6 +669,17 @@ globalThis.fetch = async (input, init) => {
     __cell.inboundRequestUrl || __cell.canonicalInboundUrl || "";
   const plan = JSON.parse(__op_fetch_plan(req.url, inbound));
   if (plan.action === "loopback" && __cell.loopbackEnabled) {
+    let loopPath = "/";
+    try { loopPath = new URL(plan.url).pathname || "/"; } catch (_) {}
+    // OpenNext SSR often re-fetches PUBLIC_BASE_URL + current path. Re-entering
+    // the same inbound route on this isolate never settles (nested GET /).
+    const inboundPath = __cell.inboundPathname || "/";
+    if ((req.method || "GET") === "GET"
+        && loopPath === inboundPath
+        && (__cell.loopbackInflight || 0) > 0) {
+      throw new TypeError(
+        "fetch: refused recursive same-path loopback " + plan.url);
+    }
     const headers = new Headers(req.headers);
     __stripFetchHopByHop(headers);
     headers.set("host", plan.host);
@@ -1212,7 +1310,12 @@ const __imagesTransformer = (source) => {
           );
           const format = options.format == null ? "image/jpeg" : String(options.format);
           const type = format.includes("/") ? format : `image/${format}`;
-          return new Response(out, { headers: { "content-type": type } });
+          return new Response(out, {
+            headers: {
+              "content-type": type,
+              "cache-control": "public, max-age=86400",
+            },
+          });
         },
       };
     },
@@ -2186,9 +2289,11 @@ const __invokeSelfFetch = async (req, responseUrl) => {
   const signal = req._signalForSubrequests;
   if (signal?.aborted) throw signal.reason;
   __cell.svcDepth = (__cell.svcDepth || 0) + 1;
+  __cell.loopbackInflight = (__cell.loopbackInflight || 0) + 1;
   const ctx = __beginEvent();
   try {
-    const dispatch = __ctxRun(undefined,
+    const parentCtx = __ctxNow();
+    const dispatch = __ctxRun(parentCtx,
       () => __cell.selfFetch(req, __cell.env, ctx));
     const response = signal
       ? await __raceCallerAbort(dispatch, signal, () => {
@@ -2198,6 +2303,7 @@ const __invokeSelfFetch = async (req, responseUrl) => {
     return __wrapServiceResponse(response, responseUrl);
   } finally {
     __cell.svcDepth--;
+    __cell.loopbackInflight = Math.max(0, (__cell.loopbackInflight || 1) - 1);
     __endEvent();
   }
 };
@@ -4519,6 +4625,8 @@ globalThis.__cell = {
   namespaceKeys: {},
   node: "",
   loopbackEnabled: false,
+  inboundPathname: "",
+  loopbackInflight: 0,
   deleteAllDeletesAlarm: false,
   compat: { jsRpc: false, fetcherGetPutDelete: false, queueJsonMessages: false },
   makeNamespace,

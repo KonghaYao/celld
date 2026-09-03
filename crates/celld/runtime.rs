@@ -2519,6 +2519,9 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
         // So "waiting on nothing" is a verdict the budget reaches, not one
         // an empty op set proves.
         if ops.is_empty() {
+            if entry.nested_event_active() {
+                return Wake::Poll;
+            }
             if left.is_zero() {
                 return Wake::Idle;
             }

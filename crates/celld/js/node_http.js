@@ -10,10 +10,12 @@
 
   const EE = process.getBuiltinModule("node:events");
   const { EventEmitter } = EE;
+  const stream = process.getBuiltinModule("node:stream");
+  const { Readable, Writable } = stream;
 
-  class IncomingMessage extends EventEmitter {
+  class IncomingMessage extends Readable {
     constructor(socketOrOpts) {
-      super();
+      super({ autoDestroy: true });
       this.httpVersion = "1.1";
       this.httpVersionMajor = 1;
       this.httpVersionMinor = 1;
@@ -39,17 +41,19 @@
       this.aborted = true;
       if (error) this.emit("error", error);
       this.emit("close");
+      if (typeof super.destroy === "function") super.destroy(error);
     }
   }
 
-  class ServerResponse extends EventEmitter {
+  class ServerResponse extends Writable {
     constructor(req) {
-      super();
+      super({ autoDestroy: true });
       this.statusCode = 200;
       this.statusMessage = "OK";
       this.headers = {};
       this.headersSent = false;
       this.finished = false;
+      this.writableEnded = false;
       this.req = req;
       this.socket = req?.socket ?? null;
       this.connection = this.socket;
@@ -101,6 +105,9 @@
         encoding = undefined;
       }
       this.emit("data", chunk);
+      if (typeof super.write === "function" && chunk !== undefined) {
+        return super.write(chunk, encoding, cb);
+      }
       if (typeof cb === "function") cb();
       return true;
     }
@@ -112,9 +119,15 @@
       }
       if (data !== undefined) this.write(data, encoding);
       this.finished = true;
+      this.writableEnded = true;
       this.headersSent = true;
       this.emit("end");
+      this.emit("finish");
+      if (typeof super.end === "function") {
+        return super.end(undefined, encoding, cb);
+      }
       if (typeof cb === "function") cb();
+      return this;
     }
   }
 

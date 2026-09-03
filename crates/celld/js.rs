@@ -3076,6 +3076,12 @@ impl InFlight {
         self.request_id
     }
 
+    /// True while a nested in-isolate dispatch (loopback / service binding)
+    /// still has an open event frame inside this request.
+    pub(crate) fn nested_event_active(&self) -> bool {
+        self.context.event_depth() > 1
+    }
+
     /// The request is over and its remaining ops are being dropped. Purge
     /// their resolvers.
     ///
@@ -3402,6 +3408,8 @@ impl Worker {
 /// being served while `background` is set, and a socket the handler opened
 /// stays open for as long as that body is still going out.
 fn finish_turn(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
+    // Nested loopback attributes event frames to the thread-local IoContext.
+    let guard = CurrentGuard::enter(entry.context.clone());
     settle(tc, entry);
     tc.perform_microtask_checkpoint();
     // `abort()` and `process.exit()` terminate execution without settling
@@ -3412,6 +3420,7 @@ fn finish_turn(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
         entry.fail(error);
         entry.background = None;
         entry.abandon();
+        drop(guard);
         return Vec::new();
     }
     settle(tc, entry);
@@ -3419,7 +3428,9 @@ fn finish_turn(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
     if entry.retired() {
         entry.context.close_sockets();
     }
-    adopt(entry)
+    let ops = adopt(entry);
+    drop(guard);
+    ops
 }
 
 /// An op the JS enqueued, and the id whose promise it resolves.
@@ -6590,6 +6601,11 @@ fn pin_inbound_request_url(scope: &mut v8::PinScope, url: &str) {
         let key = v8::String::new(scope, "inboundRequestUrl").unwrap();
         let value = v8::String::new(scope, url).unwrap();
         cell.set(scope, key.into(), value.into());
+        if let Ok(parsed) = url::Url::parse(url) {
+            let key = v8::String::new(scope, "inboundPathname").unwrap();
+            let value = v8::String::new(scope, parsed.path()).unwrap();
+            cell.set(scope, key.into(), value.into());
+        }
     }
 }
 
@@ -6629,6 +6645,13 @@ fn op_fetch_plan(
     let config = actor_runtime_state(scope).loopback_config.clone();
     let plan = crate::fetch_loopback::plan_fetch(&url, &inbound, config.as_ref());
     let json = crate::fetch_loopback::plan_to_json(&plan);
+    tracing::info!(
+        event = "fetch_plan",
+        url = %url,
+        inbound = %inbound,
+        plan = %json,
+        "outbound fetch plan"
+    );
     rv.set(v8::String::new(scope, &json).unwrap().into());
 }
 
@@ -8457,8 +8480,12 @@ impl IoContext {
         gates
     }
 
-    fn depth(&self) -> usize {
+    pub(crate) fn event_depth(&self) -> usize {
         self.events.lock().unwrap().frames.len()
+    }
+
+    fn depth(&self) -> usize {
+        self.event_depth()
     }
 
     /// Close every isolate-polled socket this request opened.
