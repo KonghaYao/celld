@@ -13,7 +13,8 @@ pub(super) fn compile_module<'s>(
     name: &str,
     src: &str,
 ) -> Option<v8::Local<'s, v8::Module>> {
-    let name = v8::String::new(scope, name)?;
+    let spec = name.to_string();
+    let name = v8::String::new(scope, &spec)?;
     let source = v8::String::new(scope, src)?;
     let origin = v8::ScriptOrigin::new(
         scope,
@@ -29,7 +30,9 @@ pub(super) fn compile_module<'s>(
         None,
     );
     let mut src = v8::script_compiler::Source::new(source, Some(&origin));
-    v8::script_compiler::compile_module(scope, &mut src)
+    let compiled = v8::script_compiler::compile_module(scope, &mut src)?;
+    record_module_spec(scope, compiled, &spec);
+    Some(compiled)
 }
 
 /// specifier -> pre-compiled stub module, consulted by `resolve_external`
@@ -44,7 +47,18 @@ pub(super) fn compile_module<'s>(
 /// different isolate — not a wrong answer but an invalid one. The registry
 /// belongs to the isolate because its contents do.
 #[derive(Default)]
-pub(super) struct ModuleRegistry(Mutex<HashMap<String, v8::Global<v8::Module>>>);
+pub(super) struct ModuleRegistry(
+    Mutex<HashMap<String, v8::Global<v8::Module>>>,
+    Mutex<HashMap<std::num::NonZeroI32, String>>,
+);
+
+fn record_module_spec(scope: &mut v8::PinScope, module: v8::Local<v8::Module>, name: &str) {
+    modreg(scope)
+        .1
+        .lock()
+        .unwrap()
+        .insert(module.get_identity_hash(), name.to_string());
+}
 
 fn modreg(scope: &mut v8::PinScope) -> Arc<ModuleRegistry> {
     scope
@@ -421,6 +435,7 @@ fn stub_source(spec: &str, names: &std::collections::BTreeSet<String>) -> String
 /// instantiating a real bundle; `resolve_external` then serves them.
 pub(super) fn register_stubs(scope: &mut v8::PinScope, config: &WorkerConfig) {
     modreg(scope).0.lock().unwrap().clear();
+    modreg(scope).1.lock().unwrap().clear();
     let reg = |spec: String, source: String, scope: &mut v8::PinScope| {
         if let Some(m) = compile_module(scope, &spec, &source) {
             let g = v8::Global::new(scope, m);
@@ -663,6 +678,59 @@ fn ensure_external_stub(scope: &mut v8::PinScope, spec: &str) {
     }
 }
 
+/// Resolve `spec` imported from `referrer` (V8 module name, `/` separators).
+fn resolve_relative_module_spec(referrer: &str, spec: &str) -> Option<String> {
+    if is_external(spec) || spec.starts_with('/') {
+        return None;
+    }
+    if !spec.starts_with("./") && !spec.starts_with("../") {
+        return None;
+    }
+    let base = referrer.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let mut parts: Vec<&str> = if base.is_empty() {
+        Vec::new()
+    } else {
+        base.split('/').collect()
+    };
+    let mut remainder = spec;
+    while let Some(rest) = remainder.strip_prefix("../") {
+        remainder = rest;
+        if remainder.is_empty() {
+            return None;
+        }
+        if !parts.is_empty() {
+            parts.pop();
+        }
+    }
+    if let Some(rest) = remainder.strip_prefix("./") {
+        remainder = rest;
+    }
+    if remainder.is_empty() {
+        return None;
+    }
+    let resolved = if parts.is_empty() {
+        remainder.to_string()
+    } else {
+        format!("{}/{}", parts.join("/"), remainder)
+    };
+    Some(resolved)
+}
+
+fn module_lookup_candidates(referrer: &str, spec: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |s: String| {
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    push(spec.to_string());
+    if let Some(resolved) = resolve_relative_module_spec(referrer, spec) {
+        push(resolved.clone());
+        push(format!("./{resolved}"));
+    }
+    out
+}
+
 /// Module resolve callback: serve a registered stub for `cloudflare:*`/`node:*`.
 /// Missing builtins are registered on demand via [`ensure_external_stub`] (sibling
 /// chunks may import them without the main module listing them).
@@ -670,24 +738,36 @@ pub(super) fn resolve_external<'s>(
     context: v8::Local<'s, v8::Context>,
     specifier: v8::Local<'s, v8::String>,
     _a: v8::Local<'s, v8::FixedArray>,
-    _r: v8::Local<'s, v8::Module>,
+    referrer: v8::Local<'s, v8::Module>,
 ) -> Option<v8::Local<'s, v8::Module>> {
     v8::callback_scope!(unsafe scope, context);
     let spec = specifier.to_rust_string_lossy(scope);
     let registry = modreg(scope);
-    if !registry.0.lock().unwrap().contains_key(&spec) {
-        ensure_external_stub(scope, &spec);
-    }
-    let m = registry
-        .0
+    let referrer_spec = registry
+        .1
         .lock()
         .unwrap()
-        .get(&spec)
-        .map(|g| v8::Local::new(scope, g));
-    if m.is_none() && is_external(&spec) {
+        .get(&referrer.get_identity_hash())
+        .cloned()
+        .unwrap_or_default();
+    for candidate in module_lookup_candidates(&referrer_spec, &spec) {
+        if !registry.0.lock().unwrap().contains_key(&candidate) && is_external(&candidate) {
+            ensure_external_stub(scope, &candidate);
+        }
+        if let Some(m) = registry
+            .0
+            .lock()
+            .unwrap()
+            .get(&candidate)
+            .map(|g| v8::Local::new(scope, g))
+        {
+            return Some(m);
+        }
+    }
+    if is_external(&spec) {
         tracing::warn!(%spec, "resolve: no stub for specifier");
     }
-    m
+    None
 }
 
 /// The (guarded setup script, backing-object expression) pair for a builtin
@@ -858,6 +938,39 @@ export const ok = 1;
     fn scan_external_imports_ignores_non_external_side_effect() {
         let src = r#"import './chunk.mjs';"#;
         assert!(scan_external_imports(src).is_empty());
+    }
+
+    #[test]
+    fn resolve_relative_module_spec_from_sibling_dir() {
+        assert_eq!(
+            super::resolve_relative_module_spec(
+                "assets/server-entry-abc.js",
+                "./rsc-BeZU5rKD.js"
+            ),
+            Some("assets/rsc-BeZU5rKD.js".into())
+        );
+        assert_eq!(
+            super::resolve_relative_module_spec(
+                "assets/server-entry-abc.js",
+                "../__vite_rsc_assets_manifest.js"
+            ),
+            Some("__vite_rsc_assets_manifest.js".into())
+        );
+        assert_eq!(
+            super::resolve_relative_module_spec("worker.js", "./assets/chunk.js"),
+            Some("assets/chunk.js".into())
+        );
+    }
+
+    #[test]
+    fn module_lookup_candidates_includes_resolved_paths() {
+        let c = super::module_lookup_candidates(
+            "assets/server-entry.js",
+            "./rsc-BeZU5rKD.js",
+        );
+        assert!(c.contains(&"./rsc-BeZU5rKD.js".to_string()));
+        assert!(c.contains(&"assets/rsc-BeZU5rKD.js".to_string()));
+        assert!(c.contains(&"./assets/rsc-BeZU5rKD.js".to_string()));
     }
 
     #[test]

@@ -753,12 +753,7 @@ async fn load_worker_at_pointer(
     for (module, bytes) in fetched {
         let entry = match module.kind {
             Some(ModuleKind::Wasm) => (module.name.clone(), ModuleSource::Wasm(bytes)),
-            None => (
-                format!("./{}", module.name),
-                ModuleSource::Text(
-                    String::from_utf8(bytes.into()).context("deployment module is not UTF-8")?,
-                ),
-            ),
+            None => deployment_sibling_module(&module.name, bytes)?,
         };
         modules.push(entry);
     }
@@ -909,6 +904,21 @@ pub struct LoadedDeployment {
     pub services: Vec<(String, String, Option<String>)>,
     /// `triggers.crons` from the manifest, driving the reserved cron cell.
     pub crons: Vec<String>,
+}
+
+/// Map a non-main manifest module to how the JS runtime loads it.
+///
+/// Wrangler `Text` rules (`.md`, etc.) become default-export string modules.
+/// `no_bundle` / multi-chunk outdirs ship `.js` siblings as real ES modules.
+fn deployment_sibling_module(name: &str, bytes: bytes::Bytes) -> anyhow::Result<(String, ModuleSource)> {
+    let source =
+        String::from_utf8(bytes.into()).context("deployment module is not UTF-8")?;
+    let is_esm = name.ends_with(".js") || name.ends_with(".mjs") || name.ends_with(".cjs");
+    if is_esm {
+        Ok((name.to_string(), ModuleSource::EsModule(source)))
+    } else {
+        Ok((format!("./{name}"), ModuleSource::Text(source)))
+    }
 }
 
 fn bindings<'a>(

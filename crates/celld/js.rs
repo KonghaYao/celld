@@ -4432,10 +4432,11 @@ fn start_fetch<'s>(
     headers: &[(String, String)],
     request_id: Option<RequestId>,
 ) -> Result<Started<'s>> {
-    pin_inbound_request_url(tc, url);
+    let fetch_url = normalize_inbound_fetch_url(url);
+    pin_inbound_request_url(tc, &fetch_url);
     let req = match request_id {
-        Some(_) => make_incoming_request(tc, url, method, body, headers),
-        None => make_request(tc, url, method, body, headers),
+        Some(_) => make_incoming_request(tc, &fetch_url, method, body, headers),
+        None => make_request(tc, &fetch_url, method, body, headers),
     }?;
     let env = harness_env(tc)?;
     let recv = v8::undefined(tc).into();
@@ -6502,6 +6503,21 @@ fn op_rpc_call(
     });
     let p = promise_for(scope, id);
     rv.set(p);
+}
+
+/// OpenNext/Next 308-loop when `new URL(request.url).pathname` is `//` (see S30).
+fn normalize_inbound_fetch_url(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+    let path = parsed.path();
+    if !path.starts_with("//") {
+        return url.to_string();
+    }
+    let collapsed = format!("/{}", path.trim_start_matches('/'));
+    let mut out = parsed;
+    out.set_path(&collapsed);
+    out.to_string()
 }
 
 fn pin_inbound_request_url(scope: &mut v8::PinScope, url: &str) {

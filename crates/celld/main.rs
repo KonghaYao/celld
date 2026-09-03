@@ -1663,13 +1663,58 @@ fn request_url(parts: &hyper::http::request::Parts, trust_forwarded_headers: boo
     let scheme = forwarded("x-forwarded-proto")
         .and_then(canonical)
         .unwrap_or("http");
-    let path_and_query = collapse_request_path_and_query(
-        parts
-            .uri
-            .path_and_query()
-            .map_or("/", hyper::http::uri::PathAndQuery::as_str),
-    );
-    format!("{scheme}://{host}{path_and_query}")
+    let path_and_query = ingress_path_and_query(parts);
+    ensure_absolute_url(&format!("{scheme}://{host}{path_and_query}"))
+}
+
+/// Normalize absolute ingress URL so pathname is never `//` (OpenNext 308 loop).
+fn ensure_absolute_url(url: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+    let path = parsed.path();
+    if !path.starts_with("//") && !path.is_empty() {
+        return url.to_string();
+    }
+    let collapsed = if path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", path.trim_start_matches('/'))
+    };
+    parsed.set_path(&collapsed);
+    parsed.to_string()
+}
+
+/// Normalize the HTTP request-target (path + query) for Worker `request.url`.
+fn ingress_path_and_query(parts: &hyper::http::request::Parts) -> String {
+    let raw = parts
+        .uri
+        .path_and_query()
+        .map_or("/", hyper::http::uri::PathAndQuery::as_str);
+    collapse_request_path_and_query(&strip_absolute_uri_request_target(raw))
+}
+
+/// Proxies sometimes forward absolute-form request targets (`GET http://host/path`).
+fn strip_absolute_uri_request_target(path_and_query: &str) -> String {
+    let (path, suffix) = match path_and_query.split_once('?') {
+        Some((path, query)) => (path, format!("?{query}")),
+        None => (path_and_query, String::new()),
+    };
+    let path = if path.starts_with("http://") || path.starts_with("https://") {
+        url::Url::parse(path)
+            .ok()
+            .map(|u| {
+                let mut p = u.path().to_string();
+                if p.is_empty() {
+                    p = "/".to_string();
+                }
+                p
+            })
+            .unwrap_or_else(|| path.to_string())
+    } else {
+        path.to_string()
+    };
+    format!("{path}{suffix}")
 }
 
 /// Collapse duplicate leading slashes in the request target path (not `http://`).

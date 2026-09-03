@@ -308,9 +308,10 @@ pub struct ModuleRef {
     pub bytes: usize,
     /// content hash of this module's bytes (hex, truncated)
     pub sha256: String,
-    /// Absent means UTF-8 source: the main module is ESM, siblings become
-    /// text modules. `wasm` bytes become a module whose default export is a
-    /// compiled `WebAssembly.Module` (Wrangler's `CompiledWasm` rule).
+    /// Absent means UTF-8 source. Non-`.js` siblings become Wrangler Text
+    /// modules; `.js`/`.mjs`/`.cjs` siblings compile as ES modules (Wrangler
+    /// `no_bundle` outdirs). `wasm` bytes become a module whose default export
+    /// is a compiled `WebAssembly.Module` (Wrangler's `CompiledWasm` rule).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<ModuleKind>,
 }
