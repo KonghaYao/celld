@@ -446,16 +446,18 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .map(|entry| {
             if project.no_bundle {
                 // Already bundled by the caller's toolchain. Read it as it is;
-                // running esbuild over a Vite build is what corrupts it. A
-                // pre-bundled entry carries no sibling wasm: esbuild's copy
-                // loader is what would have produced them.
+                // running esbuild over a Vite build is what corrupts it. Wrangler
+                // and esbuild's wasm `copy` loader emit sibling `*.wasm` beside
+                // the entry; collect them the same way as the esbuild outdir.
                 let path = root.join(entry);
-                std::fs::read(&path)
-                    .with_context(|| format!("read entry point {}", path.display()))
-                    .map(|bundle| BundleOutput {
-                        bundle,
-                        wasm: Vec::new(),
-                    })
+                let bundle = std::fs::read(&path)
+                    .with_context(|| format!("read entry point {}", path.display()))?;
+                let wasm_dir = path
+                    .parent()
+                    .filter(|dir| !dir.as_os_str().is_empty())
+                    .unwrap_or(&root);
+                let wasm = read_wasm_modules_from_dir(wasm_dir)?;
+                Ok(BundleOutput { bundle, wasm })
             } else {
                 run_esbuild(&root, entry)
             }
@@ -2264,26 +2266,34 @@ fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
     }
     let bundle =
         std::fs::read(outdir.path().join("index.js")).context("read esbuild output bundle")?;
-    // The copied wasm files land beside the bundle; each becomes its own
-    // deployed module under the name the rewritten imports use.
+    let wasm = read_wasm_modules_from_dir(outdir.path())?;
+    Ok(BundleOutput { bundle, wasm })
+}
+
+/// Sibling `*.wasm` files in `dir`, keyed by basename — the name esbuild's
+/// `copy` loader and wrangler pre-bundles use for `import x from "./x.wasm"`.
+fn read_wasm_modules_from_dir(dir: &Path) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     let mut wasm = Vec::new();
-    for dirent in std::fs::read_dir(outdir.path()).context("read esbuild output directory")? {
+    for dirent in std::fs::read_dir(dir)
+        .with_context(|| format!("read wasm directory {}", dir.display()))?
+    {
         let path = dirent?.path();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("wasm") {
-            let name = path
-                .file_name()
-                .expect("read_dir entries have a file name")
-                .to_string_lossy()
-                .into_owned();
-            let bytes = std::fs::read(&path)
-                .with_context(|| format!("read wasm module {}", path.display()))?;
-            wasm.push((name, bytes));
+        if path.extension().and_then(|extension| extension.to_str()) != Some("wasm") {
+            continue;
         }
+        let name = path
+            .file_name()
+            .expect("read_dir entries have a file name")
+            .to_string_lossy()
+            .into_owned();
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("read wasm module {}", path.display()))?;
+        wasm.push((name, bytes));
     }
     // read_dir order is platform-defined; the deployment version hashes the
     // module list, so keep it stable.
     wasm.sort();
-    Ok(BundleOutput { bundle, wasm })
+    Ok(wasm)
 }
 
 /// Minimal JSONC support: line and block comments, and trailing commas.
@@ -2340,4 +2350,53 @@ fn strip_jsonc(source: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod no_bundle_wasm_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn no_bundle_includes_sibling_wasm_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("wrangler.jsonc"),
+            r#"{
+            "name": "wasm-fixture",
+            "main": "index.js",
+            "no_bundle": true,
+            "compatibility_date": "2024-01-01"
+        }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("index.js"),
+            r#"import m from "./one.wasm"; export default m;"#,
+        )
+        .unwrap();
+        fs::write(root.join("one.wasm"), b"\0asm\x01\0\0\0\0\0\0\0").unwrap();
+
+        let built = build(&Options {
+            config: Some(root.join("wrangler.jsonc")),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            dry_run: false,
+            json: false,
+        })
+        .unwrap();
+
+        let names: Vec<_> = built.modules.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(names.contains(&"index.js"));
+        assert!(names.contains(&"one.wasm"));
+        let wasm_module = built
+            .manifest
+            .modules
+            .iter()
+            .find(|module| module.name == "one.wasm")
+            .unwrap();
+        assert_eq!(wasm_module.kind, Some(ModuleKind::Wasm));
+    }
 }
