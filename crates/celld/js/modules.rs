@@ -238,6 +238,11 @@ const LAZY_MODULES: &[LazyModule] = &[
         global: "__pathWin32Module",
         source: include_str!("node_path.js"),
     },
+    LazyModule {
+        specs: &["url", "node:url"],
+        global: "__urlModule",
+        source: include_str!("node_url.js"),
+    },
     // Shares its source with the `Buffer` LAZY_GLOBALS entry; the script
     // is self-guarded, so whichever seam runs first wins and the other
     // reuses the same classes.
@@ -1097,5 +1102,41 @@ export const ok = 1;
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn scan_external_imports_node_url_aliases() {
+        let src = r#"import legacyUrl from "url";
+import { parse, fileURLToPath } from "node:url";"#;
+        let map = scan_external_imports(src);
+        let bare = map.get("url").expect("bare url specifier scanned");
+        assert!(bare.contains("default"));
+        let prefixed = map.get("node:url").expect("node:url specifier scanned");
+        assert!(prefixed.contains("parse"));
+        assert!(prefixed.contains("fileURLToPath"));
+    }
+
+    #[test]
+    fn stub_source_node_url_aliases_are_not_node_stub() {
+        for spec in ["url", "node:url"] {
+            let mut names = std::collections::BTreeSet::new();
+            names.insert("default".into());
+            names.insert("parse".into());
+            names.insert("format".into());
+            names.insert("pathToFileURL".into());
+            names.insert("fileURLToPath".into());
+            let src = super::stub_source(spec, &names);
+            assert!(src.contains("globalThis.__urlModule"), "{spec}: {src}");
+            assert!(!src.contains("= globalThis.__nodeStub"), "{spec}: {src}");
+            assert!(src.contains("export default globalThis.__urlModule;"));
+            for name in ["parse", "format", "pathToFileURL", "fileURLToPath"] {
+                assert!(
+                    src.contains(&format!(
+                        "export const {name} = globalThis.__urlModule.{name};"
+                    )),
+                    "{spec} must export {name}: {src}"
+                );
+            }
+        }
     }
 }

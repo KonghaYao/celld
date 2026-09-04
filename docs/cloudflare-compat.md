@@ -346,8 +346,11 @@ Known host notes:
 **Partial**
 
 - celld implements `node:assert`, `node:async_hooks`, `node:buffer`,
-  `node:events`, `node:path`, `node:stream`, `node:timers/promises`, and
-  `node:util`.
+  `node:events`, `node:path`, `node:stream`, `node:timers/promises`, `node:url`,
+  and `node:util` (including their supported bare aliases).
+- `node:url` implements the legacy `parse` / `format` pair and
+  `pathToFileURL` / `fileURLToPath`; other legacy URL helpers remain
+  unsupported.
 - `node:crypto` does not implement Diffie-Hellman, streaming signatures,
   ciphers, RSA-PSS, or DSA signatures and key generation.
 - `node:zlib` implements synchronous gzip/deflate helpers plus callback

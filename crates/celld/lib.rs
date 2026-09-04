@@ -575,6 +575,44 @@ mod worker_compat_tests {
     }
 
     #[test]
+    fn node_url_aliases_evaluate_with_real_legacy_api() {
+        crate::runtime::init_v8();
+        let source = r#"
+import legacyUrl from "url";
+import { parse, format, pathToFileURL, fileURLToPath } from "node:url";
+const parsed = legacyUrl.parse("/", true);
+if (!parsed || typeof parsed !== "object") throw new Error("url.parse did not return an object");
+if (parsed.pathname !== "/") throw new Error(`unexpected pathname: ${parsed.pathname}`);
+if (parsed.pathname.startsWith("/_next/image") !== false) throw new Error("root misclassified as image path");
+if (parse("/").pathname !== "/") throw new Error("node:url named parse is unavailable");
+if (format(parsed) !== "/") throw new Error(`unexpected formatted root: ${format(parsed)}`);
+const path = "/tmp/cellp url#fixture";
+if (fileURLToPath(pathToFileURL(path)) !== path) throw new Error("file URL round trip failed");
+export default { async fetch() { return new Response("ok"); } };
+"#;
+        let config = WorkerConfig::new(WorkerConfigOptions {
+            src: source.into(),
+            script_name: "node-url-test".into(),
+            do_classes: Vec::new(),
+            bindings: Vec::new(),
+            r2_bindings: Vec::new(),
+            d1_bindings: Vec::new(),
+            kv_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
+            workflow_bindings: Vec::new(),
+            ai_binding: None,
+            images_bindings: Vec::new(),
+            vars: Vec::new(),
+            node: "test-node".into(),
+            modules: Vec::new(),
+            compat: worker_compat(&json!({ "compatibility_date": "2026-01-15" })),
+        });
+
+        Worker::load_config(Arc::new(config)).expect("node url module should evaluate");
+    }
+
+    #[test]
     fn process_env_is_ready_for_module_evaluation_and_excludes_bindings() {
         crate::runtime::init_v8();
         let compat = worker_compat(&json!({
