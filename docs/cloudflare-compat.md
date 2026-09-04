@@ -350,7 +350,10 @@ Known host notes:
   `node:util`.
 - `node:crypto` does not implement Diffie-Hellman, streaming signatures,
   ciphers, RSA-PSS, or DSA signatures and key generation.
-- `node:zlib` implements only the synchronous gzip and deflate functions.
+- `node:zlib` implements synchronous gzip/deflate helpers plus callback
+  `gzip` / `gunzip` / `deflate` / `inflate` (sync work deferred via
+  `process.nextTick`; compatible with `util.promisify`). Streaming APIs are
+  not implemented.
 - `node:fs` returns `ENOENT` from each read.
 - Each other Node.js module returns an inert stub. This behavior is a known
   silent gap.

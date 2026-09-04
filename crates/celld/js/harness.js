@@ -10148,6 +10148,26 @@ if (!globalThis.structuredClone) {
 // `Buffer` is read at call time, which materializes the lazy global.
 const __zlibSync = (mode, data) =>
   Buffer.from(__zlib(mode, Buffer.from(data)));
+const __zlibAsync = (mode) => (data, options, callback) => {
+  if (typeof options === "function") {
+    callback = options;
+    options = undefined;
+  }
+  if (typeof callback !== "function") {
+    throw new TypeError("Callback must be a function");
+  }
+  const tick = globalThis.process?.nextTick || ((fn) => queueMicrotask(fn));
+  tick(() => {
+    let output;
+    try {
+      output = __zlibSync(mode, data);
+    } catch (err) {
+      callback(err);
+      return;
+    }
+    callback(null, output);
+  });
+};
 globalThis.__zlibModule = {
   constants: {
     Z_NO_FLUSH: 0,
@@ -10157,6 +10177,10 @@ globalThis.__zlibModule = {
     Z_FINISH: 4,
     Z_BLOCK: 5,
   },
+  gzip: __zlibAsync("gzip"),
+  gunzip: __zlibAsync("gunzip"),
+  deflate: __zlibAsync("deflate"),
+  inflate: __zlibAsync("inflate"),
   gzipSync: (data, _options) => __zlibSync("gzip", data),
   gunzipSync: (data, _options) => __zlibSync("gunzip", data),
   deflateSync: (data, _options) => __zlibSync("deflate", data),
@@ -10164,6 +10188,28 @@ globalThis.__zlibModule = {
   deflateRawSync: (data, _options) => __zlibSync("deflateRaw", data),
   inflateRawSync: (data, _options) => __zlibSync("inflateRaw", data),
 };
+// OpenNext / unenv install their own `process` without setImmediate; Next 16
+// schedules via `process.setImmediate` (not the global). Patch on install and
+// whenever the global is replaced.
+const __celldProcessImmediate = (() => {
+  const setImmediate = (callback, ...args) => {
+    if (typeof callback !== "function") {
+      const e = new TypeError(
+        'The "callback" argument must be of type function');
+      e.code = "ERR_INVALID_ARG_TYPE";
+      throw e;
+    }
+    return setTimeout(() => callback(...args), 0);
+  };
+  return { setImmediate, clearImmediate: (handle) => clearTimeout(handle) };
+})();
+const __celldPatchProcessTimers = (processObj) => {
+  if (!processObj || typeof processObj !== "object") return;
+  if (typeof processObj.setImmediate === "function") return;
+  processObj.setImmediate = __celldProcessImmediate.setImmediate;
+  processObj.clearImmediate = __celldProcessImmediate.clearImmediate;
+};
+globalThis.__celldPatchProcessTimers = __celldPatchProcessTimers;
 if (!globalThis.process) globalThis.process = {
   env: {}, platform: "linux", arch: "x64", version: "v20.0.0",
   versions: { node: "20.0.0" }, argv: [], cwd: () => "/",
@@ -10173,6 +10219,19 @@ if (!globalThis.process) globalThis.process = {
   nextTick: (f, ...a) => queueMicrotask(() => f(...a)),
   on() {}, once() {}, off() {}, emit() {}, hrtime: () => [0, 0],
 };
+__celldPatchProcessTimers(globalThis.process);
+{
+  let __celldProcessRef = globalThis.process;
+  Object.defineProperty(globalThis, "process", {
+    get() { return __celldProcessRef; },
+    set(next) {
+      __celldPatchProcessTimers(next);
+      __celldProcessRef = next;
+    },
+    configurable: true,
+    enumerable: true,
+  });
+}
 globalThis.process.exit = (code = 0) => {
   const actorScope = __actorEventStack[__actorEventStack.length - 1] || "";
   if (actorScope) {

@@ -528,5 +528,85 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
         sqlite_vec: has_flag("sqlite_vec"),
         websocket_standard_binary_type: has_flag("websocket_standard_binary_type"),
         queue_json_messages: switch("queue_json_messages", "queue_v8_messages", "2024-03-18"),
+        nodejs_compat_populate_process_env: has_flag("nodejs_compat")
+            && switch(
+                "nodejs_compat_populate_process_env",
+                "nodejs_compat_do_not_populate_process_env",
+                "2025-04-01",
+            ),
+    }
+}
+
+#[cfg(test)]
+mod worker_compat_tests {
+    use super::worker_compat;
+    use crate::js::{Worker, WorkerConfig, WorkerConfigOptions};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[test]
+    fn process_env_requires_nodejs_compat() {
+        let compat = worker_compat(&json!({ "compatibility_date": "2026-01-15" }));
+        assert!(!compat.nodejs_compat_populate_process_env);
+    }
+
+    #[test]
+    fn process_env_follows_date_and_explicit_flags() {
+        let current = worker_compat(&json!({
+            "compatibility_date": "2026-01-15",
+            "compatibility_flags": ["nodejs_compat"],
+        }));
+        assert!(current.nodejs_compat_populate_process_env);
+
+        let opted_out = worker_compat(&json!({
+            "compatibility_date": "2026-01-15",
+            "compatibility_flags": [
+                "nodejs_compat",
+                "nodejs_compat_do_not_populate_process_env",
+            ],
+        }));
+        assert!(!opted_out.nodejs_compat_populate_process_env);
+
+        let opted_in = worker_compat(&json!({
+            "compatibility_date": "2024-01-01",
+            "compatibility_flags": ["nodejs_compat", "nodejs_compat_populate_process_env"],
+        }));
+        assert!(opted_in.nodejs_compat_populate_process_env);
+    }
+
+    #[test]
+    fn process_env_is_ready_for_module_evaluation_and_excludes_bindings() {
+        crate::runtime::init_v8();
+        let compat = worker_compat(&json!({
+            "compatibility_date": "2026-01-15",
+            "compatibility_flags": ["nodejs_compat"],
+        }));
+        let source = r#"
+const captured = process.env.STRING_VAR;
+if (captured !== "from-config") throw new Error("string var unavailable at module evaluation");
+if (process.env.DB !== undefined) throw new Error("D1 binding leaked into process.env");
+if (process.env.CACHE !== undefined) throw new Error("R2 binding leaked into process.env");
+export default { async fetch() { return new Response(captured); } };
+"#;
+        let config = WorkerConfig::new(WorkerConfigOptions {
+            src: source.into(),
+            script_name: "process-env-test".into(),
+            do_classes: Vec::new(),
+            bindings: Vec::new(),
+            r2_bindings: vec![("CACHE".into(), "test-cache".into())],
+            d1_bindings: vec![("DB".into(), "test-database".into())],
+            kv_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
+            workflow_bindings: Vec::new(),
+            ai_binding: None,
+            images_bindings: Vec::new(),
+            vars: vec![("STRING_VAR".into(), "from-config".into())],
+            node: "test-node".into(),
+            modules: Vec::new(),
+            compat,
+        });
+
+        Worker::load_config(Arc::new(config)).expect("worker module should evaluate");
     }
 }

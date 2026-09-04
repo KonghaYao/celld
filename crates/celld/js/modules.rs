@@ -386,6 +386,7 @@ pub(super) fn install_lazy_globals(scope: &mut v8::PinScope) -> Result<()> {
 /// `LAZY_MODULES` instead.
 fn eager_module_global(spec: &str) -> Option<&'static str> {
     Some(match spec {
+        "process" | "node:process" => "globalThis.process",
         "fs" | "node:fs" | "fs/promises" | "node:fs/promises" => "globalThis.__fs",
         "zlib" | "node:zlib" => "globalThis.__zlibModule",
         _ => return None,
@@ -1056,6 +1057,32 @@ export const ok = 1;
         );
         assert!(src.contains("export const setImmediate"));
         assert!(src.contains("export const clearImmediate"));
+    }
+
+    #[test]
+    fn builtin_source_node_process_uses_real_process() {
+        let (setup, expr) = super::builtin_source("node:process").unwrap();
+        assert!(setup.is_empty());
+        assert_eq!(expr, "globalThis.process");
+    }
+
+    #[test]
+    fn stub_source_node_process_next_tick_is_not_node_stub() {
+        let mut names = std::collections::BTreeSet::new();
+        names.insert("nextTick".into());
+        let src = super::stub_source("node:process", &names);
+        assert!(src.contains("globalThis.process.nextTick"));
+        assert!(!src.contains("= globalThis.__nodeStub"));
+    }
+
+    /// OpenNext bundles replace `globalThis.process` with unenv; harness must
+    /// still expose `process.setImmediate` for Next scheduling.
+    #[test]
+    fn harness_patches_process_set_immediate() {
+        let harness = include_str!("harness.js");
+        assert!(harness.contains("__celldPatchProcessTimers"));
+        assert!(harness.contains("globalThis.__celldPatchProcessTimers"));
+        assert!(harness.contains(r#"Object.defineProperty(globalThis, "process""#));
     }
 
     /// Minimal h3 `send()` shape: schedule `res.end` on `setImmediate`.

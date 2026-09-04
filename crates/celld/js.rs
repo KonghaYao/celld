@@ -1791,6 +1791,10 @@ pub struct Compat {
     /// Queue bodies default to JSON on compatibility dates after 2024-03-18;
     /// older deployments retain the V8 structured-clone default.
     pub queue_json_messages: bool,
+    /// With `nodejs_compat`, expose string Worker vars through `process.env`.
+    /// Workerd enables this by date from 2025-04-01, with explicit opt-in/out
+    /// flags available on either side of that date.
+    pub nodejs_compat_populate_process_env: bool,
 }
 
 /// A non-main module the worker's main module may import, tagged by how the
@@ -4458,6 +4462,7 @@ fn start_fetch<'s>(
     let recv = v8::undefined(tc).into();
     let f = fetch;
     let execution_ctx = begin_event_context(tc)?;
+    patch_process_timers(tc)?;
     let Some(ret) = f.call(tc, recv, &[req, env, execution_ctx]) else {
         // The handler threw synchronously. Termination carries its own error;
         // otherwise the pending exception is on the caller's TryCatch, which
@@ -4561,6 +4566,10 @@ impl Worker {
             // read Cloudflare.compatibilityFlags at module scope.
             inject_compatibility_flags(scope, compat)?;
             inject_storage_compatibility(scope, compat)?;
+            // `process.env` is observable from top-level module code. Populate
+            // only text vars, before any worker module evaluates; resource
+            // bindings are created later in `build_env` and never enter it.
+            inject_process_env(scope, &config)?;
 
             let module = match compile_module(scope, "worker.js", src) {
                 Some(m) => m,
@@ -4602,6 +4611,8 @@ impl Worker {
                     ));
                 }
             }
+
+            patch_process_timers(scope)?;
 
             let ns = module
                 .get_module_namespace()
@@ -9244,9 +9255,9 @@ mod v8_strings;
 use bootstrap::{
     adopt_cell, begin_event_context, build_env, end_event_context, harness_env,
     inject_compatibility_flags, inject_crons, inject_kv_limits, inject_loopback_config,
-    inject_namespace_keys,
-    inject_queue_config, inject_routing, inject_storage_compatibility, inject_workflows,
-    install_harness, install_prelude, populate_cf_exports, register_class, register_entrypoints,
+    inject_namespace_keys, inject_process_env, inject_queue_config, inject_routing,
+    inject_storage_compatibility, inject_workflows, install_harness, install_prelude,
+    patch_process_timers, populate_cf_exports, register_class, register_entrypoints,
     validate_workflow_classes,
 };
 use modules::{

@@ -507,6 +507,11 @@ pub(super) fn inject_compatibility_flags(scope: &mut v8::PinScope, compat: Compa
     set_flag(scope, "sqlite_vec", compat.sqlite_vec);
     set_flag(
         scope,
+        "nodejs_compat_populate_process_env",
+        compat.nodejs_compat_populate_process_env,
+    );
+    set_flag(
+        scope,
         "fetcher_no_get_put_delete",
         !compat.fetcher_get_put_delete,
     );
@@ -516,6 +521,45 @@ pub(super) fn inject_compatibility_flags(scope: &mut v8::PinScope, compat: Compa
     let key = v8::String::new(scope, "Cloudflare").unwrap();
     global.set(scope, key.into(), cloudflare.into());
     Ok(())
+}
+
+pub(super) fn inject_process_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Result<()> {
+    if !config.compat.nodejs_compat_populate_process_env {
+        return Ok(());
+    }
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let process_key = v8::String::new(scope, "process").unwrap();
+    let process = global
+        .get(scope, process_key.into())
+        .and_then(|value| value.to_object(scope))
+        .ok_or_else(|| anyhow!("missing process object"))?;
+    let env_key = v8::String::new(scope, "env").unwrap();
+    let env = process
+        .get(scope, env_key.into())
+        .and_then(|value| value.to_object(scope))
+        .ok_or_else(|| anyhow!("missing process.env object"))?;
+    for (name, value) in &config.vars {
+        let name = v8::String::new(scope, name).unwrap();
+        let value = v8::String::new(scope, value).unwrap();
+        anyhow::ensure!(
+            env.set(scope, name.into(), value.into()).unwrap_or(false),
+            "could not populate process.env"
+        );
+    }
+    Ok(())
+}
+
+/// OpenNext/unenv replace `globalThis.process` with a plain object that omits
+/// `setImmediate`. Harness installs a setter, but top-level module evaluation
+/// order can leave the live object unpatched until we run this explicitly.
+pub(super) fn patch_process_timers(scope: &mut v8::PinScope) -> Result<()> {
+    run_bootstrap_script(
+        scope,
+        "patch_process_timers",
+        "if (typeof __celldPatchProcessTimers === 'function') { \
+         __celldPatchProcessTimers(globalThis.process); }",
+    )
 }
 
 pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Result<()> {
