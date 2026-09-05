@@ -456,7 +456,11 @@ globalThis.Response = class Response {
 // every Request construction, which is the HTTP hot path.
 const __HTTP_METHODS = new Set(
   ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]);
+// Fetch stores the URL in an internal slot. A plain `this.url = ...` would
+// invoke an inherited getter-only override while constructing a subclass (as
+// NextRequest does), unlike the native Request constructor.
 globalThis.Request = class Request {
+  #url;
   constructor(input, init = {}) {
     const prior = input instanceof Request ? input : null;
     const suppliedSignal = init.signal !== undefined;
@@ -465,7 +469,7 @@ globalThis.Request = class Request {
     if (init.cache !== undefined)
       throw new Error("The 'cache' field on 'RequestInitializerDict' " +
         "is not implemented.");
-    this.url = prior ? prior.url : String(input);
+    this.#url = prior ? prior.#url : String(input);
     {
       // Workers upper-cases every method (the
       // upper_case_all_http_methods flag) but rejects anything outside
@@ -555,6 +559,7 @@ globalThis.Request = class Request {
         ? this.signal
         : (prior ? prior._signalForSubrequests : null);
   }
+  get url() { return this.#url; }
   get headers() {
     if (this._headers === null) {
       const src = this._headersJson !== undefined

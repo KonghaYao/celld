@@ -613,6 +613,50 @@ export default { async fetch() { return new Response("ok"); } };
     }
 
     #[test]
+    fn request_subclass_with_getter_only_url_constructs() {
+        crate::runtime::init_v8();
+        let source = r#"
+class NextLikeRequest extends Request {
+  get url() { return super.url.replace("/original", "/normalized"); }
+}
+const request = new NextLikeRequest("https://example.test/original");
+if (request.url !== "https://example.test/normalized") {
+  throw new Error(`unexpected subclass URL: ${request.url}`);
+}
+const copied = new Request(request);
+if (copied.url !== "https://example.test/original") {
+  throw new Error(`copy did not use the Request URL slot: ${copied.url}`);
+}
+const cloned = request.clone();
+if (cloned.url !== "https://example.test/original") {
+  throw new Error(`clone did not use the Request URL slot: ${cloned.url}`);
+}
+export default { async fetch() { return new Response(request.url); } };
+"#;
+        let config = WorkerConfig::new(WorkerConfigOptions {
+            src: source.into(),
+            script_name: "request-subclass-test".into(),
+            do_classes: Vec::new(),
+            bindings: Vec::new(),
+            r2_bindings: Vec::new(),
+            d1_bindings: Vec::new(),
+            kv_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
+            workflow_bindings: Vec::new(),
+            ai_binding: None,
+            images_bindings: Vec::new(),
+            vars: Vec::new(),
+            node: "test-node".into(),
+            modules: Vec::new(),
+            compat: worker_compat(&json!({ "compatibility_date": "2026-01-15" })),
+        });
+
+        Worker::load_config(Arc::new(config))
+            .expect("Request subclasses with getter-only url should construct");
+    }
+
+    #[test]
     fn process_env_is_ready_for_module_evaluation_and_excludes_bindings() {
         crate::runtime::init_v8();
         let compat = worker_compat(&json!({

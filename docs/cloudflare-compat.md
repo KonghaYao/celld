@@ -234,6 +234,8 @@ still matches `env.IMAGES.input(stream|bytes|Response)`.
 **Partial**
 
 - The `cache` request option is not available.
+- `Request` keeps its URL in an internal slot, so a subclass may define a
+  getter-only `url` property and can still be constructed, copied, and cloned.
 - celld removes `Content-Length` from a Worker response. It preserves the
   header for a `HEAD` response.
 - A remote Durable Object call streams the request body to the owner. The call
