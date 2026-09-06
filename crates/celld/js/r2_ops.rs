@@ -666,6 +666,23 @@ pub(super) fn op_r2_list(
 
 // ---- writes --------------------------------------------------------------
 
+/// Clear a branch delete marker after its replacement object has committed.
+/// A cleanup failure is reported even though the object may now exist; the
+/// caller must not claim the replacement is visible, and retry remains safe.
+async fn reveal_written_object(overlay: bool, bucket_name: &str, key: &str) -> Result<(), String> {
+    if overlay {
+        crate::r2_overlay::clear_tombstone(store()?, bucket_name, key)
+            .await
+            .map_err(|error| {
+                format!(
+                    "R2 put of {key} committed, but celld could not clear its branch tombstone: \
+                     {error}"
+                )
+            })?;
+    }
+    Ok(())
+}
+
 /// The bytes of an `ArrayBuffer` view argument, or `None` when the
 /// argument is not one.
 fn view_bytes(value: v8::Local<v8::Value>) -> Option<Vec<u8>> {
@@ -695,6 +712,7 @@ async fn put_once(
         storage_class: request.storage_class,
     };
     let conditions = BlobConditions::from(request.only_if.unwrap_or_default());
+    let overlay = overlay_active(&bucket_name).await?;
     let meta = store()?
         .put_blob(
             &blob_key(&bucket_name, &key),
@@ -704,15 +722,16 @@ async fn put_once(
         )
         .await
         .map_err(|error| error.to_string())?;
-    Ok(match meta {
+    let Some(meta) = meta else {
         // R2 answers a refused precondition with `null`, not a throw.
-        None => serde_json::json!({ "stored": false }).to_string(),
-        Some(meta) => serde_json::json!({
-            "stored": true,
-            "object": object_json(&key, &meta, None),
-        })
-        .to_string(),
+        return Ok(serde_json::json!({ "stored": false }).to_string());
+    };
+    reveal_written_object(overlay, &bucket_name, &key).await?;
+    Ok(serde_json::json!({
+        "stored": true,
+        "object": object_json(&key, &meta, None),
     })
+    .to_string())
 }
 
 /// `__r2_put(bucketName, key, bytes, requestJson)`. The whole body is in
@@ -744,6 +763,7 @@ struct PutStream {
     bucket_name: String,
     key: String,
     request: PutRequest,
+    overlay: bool,
     digests: Digests,
     /// Bytes not yet handed to the store.
     buffered: Vec<u8>,
@@ -842,6 +862,7 @@ impl PutStream {
             .complete()
             .await
             .map_err(|error| format!("R2 put of {}: {error}", self.key))?;
+        reveal_written_object(self.overlay, &self.bucket_name, &self.key).await?;
         let meta = BlobMeta {
             size: self.size,
             etag: result.e_tag.clone(),
@@ -928,8 +949,10 @@ pub(super) fn op_r2_put_begin(
     let id = asyncrt::enqueue(async move {
         let request = request?;
         reap_puts();
-        // Fail before a byte moves if there is no bucket at all.
+        // Fail before a byte moves if there is no bucket or a declared branch
+        // overlay cannot be opened.
         store()?;
+        let overlay = overlay_active(&bucket_name).await?;
         let digests = Digests::wanted(&request.verify, true);
         let put_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         puts().lock().unwrap().insert(
@@ -938,6 +961,7 @@ pub(super) fn op_r2_put_begin(
                 bucket_name,
                 key,
                 request,
+                overlay,
                 digests,
                 buffered: Vec::new(),
                 size: 0,
@@ -1010,6 +1034,7 @@ pub(super) fn op_r2_put_end(
 struct UploadEntry {
     bucket_name: String,
     key: String,
+    overlay: bool,
     upload: Box<dyn MultipartUpload>,
     /// Part numbers already handed to the store, in that order. The store
     /// owns the part bookkeeping and concatenates the parts in the order
@@ -1115,6 +1140,7 @@ pub(super) fn op_r2_mp_begin(
             checksums: BTreeMap::new(),
             storage_class: request.storage_class,
         };
+        let overlay = overlay_active(&bucket_name).await?;
         let upload = store()?
             .begin_multipart(&blob_key(&bucket_name, &key), &envelope.write())
             .await
@@ -1125,6 +1151,7 @@ pub(super) fn op_r2_mp_begin(
             Arc::new(tokio::sync::Mutex::new(UploadEntry {
                 bucket_name,
                 key,
+                overlay,
                 upload,
                 flushed: Vec::new(),
                 pending: BTreeMap::new(),
@@ -1275,7 +1302,9 @@ pub(super) fn op_r2_mp_complete(
                 );
             }
         }
-        result
+        let result = result?;
+        reveal_written_object(entry.overlay, &entry.bucket_name, &entry.key).await?;
+        Ok(result)
     });
     rv.set(promise_for(scope, id));
 }
