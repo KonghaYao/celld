@@ -92,9 +92,7 @@ static IMPORT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|
 static IMPORT_BRACES_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"\{([^}]*)\}").unwrap());
 static SIDE_EFFECT_IMPORT_RE: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"import\s+["']([^"']+)["']\s*;"#).unwrap()
-    });
+    std::sync::LazyLock::new(|| regex::Regex::new(r#"import\s+["']([^"']+)["']\s*;"#).unwrap());
 
 /// Counts scans of a source carrying [`SCAN_PROBE_MARKER`].
 ///
@@ -242,6 +240,11 @@ const LAZY_MODULES: &[LazyModule] = &[
         specs: &["url", "node:url"],
         global: "__urlModule",
         source: include_str!("node_url.js"),
+    },
+    LazyModule {
+        specs: &["querystring", "node:querystring"],
+        global: "__querystringModule",
+        source: include_str!("node_querystring.js"),
     },
     // Shares its source with the `Buffer` LAZY_GLOBALS entry; the script
     // is self-guarded, so whichever seam runs first wins and the other
@@ -641,6 +644,48 @@ pub(super) fn register_wasm_modules(scope: &mut v8::PinScope, modules: &[(String
     }
 }
 
+fn binary_module_eval_source(name: &str) -> String {
+    let quoted = serde_json::to_string(name).unwrap();
+    format!(
+        "const b = globalThis.__binaryModules[{quoted}];\n\
+         delete globalThis.__binaryModules[{quoted}];\n\
+         export default b;"
+    )
+}
+
+/// Register each sibling binary module under its name and `./name` as a stub
+/// whose default export is an `ArrayBuffer` — the shape Wrangler/workerd give a
+/// `Data` module import for dynamic `import("./x.bin")`.
+pub(super) fn register_binary_modules(
+    scope: &mut v8::PinScope,
+    modules: &[(String, ModuleSource)],
+) {
+    let binary = modules.iter().filter_map(|(name, source)| match source {
+        ModuleSource::Binary(bytes) => Some((name, bytes)),
+        _ => None,
+    });
+    let mut table = None;
+    for (name, bytes) in binary {
+        let table = *table.get_or_insert_with(|| {
+            let global = scope.get_current_context().global(scope);
+            let table = v8::Object::new(scope);
+            let table_key = v8::String::new(scope, "__binaryModules").unwrap();
+            global.define_own_property(
+                scope,
+                table_key.into(),
+                table.into(),
+                v8::PropertyAttribute::DONT_ENUM,
+            );
+            table
+        });
+        let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes.to_vec()).make_shared();
+        let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
+        let key = v8::String::new(scope, name).unwrap();
+        table.set(scope, key.into(), buffer.into());
+        register_sibling_module(scope, name, &binary_module_eval_source(name));
+    }
+}
+
 /// Register a loaded worker's sibling JS modules (Worker Loader multi-module
 /// bundles), in addition to the builtins `register_stubs` already added for the
 /// main module. Each module is registered under its own name and `./name` so
@@ -684,8 +729,7 @@ fn ensure_external_stub(scope: &mut v8::PinScope, spec: &str) {
     }
     let mut names = std::collections::BTreeSet::new();
     names.insert("*".into());
-    let s = full_surface_source(scope, spec, &names)
-        .unwrap_or_else(|| stub_source(spec, &names));
+    let s = full_surface_source(scope, spec, &names).unwrap_or_else(|| stub_source(spec, &names));
     if let Some(m) = compile_module(scope, spec, &s) {
         let g = v8::Global::new(scope, m);
         registry.0.lock().unwrap().insert(spec.to_string(), g);
@@ -695,6 +739,10 @@ fn ensure_external_stub(scope: &mut v8::PinScope, spec: &str) {
 }
 
 /// Resolve `spec` imported from `referrer` (V8 module name, `/` separators).
+///
+/// Lexical normalization matches [`crate::deploy::resolve_no_bundle_relative_spec`]:
+/// each path segment is processed (`.` dropped, `..` pops), leading `./` stripped,
+/// and paths that escape the deployment root or normalize to empty return `None`.
 fn resolve_relative_module_spec(referrer: &str, spec: &str) -> Option<String> {
     if is_external(spec) || spec.starts_with('/') {
         return None;
@@ -703,33 +751,32 @@ fn resolve_relative_module_spec(referrer: &str, spec: &str) -> Option<String> {
         return None;
     }
     let base = referrer.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
-    let mut parts: Vec<&str> = if base.is_empty() {
+    let mut segments: Vec<&str> = if base.is_empty() {
         Vec::new()
     } else {
-        base.split('/').collect()
+        base.split('/').filter(|part| !part.is_empty()).collect()
     };
-    let mut remainder = spec;
-    while let Some(rest) = remainder.strip_prefix("../") {
-        remainder = rest;
-        if remainder.is_empty() {
-            return None;
-        }
-        if !parts.is_empty() {
-            parts.pop();
-        }
+    let mut path = spec;
+    while path.starts_with("./") {
+        path = &path[2..];
     }
-    if let Some(rest) = remainder.strip_prefix("./") {
-        remainder = rest;
+    for component in path.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            if segments.is_empty() {
+                return None;
+            }
+            segments.pop();
+            continue;
+        }
+        segments.push(component);
     }
-    if remainder.is_empty() {
+    if segments.is_empty() {
         return None;
     }
-    let resolved = if parts.is_empty() {
-        remainder.to_string()
-    } else {
-        format!("{}/{}", parts.join("/"), remainder)
-    };
-    Some(resolved)
+    Some(segments.join("/"))
 }
 
 fn module_lookup_candidates(referrer: &str, spec: &str) -> Vec<String> {
@@ -1007,10 +1054,7 @@ export const ok = 1;
     #[test]
     fn resolve_relative_module_spec_from_sibling_dir() {
         assert_eq!(
-            super::resolve_relative_module_spec(
-                "assets/server-entry-abc.js",
-                "./rsc-BeZU5rKD.js"
-            ),
+            super::resolve_relative_module_spec("assets/server-entry-abc.js", "./rsc-BeZU5rKD.js"),
             Some("assets/rsc-BeZU5rKD.js".into())
         );
         assert_eq!(
@@ -1027,11 +1071,36 @@ export const ok = 1;
     }
 
     #[test]
-    fn module_lookup_candidates_includes_resolved_paths() {
-        let c = super::module_lookup_candidates(
-            "assets/server-entry.js",
-            "./rsc-BeZU5rKD.js",
+    fn resolve_relative_module_spec_lexical_normalization() {
+        assert_eq!(
+            super::resolve_relative_module_spec("lib/sub/index.js", "../helper.js"),
+            Some("lib/helper.js".into())
         );
+        assert_eq!(
+            super::resolve_relative_module_spec("lib/sub/index.js", "./../peer.js"),
+            Some("lib/peer.js".into())
+        );
+        assert_eq!(
+            super::resolve_relative_module_spec("a/b/c.js", "./././chunk.js"),
+            Some("a/b/chunk.js".into())
+        );
+        assert_eq!(
+            super::resolve_relative_module_spec("index.js", "../../../../escape.js"),
+            None
+        );
+        assert_eq!(
+            super::resolve_relative_module_spec("worker.js", "./../outside.js"),
+            None
+        );
+        assert_eq!(
+            super::resolve_relative_module_spec("lib/sub/index.js", "./../"),
+            Some("lib".into())
+        );
+    }
+
+    #[test]
+    fn module_lookup_candidates_includes_resolved_paths() {
+        let c = super::module_lookup_candidates("assets/server-entry.js", "./rsc-BeZU5rKD.js");
         assert!(c.contains(&"./rsc-BeZU5rKD.js".to_string()));
         assert!(c.contains(&"assets/rsc-BeZU5rKD.js".to_string()));
         assert!(c.contains(&"./assets/rsc-BeZU5rKD.js".to_string()));
@@ -1082,6 +1151,15 @@ export const ok = 1;
 
     /// OpenNext bundles replace `globalThis.process` with unenv; harness must
     /// still expose `process.setImmediate` for Next scheduling.
+    #[test]
+    fn binary_module_eval_source_exports_array_buffer() {
+        let src = super::binary_module_eval_source("font.ttf.bin");
+        assert!(src.contains("__binaryModules"));
+        assert!(src.contains("export default b"));
+        assert!(!src.contains("Uint8Array"));
+        assert!(!src.contains("JSON.stringify"));
+    }
+
     #[test]
     fn harness_patches_process_set_immediate() {
         let harness = include_str!("harness.js");

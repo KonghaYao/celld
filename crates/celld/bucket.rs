@@ -436,11 +436,11 @@ fn user_metadata(attributes: &Attributes) -> Vec<(String, String)> {
 /// paginated listing serves an operator command rather than a node
 /// decision, so no injected store reaches one. Refusing is louder than an
 /// empty page, which a caller would read as a fleet that holds no cells.
-#[cfg(celld_internal_tests)]
+#[cfg(any(test, celld_internal_tests))]
 #[derive(Debug)]
 struct UnpaginatedStore;
 
-#[cfg(celld_internal_tests)]
+#[cfg(any(test, celld_internal_tests))]
 #[async_trait::async_trait]
 impl PaginatedListStore for UnpaginatedStore {
     async fn list_paginated(
@@ -456,7 +456,7 @@ impl PaginatedListStore for UnpaginatedStore {
 
 impl Bucket {
     /// Builds a bucket over injected ordinary and conditional-write stores.
-    #[cfg(celld_internal_tests)]
+    #[cfg(any(test, celld_internal_tests))]
     #[doc(hidden)]
     pub fn with_stores(
         store: Arc<dyn ObjectStore>,

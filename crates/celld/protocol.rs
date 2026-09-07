@@ -61,6 +61,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_R2_V1,
     FEATURE_IMAGES_V1,
     FEATURE_WASM_V1,
+    FEATURE_BINARY_V1,
     FEATURE_WORKFLOWS_V1,
 ];
 
@@ -85,6 +86,8 @@ pub const FEATURE_R2_V1: &str = "r2-v1";
 pub const FEATURE_IMAGES_V1: &str = "images-v1";
 pub const FEATURE_SQLITE_VEC_V1: &str = "sqlite-vec-v1";
 pub const FEATURE_WASM_V1: &str = "wasm-v1";
+/// Wrangler `Data` rule sibling modules (`.bin` default export is an `ArrayBuffer`).
+pub const FEATURE_BINARY_V1: &str = "binary-v1";
 /// A deployment with `workflows` bindings. Required because a build without
 /// the reserved workflow cell would load the manifest, build an `env` missing
 /// the binding, and fail only when the application first calls `create()` —
@@ -317,6 +320,8 @@ pub struct ModuleRef {
     /// modules; `.js`/`.mjs`/`.cjs` siblings compile as ES modules (Wrangler
     /// `no_bundle` outdirs). `wasm` bytes become a module whose default export
     /// is a compiled `WebAssembly.Module` (Wrangler's `CompiledWasm` rule).
+    /// `binary` bytes become a module whose default export is an `ArrayBuffer`
+    /// (Wrangler's `Data` rule for `.bin` siblings).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<ModuleKind>,
 }
@@ -325,6 +330,7 @@ pub struct ModuleRef {
 #[serde(rename_all = "lowercase")]
 pub enum ModuleKind {
     Wasm,
+    Binary,
 }
 
 /// Reference from a deploy manifest to its immutable, canonical asset index.

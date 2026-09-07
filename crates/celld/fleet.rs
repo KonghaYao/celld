@@ -753,6 +753,7 @@ async fn load_worker_at_pointer(
     for (module, bytes) in fetched {
         let entry = match module.kind {
             Some(ModuleKind::Wasm) => (module.name.clone(), ModuleSource::Wasm(bytes)),
+            Some(ModuleKind::Binary) => (module.name.clone(), ModuleSource::Binary(bytes)),
             None => deployment_sibling_module(&module.name, bytes)?,
         };
         modules.push(entry);

@@ -98,6 +98,21 @@ pub async fn write_tombstone(child: &Bucket, bucket_name: &str, object_key: &str
         .await
 }
 
+/// Make a successfully written child object visible again.
+///
+/// Call this only after the object write or multipart completion succeeds. If
+/// deletion reports failure, the caller must report that the object committed
+/// without claiming the replacement is visible; retry remains safe.
+pub async fn clear_tombstone(
+    child: &Bucket,
+    bucket_name: &str,
+    object_key: &str,
+) -> anyhow::Result<()> {
+    child
+        .delete(&r2_tombstone_key(bucket_name, object_key))
+        .await
+}
+
 pub async fn read_overlay_pointer(
     store: &Bucket,
     bucket_name: &str,
@@ -240,6 +255,17 @@ pub async fn overlay_get_blob(
 mod tests {
     use super::*;
 
+    fn test_store() -> Bucket {
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        Bucket::with_stores(
+            store.clone(),
+            store,
+            crate::bucket::StorageBackend::Local,
+            "r2-overlay-test".to_string(),
+            String::new(),
+        )
+    }
+
     #[test]
     fn tombstone_key_preserves_object_key_slashes() {
         assert_eq!(
@@ -256,5 +282,46 @@ mod tests {
         let json = serde_json::to_string(&pointer).unwrap();
         let parsed: R2OverlayPointer = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, pointer);
+    }
+
+    #[tokio::test]
+    async fn clear_tombstone_reveals_replacement_object() {
+        let child = test_store();
+        let bucket_name = "assets";
+        let object_key = "dir/object.txt";
+        child
+            .put(
+                &r2_object_key(bucket_name, object_key),
+                Bytes::from_static(b"replacement"),
+            )
+            .await
+            .unwrap();
+        write_tombstone(&child, bucket_name, object_key)
+            .await
+            .unwrap();
+        assert!(is_tombstoned(&child, bucket_name, object_key)
+            .await
+            .unwrap());
+
+        clear_tombstone(&child, bucket_name, object_key)
+            .await
+            .unwrap();
+
+        assert!(!is_tombstoned(&child, bucket_name, object_key)
+            .await
+            .unwrap());
+        let (body, _) = child
+            .get(&r2_object_key(bucket_name, object_key))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(body, Bytes::from_static(b"replacement"));
+    }
+
+    #[tokio::test]
+    async fn clear_missing_tombstone_is_idempotent() {
+        clear_tombstone(&test_store(), "assets", "missing.txt")
+            .await
+            .unwrap();
     }
 }

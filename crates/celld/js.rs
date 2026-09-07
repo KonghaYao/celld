@@ -1810,6 +1810,10 @@ pub enum ModuleSource {
     /// `WebAssembly.Module` (Wrangler's `CompiledWasm` rule), registered
     /// under both `name` and `./name`.
     Wasm(bytes::Bytes),
+    /// Opaque bytes served as a module whose default export is an `ArrayBuffer`
+    /// (Wrangler's `Data` rule for `.bin` siblings), registered under both
+    /// `name` and `./name`.
+    Binary(bytes::Bytes),
 }
 
 /// A Workflow binding keeps the three names distinct across deployment
@@ -4577,6 +4581,7 @@ impl Worker {
             };
             register_stubs(scope, &config); // cloudflare:*/node:* + text modules
             register_wasm_modules(scope, &config.modules);
+            register_binary_modules(scope, &config.modules);
             register_loader_modules(scope, &config);
             module
                 .instantiate_module(scope, resolve_external)
@@ -6134,7 +6139,7 @@ fn op_loader_load(
             .iter()
             .map(|(_, source)| match source {
                 ModuleSource::Text(source) | ModuleSource::EsModule(source) => source.len(),
-                ModuleSource::Wasm(bytes) => bytes.len(),
+                ModuleSource::Wasm(bytes) | ModuleSource::Binary(bytes) => bytes.len(),
             })
             .sum::<usize>();
     if code_size > MAX_DYNAMIC_WORKER_CODE_SIZE {
@@ -9262,7 +9267,8 @@ use bootstrap::{
 };
 use modules::{
     compile_module, host_import_module_dynamically, install_lazy_globals, op_builtin_module,
-    register_loader_modules, register_stubs, register_wasm_modules, resolve_external,
+    register_loader_modules, register_stubs, register_wasm_modules, register_binary_modules,
+    resolve_external,
     ModuleRegistry,
 };
 use v8_strings::key as static_key;
