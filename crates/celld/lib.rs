@@ -318,16 +318,16 @@ pub mod asyncrt {
 mod asyncrt_contract_tests {
     include!(env!("CELLD_INTERNAL_ASYNCRT_TESTS"));
 }
+pub(crate) mod binding_branch;
 pub mod bucket;
+pub(crate) mod cell_branch;
 pub mod cell_cli;
 pub mod cli_options;
 pub mod cli_output;
 pub mod control_plane;
-pub(crate) mod cell_branch;
-pub(crate) mod binding_branch;
 pub(crate) mod d1_branch;
-pub(crate) mod d1_import;
 pub mod d1_cli;
+pub(crate) mod d1_import;
 pub mod dead_node_gc;
 pub mod deploy;
 pub mod dev;
@@ -345,8 +345,8 @@ pub mod generation;
 pub mod host_services;
 pub(crate) mod images;
 pub mod js;
-pub mod kv_cli;
 pub(crate) mod kv_blob_branch;
+pub mod kv_cli;
 pub(crate) mod local_store;
 pub mod ltx_repl;
 pub mod machine;
@@ -361,9 +361,10 @@ pub mod peer_probe;
 pub mod pool;
 pub mod protocol;
 pub mod queue_cli;
-pub mod r2_cli;
 pub(crate) mod r2_branch;
+pub mod r2_cli;
 pub(crate) mod r2_overlay;
+pub mod opennext_compat;
 pub mod replication;
 pub mod runtime;
 pub mod startup;
@@ -540,9 +541,10 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
 #[cfg(test)]
 mod worker_compat_tests {
     use super::worker_compat;
-    use crate::js::{Worker, WorkerConfig, WorkerConfigOptions};
+    use crate::js::{ModuleSource, RequestBody, Worker, WorkerConfig, WorkerConfigOptions};
     use serde_json::json;
     use std::sync::Arc;
+    use std::time::Instant;
 
     #[test]
     fn process_env_requires_nodejs_compat() {
@@ -610,6 +612,44 @@ export default { async fetch() { return new Response("ok"); } };
         });
 
         Worker::load_config(Arc::new(config)).expect("node url module should evaluate");
+    }
+
+    #[test]
+    fn node_querystring_aliases_normalize_redirect_queries() {
+        crate::runtime::init_v8();
+        let source = r#"
+import legacyQuerystring from "querystring";
+import { parse, stringify } from "node:querystring";
+const simple = stringify(parse("missing=true"));
+if (simple !== "missing=true") throw new Error(`unexpected simple query: ${simple}`);
+const encoded = stringify(parse("q=%C3%A4%C3%B6%C3%A5%E2%82%AC"));
+if (encoded !== "q=%C3%A4%C3%B6%C3%A5%E2%82%AC") throw new Error(`unexpected encoded query: ${encoded}`);
+const repeated = legacyQuerystring.parse("tag=one&tag=two");
+if (!Array.isArray(repeated.tag) || repeated.tag.join(",") !== "one,two") {
+  throw new Error("repeated query values were not preserved");
+}
+export default { async fetch() { return new Response("ok"); } };
+"#;
+        let config = WorkerConfig::new(WorkerConfigOptions {
+            src: source.into(),
+            script_name: "node-querystring-test".into(),
+            do_classes: Vec::new(),
+            bindings: Vec::new(),
+            r2_bindings: Vec::new(),
+            d1_bindings: Vec::new(),
+            kv_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
+            workflow_bindings: Vec::new(),
+            ai_binding: None,
+            images_bindings: Vec::new(),
+            vars: Vec::new(),
+            node: "test-node".into(),
+            modules: Vec::new(),
+            compat: worker_compat(&json!({ "compatibility_date": "2026-01-15" })),
+        });
+
+        Worker::load_config(Arc::new(config)).expect("node querystring module should evaluate");
     }
 
     #[test]
@@ -690,5 +730,94 @@ export default { async fetch() { return new Response(captured); } };
         });
 
         Worker::load_config(Arc::new(config)).expect("worker module should evaluate");
+    }
+
+    #[test]
+    fn binary_module_dynamic_import_default_is_array_buffer() {
+        crate::runtime::init_v8();
+        let bin_name = "font.ttf.bin";
+        let bin_bytes = bytes::Bytes::from_static(&[0, 1, 2, 255]);
+        let source = format!(
+            r#"
+export default {{
+  async fetch() {{
+    const mod = await import("./{bin_name}");
+    const buf = mod.default;
+    if (!(buf instanceof ArrayBuffer)) {{
+      throw new Error(`expected ArrayBuffer default export, got ${{buf?.constructor?.name ?? typeof buf}}`);
+    }}
+    const bytes = [...new Uint8Array(buf)];
+    const expected = [0, 1, 2, 255];
+    if (bytes.length !== expected.length || !expected.every((b, i) => bytes[i] === b)) {{
+      throw new Error(`unexpected binary bytes: ${{JSON.stringify(bytes)}}`);
+    }}
+    return new Response("ok");
+  }},
+}};
+"#
+        );
+        let config = WorkerConfig::new(WorkerConfigOptions {
+            src: source,
+            script_name: "binary-module-test".into(),
+            do_classes: Vec::new(),
+            bindings: Vec::new(),
+            r2_bindings: Vec::new(),
+            d1_bindings: Vec::new(),
+            kv_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
+            workflow_bindings: Vec::new(),
+            ai_binding: None,
+            images_bindings: Vec::new(),
+            vars: Vec::new(),
+            node: "test-node".into(),
+            modules: vec![(
+                bin_name.to_string(),
+                ModuleSource::Binary(bin_bytes.clone()),
+            )],
+            compat: worker_compat(&json!({ "compatibility_date": "2026-01-15" })),
+        });
+        let worker = Worker::load_config(Arc::new(config))
+            .expect("worker with binary sibling module should load");
+        let slot = crate::pool::Slot::standalone(worker);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime for worker fetch");
+        rt.block_on(async {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            let job = super::WorkerJob::Fetch {
+                queued_at: Instant::now(),
+                url: "https://example.test/binary-module".into(),
+                method: "GET".into(),
+                body: RequestBody::Bytes(bytes::Bytes::new()),
+                headers: Vec::new(),
+                request_id: Some(crate::js::next_request_id()),
+                reply,
+            };
+            let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
+            let response = match receive.await {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    panic!("binary module fetch failed: {error:#}");
+                }
+                Err(_) => match driving.await {
+                    Ok(()) => panic!("worker dropped fetch response without sending"),
+                    Err(error) => panic!("worker fetch task failed: {error}"),
+                },
+            };
+            assert_eq!(
+                response.status,
+                200,
+                "unexpected status {} body {:?}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            );
+            assert_eq!(
+                response.body, b"ok",
+                "handler should return ok after binary import checks"
+            );
+        });
     }
 }

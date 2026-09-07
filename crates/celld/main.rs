@@ -259,12 +259,31 @@ fn forwards_worker_header(
 fn runtime_response(
     worker_response: celld::js::HttpResponse,
     preserve_representation_length: bool,
+    ingress_url: Option<&str>,
 ) -> HttpReply {
     let Ok(status) = StatusCode::from_u16(worker_response.status) else {
         return response(StatusCode::INTERNAL_SERVER_ERROR, "invalid Worker status");
     };
+    let headers = if let Some(base) = ingress_url {
+        worker_response
+            .headers
+            .into_iter()
+            .map(|(name, value)| {
+                if name.eq_ignore_ascii_case("location") {
+                    (
+                        name,
+                        celld::opennext_compat::normalize_worker_location(&value, base),
+                    )
+                } else {
+                    (name, value)
+                }
+            })
+            .collect()
+    } else {
+        worker_response.headers
+    };
     let mut builder = Response::builder().status(status);
-    for (name, value) in worker_response.headers {
+    for (name, value) in headers {
         if !forwards_worker_header(&name, preserve_representation_length, status) {
             continue;
         }
@@ -1327,16 +1346,7 @@ async fn request_payload(
     let body = collect_limited_body(body, max_body_bytes)
         .await
         .map_err(|error| body_read_error("request", error))?;
-    let headers = parts
-        .headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.to_string(), value.to_string()))
-        })
-        .collect();
+    let headers = worker_request_headers(&parts, trust_forwarded_headers);
     Ok((
         request_url(&parts, trust_forwarded_headers),
         parts.method.to_string(),
@@ -1512,16 +1522,7 @@ fn ingress_payload_parts(
     Option<Incoming>,
 ) {
     let (parts, body) = request.into_parts();
-    let headers: Vec<(String, String)> = parts
-        .headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.to_string(), value.to_string()))
-        })
-        .collect();
+    let headers = worker_request_headers(&parts, trust_forwarded_headers);
     let url = request_url(&parts, trust_forwarded_headers);
     let method = parts.method.to_string();
     let declared = parts
@@ -1603,6 +1604,65 @@ fn well_formed_host(host: &str) -> Option<&str> {
     }
 }
 
+fn first_header_value<'a>(parts: &'a hyper::http::request::Parts, name: &str) -> Option<&'a str> {
+    parts
+        .headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn last_header_value<'a>(parts: &'a hyper::http::request::Parts, name: &str) -> Option<&'a str> {
+    // A header can arrive as several lines as well as one comma-joined line,
+    // and `HeaderMap::get` returns only the first line. Select the actual final
+    // field before validating it. Skipping an unusable final field would expose
+    // an earlier client value again, which is the defect this gate prevents.
+    parts
+        .headers
+        .get_all(name)
+        .into_iter()
+        .next_back()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next_back())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn trusted_forwarded_host(
+    parts: &hyper::http::request::Parts,
+    trust_forwarded_headers: bool,
+) -> Option<&str> {
+    trust_forwarded_headers
+        .then(|| last_header_value(parts, "x-forwarded-host"))
+        .flatten()
+        .and_then(well_formed_host)
+}
+
+/// Copy ingress headers for the Worker, making `Host` agree with
+/// `request.url` only when the trusted proxy supplied a valid public authority.
+fn worker_request_headers(
+    parts: &hyper::http::request::Parts,
+    trust_forwarded_headers: bool,
+) -> Vec<(String, String)> {
+    let forwarded_host = trusted_forwarded_host(parts, trust_forwarded_headers);
+    let mut headers =
+        Vec::with_capacity(parts.headers.len() + usize::from(forwarded_host.is_some()));
+    for (name, value) in &parts.headers {
+        if forwarded_host.is_some() && name == hyper::header::HOST {
+            continue;
+        }
+        if let Ok(value) = value.to_str() {
+            headers.push((name.to_string(), value.to_string()));
+        }
+    }
+    if let Some(host) = forwarded_host {
+        headers.push((hyper::header::HOST.to_string(), host.to_string()));
+    }
+    headers
+}
+
 /// `request.url` controls application routing and absolute links, so celld
 /// does not let an untrusted forwarding header or request-target authority set
 /// its scheme or host. The path and query always come from the request target.
@@ -1626,45 +1686,101 @@ fn well_formed_host(host: &str) -> Option<&str> {
 /// gate is what makes that trade safe: neither value can reshape the URL, and
 /// no hostname in `request.url` is trustworthy anyway.
 fn request_url(parts: &hyper::http::request::Parts, trust_forwarded_headers: bool) -> String {
-    // A header can arrive as several lines as well as one comma-joined line,
-    // and `HeaderMap::get` returns only the first line. Select the actual final
-    // field before validating it. Skipping an unusable final field would expose
-    // an earlier client value again, which is the defect this gate prevents.
-    let last_value = |name: &str| {
-        parts
-            .headers
-            .get_all(name)
-            .into_iter()
-            .next_back()
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(',').next_back())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+    let forwarded = |name: &str| {
+        trust_forwarded_headers
+            .then(|| last_header_value(parts, name))
+            .flatten()
     };
-    let first_value = |name: &str| {
-        parts
-            .headers
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(',').next())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    };
-    let forwarded = |name: &str| trust_forwarded_headers.then(|| last_value(name)).flatten();
 
     // The gate applies per source, not once at the end of the chain, so a
     // malformed forwarded value falls through to `Host` instead of discarding
     // the whole chain.
-    let host = forwarded("x-forwarded-host")
-        .and_then(well_formed_host)
-        .or_else(|| first_value("host").and_then(well_formed_host))
+    let host = trusted_forwarded_host(parts, trust_forwarded_headers)
+        .or_else(|| first_header_value(parts, "host").and_then(well_formed_host))
         .unwrap_or("celld.local");
     let canonical = |scheme: &str| celld_logic::http::canonical_scheme(scheme);
     let scheme = forwarded("x-forwarded-proto")
         .and_then(canonical)
         .unwrap_or("http");
     let path_and_query = ingress_path_and_query(parts);
-    ensure_absolute_url(&format!("{scheme}://{host}{path_and_query}"))
+    celld::opennext_compat::normalize_worker_request_url(
+        &ensure_absolute_url(&format!("{scheme}://{host}{path_and_query}")),
+    )
+}
+
+#[cfg(test)]
+mod ingress_authority_tests {
+    use super::*;
+
+    fn request_parts(
+        host: &str,
+        forwarded_host: &str,
+        forwarded_proto: &str,
+    ) -> hyper::http::request::Parts {
+        Request::builder()
+            .uri("/api/host?source=test")
+            .header(hyper::header::HOST, host)
+            .header("x-forwarded-host", forwarded_host)
+            .header("x-forwarded-proto", forwarded_proto)
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0
+    }
+
+    fn worker_hosts(headers: &[(String, String)]) -> Vec<&str> {
+        headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
+            .map(|(_, value)| value.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn trusted_forwarded_host_normalizes_worker_authority() {
+        let parts = request_parts("synthetic.v1.example.test", "v1.example.test:8787", "https");
+
+        assert_eq!(
+            request_url(&parts, true),
+            "https://v1.example.test:8787/api/host?source=test"
+        );
+        assert_eq!(
+            worker_hosts(&worker_request_headers(&parts, true)),
+            vec!["v1.example.test:8787"]
+        );
+    }
+
+    #[test]
+    fn untrusted_forwarded_host_preserves_worker_authority() {
+        let parts = request_parts("synthetic.v1.example.test", "v1.example.test:8787", "https");
+
+        assert_eq!(
+            request_url(&parts, false),
+            "http://synthetic.v1.example.test/api/host?source=test"
+        );
+        assert_eq!(
+            worker_hosts(&worker_request_headers(&parts, false)),
+            vec!["synthetic.v1.example.test"]
+        );
+    }
+
+    #[test]
+    fn malformed_forwarded_host_preserves_worker_authority() {
+        let parts = request_parts(
+            "synthetic.v1.example.test",
+            "v1.example.test:8787/path",
+            "https",
+        );
+
+        assert_eq!(
+            request_url(&parts, true),
+            "https://synthetic.v1.example.test/api/host?source=test"
+        );
+        assert_eq!(
+            worker_hosts(&worker_request_headers(&parts, true)),
+            vec!["synthetic.v1.example.test"]
+        );
+    }
 }
 
 /// Normalize absolute ingress URL so pathname is never `//` (OpenNext 308 loop).
@@ -1753,6 +1869,7 @@ async fn dispatch_cell_fetch(
     headers: Vec<(String, String)>,
 ) -> HttpReply {
     let preserve_representation_length = method.eq_ignore_ascii_case("HEAD");
+    let ingress_url = url.clone();
     let (reply, receive) = oneshot::channel();
     let (cancel_tx, cancel) = oneshot::channel();
     let accepted = celld::js::submit_do_call(celld::js::DoCallReq {
@@ -1785,7 +1902,7 @@ async fn dispatch_cell_fetch(
     let _hangup = HangUp(Some(cancel_tx));
     match receive.await {
         Ok(Ok(worker_response)) => {
-            runtime_response(worker_response, preserve_representation_length)
+            runtime_response(worker_response, preserve_representation_length, Some(&ingress_url))
         }
         Ok(Err(error)) if request_body_limit_error(&error) => {
             response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
@@ -1843,6 +1960,7 @@ pub(crate) async fn dispatch_forwarded_fetch(
         request_id,
         capacity_handoff,
     } = fetch;
+    let ingress_url = url.clone();
     let _request_body_guard = celld::js::RequestBodyGuard::of(&request_body);
     let preserve_representation_length = method.eq_ignore_ascii_case("HEAD");
     let routed = if capacity_handoff {
@@ -1958,7 +2076,11 @@ pub(crate) async fn dispatch_forwarded_fetch(
                         abort.disarm();
                         drop(activity);
                     }
-                    runtime_response(worker_response, preserve_representation_length)
+                    runtime_response(
+                        worker_response,
+                        preserve_representation_length,
+                        Some(&ingress_url),
+                    )
                 }
                 Err(error) => internal_do_worker_error(error),
             }
@@ -2201,11 +2323,16 @@ async fn handle_ingress(
         Err(response) => return response,
     };
     let preserve_representation_length = method.eq_ignore_ascii_case("HEAD");
+    let ingress_url = url.clone();
     match app
         .fetch_worker(url, method, body, headers, connection)
         .await
     {
-        Ok(worker_response) => runtime_response(worker_response, preserve_representation_length),
+        Ok(worker_response) => runtime_response(
+            worker_response,
+            preserve_representation_length,
+            Some(&ingress_url),
+        ),
         Err(error) if request_body_limit_error(&error) => {
             response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
         }

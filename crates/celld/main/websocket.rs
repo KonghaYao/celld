@@ -839,7 +839,7 @@ pub(crate) async fn handle_websocket(mut request: Request<Incoming>, app: AppHan
                     status: worker_response.status,
                 },
             );
-            return runtime_response(worker_response, false);
+            return runtime_response(worker_response, false, None);
         }
     };
     let target = match &websocket {
