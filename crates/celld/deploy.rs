@@ -15,11 +15,10 @@ use crate::bucket::Bucket;
 use crate::note;
 use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, AssetRoutesConfig,
-    DeployPointer, Manifest,
-    ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig, QueueConsumerDeployment,
-    Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_KV_V1,
-    FEATURE_IMAGES_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1,
-    FEATURE_WORKFLOWS_V1,
+    DeployPointer, Manifest, ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig,
+    QueueConsumerDeployment, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_BINARY_V1,
+    FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_IMAGES_V1, FEATURE_KV_V1, FEATURE_QUEUES_V1,
+    FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
     QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
@@ -29,11 +28,24 @@ use futures_util::{stream, StreamExt, TryStreamExt};
 use serde_json::{json, Map, Value};
 use sha2::Digest;
 use sha2::Sha256;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+
+static NO_BUNDLE_STATIC_IMPORT_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"import\s*(?:type\s+)?(?:\{[^}]*\}|[^'"(;\n]+?)\s*from\s*['"]([^'"]+)['"]"#)
+        .unwrap()
+});
+static NO_BUNDLE_SIDE_EFFECT_IMPORT_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#"(?m)import\s*['"]([^'"]+)['"]\s*(?:;|\s*$)"#).unwrap());
+static NO_BUNDLE_DYNAMIC_IMPORT_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#"import\s*\(\s*['"]([^'"]+)['"]"#).unwrap());
+static NO_BUNDLE_EXPORT_FROM_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"export\s+(?:\*|\{[^}]*\})\s*from\s*['"]([^'"]+)['"]"#).unwrap()
+});
 
 /// Config keys we understand. Anything else is an error: refusing is
 /// compat-safe, guessing produces confusing activation failures later.
@@ -456,16 +468,17 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                 let path = root.join(entry);
                 let bundle = std::fs::read(&path)
                     .with_context(|| format!("read entry point {}", path.display()))?;
-                let wasm_dir = path
+                let sibling_dir = path
                     .parent()
                     .filter(|dir| !dir.as_os_str().is_empty())
                     .unwrap_or(&root);
-                let wasm = read_wasm_modules_from_dir(wasm_dir)?;
-                let sibling_js = read_js_modules_from_dir(wasm_dir, &path)?;
+                let (sibling_js, wasm, binary) =
+                    collect_no_bundle_siblings(sibling_dir, &path, &bundle)?;
                 Ok(BundleOutput {
                     bundle,
                     wasm,
                     sibling_js,
+                    binary,
                 })
             } else {
                 run_esbuild(&root, entry)
@@ -477,17 +490,21 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     // esbuild emits one JS module plus a copy of every wasm file the bundle
     // imports; the copies ship as sibling modules.
     let module_name = "index.js".to_string();
-    let (mut modules, wasm_modules, sibling_js) = match bundle {
+    let (mut modules, wasm_modules, sibling_js, binary_modules) = match bundle {
         Some(output) => (
             vec![(module_name.clone(), output.bundle)],
             output.wasm,
             output.sibling_js,
+            output.binary,
         ),
-        None => (Vec::new(), Vec::new(), Vec::new()),
+        None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
     };
-    let wasm_names: BTreeSet<String> = wasm_modules.iter().map(|(name, _)| name.clone()).collect();
     modules.extend(sibling_js);
     modules.extend(wasm_modules);
+    modules.extend(binary_modules);
+    if project.no_bundle {
+        validate_no_bundle_module_closure(&modules)?;
+    }
     // Identity is over the exact metadata bytes the manifest retains, so the
     // serialization happens once and is reused for both.
     let metadata_json = serde_json::to_vec(&project.metadata)?;
@@ -522,7 +539,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                 name: name.clone(),
                 bytes: bytes.len(),
                 sha256: format!("{:x}", Sha256::digest(bytes))[..16].to_string(),
-                kind: wasm_names.contains(name).then_some(ModuleKind::Wasm),
+                kind: module_kind_for_deploy_name(name),
             })
             .collect(),
         assets: asset_reference,
@@ -560,8 +577,17 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             if sqlite_vec {
                 features.push(FEATURE_SQLITE_VEC_V1.to_string());
             }
-            if !wasm_names.is_empty() {
+            if modules
+                .iter()
+                .any(|(name, _)| module_kind_for_deploy_name(name) == Some(ModuleKind::Wasm))
+            {
                 features.push(FEATURE_WASM_V1.to_string());
+            }
+            if modules
+                .iter()
+                .any(|(name, _)| module_kind_for_deploy_name(name) == Some(ModuleKind::Binary))
+            {
+                features.push(FEATURE_BINARY_V1.to_string());
             }
             features
         },
@@ -2032,10 +2058,7 @@ fn read_routes_json(directory: &Path) -> anyhow::Result<Option<AssetRoutesConfig
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let object: Map<String, Value> =
         serde_json::from_str(&contents).context("parse _routes.json")?;
-    let version = object
-        .get("version")
-        .and_then(Value::as_u64)
-        .unwrap_or(1);
+    let version = object.get("version").and_then(Value::as_u64).unwrap_or(1);
     if version != 1 {
         bail!("unsupported _routes.json version: {version}");
     }
@@ -2187,7 +2210,9 @@ fn collect_asset_files(
                 entry.path().display()
             );
         }
-        if relative.is_empty() && matches!(name.as_str(), "_headers" | "_redirects" | "_routes.json") {
+        if relative.is_empty()
+            && matches!(name.as_str(), "_headers" | "_redirects" | "_routes.json")
+        {
             continue;
         }
         if name.contains(['\\', '\0']) {
@@ -2265,6 +2290,8 @@ struct BundleOutput {
     wasm: Vec<(String, Vec<u8>)>,
     /// Extra ESM modules beside the entry (wrangler `no_bundle` outdir).
     sibling_js: Vec<(String, Vec<u8>)>,
+    /// Binary sibling modules (Wrangler `Data` rule, e.g. `.bin` font blobs).
+    binary: Vec<(String, Vec<u8>)>,
 }
 
 fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
@@ -2322,6 +2349,7 @@ fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
         bundle,
         wasm,
         sibling_js: Vec::new(),
+        binary: Vec::new(),
     })
 }
 
@@ -2329,20 +2357,20 @@ fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
 /// `copy` loader and wrangler pre-bundles use for `import x from "./x.wasm"`.
 fn read_wasm_modules_from_dir(dir: &Path) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     let mut wasm = Vec::new();
-    for dirent in std::fs::read_dir(dir)
-        .with_context(|| format!("read wasm directory {}", dir.display()))?
+    for dirent in
+        std::fs::read_dir(dir).with_context(|| format!("read wasm directory {}", dir.display()))?
     {
         let path = dirent?.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("wasm") {
-            continue;
-        }
         let name = path
             .file_name()
             .expect("read_dir entries have a file name")
             .to_string_lossy()
             .into_owned();
-        let bytes = std::fs::read(&path)
-            .with_context(|| format!("read wasm module {}", path.display()))?;
+        if !is_wasm_module_name(&name) {
+            continue;
+        }
+        let bytes =
+            std::fs::read(&path).with_context(|| format!("read wasm module {}", path.display()))?;
         wasm.push((name, bytes));
     }
     // read_dir order is platform-defined; the deployment version hashes the
@@ -2351,47 +2379,212 @@ fn read_wasm_modules_from_dir(dir: &Path) -> anyhow::Result<Vec<(String, Vec<u8>
     Ok(wasm)
 }
 
-/// Wrangler `no_bundle` outdirs ship many ESM files (e.g. Waku `assets/*.js`).
-/// Module names are paths relative to `dir`, using `/` separators.
-fn read_js_modules_from_dir(dir: &Path, entry: &Path) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
-    let mut modules = Vec::new();
-    let entry_canon = entry.canonicalize().ok();
-    collect_js_modules(dir, dir, entry_canon.as_ref(), &mut modules)?;
-    modules.sort();
-    Ok(modules)
+fn is_wasm_module_name(name: &str) -> bool {
+    name.ends_with(".wasm") || name.ends_with(".wasm?module")
 }
 
-fn collect_js_modules(
+fn is_binary_module_name(name: &str) -> bool {
+    // OpenNext / Next dry-run workers may `import("./.next/*.json")` as data modules.
+    name.ends_with(".bin") || name.ends_with(".json")
+}
+
+fn module_kind_for_deploy_name(name: &str) -> Option<ModuleKind> {
+    if is_wasm_module_name(name) {
+        Some(ModuleKind::Wasm)
+    } else if is_binary_module_name(name) {
+        Some(ModuleKind::Binary)
+    } else {
+        None
+    }
+}
+
+fn collect_no_bundle_siblings(
     root: &Path,
-    current: &Path,
-    entry_canon: Option<&std::path::PathBuf>,
-    out: &mut Vec<(String, Vec<u8>)>,
-) -> anyhow::Result<()> {
-    for dirent in std::fs::read_dir(current)
-        .with_context(|| format!("read module directory {}", current.display()))?
+    entry: &Path,
+    entry_bytes: &[u8],
+) -> anyhow::Result<(
+    Vec<(String, Vec<u8>)>,
+    Vec<(String, Vec<u8>)>,
+    Vec<(String, Vec<u8>)>,
+)> {
+    let root_canon = root
+        .canonicalize()
+        .with_context(|| format!("resolve module root {}", root.display()))?;
+    let entry_canon = entry
+        .canonicalize()
+        .with_context(|| format!("resolve entry module {}", entry.display()))?;
+    if !entry_canon.starts_with(&root_canon) {
+        bail!(
+            "no_bundle entry module {} escapes deployment root {}",
+            entry.display(),
+            root.display()
+        );
+    }
+
+    let mut js = Vec::new();
+    let mut wasm = Vec::new();
+    let mut binary = Vec::new();
+    let mut pending = VecDeque::from([("index.js".to_string(), entry_bytes.to_vec())]);
+    let mut visited = BTreeSet::from(["index.js".to_string()]);
+
+    while let Some((referrer, bytes)) = pending.pop_front() {
+        let src = std::str::from_utf8(&bytes)
+            .with_context(|| format!("no_bundle JavaScript module {referrer:?} is not UTF-8"))?;
+        for spec in scan_no_bundle_relative_specs(src) {
+            let resolved = match resolve_no_bundle_relative_spec(&referrer, &spec) {
+                NoBundleRelativeResolve::Skip => continue,
+                NoBundleRelativeResolve::RootEscape(escape) => {
+                    bail!(
+                        "no_bundle deployment module {spec:?} from {referrer:?} escapes deployment root ({escape:?})"
+                    );
+                }
+                NoBundleRelativeResolve::Resolved(resolved) => resolved,
+            };
+            if !visited.insert(resolved.clone()) {
+                continue;
+            }
+
+            let path = root.join(&resolved);
+            let path_canon = path.canonicalize().with_context(|| {
+                format!(
+                    "no_bundle deployment references missing module {spec:?} imported from {referrer:?} (resolved to {resolved:?})"
+                )
+            })?;
+            if !path_canon.starts_with(&root_canon) {
+                bail!(
+                    "no_bundle deployment module {spec:?} from {referrer:?} resolves outside deployment root"
+                );
+            }
+            if !path_canon.is_file() {
+                bail!(
+                    "no_bundle deployment module {spec:?} from {referrer:?} does not resolve to a file ({resolved:?})"
+                );
+            }
+            let bytes = std::fs::read(&path_canon)
+                .with_context(|| format!("read no_bundle module {}", path.display()))?;
+            if resolved.ends_with(".js") || resolved.ends_with(".mjs") || resolved.ends_with(".cjs")
+            {
+                pending.push_back((resolved.clone(), bytes.clone()));
+                js.push((resolved, bytes));
+            } else if is_wasm_module_name(&resolved) {
+                wasm.push((resolved, bytes));
+            } else if is_binary_module_name(&resolved) {
+                binary.push((resolved, bytes));
+            } else {
+                bail!(
+                    "no_bundle deployment references unsupported module {spec:?} imported from {referrer:?} (resolved to {resolved:?})"
+                );
+            }
+        }
+    }
+
+    js.sort();
+    wasm.sort();
+    binary.sort();
+    Ok((js, wasm, binary))
+}
+
+fn is_no_bundle_external_spec(spec: &str) -> bool {
+    if spec.starts_with("node:")
+        || spec.starts_with("cloudflare:")
+        || spec.starts_with("http://")
+        || spec.starts_with("https://")
     {
-        let dirent = dirent?;
-        let path = dirent.path();
-        if path.is_dir() {
-            collect_js_modules(root, &path, entry_canon, out)?;
+        return true;
+    }
+    !spec.starts_with("./") && !spec.starts_with("../")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NoBundleRelativeResolve {
+    Skip,
+    Resolved(String),
+    RootEscape(String),
+}
+
+fn resolve_no_bundle_relative_spec(referrer: &str, spec: &str) -> NoBundleRelativeResolve {
+    if is_no_bundle_external_spec(spec) || spec.starts_with('/') {
+        return NoBundleRelativeResolve::Skip;
+    }
+    if !spec.starts_with("./") && !spec.starts_with("../") {
+        return NoBundleRelativeResolve::Skip;
+    }
+    let base = referrer.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let mut segments: Vec<&str> = if base.is_empty() {
+        Vec::new()
+    } else {
+        base.split('/').filter(|part| !part.is_empty()).collect()
+    };
+    let mut path = spec;
+    while path.starts_with("./") {
+        path = &path[2..];
+    }
+    for component in path.split('/') {
+        if component.is_empty() || component == "." {
             continue;
         }
-        let Some(ext) = path.extension().and_then(|extension| extension.to_str()) else {
+        if component == ".." {
+            if segments.is_empty() {
+                return NoBundleRelativeResolve::RootEscape(spec.to_string());
+            }
+            segments.pop();
+            continue;
+        }
+        segments.push(component);
+    }
+    if segments.is_empty() {
+        return NoBundleRelativeResolve::RootEscape(spec.to_string());
+    }
+    NoBundleRelativeResolve::Resolved(segments.join("/"))
+}
+
+fn scan_no_bundle_relative_specs(src: &str) -> Vec<String> {
+    let mut specs = Vec::new();
+    for re in [
+        &*NO_BUNDLE_STATIC_IMPORT_RE,
+        &*NO_BUNDLE_SIDE_EFFECT_IMPORT_RE,
+        &*NO_BUNDLE_DYNAMIC_IMPORT_RE,
+        &*NO_BUNDLE_EXPORT_FROM_RE,
+    ] {
+        for cap in re.captures_iter(src) {
+            let idx = cap.len().saturating_sub(1);
+            specs.push(cap[idx].to_string());
+        }
+    }
+    specs
+}
+
+fn validate_no_bundle_module_closure(modules: &[(String, Vec<u8>)]) -> anyhow::Result<()> {
+    let published: BTreeSet<String> = modules.iter().map(|(name, _)| name.clone()).collect();
+    for (referrer, bytes) in modules {
+        let Ok(src) = std::str::from_utf8(bytes) else {
             continue;
         };
-        if ext != "js" && ext != "mjs" && ext != "cjs" {
+        if !referrer.ends_with(".js") && !referrer.ends_with(".mjs") && !referrer.ends_with(".cjs")
+        {
             continue;
         }
-        if entry_canon.is_some_and(|entry| path.canonicalize().ok().as_ref() == Some(entry)) {
-            continue;
+        for spec in scan_no_bundle_relative_specs(src) {
+            if is_no_bundle_external_spec(&spec) {
+                continue;
+            }
+            match resolve_no_bundle_relative_spec(referrer, &spec) {
+                NoBundleRelativeResolve::Skip => continue,
+                NoBundleRelativeResolve::RootEscape(escape) => {
+                    bail!(
+                        "no_bundle deployment module {spec:?} from {referrer:?} escapes deployment root ({escape:?})"
+                    );
+                }
+                NoBundleRelativeResolve::Resolved(resolved) => {
+                    if published.contains(&resolved) {
+                        continue;
+                    }
+                    bail!(
+                        "no_bundle deployment references missing module {spec:?} imported from {referrer:?} (resolved to {resolved:?})"
+                    );
+                }
+            }
         }
-        let rel = path
-            .strip_prefix(root)
-            .with_context(|| format!("module {} outside {}", path.display(), root.display()))?;
-        let name = rel.to_string_lossy().replace('\\', "/");
-        let bytes = std::fs::read(&path)
-            .with_context(|| format!("read module {}", path.display()))?;
-        out.push((name, bytes));
     }
     Ok(())
 }
@@ -2488,7 +2681,11 @@ mod no_bundle_wasm_tests {
         })
         .unwrap();
 
-        let names: Vec<_> = built.modules.iter().map(|(name, _)| name.as_str()).collect();
+        let names: Vec<_> = built
+            .modules
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
         assert!(names.contains(&"index.js"));
         assert!(names.contains(&"one.wasm"));
         let wasm_module = built
@@ -2532,9 +2729,376 @@ mod no_bundle_wasm_tests {
         })
         .unwrap();
 
-        let names: Vec<_> = built.modules.iter().map(|(name, _)| name.as_str()).collect();
+        let names: Vec<_> = built
+            .modules
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
         assert!(names.contains(&"index.js"));
         assert!(names.contains(&"lib/helper.js"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_bundle_rejects_sibling_symlink_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("wrangler.jsonc"),
+            r#"{
+            "name": "symlink-escape-fixture",
+            "main": "index.js",
+            "no_bundle": true,
+            "compatibility_date": "2024-01-01"
+        }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("index.js"),
+            r#"import value from "./escape.js"; export default value;"#,
+        )
+        .unwrap();
+        fs::write(outside.path().join("escape.js"), "export default 42;").unwrap();
+        symlink(outside.path().join("escape.js"), root.join("escape.js")).unwrap();
+
+        let error = match build(&Options {
+            config: Some(root.join("wrangler.jsonc")),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            dry_run: false,
+            json: false,
+        }) {
+            Ok(_) => panic!("symlink escaping the deployment root must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("resolves outside deployment root"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn no_bundle_preserves_wasm_module_query_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let wasm_name = "abc-resvg.wasm?module";
+        fs::write(
+            root.join("wrangler.jsonc"),
+            r#"{
+            "name": "wasm-query-fixture",
+            "main": "index.js",
+            "no_bundle": true,
+            "compatibility_date": "2024-01-01"
+        }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("index.js"),
+            format!(r#"import m from "./{wasm_name}"; export default m;"#),
+        )
+        .unwrap();
+        fs::write(root.join(wasm_name), b"\0asm\x01\0\0\0\0\0\0\0").unwrap();
+
+        let built = build(&Options {
+            config: Some(root.join("wrangler.jsonc")),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            dry_run: false,
+            json: false,
+        })
+        .unwrap();
+
+        assert!(built.modules.iter().any(|(name, _)| name == wasm_name));
+        let wasm_module = built
+            .manifest
+            .modules
+            .iter()
+            .find(|module| module.name == wasm_name)
+            .unwrap();
+        assert_eq!(wasm_module.kind, Some(ModuleKind::Wasm));
+        assert!(built
+            .manifest
+            .required_features
+            .iter()
+            .any(|feature| feature == crate::protocol::FEATURE_WASM_V1));
+    }
+
+    #[test]
+    fn no_bundle_includes_binary_sibling_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let bin_name = "font.ttf.bin";
+        fs::write(
+            root.join("wrangler.jsonc"),
+            r#"{
+            "name": "bin-fixture",
+            "main": "index.js",
+            "no_bundle": true,
+            "compatibility_date": "2024-01-01"
+        }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("index.js"),
+            format!(r#"export default async () => (await import("./{bin_name}")).default;"#),
+        )
+        .unwrap();
+        fs::write(root.join(bin_name), &[0u8, 1, 2, 255]).unwrap();
+
+        let built = build(&Options {
+            config: Some(root.join("wrangler.jsonc")),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            dry_run: false,
+            json: false,
+        })
+        .unwrap();
+
+        let bin_module = built
+            .manifest
+            .modules
+            .iter()
+            .find(|module| module.name == bin_name)
+            .unwrap();
+        assert_eq!(bin_module.kind, Some(ModuleKind::Binary));
+        assert!(built
+            .manifest
+            .required_features
+            .iter()
+            .any(|feature| feature == crate::protocol::FEATURE_BINARY_V1));
+    }
+
+    #[test]
+    fn no_bundle_includes_json_sibling_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("wrangler.jsonc"),
+            r#"{
+            "name": "json-fixture",
+            "main": "index.js",
+            "no_bundle": true,
+            "compatibility_date": "2024-01-01"
+        }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("index.js"),
+            r#"export default async () => (await import("./.next/prerender-manifest.json")).version;"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join(".next")).unwrap();
+        fs::write(
+            root.join(".next/prerender-manifest.json"),
+            r#"{"version":4,"routes":{}}"#,
+        )
+        .unwrap();
+
+        let built = build(&Options {
+            config: Some(root.join("wrangler.jsonc")),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            dry_run: false,
+            json: false,
+        })
+        .unwrap();
+
+        let json_module = built
+            .manifest
+            .modules
+            .iter()
+            .find(|module| module.name == ".next/prerender-manifest.json")
+            .unwrap();
+        assert_eq!(json_module.kind, Some(ModuleKind::Binary));
+    }
+
+    #[test]
+    fn no_bundle_includes_only_reachable_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("wrangler.jsonc"),
+            r#"{
+            "name": "closure-fixture",
+            "main": "index.js",
+            "no_bundle": true,
+            "compatibility_date": "2024-01-01"
+        }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("index.js"),
+            r#"import value from "./lib/reachable.js"; export default value;"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("lib")).unwrap();
+        fs::write(
+            root.join("lib/reachable.js"),
+            r#"import bytes from "../font.bin"; export default bytes;"#,
+        )
+        .unwrap();
+        fs::write(root.join("font.bin"), [1_u8, 2, 3]).unwrap();
+        fs::write(root.join("unreferenced.js"), "export default 99;").unwrap();
+
+        let built = build(&Options {
+            config: Some(root.join("wrangler.jsonc")),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            dry_run: false,
+            json: false,
+        })
+        .unwrap();
+
+        let names = built
+            .modules
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"index.js"), "{names:?}");
+        assert!(names.contains(&"lib/reachable.js"), "{names:?}");
+        assert!(names.contains(&"font.bin"), "{names:?}");
+        assert!(!names.contains(&"unreferenced.js"), "{names:?}");
+    }
+
+    #[test]
+    fn no_bundle_missing_relative_module_is_diagnosed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("wrangler.jsonc"),
+            r#"{
+            "name": "missing-fixture",
+            "main": "index.js",
+            "no_bundle": true,
+            "compatibility_date": "2024-01-01"
+        }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("index.js"),
+            r#"import "./missing-chunk.js"; export default {};"#,
+        )
+        .unwrap();
+
+        let error = match build(&Options {
+            config: Some(root.join("wrangler.jsonc")),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            dry_run: false,
+            json: false,
+        }) {
+            Ok(_) => panic!("expected missing module error"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("missing module"), "{error}");
+        assert!(error.contains("./missing-chunk.js"), "{error}");
+    }
+
+    #[test]
+    fn no_bundle_scanner_finds_reexport_and_compact_static_import() {
+        let src = r#"
+import{foo}from"./chunk.js";
+export { bar } from "./reexport.js";
+export * from "./star.js";
+"#;
+        let specs = scan_no_bundle_relative_specs(src);
+        assert!(specs.contains(&"./chunk.js".to_string()), "{specs:?}");
+        assert!(specs.contains(&"./reexport.js".to_string()), "{specs:?}");
+        assert!(specs.contains(&"./star.js".to_string()), "{specs:?}");
+    }
+
+    #[test]
+    fn no_bundle_scanner_finds_side_effect_import_without_semicolon() {
+        let src = "import \"./polyfill.js\"\nexport default 1;\n";
+        let specs = scan_no_bundle_relative_specs(src);
+        assert_eq!(specs, vec!["./polyfill.js".to_string()]);
+    }
+
+    #[test]
+    fn no_bundle_resolve_allows_lexical_parent_segment() {
+        match resolve_no_bundle_relative_spec("lib/sub/index.js", "../helper.js") {
+            NoBundleRelativeResolve::Resolved(resolved) => {
+                assert_eq!(resolved, "lib/helper.js");
+            }
+            other => panic!("expected resolved path, got {other:?}"),
+        }
+        match resolve_no_bundle_relative_spec("lib/sub/index.js", "./../peer.js") {
+            NoBundleRelativeResolve::Resolved(resolved) => {
+                assert_eq!(resolved, "lib/peer.js");
+            }
+            other => panic!("expected resolved path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_bundle_root_escape_is_rejected_at_validate() {
+        let modules = vec![(
+            "index.js".to_string(),
+            br#"import x from "../../outside.js"; export default x;"#.to_vec(),
+        )];
+        let error = validate_no_bundle_module_closure(&modules)
+            .expect_err("expected root escape")
+            .to_string();
+        assert!(error.contains("escapes deployment root"), "{error}");
+        assert!(error.contains("../../outside.js"), "{error}");
+        assert!(error.contains("index.js"), "{error}");
+    }
+
+    #[test]
+    fn no_bundle_wasm_module_query_still_scanned_for_closure() {
+        let src = r#"import m from "./abc-resvg.wasm?module"; export default m;"#;
+        let specs = scan_no_bundle_relative_specs(src);
+        assert!(
+            specs.iter().any(|spec| spec == "./abc-resvg.wasm?module"),
+            "{specs:?}"
+        );
+    }
+
+    #[test]
+    fn no_bundle_reexport_closure_requires_target_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("wrangler.jsonc"),
+            r#"{
+            "name": "reexport-missing",
+            "main": "index.js",
+            "no_bundle": true,
+            "compatibility_date": "2024-01-01"
+        }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("index.js"),
+            r#"export { x } from "./missing.js"; export default {};"#,
+        )
+        .unwrap();
+
+        let error = match build(&Options {
+            config: Some(root.join("wrangler.jsonc")),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            dry_run: false,
+            json: false,
+        }) {
+            Ok(_) => panic!("expected missing reexport target"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("missing module"), "{error}");
+        assert!(error.contains("./missing.js"), "{error}");
     }
 
     #[test]
