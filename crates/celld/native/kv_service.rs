@@ -98,11 +98,21 @@ impl KvHostService {
     }
 }
 
+/// __KvNamespaceCell.fetch returns `Response.json({ result })`; operator RPC
+/// callers unwrap that envelope before reading fields.
+fn kv_cell_payload(envelope: &Value) -> &Value {
+    envelope.get("result").unwrap_or(envelope)
+}
+
 fn decode_operator_response(body: &[u8], request: &Value) -> Result<Option<Vec<u8>>, KvError> {
     if request.get("op").and_then(Value::as_str) != Some("get") {
         return Ok(None);
     }
-    let value: Value = serde_json::from_slice(body).map_err(|_| KvError::Unavailable)?;
+    let envelope: Value = serde_json::from_slice(body).map_err(|_| KvError::Unavailable)?;
+    if envelope.get("error").is_some() {
+        return Err(KvError::Unavailable);
+    }
+    let value = kv_cell_payload(&envelope);
     if value.get("found").and_then(Value::as_bool) != Some(true) {
         return Ok(None);
     }
@@ -137,5 +147,16 @@ mod tests {
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         drop(CancelOnDrop(Some(tx)));
         assert!(rx.try_recv().is_ok() || rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn decode_get_unwraps_result_envelope() {
+        let request = json!({ "op": "get", "key": "k" });
+        let body = serde_json::to_vec(&json!({
+            "result": { "found": true, "value": [110, 97, 116, 105, 118, 101] }
+        }))
+        .expect("json");
+        let got = decode_operator_response(&body, &request).expect("decode");
+        assert_eq!(got, Some(b"native".to_vec()));
     }
 }
