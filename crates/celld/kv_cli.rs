@@ -417,10 +417,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             out.finish()?;
         }
         Action::Branch { parent_bucket } => {
-            let project_id = crate::cell_branch::branch_cli_project_id(
-                "",
-                Some(&storage.bucket),
-            );
+            let project_id = crate::cell_branch::branch_cli_project_id("", Some(&storage.bucket));
             crate::cell_branch::validate_parent_bucket(&parent_bucket, &project_id)
                 .map_err(|error| anyhow!("{error}"))?;
             let result = namespace
@@ -432,7 +429,10 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                 out.row(&BranchReply(result))?;
                 out.finish()?;
             } else {
-                let fork_txid = result.get("fork_txid").and_then(Value::as_u64).unwrap_or_default();
+                let fork_txid = result
+                    .get("fork_txid")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
                 let bytes_parent = result
                     .get("bytes_parent")
                     .and_then(Value::as_u64)
@@ -701,79 +701,79 @@ impl Command {
             if !positional.is_empty() {
                 bail!("celld kv branch takes no positional arguments besides the namespace id");
             }
-            let parent_bucket = parent_bucket
-                .ok_or_else(|| anyhow!("celld kv branch requires --parent-bucket"))?;
+            let parent_bucket =
+                parent_bucket.ok_or_else(|| anyhow!("celld kv branch requires --parent-bucket"))?;
             Action::Branch { parent_bucket }
         } else {
             match verb.as_str() {
-            "get" => {
-                refuse("--path", file.is_some())?;
-                refuse("--ttl", expiration_ttl.is_some())?;
-                refuse("--metadata", metadata.is_some())?;
-                let [key] = positional.as_slice() else {
-                    bail!("celld kv get needs exactly one key");
-                };
-                Action::Get { key: key.clone() }
-            }
-            "put" => {
-                let key = positional
-                    .first()
-                    .ok_or_else(|| anyhow!("celld kv put needs a key"))?
-                    .clone();
-                let inline = positional.get(1).cloned();
-                if inline.is_some() == file.is_some() {
-                    bail!("celld kv put requires exactly one of a value or --path");
+                "get" => {
+                    refuse("--path", file.is_some())?;
+                    refuse("--ttl", expiration_ttl.is_some())?;
+                    refuse("--metadata", metadata.is_some())?;
+                    let [key] = positional.as_slice() else {
+                        bail!("celld kv get needs exactly one key");
+                    };
+                    Action::Get { key: key.clone() }
                 }
-                if positional.len() > 2 {
-                    bail!("celld kv put takes one key and at most one value");
+                "put" => {
+                    let key = positional
+                        .first()
+                        .ok_or_else(|| anyhow!("celld kv put needs a key"))?
+                        .clone();
+                    let inline = positional.get(1).cloned();
+                    if inline.is_some() == file.is_some() {
+                        bail!("celld kv put requires exactly one of a value or --path");
+                    }
+                    if positional.len() > 2 {
+                        bail!("celld kv put takes one key and at most one value");
+                    }
+                    Action::Put {
+                        key,
+                        value: inline,
+                        file,
+                        expiration_ttl,
+                        expiration,
+                        metadata,
+                    }
                 }
-                Action::Put {
-                    key,
-                    value: inline,
-                    file,
-                    expiration_ttl,
-                    expiration,
-                    metadata,
+                "delete" => {
+                    refuse("--path", file.is_some())?;
+                    if positional.is_empty() {
+                        bail!("celld kv delete needs at least one key");
+                    }
+                    Action::Delete { keys: positional }
                 }
-            }
-            "delete" => {
-                refuse("--path", file.is_some())?;
-                if positional.is_empty() {
-                    bail!("celld kv delete needs at least one key");
+                "list" => {
+                    refuse("--path", file.is_some())?;
+                    if !positional.is_empty() {
+                        bail!("celld kv list takes no positional arguments; use --prefix");
+                    }
+                    Action::List {
+                        prefix,
+                        bounds: bounds.clone(),
+                        json,
+                    }
                 }
-                Action::Delete { keys: positional }
-            }
-            "list" => {
-                refuse("--path", file.is_some())?;
-                if !positional.is_empty() {
-                    bail!("celld kv list takes no positional arguments; use --prefix");
+                "info" => {
+                    if !positional.is_empty() {
+                        bail!("celld kv info takes no positional arguments");
+                    }
+                    Action::Info
                 }
-                Action::List {
-                    prefix,
-                    bounds: bounds.clone(),
-                    json,
+                "bulk-get" => Action::BulkGet {
+                    file: file.or_else(|| positional.first().map(PathBuf::from)),
+                },
+                "bulk-put" | "bulk-delete" => {
+                    let path = file
+                        .or_else(|| positional.first().map(PathBuf::from))
+                        .ok_or_else(|| anyhow!("celld kv {verb} needs a file"))?;
+                    if verb == "bulk-put" {
+                        Action::BulkPut { file: path }
+                    } else {
+                        Action::BulkDelete { file: path }
+                    }
                 }
-            }
-            "info" => {
-                if !positional.is_empty() {
-                    bail!("celld kv info takes no positional arguments");
-                }
-                Action::Info
-            }
-            "bulk-get" => Action::BulkGet {
-                file: file.or_else(|| positional.first().map(PathBuf::from)),
-            },
-            "bulk-put" | "bulk-delete" => {
-                let path = file
-                    .or_else(|| positional.first().map(PathBuf::from))
-                    .ok_or_else(|| anyhow!("celld kv {verb} needs a file"))?;
-                if verb == "bulk-put" {
-                    Action::BulkPut { file: path }
-                } else {
-                    Action::BulkDelete { file: path }
-                }
-            }
-            _ => unreachable!("the verb was matched above"),
+                _ => unreachable!("the verb was matched above"),
             }
         };
         bounds.validate()?;

@@ -55,7 +55,10 @@ fn overlays() -> &'static Mutex<HashMap<String, OverlayState>> {
     OVERLAYS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub async fn load_overlay(child: &Bucket, bucket_name: &str) -> anyhow::Result<Option<ValidatedParentBucket>> {
+pub async fn load_overlay(
+    child: &Bucket,
+    bucket_name: &str,
+) -> anyhow::Result<Option<ValidatedParentBucket>> {
     if let Some(state) = overlays().lock().unwrap().get(bucket_name) {
         return Ok(Some(state.parent.clone()));
     }
@@ -64,7 +67,8 @@ pub async fn load_overlay(child: &Bucket, bucket_name: &str) -> anyhow::Result<O
         return Ok(None);
     };
     let pointer: R2OverlayPointer = serde_json::from_slice(&bytes)?;
-    let project_id = cell_branch::runtime_project_id().map_err(|error| anyhow::anyhow!("{error}"))?;
+    let project_id =
+        cell_branch::runtime_project_id().map_err(|error| anyhow::anyhow!("{error}"))?;
     let parent = validate_parent_bucket(&pointer.parent_bucket, &project_id)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let store = open_parent_bucket(&parent)?;
@@ -79,17 +83,29 @@ pub async fn load_overlay(child: &Bucket, bucket_name: &str) -> anyhow::Result<O
 }
 
 pub async fn parent_store(bucket_name: &str) -> Option<Bucket> {
-    overlays().lock().unwrap().get(bucket_name).map(|state| state.store.clone())
+    overlays()
+        .lock()
+        .unwrap()
+        .get(bucket_name)
+        .map(|state| state.store.clone())
 }
 
-pub async fn is_tombstoned(child: &Bucket, bucket_name: &str, object_key: &str) -> anyhow::Result<bool> {
+pub async fn is_tombstoned(
+    child: &Bucket,
+    bucket_name: &str,
+    object_key: &str,
+) -> anyhow::Result<bool> {
     Ok(child
         .head(&r2_tombstone_key(bucket_name, object_key))
         .await?
         .is_some())
 }
 
-pub async fn write_tombstone(child: &Bucket, bucket_name: &str, object_key: &str) -> anyhow::Result<()> {
+pub async fn write_tombstone(
+    child: &Bucket,
+    bucket_name: &str,
+    object_key: &str,
+) -> anyhow::Result<()> {
     child
         .put(
             &r2_tombstone_key(bucket_name, object_key),

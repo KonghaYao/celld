@@ -1703,9 +1703,9 @@ fn request_url(parts: &hyper::http::request::Parts, trust_forwarded_headers: boo
         .and_then(canonical)
         .unwrap_or("http");
     let path_and_query = ingress_path_and_query(parts);
-    celld::opennext_compat::normalize_worker_request_url(
-        &ensure_absolute_url(&format!("{scheme}://{host}{path_and_query}")),
-    )
+    celld::opennext_compat::normalize_worker_request_url(&ensure_absolute_url(&format!(
+        "{scheme}://{host}{path_and_query}"
+    )))
 }
 
 #[cfg(test)]
@@ -1901,9 +1901,11 @@ async fn dispatch_cell_fetch(
     }
     let _hangup = HangUp(Some(cancel_tx));
     match receive.await {
-        Ok(Ok(worker_response)) => {
-            runtime_response(worker_response, preserve_representation_length, Some(&ingress_url))
-        }
+        Ok(Ok(worker_response)) => runtime_response(
+            worker_response,
+            preserve_representation_length,
+            Some(&ingress_url),
+        ),
         Ok(Err(error)) if request_body_limit_error(&error) => {
             response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
         }
@@ -3738,6 +3740,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     assets: None,
                     services: Vec::new(),
                     crons,
+                    native: None,
                 }),
                 GenerationOptions {
                     loader_binding: worker_loader_binding(),

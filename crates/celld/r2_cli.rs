@@ -554,7 +554,12 @@ mod tests {
 
     #[test]
     fn bulk_manifest_rejects_noncanonical_keys() {
-        for key in ["/leading", "trailing/", "two//segments", "relative/../segment"] {
+        for key in [
+            "/leading",
+            "trailing/",
+            "two//segments",
+            "relative/../segment",
+        ] {
             let error = validate_object_key(key).unwrap_err();
             assert!(error.to_string().contains("must be canonical"), "{error}");
         }

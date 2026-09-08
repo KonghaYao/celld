@@ -77,8 +77,7 @@ fn rsa_public_from_args(args: &serde_json::Value) -> Result<rsa::RsaPublicKey> {
     }
     let key = crypto_bytes(args, "key")?;
     use rsa::pkcs8::DecodePublicKey;
-    rsa::RsaPublicKey::from_public_key_der(&key)
-        .map_err(|_| anyhow!("invalid RSA SPKI public key"))
+    rsa::RsaPublicKey::from_public_key_der(&key).map_err(|_| anyhow!("invalid RSA SPKI public key"))
 }
 
 fn rsa_private_from_args(args: &serde_json::Value) -> Result<rsa::RsaPrivateKey> {
@@ -1947,8 +1946,11 @@ mod tests {
 
     #[test]
     fn rsa_pss_sign_verify_roundtrip() {
-        let pair = crypto_operation("asym-key-generate", &json!({"type": "rsa", "modulusLength": 2048}))
-            .unwrap();
+        let pair = crypto_operation(
+            "asym-key-generate",
+            &json!({"type": "rsa", "modulusLength": 2048}),
+        )
+        .unwrap();
         let data: Vec<u8> = b"celld-pss".to_vec();
         let signed = crypto_operation(
             "rsa-pss-sign",
@@ -1998,8 +2000,11 @@ mod tests {
 
     #[test]
     fn rsa_pkcs1_sign_verify_roundtrip() {
-        let pair = crypto_operation("asym-key-generate", &json!({"type": "rsa", "modulusLength": 2048}))
-            .unwrap();
+        let pair = crypto_operation(
+            "asym-key-generate",
+            &json!({"type": "rsa", "modulusLength": 2048}),
+        )
+        .unwrap();
         let data: Vec<u8> = b"celld-pkcs1".to_vec();
         let signed = crypto_operation(
             "rsa-pkcs1-sign",

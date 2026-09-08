@@ -74,10 +74,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                 .await?
         }
         Action::Branch { parent_bucket } => {
-            let project_id = crate::cell_branch::branch_cli_project_id(
-                "",
-                Some(&storage.bucket),
-            );
+            let project_id = crate::cell_branch::branch_cli_project_id("", Some(&storage.bucket));
             crate::cell_branch::validate_parent_bucket(&parent_bucket, &project_id)
                 .map_err(|error| anyhow!("{error}"))?;
             queue

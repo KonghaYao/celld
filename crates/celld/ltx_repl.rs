@@ -27,14 +27,15 @@ use std::sync::Weak;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use celld_ltx::base::{self, BasePointer};
+use celld_ltx::compaction_level::SNAPSHOT_LEVEL;
 use celld_ltx::object_store::ObjectStore;
 use celld_ltx::replica;
-use celld_ltx::replica_compactor::ReplicaCompactor;
-use celld_ltx::base::{self, BasePointer};
 use celld_ltx::replica::calc_restore_plan;
+use celld_ltx::replica_compactor::ReplicaCompactor;
 use celld_ltx::ChainedReplicaClient;
+use celld_ltx::Checksum;
 use celld_ltx::Db;
-use celld_ltx::compaction_level::SNAPSHOT_LEVEL;
 use celld_ltx::HostTaskError;
 use celld_ltx::LtxHost;
 use celld_ltx::ObjectStoreClient;
@@ -42,7 +43,6 @@ use celld_ltx::ObjectStoreConfig;
 use celld_ltx::Pos;
 use celld_ltx::Replica;
 use celld_ltx::ReplicaClient;
-use celld_ltx::Checksum;
 use celld_ltx::TimestampMetadataKey;
 use celld_ltx::TXID;
 use tokio::sync::mpsc;
@@ -1268,9 +1268,11 @@ impl LtxRepl {
             if !key.contains(".ltx") {
                 continue;
             }
-            if let Some(epoch) = key.split("/ltx/e").nth(1).and_then(|rest| {
-                rest.split('/').next()?.parse::<u64>().ok()
-            }) {
+            if let Some(epoch) = key
+                .split("/ltx/e")
+                .nth(1)
+                .and_then(|rest| rest.split('/').next()?.parse::<u64>().ok())
+            {
                 epochs.insert(epoch);
             }
         }
@@ -1288,9 +1290,7 @@ impl LtxRepl {
             if self.prefix_has_min_txid_one_anchor(&client).await? {
                 return Ok(hint);
             }
-            anyhow::bail!(
-                "parent epoch {hint} for {cell} has no MinTXID==1 LTX (L0 or L9)"
-            );
+            anyhow::bail!("parent epoch {hint} for {cell} has no MinTXID==1 LTX (L0 or L9)");
         }
         let epochs = self.ltx_epochs_in_prefix(bucket_prefix, cell).await?;
         for epoch in epochs.iter().copied().rev() {
@@ -1318,20 +1318,13 @@ impl LtxRepl {
         anyhow::bail!("parent prefix has no restorable LTX for {cell}")
     }
 
-    pub(crate) async fn child_has_base_json(
-        &self,
-        cell: &str,
-        epoch: u64,
-    ) -> anyhow::Result<bool> {
+    pub(crate) async fn child_has_base_json(&self, cell: &str, epoch: u64) -> anyhow::Result<bool> {
         crate::cell_branch::read_base_json(self.store.as_ref(), &self.prefix, cell, epoch)
             .await
             .map(|value| value.is_some())
     }
 
-    pub async fn active_base_pointer(
-        &self,
-        cell: &str,
-    ) -> anyhow::Result<Option<BasePointer>> {
+    pub async fn active_base_pointer(&self, cell: &str) -> anyhow::Result<Option<BasePointer>> {
         let epoch = crate::storage::activation_epoch(cell)
             .ok_or_else(|| anyhow!("no active database for {cell}"))?;
         crate::cell_branch::read_base_json(self.store.as_ref(), &self.prefix, cell, epoch).await
@@ -1379,14 +1372,9 @@ impl LtxRepl {
         cancel_compaction(&handle);
 
         let child_client = self.client_for(cell, epoch);
-        if crate::cell_branch::read_base_json(
-            self.store.as_ref(),
-            &self.prefix,
-            cell,
-            epoch,
-        )
-        .await?
-        .is_some()
+        if crate::cell_branch::read_base_json(self.store.as_ref(), &self.prefix, cell, epoch)
+            .await?
+            .is_some()
         {
             anyhow::bail!("child prefix already has base.json");
         }
@@ -1407,8 +1395,7 @@ impl LtxRepl {
             anyhow::bail!("parent is already a branch; compact first");
         }
 
-        let parent_client =
-            self.client_for_bucket_prefix(&parent.key_prefix, cell, parent_epoch);
+        let parent_client = self.client_for_bucket_prefix(&parent.key_prefix, cell, parent_epoch);
         let parent_plan = calc_restore_plan(&parent_client, TXID(0))
             .await
             .map_err(|error| {
@@ -1421,9 +1408,9 @@ impl LtxRepl {
             .last()
             .ok_or_else(|| anyhow!("parent prefix has no restorable LTX"))?;
         let fork_txid = terminal.max_txid;
-        calc_restore_plan(&parent_client, fork_txid).await.map_err(|error| {
-            anyhow!("parent cannot restore to fork txid {fork_txid}: {error}")
-        })?;
+        calc_restore_plan(&parent_client, fork_txid)
+            .await
+            .map_err(|error| anyhow!("parent cannot restore to fork txid {fork_txid}: {error}"))?;
         let terminal_bytes = parent_client
             .open_ltx_file(terminal.level, terminal.min_txid, terminal.max_txid)
             .await
@@ -1519,7 +1506,9 @@ impl LtxRepl {
         handle.synced_seq.store(0, Ordering::SeqCst);
         handle.submitted_seq.store(0, Ordering::SeqCst);
         handle.shipped_seq.store(0, Ordering::SeqCst);
-        handle.submitted_txid.store(seed_pos.txid.0, Ordering::SeqCst);
+        handle
+            .submitted_txid
+            .store(seed_pos.txid.0, Ordering::SeqCst);
         handle.shipped_txid.store(seed_pos.txid.0, Ordering::SeqCst);
         handle.durable_txid.store(seed_pos.txid.0, Ordering::SeqCst);
         handle.percell_txid.store(0, Ordering::SeqCst);
@@ -1724,17 +1713,11 @@ impl LtxRepl {
                     } else {
                         self.highest_nonempty_epoch_in_prefix(&parent.key_prefix, cell)
                             .await?
-                            .ok_or_else(|| {
-                                anyhow!("parent prefix has no LTX epoch for {cell}")
-                            })?
+                            .ok_or_else(|| anyhow!("parent prefix has no LTX epoch for {cell}"))?
                     };
-                    let parent_client = self.client_for_bucket_prefix(
-                        &parent.key_prefix,
-                        cell,
-                        parent_epoch,
-                    );
-                    let parent_plan =
-                        calc_restore_plan(&parent_client, base.fork_txid()).await?;
+                    let parent_client =
+                        self.client_for_bucket_prefix(&parent.key_prefix, cell, parent_epoch);
+                    let parent_plan = calc_restore_plan(&parent_client, base.fork_txid()).await?;
                     let terminal = parent_plan
                         .last()
                         .ok_or_else(|| anyhow!("parent plan missing terminal LTX"))?;
@@ -1747,11 +1730,7 @@ impl LtxRepl {
                     let fork_checksum = base::post_apply_checksum_from_ltx(&terminal_bytes)?;
                     branch_baseline = Some((base.fork_txid(), fork_checksum));
                     let chained = ChainedReplicaClient::new(
-                        self.client_for_bucket_prefix(
-                            &parent.key_prefix,
-                            cell,
-                            parent_epoch,
-                        ),
+                        self.client_for_bucket_prefix(&parent.key_prefix, cell, parent_epoch),
                         self.client_for(cell, from),
                         base.fork_txid(),
                     );
@@ -2244,9 +2223,7 @@ impl LtxRepl {
         let artifact = if self.child_has_base_json(cell, epoch).await? {
             info!(
                 event = "ltx_handoff_snapshot_skipped_branch",
-                cell,
-                epoch,
-                "skipping MinTXID=1 handoff snapshot on branched cell"
+                cell, epoch, "skipping MinTXID=1 handoff snapshot on branched cell"
             );
             EvictionRestoreArtifact::L0Chain
         } else {
@@ -2563,8 +2540,8 @@ impl LtxRepl {
         let truncate_pages = self.truncate_pages_for_cell(cell);
         let client = self.client_for(cell, epoch);
         let handle_ = handle.clone();
-        let (bytes, snapshot_txid, snapshot_ltx, pos) = asyncrt::blocking(
-            move || -> anyhow::Result<(u64, u64, Vec<u8>, Pos)> {
+        let (bytes, snapshot_txid, snapshot_ltx, pos) =
+            asyncrt::blocking(move || -> anyhow::Result<(u64, u64, Vec<u8>, Pos)> {
                 let mut replica_slot = handle_.replica.lock().unwrap();
                 let replica = replica_slot
                     .take()
@@ -2584,14 +2561,13 @@ impl LtxRepl {
                     .map_err(|error| anyhow!("reset local LTX state: {error}"))?;
                 db.sync()
                     .map_err(|error| anyhow!("capture import snapshot: {error}"))?;
-                let pos = db.pos().map_err(|error| anyhow!("read import position: {error}"))?;
-                anyhow::ensure!(
-                    pos.txid >= TXID(1),
-                    "import produced no durable snapshot"
-                );
-                let snapshot_ltx = db.read_ltx_file(0, TXID(1), pos.txid).map_err(|error| {
-                    anyhow!("import snapshot MinTXID==1 missing: {error}")
-                })?;
+                let pos = db
+                    .pos()
+                    .map_err(|error| anyhow!("read import position: {error}"))?;
+                anyhow::ensure!(pos.txid >= TXID(1), "import produced no durable snapshot");
+                let snapshot_ltx = db
+                    .read_ltx_file(0, TXID(1), pos.txid)
+                    .map_err(|error| anyhow!("import snapshot MinTXID==1 missing: {error}"))?;
                 let snapshot_txid = pos.txid.0;
 
                 // Do not seed_pos until the snapshot is in the bucket.
@@ -2599,10 +2575,9 @@ impl LtxRepl {
                 // upload, so a child branch listed an empty parent prefix.
                 *replica_slot = Some(Replica::new(db, client));
                 Ok((bytes, snapshot_txid, snapshot_ltx, pos))
-            },
-        )
-        .await
-        .map_err(|error| anyhow!("join sqlite import task: {error}"))??;
+            })
+            .await
+            .map_err(|error| anyhow!("join sqlite import task: {error}"))??;
 
         let uploaded = handle
             .client
@@ -2631,7 +2606,9 @@ impl LtxRepl {
         handle.shipped_txid.store(snapshot_txid, Ordering::SeqCst);
         handle.durable_txid.store(snapshot_txid, Ordering::SeqCst);
         handle.percell_txid.store(snapshot_txid, Ordering::SeqCst);
-        handle.last_sync_ms.store(asyncrt::wall_ms().max(0) as u64, Ordering::SeqCst);
+        handle
+            .last_sync_ms
+            .store(asyncrt::wall_ms().max(0) as u64, Ordering::SeqCst);
 
         info!(
             event = "d1_import_snapshot",

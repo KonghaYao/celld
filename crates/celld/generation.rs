@@ -297,6 +297,7 @@ pub struct Generation {
     /// whether the schedule changed without re-reading the manifest.
     #[allow(dead_code)]
     pub(crate) crons: Vec<String>,
+    pub(crate) native: Option<crate::native::NativeExecution>,
 }
 
 impl Generation {

@@ -35,9 +35,13 @@ pub async fn get_blob(
         return Ok(None);
     };
     if base.parent_cell != cell {
-        anyhow::bail!("branch parent_cell {:?} does not match {cell}", base.parent_cell);
+        anyhow::bail!(
+            "branch parent_cell {:?} does not match {cell}",
+            base.parent_cell
+        );
     }
-    let project_id = cell_branch::runtime_project_id().map_err(|error| anyhow::anyhow!("{error}"))?;
+    let project_id =
+        cell_branch::runtime_project_id().map_err(|error| anyhow::anyhow!("{error}"))?;
     let parent = validate_parent_bucket(&base.parent_bucket, &project_id)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let parent_store = open_parent_bucket(&parent)?;

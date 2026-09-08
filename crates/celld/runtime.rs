@@ -875,6 +875,7 @@ impl Generation {
             assets: primary_assets,
             services,
             crons,
+            native,
         } = primary;
         let mut assets = HashMap::new();
         if let Some(resolver) = primary_assets {
@@ -1000,6 +1001,7 @@ impl Generation {
             default_do_class,
             assets,
             crons,
+            native: native.map(|execution| execution.with_generation(id)),
         })
     }
 }
@@ -1360,6 +1362,9 @@ impl RuntimeManager {
         request_id: js::RequestId,
     ) -> anyhow::Result<HttpResponse> {
         let generation = self.generation();
+        if let Some(native) = generation.native.as_ref() {
+            return native.fetch(url, method, body, headers, request_id).await;
+        }
         generation
             .stateless
             .fetch(url, method, body, headers, Some(request_id))

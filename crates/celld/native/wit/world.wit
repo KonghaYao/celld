@@ -1,0 +1,7 @@
+package cellp:native@0.1.0;
+
+world native-http-v1 {
+  import cellp:config/config@0.1.0;
+  import cellp:kv/kv@0.1.0;
+  export wasi:http/incoming-handler@0.2.12;
+}

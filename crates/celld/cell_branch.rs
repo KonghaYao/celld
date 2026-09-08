@@ -54,7 +54,10 @@ pub struct ValidatedParentBucket {
 }
 
 /// Validate `s3://cellp-celld/{project_id}/{parentVersion}`.
-pub fn validate_parent_bucket(uri: &str, project_id: &str) -> Result<ValidatedParentBucket, String> {
+pub fn validate_parent_bucket(
+    uri: &str,
+    project_id: &str,
+) -> Result<ValidatedParentBucket, String> {
     if uri.starts_with("http://") || uri.starts_with("https://") {
         return Err("parent bucket must be s3://cellp-celld/{project}/{version}".into());
     }
@@ -184,7 +187,8 @@ pub async fn branch_prepared(prepared: PreparedBranch) -> Result<BranchOk, Branc
         ..
     } = prepared;
     let project_id = runtime_project_id().map_err(branch_error)?;
-    let parent = validate_parent_bucket(&request.parent_bucket, &project_id).map_err(branch_error)?;
+    let parent =
+        validate_parent_bucket(&request.parent_bucket, &project_id).map_err(branch_error)?;
     let result = ltx
         .branch_from_parent(&scope, epoch, &parent, request.parent_epoch)
         .await
@@ -217,7 +221,9 @@ pub(crate) async fn read_base_json(
     match store.get(&ObjPath::from(key)).await {
         Ok(object) => {
             let bytes = object.bytes().await?;
-            BasePointer::parse_json(&bytes).map(Some).map_err(Into::into)
+            BasePointer::parse_json(&bytes)
+                .map(Some)
+                .map_err(Into::into)
         }
         Err(OsError::NotFound { .. }) => Ok(None),
         Err(error) => Err(anyhow::anyhow!("read base.json: {error}")),
@@ -250,7 +256,8 @@ pub(crate) async fn put_base_json_cas(
 }
 
 pub fn verify_fork_checksum(ltx_bytes: &[u8], expected_hex: &str) -> Result<(), String> {
-    let actual = base::post_apply_checksum_from_ltx(ltx_bytes).map_err(|error| error.to_string())?;
+    let actual =
+        base::post_apply_checksum_from_ltx(ltx_bytes).map_err(|error| error.to_string())?;
     let expected = base::parse_checksum_hex(expected_hex).map_err(|error| error.to_string())?;
     if actual != expected {
         return Err(format!(

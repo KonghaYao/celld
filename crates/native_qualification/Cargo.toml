@@ -1,0 +1,16 @@
+[package]
+name = "native_qualification"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95.0"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
+wasmtime = { workspace = true, features = ["wat"] }
+wasmtime-wasi.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

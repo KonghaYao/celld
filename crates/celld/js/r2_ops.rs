@@ -90,9 +90,7 @@ async fn ensure_overlay(bucket_name: &str) -> Result<(), String> {
 
 async fn overlay_active(bucket_name: &str) -> Result<bool, String> {
     ensure_overlay(bucket_name).await?;
-    Ok(crate::r2_overlay::parent_store(bucket_name)
-        .await
-        .is_some())
+    Ok(crate::r2_overlay::parent_store(bucket_name).await.is_some())
 }
 
 // ---- the object record ---------------------------------------------------
@@ -479,15 +477,9 @@ pub(super) fn op_r2_get(
             .unwrap_or(BlobRange::Whole);
         let conditions = BlobConditions::from(request.only_if.unwrap_or_default());
         let read = if overlay_active(&bucket_name).await? {
-            crate::r2_overlay::overlay_get_blob(
-                store()?,
-                &bucket_name,
-                &key,
-                range,
-                &conditions,
-            )
-            .await
-            .map_err(|error| error.to_string())?
+            crate::r2_overlay::overlay_get_blob(store()?, &bucket_name, &key, range, &conditions)
+                .await
+                .map_err(|error| error.to_string())?
         } else {
             store()?
                 .get_blob(&blob_key(&bucket_name, &key), range, &conditions)
@@ -1260,10 +1252,7 @@ pub(super) fn op_r2_mp_part(
             entry.held = held;
             // S3-style part etag (MD5 hex, quoted) for Worker-side multipart verification.
             use md5::Digest as _;
-            let etag = format!(
-                "\"{:x}\"",
-                md5::Md5::digest(&bytes)
-            );
+            let etag = format!("\"{:x}\"", md5::Md5::digest(&bytes));
             entry.pending.insert(part_number, bytes);
             entry.drain().await?;
             Ok(serde_json::json!({ "partNumber": part_number, "etag": etag }).to_string())

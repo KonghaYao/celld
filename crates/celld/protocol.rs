@@ -11,12 +11,21 @@ use std::collections::BTreeMap;
 /// `deploy/<script>/<version>/manifest.json` — the normalized thing celld reads
 /// to know what to run. The script name is deployment identity, not a fleet
 /// selector: one fleet has one current application.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Manifest {
     #[serde(default = "legacy_manifest_schema_version")]
     pub schema_version: u32,
     pub version: String,
     pub script_name: String,
+    /// Historical default. Omitted from serialization when `js-v8`.
+    #[serde(
+        default = "default_execution_profile",
+        skip_serializing_if = "is_default_execution_profile"
+    )]
+    pub execution_profile: String,
+    /// Native Component descriptor. Absent for JS / `wasm-v1` deployments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_component: Option<NativeComponentDescriptor>,
     /// Absent for Wrangler asset-only deployments.
     pub main_module: Option<String>,
     /// Durable Object classes exported by the worker.
@@ -43,6 +52,148 @@ pub struct Manifest {
     pub raw_metadata: serde_json::Value,
 }
 
+impl Manifest {
+    pub fn validate_execution(&self) -> anyhow::Result<()> {
+        validate_required_features(&self.required_features)?;
+        match self.execution_profile.as_str() {
+            EXECUTION_PROFILE_JS_V8 => {
+                anyhow::ensure!(
+                    self.native_component.is_none(),
+                    "js-v8 deployment cannot carry a native_component descriptor"
+                );
+                anyhow::ensure!(
+                    !self
+                        .required_features
+                        .iter()
+                        .any(|feature| feature == FEATURE_NATIVE_HTTP_V1),
+                    "js-v8 deployment cannot require {FEATURE_NATIVE_HTTP_V1}"
+                );
+            }
+            EXECUTION_PROFILE_NATIVE_HTTP_V1 => {
+                let descriptor = self
+                    .native_component
+                    .as_ref()
+                    .context("native-http-v1 deployment is missing native_component")?;
+                descriptor.validate()?;
+                anyhow::ensure!(
+                    self.required_features
+                        .iter()
+                        .any(|feature| feature == FEATURE_NATIVE_HTTP_V1),
+                    "native-http-v1 deployment does not require {FEATURE_NATIVE_HTTP_V1}"
+                );
+                anyhow::ensure!(
+                    !self
+                        .required_features
+                        .iter()
+                        .any(|feature| feature == FEATURE_WASM_V1),
+                    "native-http-v1 cannot mix with {FEATURE_WASM_V1}"
+                );
+                anyhow::ensure!(
+                    self.main_module.is_none(),
+                    "native-http-v1 cannot mix a JS main_module"
+                );
+                let has_kv = self
+                    .raw_metadata
+                    .get("bindings")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .any(|binding| {
+                        binding.get("type").and_then(serde_json::Value::as_str) == Some("kv")
+                    });
+                let admits_kv = descriptor
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == NATIVE_CAPABILITY_KV);
+                anyhow::ensure!(
+                    has_kv == admits_kv,
+                    "native KV capability must match declared KV bindings exactly"
+                );
+                anyhow::ensure!(
+                    self.assets.is_none()
+                        && self.crons.is_empty()
+                        && self.queue_consumers.is_empty(),
+                    "native-http-v1 does not support assets, cron, or queue consumers"
+                );
+                let unsupported = self
+                    .raw_metadata
+                    .get("bindings")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|binding| binding.get("type").and_then(serde_json::Value::as_str))
+                    .find(|kind| !matches!(*kind, "kv" | "plain_text"));
+                if let Some(kind) = unsupported {
+                    anyhow::bail!("native-http-v1 does not support {kind} bindings");
+                }
+            }
+            other => anyhow::bail!("unknown execution_profile {other:?}"),
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct ManifestWire {
+    #[serde(default = "legacy_manifest_schema_version")]
+    schema_version: u32,
+    version: String,
+    script_name: String,
+    #[serde(default = "default_execution_profile")]
+    execution_profile: String,
+    #[serde(default)]
+    native_component: Option<NativeComponentDescriptor>,
+    main_module: Option<String>,
+    do_classes: Vec<String>,
+    sqlite_classes: Vec<String>,
+    modules: Vec<ModuleRef>,
+    #[serde(default)]
+    assets: Option<AssetManifestRef>,
+    #[serde(default)]
+    crons: Vec<String>,
+    #[serde(default)]
+    queue_consumers: Vec<QueueConsumerConfig>,
+    #[serde(default)]
+    required_features: Vec<String>,
+    raw_metadata: serde_json::Value,
+}
+
+impl TryFrom<ManifestWire> for Manifest {
+    type Error = anyhow::Error;
+
+    fn try_from(wire: ManifestWire) -> Result<Self, Self::Error> {
+        let manifest = Self {
+            schema_version: wire.schema_version,
+            version: wire.version,
+            script_name: wire.script_name,
+            execution_profile: wire.execution_profile,
+            native_component: wire.native_component,
+            main_module: wire.main_module,
+            do_classes: wire.do_classes,
+            sqlite_classes: wire.sqlite_classes,
+            modules: wire.modules,
+            assets: wire.assets,
+            crons: wire.crons,
+            queue_consumers: wire.queue_consumers,
+            required_features: wire.required_features,
+            raw_metadata: wire.raw_metadata,
+        };
+        manifest.validate_execution()?;
+        Ok(manifest)
+    }
+}
+
+impl<'de> Deserialize<'de> for Manifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        ManifestWire::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 fn legacy_manifest_schema_version() -> u32 {
     1
 }
@@ -63,6 +214,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_WASM_V1,
     FEATURE_BINARY_V1,
     FEATURE_WORKFLOWS_V1,
+    FEATURE_NATIVE_HTTP_V1,
 ];
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
@@ -86,6 +238,80 @@ pub const FEATURE_R2_V1: &str = "r2-v1";
 pub const FEATURE_IMAGES_V1: &str = "images-v1";
 pub const FEATURE_SQLITE_VEC_V1: &str = "sqlite-vec-v1";
 pub const FEATURE_WASM_V1: &str = "wasm-v1";
+pub const FEATURE_NATIVE_HTTP_V1: &str = "native-http-v1";
+pub const EXECUTION_PROFILE_JS_V8: &str = "js-v8";
+pub const EXECUTION_PROFILE_NATIVE_HTTP_V1: &str = "native-http-v1";
+pub const NATIVE_BASELINE_1: &str = "cellp-native-baseline-1";
+pub const NATIVE_HTTP_WORLD: &str = "wasi:http/proxy@0.2";
+pub const NATIVE_CAPABILITY_CONFIG: &str = "cellp:config@0.1";
+pub const NATIVE_CAPABILITY_KV: &str = "cellp:kv@0.1";
+
+fn default_execution_profile() -> String {
+    EXECUTION_PROFILE_JS_V8.to_string()
+}
+
+fn is_default_execution_profile(profile: &str) -> bool {
+    profile == EXECUTION_PROFILE_JS_V8
+}
+
+/// Immutable Native Component admission descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeComponentDescriptor {
+    pub path: String,
+    pub sha256: String,
+    pub baseline: String,
+    pub world: String,
+    pub capabilities: Vec<String>,
+}
+
+impl NativeComponentDescriptor {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.path.is_empty()
+                && !self.path.contains('\\')
+                && !self.path.split('/').any(|part| part.is_empty()
+                    || part == "."
+                    || part == ".."
+                    || part.contains(':')),
+            "native component path is invalid"
+        );
+        anyhow::ensure!(
+            self.sha256.len() == 64
+                && self
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "native component digest must be a full lowercase SHA-256"
+        );
+        anyhow::ensure!(
+            self.baseline == NATIVE_BASELINE_1,
+            "unsupported native baseline {:?}",
+            self.baseline
+        );
+        anyhow::ensure!(
+            self.world == NATIVE_HTTP_WORLD,
+            "unsupported native world {:?}",
+            self.world
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for capability in &self.capabilities {
+            anyhow::ensure!(
+                capability == NATIVE_CAPABILITY_CONFIG || capability == NATIVE_CAPABILITY_KV,
+                "unsupported native capability {capability:?}"
+            );
+            anyhow::ensure!(
+                seen.insert(capability.as_str()),
+                "native capability {capability:?} is repeated"
+            );
+        }
+        anyhow::ensure!(
+            seen.contains(NATIVE_CAPABILITY_CONFIG),
+            "native component must admit {NATIVE_CAPABILITY_CONFIG}"
+        );
+        Ok(())
+    }
+}
 /// Wrangler `Data` rule sibling modules (`.bin` default export is an `ArrayBuffer`).
 pub const FEATURE_BINARY_V1: &str = "binary-v1";
 /// A deployment with `workflows` bindings. Required because a build without
@@ -474,3 +700,90 @@ pub fn deployment_version(
     }
     format!("{:x}", hasher.finalize())[..16].to_string()
 }
+
+#[cfg(test)]
+mod native_manifest_tests {
+    use super::*;
+
+    fn js_manifest() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "version": "abc",
+            "script_name": "app",
+            "main_module": "index.js",
+            "do_classes": [],
+            "sqlite_classes": [],
+            "modules": [],
+            "raw_metadata": {}
+        })
+    }
+
+    #[test]
+    fn missing_profile_defaults_to_js_v8_and_omits_on_serialize() {
+        let manifest: Manifest = serde_json::from_value(js_manifest()).unwrap();
+        assert_eq!(manifest.execution_profile, EXECUTION_PROFILE_JS_V8);
+        let encoded = serde_json::to_value(&manifest).unwrap();
+        assert!(encoded.get("execution_profile").is_none());
+        assert!(encoded.get("native_component").is_none());
+    }
+
+    #[test]
+    fn native_requires_descriptor_and_feature() {
+        let mut value = js_manifest();
+        value["execution_profile"] = "native-http-v1".into();
+        value["main_module"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<Manifest>(value.clone()).is_err());
+        value["required_features"] = serde_json::json!([FEATURE_NATIVE_HTTP_V1]);
+        value["native_component"] = serde_json::json!({
+            "path": "component.wasm",
+            "sha256": "a".repeat(64),
+            "baseline": NATIVE_BASELINE_1,
+            "world": NATIVE_HTTP_WORLD,
+            "capabilities": [NATIVE_CAPABILITY_CONFIG]
+        });
+        serde_json::from_value::<Manifest>(value).unwrap();
+    }
+
+    #[test]
+    fn native_rejects_js_main_and_wasm_v1_mix() {
+        let mut value = js_manifest();
+        value["execution_profile"] = "native-http-v1".into();
+        value["required_features"] = serde_json::json!([FEATURE_NATIVE_HTTP_V1, FEATURE_WASM_V1]);
+        value["native_component"] = serde_json::json!({
+            "path": "component.wasm",
+            "sha256": "a".repeat(64),
+            "baseline": NATIVE_BASELINE_1,
+            "world": NATIVE_HTTP_WORLD,
+            "capabilities": [NATIVE_CAPABILITY_CONFIG]
+        });
+        assert!(serde_json::from_value::<Manifest>(value).is_err());
+    }
+
+    #[test]
+    fn native_kv_capability_must_match_bindings() {
+        let mut value = js_manifest();
+        value["execution_profile"] = "native-http-v1".into();
+        value["main_module"] = serde_json::Value::Null;
+        value["required_features"] = serde_json::json!([FEATURE_NATIVE_HTTP_V1]);
+        value["native_component"] = serde_json::json!({
+            "path": "component.wasm",
+            "sha256": "a".repeat(64),
+            "baseline": NATIVE_BASELINE_1,
+            "world": NATIVE_HTTP_WORLD,
+            "capabilities": [NATIVE_CAPABILITY_CONFIG, NATIVE_CAPABILITY_KV]
+        });
+        assert!(serde_json::from_value::<Manifest>(value.clone()).is_err());
+        value["raw_metadata"] = serde_json::json!({
+            "bindings": [{"type":"kv","name":"VALUES","id":"example-values"}]
+        });
+        serde_json::from_value::<Manifest>(value).unwrap();
+    }
+
+    #[test]
+    fn unknown_profile_fails_closed() {
+        let mut value = js_manifest();
+        value["execution_profile"] = "mystery".into();
+        assert!(serde_json::from_value::<Manifest>(value).is_err());
+    }
+}
+

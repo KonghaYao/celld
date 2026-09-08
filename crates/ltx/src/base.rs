@@ -21,15 +21,13 @@ pub struct BasePointer {
 
 impl BasePointer {
     pub fn parse_json(bytes: &[u8]) -> Result<Self> {
-        serde_json::from_slice(bytes).map_err(|error| {
-            Error::Other(format!("parse base.json: {error}").into())
-        })
+        serde_json::from_slice(bytes)
+            .map_err(|error| Error::Other(format!("parse base.json: {error}").into()))
     }
 
     pub fn to_json(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec_pretty(self).map_err(|error| {
-            Error::Other(format!("serialize base.json: {error}").into())
-        })
+        serde_json::to_vec_pretty(self)
+            .map_err(|error| Error::Other(format!("serialize base.json: {error}").into()))
     }
 
     pub fn fork_txid(&self) -> TXID {

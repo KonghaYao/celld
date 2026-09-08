@@ -5,8 +5,8 @@
 use serde::Serialize;
 
 pub(crate) use crate::cell_branch::{
-    branch_cli_project_id, prepare, branch_prepared, BranchRequest, BranchOk, BranchFailure,
-    ReopenSpec, validate_parent_bucket,
+    branch_cli_project_id, branch_prepared, prepare, validate_parent_bucket, BranchFailure,
+    BranchOk, BranchRequest, ReopenSpec,
 };
 
 pub const KV_BRANCH_FAMILY: &str = "KV_BRANCH_ERROR";
@@ -36,9 +36,7 @@ pub fn prepare_binding(
     if scope != expected_scope {
         return Err(binding_error(
             KV_BRANCH_FAMILY,
-            format!(
-                "cell scope {scope:?} does not match binding identity {expected_scope:?}"
-            ),
+            format!("cell scope {scope:?} does not match binding identity {expected_scope:?}"),
         ));
     }
     prepare(scope, request, false)
@@ -54,9 +52,7 @@ pub fn prepare_queue_binding(
     if scope != expected_scope {
         return Err(binding_error(
             QUEUE_BRANCH_FAMILY,
-            format!(
-                "cell scope {scope:?} does not match binding identity {expected_scope:?}"
-            ),
+            format!("cell scope {scope:?} does not match binding identity {expected_scope:?}"),
         ));
     }
     prepare(scope, request, false)
@@ -80,7 +76,8 @@ pub async fn branch_binding_prepared(
 }
 
 pub(crate) fn reopen(spec: &ReopenSpec) -> Result<(), BindingBranchError<'static>> {
-    crate::cell_branch::reopen(spec).map_err(|failure| binding_error(KV_BRANCH_FAMILY, failure.message))
+    crate::cell_branch::reopen(spec)
+        .map_err(|failure| binding_error(KV_BRANCH_FAMILY, failure.message))
 }
 
 fn binding_error(family: &'static str, message: String) -> BindingBranchError<'static> {

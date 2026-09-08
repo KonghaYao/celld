@@ -5398,15 +5398,14 @@ fn op_cell_branch(
         crate::binding_branch::KV_BRANCH_FAMILY
     };
     let id = asyncrt::enqueue(async move {
-        let reply = match crate::binding_branch::branch_binding_prepared(prepared, family_static)
-            .await
-        {
-            Ok(ok) => serde_json::json!({ "ok": ok }).to_string(),
-            Err(failure) => serde_json::json!({
-                "error": { "family": failure.family, "message": failure.message },
-            })
-            .to_string(),
-        };
+        let reply =
+            match crate::binding_branch::branch_binding_prepared(prepared, family_static).await {
+                Ok(ok) => serde_json::json!({ "ok": ok }).to_string(),
+                Err(failure) => serde_json::json!({
+                    "error": { "family": failure.family, "message": failure.message },
+                })
+                .to_string(),
+            };
         Ok(asyncrt::OpOut::Str(reply))
     });
     register_binding_branch_reopen(scope, id, reopen);
@@ -6585,9 +6584,7 @@ fn normalize_inbound_fetch_url(url: &str, inbound_base: &str) -> String {
             base
         };
         url::Url::parse(&format!("http:{url}"))
-            .or_else(|_| {
-                url::Url::parse(base).and_then(|b| b.join(url.trim_start_matches('/')))
-            })
+            .or_else(|_| url::Url::parse(base).and_then(|b| b.join(url.trim_start_matches('/'))))
             .map(|u| u.to_string())
             .unwrap_or_else(|_| url.to_string())
     } else {
@@ -6691,8 +6688,11 @@ fn op_fetch(
     let method = args.get(0).to_rust_string_lossy(scope);
     let url = args.get(1).to_rust_string_lossy(scope);
     let inbound = loopback_inbound_base(scope);
-    let egress_plan =
-        crate::fetch_loopback::plan_fetch(&url, &inbound, actor_runtime_state(scope).loopback_config.as_ref());
+    let egress_plan = crate::fetch_loopback::plan_fetch(
+        &url,
+        &inbound,
+        actor_runtime_state(scope).loopback_config.as_ref(),
+    );
     if !matches!(egress_plan, crate::fetch_loopback::FetchPlan::Egress) {
         let message = match egress_plan {
             crate::fetch_loopback::FetchPlan::Reject(error) => error,
@@ -9267,9 +9267,8 @@ use bootstrap::{
 };
 use modules::{
     compile_module, host_import_module_dynamically, install_lazy_globals, op_builtin_module,
-    register_loader_modules, register_stubs, register_wasm_modules, register_binary_modules,
-    resolve_external,
-    ModuleRegistry,
+    register_binary_modules, register_loader_modules, register_stubs, register_wasm_modules,
+    resolve_external, ModuleRegistry,
 };
 use v8_strings::key as static_key;
 /// Like `make_request`, but marks the request as incoming. Its signal is

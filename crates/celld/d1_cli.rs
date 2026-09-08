@@ -239,7 +239,10 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             if command.json {
                 out.row(&ImportReply(result.clone()))?;
             } else {
-                let bytes = result.get("bytes").and_then(Value::as_u64).unwrap_or_default();
+                let bytes = result
+                    .get("bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
                 let duration_ms = result
                     .get("duration_ms")
                     .and_then(Value::as_u64)
@@ -248,16 +251,12 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                     .get("snapshot_txid")
                     .and_then(Value::as_u64)
                     .unwrap_or_default();
-                note!(
-                    "Imported {bytes} bytes in {duration_ms}ms (snapshot txid {snapshot_txid})"
-                );
+                note!("Imported {bytes} bytes in {duration_ms}ms (snapshot txid {snapshot_txid})");
             }
         }
         Action::Branch { parent_bucket } => {
-            let project_id = crate::d1_branch::branch_cli_project_id(
-                &project.project_id,
-                Some(&storage.bucket),
-            );
+            let project_id =
+                crate::d1_branch::branch_cli_project_id(&project.project_id, Some(&storage.bucket));
             crate::d1_branch::validate_parent_bucket(&parent_bucket, &project_id)
                 .map_err(|error| anyhow!("{error}"))?;
             let result = database
@@ -267,7 +266,10 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             if command.json {
                 out.row(&ImportReply(result.clone()))?;
             } else {
-                let fork_txid = result.get("fork_txid").and_then(Value::as_u64).unwrap_or_default();
+                let fork_txid = result
+                    .get("fork_txid")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
                 let bytes_parent = result
                     .get("bytes_parent")
                     .and_then(Value::as_u64)
@@ -528,8 +530,7 @@ fn validate_import_seed(path: &Path) -> anyhow::Result<(PathBuf, u64)> {
             .context("resolve the working directory")?
             .join(path)
     };
-    let metadata = std::fs::metadata(&path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let metadata = std::fs::metadata(&path).with_context(|| format!("read {}", path.display()))?;
     if !metadata.is_file() {
         bail!("{} is not a file", path.display());
     }
@@ -562,8 +563,8 @@ fn validate_import_seed(path: &Path) -> anyhow::Result<(PathBuf, u64)> {
             path.display()
         );
     }
-    let absolute = std::fs::canonicalize(&path)
-        .with_context(|| format!("resolve {}", path.display()))?;
+    let absolute =
+        std::fs::canonicalize(&path).with_context(|| format!("resolve {}", path.display()))?;
     Ok((absolute, size))
 }
 
@@ -681,8 +682,8 @@ impl Command {
             if sql.is_some() || file.is_some() {
                 bail!("`celld d1 branch` takes no --command or --file");
             }
-            let parent_bucket = parent_bucket
-                .ok_or_else(|| anyhow!("celld d1 branch requires --parent-bucket"))?;
+            let parent_bucket =
+                parent_bucket.ok_or_else(|| anyhow!("celld d1 branch requires --parent-bucket"))?;
             Action::Branch { parent_bucket }
         } else if import {
             if sql.is_some() {

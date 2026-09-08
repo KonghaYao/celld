@@ -1,0 +1,5 @@
+package cellp:config@0.1.0;
+
+interface config {
+  get: func(name: string) -> option<string>;
+}

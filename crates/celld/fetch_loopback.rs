@@ -28,7 +28,9 @@ pub enum FetchPlan {
     Reject(String),
 }
 
-const DEFAULT_DENIED_PORTS: &[u16] = &[8787, 8790, 8791, 8792, 8793, 8794, 8795, 8796, 8797, 8798, 8799];
+const DEFAULT_DENIED_PORTS: &[u16] = &[
+    8787, 8790, 8791, 8792, 8793, 8794, 8795, 8796, 8797, 8798, 8799,
+];
 
 pub fn denied_ports_from_env() -> Vec<u16> {
     std::env::var("CELLD_FETCH_DENIED_PORTS")
@@ -57,12 +59,16 @@ pub fn config_from_vars(vars: &[(String, String)]) -> Option<LoopbackConfig> {
         return None;
     };
     let parsed = Url::parse(public_base).ok()?;
-    let scheme = canonical_scheme(parsed.scheme()).unwrap_or(parsed.scheme()).to_string();
+    let scheme = canonical_scheme(parsed.scheme())
+        .unwrap_or(parsed.scheme())
+        .to_string();
     let host = parsed.host_str()?.to_string();
     if !authority_ok(&host, parsed.port()) {
         return None;
     }
-    let port = parsed.port_or_known_default().unwrap_or(if scheme == "https" { 443 } else { 80 });
+    let port = parsed
+        .port_or_known_default()
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
     let canonical_inbound_url = format!("{}://{}:{}/", scheme, host, port);
     let loopback_enabled = loopback_flag_enabled();
     Some(LoopbackConfig {
@@ -114,7 +120,9 @@ fn origins_match(resolved: &Url, config: &LoopbackConfig) -> bool {
     if host != config_host {
         return false;
     }
-    let port = resolved.port_or_known_default().unwrap_or(if scheme == "https" { 443 } else { 80 });
+    let port = resolved
+        .port_or_known_default()
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
     port == config.port
 }
 
@@ -136,7 +144,7 @@ fn is_restricted_endpoint(host: &str, port: u16, denied_ports: &[u16]) -> bool {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return is_restricted_ip(ip);
     }
-  // Bracketed IPv6 in URL host_str is without brackets
+    // Bracketed IPv6 in URL host_str is without brackets
     if let Ok(ip) = parse_ipv6_literal(host) {
         return is_restricted_ip(ip);
     }
@@ -186,7 +194,9 @@ fn is_restricted_ip(ip: IpAddr) -> bool {
 pub fn plan_fetch(url: &str, inbound_base: &str, config: Option<&LoopbackConfig>) -> FetchPlan {
     let inbound = inbound_base.trim();
     let base = if inbound.is_empty() {
-        config.map(|c| c.canonical_inbound_url.as_str()).unwrap_or("")
+        config
+            .map(|c| c.canonical_inbound_url.as_str())
+            .unwrap_or("")
     } else {
         inbound
     };
@@ -210,7 +220,11 @@ pub fn plan_fetch(url: &str, inbound_base: &str, config: Option<&LoopbackConfig>
     let host = resolved.host_str().unwrap_or("");
     let port = resolved
         .port_or_known_default()
-        .unwrap_or(if resolved.scheme() == "https" { 443 } else { 80 });
+        .unwrap_or(if resolved.scheme() == "https" {
+            443
+        } else {
+            80
+        });
     if let Some(config) = config {
         let canonical_match = origins_match(&resolved, config);
         if canonical_match {
@@ -315,7 +329,11 @@ mod tests {
 
     #[test]
     fn external_egress() {
-        let plan = plan_fetch("https://example.com/", "http://support-flaremo.lvh.me:8787/", Some(&cfg()));
+        let plan = plan_fetch(
+            "https://example.com/",
+            "http://support-flaremo.lvh.me:8787/",
+            Some(&cfg()),
+        );
         assert_eq!(plan, FetchPlan::Egress);
     }
 

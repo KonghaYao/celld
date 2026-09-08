@@ -2,13 +2,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use celld_ltx::compaction_level::SNAPSHOT_LEVEL;
 use celld_ltx::replica::calc_restore_plan;
 use celld_ltx::ChainedReplicaClient;
 use celld_ltx::Error;
 use celld_ltx::FileInfo;
 use celld_ltx::ReplicaClient;
 use celld_ltx::TXID;
-use celld_ltx::compaction_level::SNAPSHOT_LEVEL;
 use tokio::sync::Mutex;
 
 #[derive(Default)]
@@ -92,23 +92,15 @@ async fn chained_restore_plan_parent_snapshot_plus_child_incremental() {
         .lock()
         .await
         .insert(file(SNAPSHOT_LEVEL, 1, 42));
-    parent_store
-        .lock()
-        .await
-        .insert(file(0, 1, 42));
+    parent_store.lock().await.insert(file(0, 1, 42));
 
     let child_store = Arc::new(Mutex::new(MockStore::default()));
-    child_store
-        .lock()
-        .await
-        .insert(file(0, 43, 45));
+    child_store.lock().await.insert(file(0, 43, 45));
 
     let parent = MockClient {
         store: parent_store,
     };
-    let child = MockClient {
-        store: child_store,
-    };
+    let child = MockClient { store: child_store };
     let chained = ChainedReplicaClient::new(parent, child, TXID(42));
 
     let plan = calc_restore_plan(&chained, TXID(0)).await.expect("plan");
@@ -132,9 +124,7 @@ async fn chained_restore_plan_empty_child_restores_to_fork_txid() {
         MockClient {
             store: parent_store,
         },
-        MockClient {
-            store: child_store,
-        },
+        MockClient { store: child_store },
         TXID(10),
     );
 
@@ -154,15 +144,11 @@ async fn chained_restore_plan_gap_returns_tx_not_available() {
         MockClient {
             store: parent_store,
         },
-        MockClient {
-            store: child_store,
-        },
+        MockClient { store: child_store },
         TXID(5),
     );
 
-    let error = calc_restore_plan(&chained, TXID(0))
-        .await
-        .expect_err("gap");
+    let error = calc_restore_plan(&chained, TXID(0)).await.expect_err("gap");
     assert!(
         matches!(error, Error::TxNotAvailable | Error::Other(_)),
         "unexpected error: {error:?}"

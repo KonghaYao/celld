@@ -142,4 +142,7 @@ urlpattern = "=0.4.2"
 # denoland/rusty_v8#2044 and #2045. Both ship in 152.1.0, so this is an
 # ordinary dependency again — no path override, and no hand-built archive.
 v8 = "152.1"
+wasmtime = { version = "=48.0.1", default-features = false, features = ["runtime", "component-model", "component-model-async", "async", "cranelift"] }
+wasmtime-wasi = { version = "=48.0.1", default-features = false, features = ["p2"] }
+wasmtime-wasi-http = { version = "=48.0.1", default-features = false, features = ["p2", "component-model-async", "default-send-request"] }
 webpki-roots = "1"

@@ -92,7 +92,9 @@ pub fn info(input: &[u8]) -> anyhow::Result<Value> {
         .with_guessed_format()
         .context("Images could not read the input")?;
     let format = reader.format();
-    let decoded = reader.decode().context("Images could not decode the input")?;
+    let decoded = reader
+        .decode()
+        .context("Images could not decode the input")?;
     let (width, height) = decoded.dimensions();
     Ok(json!({
         "format": format_name(format),
@@ -156,12 +158,7 @@ fn apply_transform(mut image: DynamicImage, value: &Value) -> anyhow::Result<Dyn
                 }
             }
         }
-        "cover" | "crop" => crop_cover(
-            image,
-            dst_w,
-            dst_h,
-            transform.gravity.as_ref(),
-        )?,
+        "cover" | "crop" => crop_cover(image, dst_w, dst_h, transform.gravity.as_ref())?,
         other => bail!("Images.transform() fit {other:?} is not supported"),
     })
 }
@@ -180,10 +177,7 @@ fn target_size(
             Ok((w.min(src_w), h.min(src_h)))
         }
         "contain" | "pad" => Ok(contain_size(src_w, src_h, width, height)),
-        "cover" | "crop" => Ok((
-            width.unwrap_or(src_w),
-            height.unwrap_or(src_h),
-        )),
+        "cover" | "crop" => Ok((width.unwrap_or(src_w), height.unwrap_or(src_h))),
         other => bail!("Images.transform() fit {other:?} is not supported"),
     }
 }
@@ -286,7 +280,8 @@ fn pad(
         return Ok(image);
     }
     let color = parse_background(background.unwrap_or("#000000"))?;
-    let mut canvas = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(canvas_w, canvas_h, color));
+    let mut canvas =
+        DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(canvas_w, canvas_h, color));
     let left = canvas_w.saturating_sub(src_w) / 2;
     let top = canvas_h.saturating_sub(src_h) / 2;
     image::imageops::overlay(&mut canvas, &image, left.into(), top.into());
@@ -392,12 +387,7 @@ mod tests {
 
     fn png_bytes(width: u32, height: u32) -> Vec<u8> {
         let image = DynamicImage::ImageRgba8(ImageBuffer::from_fn(width, height, |x, y| {
-            Rgba([
-                (x * 17) as u8,
-                (y * 17) as u8,
-                80,
-                255,
-            ])
+            Rgba([(x * 17) as u8, (y * 17) as u8, 80, 255])
         }));
         let mut bytes = Vec::new();
         image

@@ -11,8 +11,11 @@
 use crate::bucket::{Bucket, CasVerdict};
 use crate::deploy;
 use crate::js::{ModuleSource, WorkerConfigOptions};
+use crate::native::NativeExecution;
 use crate::ownership_store::NodeLeaseWire;
-use crate::protocol::{DeployPointer, Manifest, ModuleKind, Rollout};
+use crate::protocol::{
+    DeployPointer, Manifest, ModuleKind, Rollout, EXECUTION_PROFILE_NATIVE_HTTP_V1,
+};
 use anyhow::{bail, Context};
 use std::borrow::Cow;
 
@@ -726,9 +729,20 @@ async fn load_worker_at_pointer(
     }
     crate::protocol::validate_required_features(&manifest.required_features)?;
     crate::protocol::validate_queue_manifest(&manifest)?;
+    manifest.validate_execution()?;
+    let native = if manifest.execution_profile == EXECUTION_PROFILE_NATIVE_HTTP_V1 {
+        let descriptor = manifest
+            .native_component
+            .clone()
+            .context("native-http-v1 deployment is missing native_component")?;
+        let bytes = get_bytes(bucket, &format!("{}/{}", pointer.prefix, descriptor.path)).await?;
+        Some((descriptor, bytes))
+    } else {
+        None
+    };
     let src = match manifest.main_module.as_deref() {
         Some(main) => get_string(bucket, &format!("{}/{main}", pointer.prefix)).await?,
-        None if manifest.assets.is_some() => {
+        None if manifest.assets.is_some() || native.is_some() => {
             // Ingress is handled by the immutable asset resolver. Keeping a
             // synthetic Worker makes the runtime construction path uniform
             // and is a fail-closed guard if an asset-only request escapes it.
@@ -794,7 +808,7 @@ async fn load_worker_at_pointer(
     // (env name, namespace identity). The identity is the config's `id`
     // verbatim: upstream's `kv_namespaces` has no human-readable name field, so
     // there is no second key to fall back to and none is invented.
-    let kv_bindings = bindings(&manifest, "kv")
+    let kv_bindings: Vec<(String, String)> = bindings(&manifest, "kv")
         .filter_map(|binding| {
             Some((
                 binding.get("name")?.as_str()?.to_string(),
@@ -863,6 +877,17 @@ async fn load_worker_at_pointer(
     let version = manifest.version.clone();
     let prefix = pointer.prefix.clone();
     let crons = manifest.crons.clone();
+    let native_execution = match native {
+        Some((descriptor, bytes)) => Some(NativeExecution::build(
+            &bytes,
+            &descriptor,
+            vars.clone(),
+            kv_bindings.clone(),
+            version.clone(),
+            0,
+        )?),
+        None => None,
+    };
     Ok(LoadedDeployment {
         options: WorkerConfigOptions {
             src,
@@ -889,6 +914,7 @@ async fn load_worker_at_pointer(
         assets,
         services,
         crons,
+        native: native_execution,
     })
 }
 
@@ -909,15 +935,18 @@ pub struct LoadedDeployment {
     pub services: Vec<(String, String, Option<String>)>,
     /// `triggers.crons` from the manifest, driving the reserved cron cell.
     pub crons: Vec<String>,
+    pub native: Option<crate::native::NativeExecution>,
 }
 
 /// Map a non-main manifest module to how the JS runtime loads it.
 ///
 /// Wrangler `Text` rules (`.md`, etc.) become default-export string modules.
 /// `no_bundle` / multi-chunk outdirs ship `.js` siblings as real ES modules.
-fn deployment_sibling_module(name: &str, bytes: bytes::Bytes) -> anyhow::Result<(String, ModuleSource)> {
-    let source =
-        String::from_utf8(bytes.into()).context("deployment module is not UTF-8")?;
+fn deployment_sibling_module(
+    name: &str,
+    bytes: bytes::Bytes,
+) -> anyhow::Result<(String, ModuleSource)> {
+    let source = String::from_utf8(bytes.into()).context("deployment module is not UTF-8")?;
     let is_esm = name.ends_with(".js") || name.ends_with(".mjs") || name.ends_with(".cjs");
     if is_esm {
         Ok((name.to_string(), ModuleSource::EsModule(source)))

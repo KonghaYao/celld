@@ -351,7 +351,9 @@ pub(crate) mod local_store;
 pub mod ltx_repl;
 pub mod machine;
 pub mod memory;
+pub mod native;
 pub mod node_log;
+pub mod opennext_compat;
 pub(crate) mod operator_cell;
 #[doc(hidden)]
 pub mod otlp;
@@ -364,7 +366,6 @@ pub mod queue_cli;
 pub(crate) mod r2_branch;
 pub mod r2_cli;
 pub(crate) mod r2_overlay;
-pub mod opennext_compat;
 pub mod replication;
 pub mod runtime;
 pub mod startup;

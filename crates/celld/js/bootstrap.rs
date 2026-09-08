@@ -1024,12 +1024,11 @@ pub(super) fn inject_loopback_config(
 ) -> Result<()> {
     let src = format!(
         "(() => {{ __cell.canonicalInboundUrl = {:?}; __cell.loopbackEnabled = {}; }})();",
-        config.canonical_inbound_url,
-        config.loopback_enabled,
+        config.canonical_inbound_url, config.loopback_enabled,
     );
     let code = v8::String::new(scope, &src).unwrap();
-    let script = v8::Script::compile(scope, code, None)
-        .ok_or_else(|| anyhow!("loopback config compile"))?;
+    let script =
+        v8::Script::compile(scope, code, None).ok_or_else(|| anyhow!("loopback config compile"))?;
     script
         .run(scope)
         .ok_or_else(|| anyhow!("loopback config run"))?;

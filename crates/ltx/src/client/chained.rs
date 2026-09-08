@@ -52,10 +52,7 @@ impl<P, C> ChainedReplicaClient<P, C> {
     }
 }
 
-fn merge_ltx_files(
-    parent_files: Vec<FileInfo>,
-    child_files: Vec<FileInfo>,
-) -> Vec<FileInfo> {
+fn merge_ltx_files(parent_files: Vec<FileInfo>, child_files: Vec<FileInfo>) -> Vec<FileInfo> {
     let mut seen = HashSet::new();
     let mut merged = Vec::with_capacity(parent_files.len() + child_files.len());
     for info in parent_files.into_iter().chain(child_files) {

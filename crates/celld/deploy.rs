@@ -15,10 +15,12 @@ use crate::bucket::Bucket;
 use crate::note;
 use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, AssetRoutesConfig,
-    DeployPointer, Manifest, ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig,
-    QueueConsumerDeployment, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_BINARY_V1,
-    FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_IMAGES_V1, FEATURE_KV_V1, FEATURE_QUEUES_V1,
-    FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
+    DeployPointer, Manifest, ModuleKind, ModuleRef, NativeComponentDescriptor, QueueConsumerAttachment, QueueConsumerConfig,
+    QueueConsumerDeployment, Rollout, RunWorkerFirst, EXECUTION_PROFILE_JS_V8,
+    EXECUTION_PROFILE_NATIVE_HTTP_V1, FEATURE_ASSETS_V1, FEATURE_BINARY_V1,
+    FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_IMAGES_V1, FEATURE_KV_V1, FEATURE_NATIVE_HTTP_V1,
+    FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
+    NATIVE_BASELINE_1, NATIVE_CAPABILITY_CONFIG, NATIVE_CAPABILITY_KV, NATIVE_HTTP_WORLD,
     QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
@@ -68,6 +70,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "r2_buckets",
     "images",
     "no_bundle",
+    "cellp",
 ];
 
 /// The Durable Object class every D1 database runs as. It is supplied by the
@@ -286,6 +289,12 @@ struct Project {
     has_queues: bool,
     has_r2: bool,
     has_images: bool,
+    native: Option<NativeProject>,
+}
+
+struct NativeProject {
+    path: String,
+    bytes: Vec<u8>,
 }
 
 struct ProjectAssets {
@@ -502,6 +511,26 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     modules.extend(sibling_js);
     modules.extend(wasm_modules);
     modules.extend(binary_modules);
+    let native_component = if let Some(native) = &project.native {
+        anyhow::ensure!(
+            !modules.iter().any(|(name, _)| name == &native.path),
+            "native component path collides with a JS module"
+        );
+        modules.push((native.path.clone(), native.bytes.clone()));
+        let mut capabilities = vec![NATIVE_CAPABILITY_CONFIG.to_string()];
+        if project.has_kv {
+            capabilities.push(NATIVE_CAPABILITY_KV.to_string());
+        }
+        Some(NativeComponentDescriptor {
+            path: native.path.clone(),
+            sha256: format!("{:x}", Sha256::digest(&native.bytes)),
+            baseline: NATIVE_BASELINE_1.to_string(),
+            world: NATIVE_HTTP_WORLD.to_string(),
+            capabilities,
+        })
+    } else {
+        None
+    };
     if project.no_bundle {
         validate_no_bundle_module_closure(&modules)?;
     }
@@ -530,6 +559,12 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         schema_version: if asset_reference.is_some() { 2 } else { 1 },
         version: version.clone(),
         script_name: project.script_name.clone(),
+        execution_profile: if native_component.is_some() {
+            EXECUTION_PROFILE_NATIVE_HTTP_V1.to_string()
+        } else {
+            EXECUTION_PROFILE_JS_V8.to_string()
+        },
+        native_component: native_component.clone(),
         main_module: project.entry.as_ref().map(|_| module_name.clone()),
         do_classes: project.do_classes,
         sqlite_classes: project.sqlite_classes,
@@ -539,17 +574,24 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                 name: name.clone(),
                 bytes: bytes.len(),
                 sha256: format!("{:x}", Sha256::digest(bytes))[..16].to_string(),
-                kind: module_kind_for_deploy_name(name),
+                kind: if native_component
+                    .as_ref()
+                    .is_some_and(|component| component.path == *name)
+                {
+                    Some(ModuleKind::Wasm)
+                } else {
+                    module_kind_for_deploy_name(name)
+                },
             })
             .collect(),
         assets: asset_reference,
         crons: project.crons.clone(),
         queue_consumers: project.queue_consumers,
-        // Each capability the manifest depends on is named here, so a node
-        // that predates it rejects the deployment up front instead of
-        // partially deserializing the manifest and failing at worker load.
         required_features: {
             let mut features = Vec::new();
+            if native_component.is_some() {
+                features.push(FEATURE_NATIVE_HTTP_V1.to_string());
+            }
             if built_assets.is_some() {
                 features.push(FEATURE_ASSETS_V1.to_string());
             }
@@ -577,9 +619,10 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             if sqlite_vec {
                 features.push(FEATURE_SQLITE_VEC_V1.to_string());
             }
-            if modules
-                .iter()
-                .any(|(name, _)| module_kind_for_deploy_name(name) == Some(ModuleKind::Wasm))
+            if native_component.is_none()
+                && modules
+                    .iter()
+                    .any(|(name, _)| module_kind_for_deploy_name(name) == Some(ModuleKind::Wasm))
             {
                 features.push(FEATURE_WASM_V1.to_string());
             }
@@ -593,6 +636,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         },
         raw_metadata: project.metadata,
     };
+    manifest.validate_execution()?;
     Ok(Built {
         script_name: project.script_name,
         version,
@@ -1057,12 +1101,16 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
     if no_bundle && main.is_none() {
         bail!("config sets `no_bundle` without `main`");
     }
+    let native = read_native_project(object, root)?;
     let assets = object
         .get("assets")
         .map(|value| read_asset_project(value, root, object))
         .transpose()?;
-    if main.is_none() && assets.is_none() {
+    if main.is_none() && assets.is_none() && native.is_none() {
         bail!("config has neither `main` nor `assets`");
+    }
+    if native.is_some() && main.is_some() {
+        bail!("native-http-v1 cannot declare a JS `main`");
     }
     if main.is_none()
         && assets.as_ref().is_some_and(|assets| {
@@ -1647,6 +1695,7 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         queue_consumers,
         has_r2: !r2_buckets.is_empty(),
         has_images: images_binding.is_some(),
+        native,
     })
 }
 
@@ -1959,6 +2008,30 @@ fn read_asset_project(
         },
         raw_metadata: json!({ "config": Value::Object(upload_config) }),
     })
+}
+
+fn read_native_project(object: &Map<String, Value>, root: &Path) -> anyhow::Result<Option<NativeProject>> {
+    let Some(cellp) = object.get("cellp") else {
+        return Ok(None);
+    };
+    let cellp = cellp
+        .as_object()
+        .ok_or_else(|| anyhow!("config `cellp` must be an object"))?;
+    let execution = cellp
+        .get("execution")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("config `cellp.execution` must be a string"))?;
+    if execution != EXECUTION_PROFILE_NATIVE_HTTP_V1 {
+        bail!("unsupported cellp.execution {execution:?}");
+    }
+    let path = cellp
+        .get("component")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("native-http-v1 requires cellp.component"))?;
+    let path = project_relative_path(path, "cellp.component")?;
+    let bytes = std::fs::read(root.join(&path))
+        .with_context(|| format!("read native component {}", path))?;
+    Ok(Some(NativeProject { path, bytes }))
 }
 
 fn project_relative_path(value: &str, key: &str) -> anyhow::Result<String> {
