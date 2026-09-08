@@ -253,10 +253,11 @@ async fn invoke_once(
                     }
                 })?;
         }
+        let hostcall_failed = store.data().hostcall_failed;
         let response = receiver
             .await
-            .map_err(|_| NativeError::guest_trap())?
-            .map_err(|_| NativeError::guest_trap())?;
+            .map_err(|_| response_outcome(hostcall_failed))?
+            .map_err(|_| response_outcome(hostcall_failed))?;
         collect_response(response, limits.max_response_body_bytes).await
     })
     .await;
@@ -279,6 +280,14 @@ fn start_epoch(engine: &Engine) -> Arc<std::sync::atomic::AtomicBool> {
         }
     });
     stop
+}
+
+fn response_outcome(hostcall_failed: bool) -> NativeError {
+    if hostcall_failed {
+        NativeError::hostcall_failed()
+    } else {
+        NativeError::guest_trap()
+    }
 }
 
 fn classify_trap_wasmtime(error: &wasmtime::Error) -> NativeError {
