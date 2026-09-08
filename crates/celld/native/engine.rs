@@ -55,6 +55,7 @@ pub struct StoreState {
     exhausted: bool,
     force_hostcall_fail: bool,
     hostcall_failed: bool,
+    capability_denied: bool,
     request: RequestContext,
 }
 
@@ -193,6 +194,7 @@ async fn invoke_once(
                 exhausted: false,
                 force_hostcall_fail,
                 hostcall_failed: false,
+                capability_denied: false,
                 request: context,
             },
         );
@@ -244,7 +246,9 @@ async fn invoke_once(
                 .call_handle(&mut store, req, out)
                 .await
                 .map_err(|error| {
-                    if store.data().exhausted {
+                    if store.data().capability_denied {
+                        NativeError::capability_denied()
+                    } else if store.data().exhausted {
                         NativeError::resource_exhausted()
                     } else if store.data().hostcall_failed {
                         NativeError::hostcall_failed()
@@ -351,11 +355,13 @@ impl ConfigHost for StoreState {
 impl KvHost for StoreState {
     async fn open(&mut self, binding: String) -> Result<wasmtime::component::Resource<Namespace>, AccessError> {
         self.charge()?;
-        let namespace = self
-            .capabilities
-            .kv_namespace(&binding)
-            .map_err(|_| AccessError::Denied)?
-            .to_string();
+        let namespace = match self.capabilities.kv_namespace(&binding) {
+            Ok(namespace) => namespace.to_string(),
+            Err(_) => {
+                self.capability_denied = true;
+                return Err(AccessError::Denied);
+            }
+        };
         self.table
             .push(KvNamespaceRecord { id: namespace })
             .map_err(|_| AccessError::Denied)
