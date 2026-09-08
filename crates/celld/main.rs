@@ -1532,8 +1532,12 @@ fn ingress_payload_parts(
         .and_then(|value| value.parse::<u64>().ok());
     // A method that carries no body does not stream. There is nothing to
     // pull, and a stream costs the handler one operation to learn this.
-    let bodyless =
-        matches!(parts.method, hyper::Method::GET | hyper::Method::HEAD) || declared == Some(0);
+    // DELETE is bodyless on the Gateway/curl path (no Content-Length); treating
+    // it as a stream breaks native-http-v1, which only accepts byte bodies.
+    let bodyless = matches!(
+        parts.method,
+        hyper::Method::GET | hyper::Method::HEAD | hyper::Method::DELETE
+    ) || declared == Some(0);
     if bodyless || declared.is_some_and(|length| length < INGRESS_STREAM_THRESHOLD) {
         return (
             url,
