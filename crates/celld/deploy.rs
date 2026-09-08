@@ -1621,6 +1621,7 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         var_count += 1;
     }
     if main.is_none()
+        && native.is_none()
         && (!do_classes.is_empty()
             || !sqlite_classes.is_empty()
             || service_count > 0
