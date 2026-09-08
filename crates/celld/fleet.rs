@@ -752,11 +752,18 @@ async fn load_worker_at_pointer(
         None => bail!("deployment has neither a main module nor assets"),
     };
     let prefix = &pointer.prefix;
+    let native_component_path = manifest
+        .native_component
+        .as_ref()
+        .map(|component| component.path.as_str());
     let fetched = futures_util::future::try_join_all(
         manifest
             .modules
             .iter()
-            .filter(|module| manifest.main_module.as_deref() != Some(module.name.as_str()))
+            .filter(|module| {
+                manifest.main_module.as_deref() != Some(module.name.as_str())
+                    && native_component_path != Some(module.name.as_str())
+            })
             .map(|module| async move {
                 let key = format!("{prefix}/{}", module.name);
                 anyhow::Ok((module, get_bytes(bucket, &key).await?))

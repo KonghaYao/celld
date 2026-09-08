@@ -578,7 +578,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                     .as_ref()
                     .is_some_and(|component| component.path == *name)
                 {
-                    Some(ModuleKind::Wasm)
+                    None
                 } else {
                     module_kind_for_deploy_name(name)
                 },
