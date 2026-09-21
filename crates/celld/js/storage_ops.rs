@@ -207,18 +207,143 @@ pub(super) fn op_storage_flush_pending_puts(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    if let Err(error) = flush_pending_puts(scope, &cell) {
+        throw_storage_error(scope, "put", error);
+    }
+}
+
+fn flush_pending_puts(scope: &mut v8::PinScope, cell: &str) -> Result<(), String> {
     let entries = actor_runtime_state(scope)
         .pending_puts
         .lock()
         .expect("pending puts lock poisoned")
-        .remove(&cell)
+        .remove(cell)
         .unwrap_or_default();
     if entries.is_empty() {
+        return Ok(());
+    }
+    storage::put_many_serialized(cell, &entries).map_err(|error| error.to_string())
+}
+
+/// `storage.sync()`: resolve once every write the cell committed before the
+/// call is proven durable, by the same proof the output gate accepts before
+/// it releases an egress.
+///
+/// The promise takes an ordinary gate ticket on its own channel rather than
+/// calling the replicator: the core checks that the proven position covers
+/// the requested one and, for a bucket proof, verifies ownership before it
+/// acks, and a direct replicator call would skip both.
+///
+/// The ticket is always a write ticket at the cell's current committed
+/// position, whether or not this event wrote. A read-only ticket trails the
+/// newest barrier open on the cell, and a commit opens a barrier only when
+/// an output of its own event takes a ticket; an event that committed and
+/// then awaited other work has none open yet, so a read-only ticket from a
+/// concurrent event would release at once with that commit unproven. The
+/// contract is "every write the cell committed before the call", so the
+/// position decides, not the caller's share of it. A cell with nothing new
+/// pays one local capture pass and uploads nothing.
+///
+/// Every storage sample happens in this turn. The completion runs on the host
+/// loop after the turn ends, and cell storage must not be reached from there
+/// (denoland/celld#170).
+pub(super) fn op_storage_sync(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    // A promise about durability fails closed. Without a gate channel no
+    // ticket can be answered, and without a running cell event nothing says
+    // which cell's writes this turn made. An egress in either state leaves
+    // ungated because it reveals no cell, but a durability statement with no
+    // proof behind it is not one this engine can make. The channel check
+    // repeats the verdict's `NoChannel` refusal on purpose: it runs before
+    // any storage is read, so a process without a gate never turns `sync()`
+    // into a silent local-only pass by a later refactor of the verdict.
+    if GATE_TX.get().is_none() {
+        throw_storage_error(scope, "sync", "this process has no output-gate channel");
         return;
     }
-    if let Err(error) = storage::put_many_serialized(&cell, &entries) {
-        throw_storage_error(scope, "put", error);
+    let context = event_context(scope);
+    let Some(frame) = current_cell_event(&context) else {
+        throw_storage_error(scope, "sync", format!("{cell} has no running cell event"));
+        return;
+    };
+    let event_cell = frame.storage;
+    // The ticket names the cell of the running event, never the scope the
+    // caller passed. They can only differ when JavaScript holds another
+    // cell's storage handle, and then the proof would be for the wrong cell.
+    // Checked before the sample below, so the op never reads another cell's
+    // connection state and never reports that state under this scope's name.
+    if event_cell != cell {
+        throw_storage_error(
+            scope,
+            "sync",
+            format!("{cell} is not the running event's cell"),
+        );
+        return;
     }
+    let sample = match storage::sync_sample(&cell) {
+        Ok(Some(sample)) => sample,
+        Ok(None) => return throw_storage_error(scope, "sync", format!("{cell} is not resident")),
+        Err(error) => return throw_storage_error(scope, "sync", error.to_string()),
+    };
+    // An open transaction advances the write position before it commits,
+    // and the replicator ships only committed frames. A ticket taken here
+    // would be released by a proof that cannot include the transaction, so
+    // the promise would settle as a statement about writes the proof does
+    // not cover. It rejects instead. The flag is the connection's, so this
+    // also rejects a caller that another event's open `transaction()` let
+    // in; that caller's own writes joined that transaction and are just as
+    // uncommitted, and a wait for the commit would still be a false
+    // statement if the transaction rolled back.
+    if sample.in_transaction {
+        throw_storage_error(
+            scope,
+            "sync",
+            format!(
+                "{cell} has an open transaction; its writes are not committed, so no \
+                 durability proof can cover them. Call sync() after the transaction commits"
+            ),
+        );
+        return;
+    }
+    // A facet's `sync()` is a statement about the root cell's database, which
+    // is where its writes live. It names that cell and carries that cell's
+    // sample, because a ticket in the facet's name would activate a cell no
+    // Worker exports. The image is copied first, so the proof the ticket waits
+    // for is a proof of a database that contains this facet's writes.
+    let gate = match frame.root {
+        Some(root) => {
+            let flush = storage::flush_embedded(&cell);
+            match storage::sql_critical_error(&cell) {
+                Some(error) => EgressGate::Unpersisted(error),
+                None if flush == storage::EmbeddedFlush::Deferred => EgressGate::Unpersisted(
+                    "the root transaction has not committed the facet image".to_string(),
+                ),
+                None => EgressGate::Wrote(
+                    root.cell,
+                    celld_logic::Channel::Sync,
+                    root.position,
+                    Some(root.epoch),
+                ),
+            }
+        }
+        None => EgressGate::Wrote(
+            cell.clone(),
+            celld_logic::Channel::Sync,
+            sample.position,
+            Some(sample.epoch),
+        ),
+    };
+    let id = asyncrt::enqueue(async move {
+        egress_gate_verdict(gate)
+            .await
+            .map_err(|refusal| format!("storage.sync: {cell}: {refusal}"))?;
+        Ok(String::new())
+    });
+    rv.set(promise_for(scope, id));
 }
 
 pub(super) fn op_storage_cancel_pending_puts(
@@ -251,8 +376,8 @@ pub(super) fn op_sql_ingest(
     };
     rv.set(v8::String::new(scope, &out.to_string()).unwrap().into());
 }
-/// `__sql_cursor_start(cell, query, bindsJson)` — open a native SQL cursor and
-/// hand back its first row.
+/// `__sql_cursor_start(cell, query, bindsJson, byteBinds)` — open a native SQL
+/// cursor and hand back its first row.
 ///
 /// Returns a `v8::Object` with `cursorId`, `columns`, `row`, `rowsWritten` and
 /// `reusedCachedQuery`. A failure throws.
@@ -274,13 +399,18 @@ pub(super) fn op_sql_cursor_start(
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
     let query = args.get(1).to_rust_string_lossy(scope);
+    let timing_started = (tracing::enabled!(target: "queue_timing", tracing::Level::DEBUG)
+        && cell
+            .split_once(':')
+            .is_some_and(|(class, _)| class == crate::deploy::QUEUE_CLASS))
+    .then(crate::asyncrt::mono_us);
     // An undecodable bind payload used to become an empty bind list, and the
     // query ran anyway. `sql_cursor_start` executes every parameter-free
     // prefix statement before it compares the final statement's parameter
     // count against the binds, so an empty default committed a prefix write
     // and then reported a parameter-count mismatch that named nothing the
     // caller had done. Refuse the call before SQLite sees any of it.
-    let binds: Vec<serde_json::Value> =
+    let json_binds: Vec<serde_json::Value> =
         match serde_json::from_str(&args.get(2).to_rust_string_lossy(scope)) {
             Ok(binds) => binds,
             Err(error) => {
@@ -290,7 +420,88 @@ pub(super) fn op_sql_cursor_start(
                 )
             }
         };
-    match storage::sql_cursor_start(&cell, &query, &binds) {
+    let mut binds: Vec<rusqlite::types::Value> =
+        json_binds.iter().map(storage::json_to_sql).collect();
+    if !args.get(3).is_undefined() {
+        let Ok(entries) = v8::Local::<v8::Array>::try_from(args.get(3)) else {
+            return loader_throw(scope, "sql: byte bindings must be an array");
+        };
+        if entries.length() as usize > binds.len() {
+            return loader_throw(scope, "sql: there are more byte bindings than placeholders");
+        }
+        let mut occupied = HashSet::with_capacity(entries.length() as usize);
+        for entry_offset in 0..entries.length() {
+            let Some(entry) = entries.get_index(scope, entry_offset) else {
+                // V8 has already installed the exception from the property
+                // read. Returning preserves that exception and, critically,
+                // keeps SQLite outside the failed validation path.
+                return;
+            };
+            let Ok(entry) = v8::Local::<v8::Array>::try_from(entry) else {
+                return loader_throw(scope, "sql: each byte binding must be an index/view pair");
+            };
+            if entry.length() != 2 {
+                return loader_throw(scope, "sql: each byte binding must be an index/view pair");
+            }
+            let Some(index_value) = entry.get_index(scope, 0) else {
+                return;
+            };
+            if !index_value.is_number() {
+                return loader_throw(scope, "sql: a byte binding index must be an integer");
+            }
+            let Some(index_number) = index_value.number_value(scope) else {
+                return;
+            };
+            if !index_number.is_finite()
+                || index_number < 0.0
+                || index_number.fract() != 0.0
+                || index_number >= binds.len() as f64
+            {
+                return loader_throw(scope, "sql: a byte binding index is out of range");
+            }
+            let index = index_number as usize;
+            if !occupied.insert(index) {
+                return loader_throw(scope, "sql: a byte binding index is duplicated");
+            }
+            if !json_binds[index].is_null() {
+                return loader_throw(scope, "sql: a byte binding requires a null placeholder");
+            }
+            let Some(value) = entry.get_index(scope, 1) else {
+                return;
+            };
+            let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(value) else {
+                return loader_throw(scope, "sql: a byte binding value must be a readable view");
+            };
+            let Some(buffer) = view.buffer(scope) else {
+                return loader_throw(scope, "sql: a byte binding value must be a readable view");
+            };
+            if buffer.was_detached() {
+                return loader_throw(scope, "sql: a byte binding value must be a readable view");
+            }
+            let mut bytes = vec![0; view.byte_length()];
+            if view.copy_contents(&mut bytes) != bytes.len() {
+                return loader_throw(scope, "sql: a byte binding value must be a readable view");
+            }
+            binds[index] = rusqlite::types::Value::Blob(bytes);
+        }
+    }
+    let result = storage::sql_cursor_start_values(&cell, &query, &binds);
+    if let Some(timing_started) = timing_started {
+        let statement = query
+            .split_ascii_whitespace()
+            .next()
+            .unwrap_or("empty")
+            .to_ascii_lowercase();
+        tracing::debug!(
+            target: "queue_timing",
+            event = "queue_sql_timing",
+            statement,
+            total_us = crate::asyncrt::mono_us().saturating_sub(timing_started),
+            ok = result.is_ok(),
+            "Queue SQL statement completed"
+        );
+    }
+    match result {
         Ok((cursor, columns, row, rows_written, reused_cached_query)) => {
             let result = v8::Object::new(scope);
             let set = |scope: &mut v8::PinScope, name: &str, value: v8::Local<v8::Value>| {
@@ -506,7 +717,30 @@ pub(super) fn op_storage_transaction_control(
     let action = args.get(1).to_rust_string_lossy(scope);
     let nested = args.get(2).boolean_value(scope);
     let savepoint = args.get(3).to_rust_string_lossy(scope);
-    match storage::transaction_control(&cell, &action, nested, &savepoint) {
+    let timing_started = (tracing::enabled!(target: "queue_timing", tracing::Level::DEBUG)
+        && cell
+            .split_once(':')
+            .is_some_and(|(class, _)| class == crate::deploy::QUEUE_CLASS))
+    .then(crate::asyncrt::mono_us);
+    // A put queues before its first await. Move that queue into the current
+    // SQL scope before every boundary: before BEGIN/SAVEPOINT it belongs to
+    // the parent, and before COMMIT/ROLLBACK it belongs to the ending scope.
+    // Clearing the cell queue on rollback would also discard parent writes;
+    // flushing after rollback would commit the canceled writes outside it.
+    let result = flush_pending_puts(scope, &cell)
+        .and_then(|()| storage::transaction_control(&cell, &action, nested, &savepoint));
+    if let Some(timing_started) = timing_started {
+        tracing::debug!(
+            target: "queue_timing",
+            event = "queue_transaction_timing",
+            action,
+            nested,
+            total_us = crate::asyncrt::mono_us().saturating_sub(timing_started),
+            ok = result.is_ok(),
+            "Queue SQL transaction control completed"
+        );
+    }
+    match result {
         Err(error) => throw_storage_error(scope, "transaction", error),
         // An outermost commit published a dirty alarm: register its
         // wake-entry PUT against the current event's output gate.
@@ -661,6 +895,121 @@ impl v8::ValueSerializerImpl for StorageValueDelegate {
 
 impl v8::ValueDeserializerImpl for StorageValueDelegate {}
 
+#[derive(Clone)]
+struct TransientCloneDelegate<'a> {
+    wasm_modules: std::rc::Rc<RefCell<Vec<v8::CompiledWasmModule>>>,
+    shared_buffers: std::rc::Rc<RefCell<Vec<v8::SharedRef<v8::BackingStore>>>>,
+    host_object_brand: v8::Local<'a, v8::Symbol>,
+    deserializers: Option<v8::Local<'a, v8::Object>>,
+}
+
+impl v8::ValueSerializerImpl for TransientCloneDelegate<'_> {
+    fn throw_data_clone_error(&self, scope: &mut v8::PinScope, message: v8::Local<v8::String>) {
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+    }
+
+    fn get_shared_array_buffer_id<'s>(
+        &self,
+        _scope: &mut v8::PinScope<'s, '_>,
+        buffer: v8::Local<'s, v8::SharedArrayBuffer>,
+    ) -> Option<u32> {
+        let mut buffers = self.shared_buffers.borrow_mut();
+        let id = u32::try_from(buffers.len()).ok()?;
+        buffers.push(v8::SharedArrayBuffer::get_backing_store(&buffer));
+        Some(id)
+    }
+
+    fn get_wasm_module_transfer_id(
+        &self,
+        _scope: &mut v8::PinScope<'_, '_>,
+        module: v8::Local<v8::WasmModuleObject>,
+    ) -> Option<u32> {
+        let mut modules = self.wasm_modules.borrow_mut();
+        let id = u32::try_from(modules.len()).ok()?;
+        modules.push(module.get_compiled_module());
+        Some(id)
+    }
+
+    fn has_custom_host_object(&self, _isolate: &v8::Isolate) -> bool {
+        true
+    }
+
+    fn is_host_object<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        object: v8::Local<'s, v8::Object>,
+    ) -> Option<bool> {
+        object.has(scope, self.host_object_brand.into())
+    }
+
+    fn write_host_object<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        object: v8::Local<'s, v8::Object>,
+        serializer: &dyn v8::ValueSerializerHelper,
+    ) -> Option<bool> {
+        let value = object.get(scope, self.host_object_brand.into())?;
+        let Ok(serialize) = value.try_cast::<v8::Function>() else {
+            let message = v8::String::new(scope, "Unsupported object type").unwrap();
+            self.throw_data_clone_error(scope, message);
+            return None;
+        };
+        let data = serialize.call(scope, object.into(), &[])?;
+        serializer.write_uint32(u32::MAX);
+        serializer.write_value(scope.get_current_context(), data)
+    }
+}
+
+impl v8::ValueDeserializerImpl for TransientCloneDelegate<'_> {
+    fn read_host_object<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        deserializer: &dyn v8::ValueDeserializerHelper,
+    ) -> Option<v8::Local<'s, v8::Object>> {
+        let mut tag = 0;
+        if !deserializer.read_uint32(&mut tag) || tag != u32::MAX {
+            return None;
+        }
+        let data = deserializer.read_value(scope.get_current_context())?;
+        let object = data.to_object(scope)?;
+        let key = v8::String::new(scope, "type").unwrap();
+        let clone_type = object.get(scope, key.into())?;
+        let revive = self.deserializers?.get(scope, clone_type)?;
+        let Ok(revive) = revive.try_cast::<v8::Function>() else {
+            let message = v8::String::new(scope, "Unsupported clone data type").unwrap();
+            scope.throw_exception(v8::Exception::error(scope, message));
+            return None;
+        };
+        let receiver = v8::null(scope).into();
+        let allow = std::pin::pin!(v8::AllowJavascriptExecutionScope::new(scope));
+        let scope = &mut allow.init();
+        revive.call(scope, receiver, &[data])?.to_object(scope)
+    }
+
+    fn get_shared_array_buffer_from_id<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        id: u32,
+    ) -> Option<v8::Local<'s, v8::SharedArrayBuffer>> {
+        let buffers = self.shared_buffers.borrow();
+        let backing_store = buffers.get(id as usize)?.clone();
+        Some(v8::SharedArrayBuffer::with_backing_store(
+            scope,
+            &backing_store,
+        ))
+    }
+
+    fn get_wasm_module_from_id<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        id: u32,
+    ) -> Option<v8::Local<'s, v8::WasmModuleObject>> {
+        let modules = self.wasm_modules.borrow();
+        v8::WasmModuleObject::from_compiled_module(scope, modules.get(id as usize)?)
+    }
+}
+
 fn serialize_storage_value(
     scope: &mut v8::PinScope,
     value: v8::Local<v8::Value>,
@@ -682,7 +1031,7 @@ fn serialize_storage_value(
     Some(bytes)
 }
 
-fn deserialize_storage_value<'s>(
+pub(super) fn deserialize_storage_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     value: storage::StoredValue,
 ) -> Option<v8::Local<'s, v8::Value>> {
@@ -767,6 +1116,81 @@ pub(super) fn op_sc_decode(
         Some(value) => rv.set(value),
         None => throw_storage_error(scope, "rpc", "corrupt clone payload"),
     }
+}
+
+/// Clone one value inside the current isolate. Unlike the persisted storage
+/// codec, this transient path can retain compiled WebAssembly modules and
+/// shared backing stores between its serializer and deserializer.
+pub(super) fn op_structured_clone(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let tc = std::pin::pin!(v8::TryCatch::new(scope));
+    let scope = &mut tc.init();
+    let context = scope.get_current_context();
+    let Ok(host_object_brand) = args.get(1).try_cast::<v8::Symbol>() else {
+        let message = v8::String::new(scope, "structured clone host brand is invalid").unwrap();
+        scope.throw_exception(v8::Exception::type_error(scope, message));
+        return;
+    };
+    let Ok(deserializers) = args.get(2).try_cast::<v8::Object>() else {
+        let message = v8::String::new(scope, "structured clone deserializers are invalid").unwrap();
+        scope.throw_exception(v8::Exception::type_error(scope, message));
+        return;
+    };
+    let delegate = TransientCloneDelegate {
+        wasm_modules: Default::default(),
+        shared_buffers: Default::default(),
+        host_object_brand,
+        deserializers: None,
+    };
+    let bytes = {
+        let serializer = v8::ValueSerializer::new(scope, Box::new(delegate.clone()));
+        serializer.write_header();
+        if !serializer
+            .write_value(context, args.get(0))
+            .unwrap_or(false)
+        {
+            if !scope.has_caught() {
+                let message =
+                    v8::String::new(scope, "structured clone serialization failed").unwrap();
+                let exception = v8::Exception::type_error(scope, message);
+                scope.throw_exception(exception);
+            }
+            scope.rethrow();
+            return;
+        }
+        serializer.release()
+    };
+    let deserializer = v8::ValueDeserializer::new(
+        scope,
+        Box::new(TransientCloneDelegate {
+            deserializers: Some(deserializers),
+            ..delegate
+        }),
+        &bytes,
+    );
+    if !deserializer.read_header(context).unwrap_or(false) {
+        if !scope.has_caught() {
+            let message = v8::String::new(scope, "structured clone header is invalid").unwrap();
+            let exception = v8::Exception::type_error(scope, message);
+            scope.throw_exception(exception);
+        }
+        scope.rethrow();
+        return;
+    }
+    let Some(value) = deserializer.read_value(context) else {
+        if !scope.has_caught() {
+            let message =
+                v8::String::new(scope, "structured clone deserialization failed").unwrap();
+            let exception = v8::Exception::type_error(scope, message);
+            scope.throw_exception(exception);
+        }
+        scope.rethrow();
+        return;
+    };
+    rv.set(value);
 }
 
 fn storage_string_array(

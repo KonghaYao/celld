@@ -1,175 +1,46 @@
 # Cloudflare compatibility
 
-celld implements the Cloudflare Workers APIs that this page links to. The notes
-list only the celld gaps and differences.
+celld implements the Cloudflare Workers APIs that this page links to. Read the
+Cloudflare documentation for the standard behavior of each API.
 
-- **Yes** means that celld implements the complete applicable API.
-- **Partial** means that celld does not implement a listed input, operation, or
-  behavior.
+This page lists only an unavailable feature, a celld-specific limit, or an
+observable difference. If an entry has no note, celld intends to match the
+linked Cloudflare API.
+
+- **Yes** means that celld implements the API, except for the listed differences.
+- **Partial** means that a substantial part of the API is unavailable.
+- **Experimental** means that celld can change the API without notice.
 - **No** means that celld does not implement the API.
 
 celld must reject an unsupported configuration or API at deployment or first
-use. An unsupported feature that does not cause an error is a defect. This page
-identifies each known exception.
+use. An unsupported feature that does not cause an error is a defect.
 
 ## Services
 
+Each supported service has a page with an example and the known differences
+from Cloudflare.
+
 | service | status |
 | --- | --- |
-| [Workers](https://developers.cloudflare.com/workers/runtime-apis/) | **Partial** |
-| [Durable Objects](https://developers.cloudflare.com/durable-objects/) | **Partial** |
-| [Static assets](https://developers.cloudflare.com/workers/static-assets/) | **Yes** |
-| [Cron Triggers](https://developers.cloudflare.com/workers/configuration/cron-triggers/) | **Partial** |
-| [Worker Loader](https://developers.cloudflare.com/workers/runtime-apis/bindings/worker-loader/) | **Partial** |
-| [KV](https://developers.cloudflare.com/kv/api/) | **Partial** |
-| [Queues](https://developers.cloudflare.com/queues/configuration/javascript-apis/) | **Partial** |
-| [D1](https://developers.cloudflare.com/d1/worker-api/d1-database/) | **Partial** |
-| [Workflows](https://developers.cloudflare.com/workflows/build/workers-api/) | **Partial** |
-| [R2](https://developers.cloudflare.com/r2/api/workers/workers-api-reference/) | **Partial** |
+| [Workers](services/workers.md) | **Yes** |
+| [Durable Objects](services/durable-objects.md) | **Yes** |
+| [Durable Object Facets](services/durable-object-facets.md) | **Yes** |
+| [Containers](services/containers.md) | **Experimental** |
+| [Static assets](services/static-assets.md) | **Yes** |
+| [Cron Triggers](services/cron-triggers.md) | **Yes** |
+| [Dynamic Workers](services/dynamic-workers.md) | **Yes** |
+| [KV](services/kv.md) | **Yes** |
+| [Queues](services/queues.md) | **Yes** |
+| [D1](services/d1.md) | **Yes** |
+| [Workflows](services/workflows.md) | **Yes** |
+| [R2](services/r2.md) | **Yes** |
+| Workers AI | **No** |
+| Vectorize | **No** |
+| Hyperdrive | **No** |
+| Browser Rendering | **No** |
+| Email Workers | **No** |
+| Python Workers | **No** |
 | [Images](https://developers.cloudflare.com/images/transform-images/bindings/) | **Partial** |
-| [Workers AI](https://developers.cloudflare.com/workers-ai/) | **No** |
-| [Vectorize](https://developers.cloudflare.com/vectorize/) | **No** |
-| [Hyperdrive](https://developers.cloudflare.com/hyperdrive/) | **No** |
-| [Browser Rendering](https://developers.cloudflare.com/browser-rendering/) | **No** |
-| [Email Workers](https://developers.cloudflare.com/email-routing/email-workers/) | **No** |
-| [Python Workers](https://developers.cloudflare.com/workers/languages/python/) | **No** |
-
-### [Workers](https://developers.cloudflare.com/workers/runtime-apis/)
-
-**Partial**
-
-- The [runtime API table](#runtime-apis) lists the Worker runtime gaps.
-- celld does not manage a custom domain or terminate TLS. Terminate TLS in the
-  ingress proxy.
-- An experimental Workers AI HTTP adapter is available through
-  `CELLD_AI_URL`.
-
-### [Durable Objects](https://developers.cloudflare.com/durable-objects/)
-
-**Partial**
-
-- An RPC stub cannot cross an isolate boundary. See [RPC](#rpc).
-- An outbound WebSocket does not continue after the object moves to another
-  node.
-- celld refuses invalid UTF-8 from a SQLite `TEXT` value. Store arbitrary
-  bytes in a `BLOB`.
-- `SqlStorage.Cursor.toArray()` gives a celld-specific error when the isolate
-  is near its V8 heap limit.
-
-### [Cron Triggers](https://developers.cloudflare.com/workers/configuration/cron-triggers/)
-
-**Partial**
-
-- celld rejects a descending range such as `SAT-SUN` or `NOV-FEB`.
-- celld rejects `*` inside a list such as `1,*`.
-- celld runs one handler for each occurrence across the complete fleet.
-- After fleet downtime, celld runs the most recent missed occurrence one time.
-- celld runs one handler at a time for each script. It retries a failed handler
-  until the next occurrence unless the handler calls `noRetry()`.
-- A service-binding target cannot run its own Cron Triggers.
-
-### [Worker Loader](https://developers.cloudflare.com/workers/runtime-apis/bindings/worker-loader/)
-
-**Partial**
-
-- Worker Loader is experimental and requires `CELLD_WORKER_LOADER=LOADER`.
-- A `globalOutbound` Fetcher is not available.
-- A loaded Worker cannot receive a capability stub in `env`.
-- Awaitable and pipelined properties are not available.
-
-### [Static assets](https://developers.cloudflare.com/workers/static-assets/)
-
-**Yes**
-
-- `celld deploy` reads `_routes.json` from the asset directory (version `1`
-  only). `include` patterns may invoke the Worker first; `exclude` patterns
-  serve from assets only and return `404` on a miss instead of falling through
-  to the Worker. Wildcards use `*`, matching ingress and
-  `assets.run_worker_first` route lists.
-- `_routes.json` is deployment metadata like `_headers` and `_redirects`; it is
-  not published as a static file.
-- `html_handling: auto-trailing-slash` resolves directory URLs such as
-  `/blog/` to `/blog/index.html` in the asset index.
-
-### [KV](https://developers.cloudflare.com/kv/api/)
-
-**Partial**
-
-- celld has no edge cache. `cacheTtl` has no effect, and `cacheStatus` is
-  `null`.
-- A value above 1 MiB requires a fleet bucket.
-- celld stores a separate object when an application writes an identical large
-  value after a namespace changes owners. The separate object prevents an old
-  owner from deleting the current value.
-- celld reads a large-value row from an older release, but it does not reclaim
-  the legacy object after the row is removed.
-- A namespace has one writer. Use more namespaces to increase write capacity.
-- A namespace ID can use the Cloudflare hexadecimal form or another stable
-  string.
-
-### [Queues](https://developers.cloudflare.com/queues/configuration/javascript-apis/)
-
-**Partial**
-
-- A queue has one writer. Use more queues to increase write capacity.
-- A Queue owner accepts two concurrent producer operations. One operation can
-  run and one operation can wait, so an overload cannot delay Queue alarms.
-  The owner refuses an additional operation, and the producer can retry it.
-- A queue can have one consumer script. The consumer cannot also export a
-  `fetch()` handler.
-- celld retains a message for four days. You cannot configure this period.
-- Pull consumers and the Queues HTTP API are not available.
-- Dashboard controls, manual consumer attachment, R2 event notifications, and
-  Queue event subscriptions are not available.
-
-### [D1](https://developers.cloudflare.com/d1/worker-api/d1-database/)
-
-**Partial**
-
-- A binding result can contain at most 100,000 rows or 32 MiB.
-- celld refuses invalid UTF-8 from a SQLite `TEXT` value. Store arbitrary
-  bytes in a `BLOB`.
-
-### [Workflows](https://developers.cloudflare.com/workflows/build/workers-api/)
-
-**Partial**
-
-- `create()` replaces a terminal instance that has the same ID. Cloudflare
-  refuses each duplicate ID.
-- celld replays `run()` from the start, so code outside a step runs again.
-- A crash after a step side effect can run the step callback again.
-- `retention` and `locationHint` are not available.
-- Non-step work cannot remain pending for more than 60 seconds.
-- A step result, an event payload, and the workflow parameters each have a
-  1 MiB limit.
-- `pause()` stops a queued or waiting instance immediately. It lets an active
-  step finish, and the status changes from `waitingForPause` to `paused` before
-  the next step starts.
-- `resume()` starts a paused instance and cancels a pending pause. A paused
-  retry, sleep, or event wait keeps its remaining wait duration.
-- `restart()` starts a new generation from the beginning by default. Its
-  `from` option can select a step by its `name`, `count`, and `type`. The
-  `count` value defaults to `1`, and the `type` value defaults to `do`.
-- A selected restart reuses each result before the selected step and reruns
-  that step and each later step. The runtime rejects a selector that does not
-  match the execution history.
-- `delete()`, `deleteBatch()`, and rollback are not available.
-- A sensitive step result and a `ReadableStream` step result are not
-  available.
-
-### [R2](https://developers.cloudflare.com/r2/api/workers/workers-api-reference/)
-
-**Partial**
-
-- An R2 binding uses the fleet bucket under `r2/<bucket_name>/`.
-- `ssecKey` is not available.
-- A conditional write cannot use a streamed body larger than 8 MiB.
-- `createMultipartUpload()` does not accept a checksum.
-- A multipart upload cannot resume on another node or after a restart.
-- celld cannot replace a multipart part that the object store already holds.
-- Out-of-order parts can use at most 256 MiB of memory, and completion cannot
-  change the order of stored parts.
-- `jurisdiction` is not available.
 
 ### [Images](https://developers.cloudflare.com/images/transform-images/bindings/)
 
@@ -207,97 +78,93 @@ still matches `env.IMAGES.input(stream|bytes|Response)`.
 
 | API | status |
 | --- | --- |
-| [Fetch, Request, Response, and Headers](https://developers.cloudflare.com/workers/runtime-apis/fetch/) | **Partial** |
-| [Bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/) | **Partial** |
-| [Context](https://developers.cloudflare.com/workers/runtime-apis/context/) | **Partial** |
-| [Handlers](https://developers.cloudflare.com/workers/runtime-apis/handlers/) | **Partial** |
-| [RPC](https://developers.cloudflare.com/workers/runtime-apis/rpc/) | **Partial** |
-| [Streams](https://developers.cloudflare.com/workers/runtime-apis/streams/) | **Partial** |
-| [Encoding](https://developers.cloudflare.com/workers/runtime-apis/encoding/) | **Yes** |
-| [WebSockets](https://developers.cloudflare.com/workers/runtime-apis/websockets/) | **Partial** |
-| [Web Crypto](https://developers.cloudflare.com/workers/runtime-apis/web-crypto/) | **Partial** |
-| [Web standards](https://developers.cloudflare.com/workers/runtime-apis/web-standards/) | **Partial** |
-| [WebAssembly](https://developers.cloudflare.com/workers/runtime-apis/webassembly/) | **Yes** |
-| [Performance and timers](https://developers.cloudflare.com/workers/runtime-apis/performance/) | **Partial** |
-| [Console](https://developers.cloudflare.com/workers/runtime-apis/console/) | **Partial** |
-| [Node.js compatibility](https://developers.cloudflare.com/workers/runtime-apis/nodejs/) | **Partial** |
-| [Facets](https://developers.cloudflare.com/dynamic-workers/usage/durable-object-facets/) | **No** |
-| [Cache](https://developers.cloudflare.com/workers/runtime-apis/cache/) | **No** |
-| [HTMLRewriter](https://developers.cloudflare.com/workers/runtime-apis/html-rewriter/) | **No** |
-| [TCP sockets](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/) | **No** |
-| [EventSource](https://developers.cloudflare.com/workers/runtime-apis/eventsource/) | **No** |
-| [MessageChannel](https://developers.cloudflare.com/workers/runtime-apis/messagechannel/) | **No** |
+| [Fetch, Request, Response, and Headers](#fetch-request-response-and-headers) | **Yes** |
+| [Bindings](#bindings) | **Yes** |
+| [Context](#context) | **Yes** |
+| [Handlers](#handlers) | **Yes** |
+| [RPC](#rpc) | **Yes** |
+| [Streams](#streams) | **Yes** |
+| Encoding | **Yes** |
+| [WebSockets](#websockets) | **Yes** |
+| [Web Crypto](#web-crypto) | **Yes** |
+| [Web standards](#web-standards) | **Yes** |
+| WebAssembly | **Yes** |
+| [Performance and timers](#performance-and-timers) | **Yes** |
+| Console | **Yes** |
+| [Node.js compatibility](#nodejs-compatibility) | **Partial** |
+| [Cache](#cache) | **Partial** |
+| HTMLRewriter | **Yes** |
+| [TCP sockets](#tcp-sockets) | **Yes** |
+| EventSource | **Yes** |
+| MessageChannel | **Yes** |
 | BroadcastChannel | **No** |
 
 ### [Fetch, Request, Response, and Headers](https://developers.cloudflare.com/workers/runtime-apis/fetch/)
 
-**Partial**
-
-- The `cache` request option is not available.
-- `Request` keeps its URL in an internal slot, so a subclass may define a
-  getter-only `url` property and can still be constructed, copied, and cloned.
-- celld removes `Content-Length` from a Worker response. It preserves the
-  header for a `HEAD` response.
-- A remote Durable Object call streams the request body to the owner. The call
-  cannot retry after body transmission starts because celld keeps no replay
-  copy.
+- The `cache` request option is unavailable.
+- An inbound `Request` has a `cf` object without Cloudflare edge fields. celld
+  cannot prove the geolocation, colo, or TLS metadata.
+- celld removes `Content-Length` from a Worker response, except for a `HEAD`
+  response.
+- A remote Durable Object call cannot retry after request-body transmission
+  starts because celld keeps no replay copy.
+- A remote Durable Object call waits for a rejected owner generation to change
+  for at most `CELLD_OPERATION_DEADLINE_MS`.
 
 ### [Bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/)
 
-**Partial**
-
+The [services table](#services) lists the available binding types. Each binding
+type that the table does not list is unavailable.
 - The [services table](#services) lists the available binding types.
-- celld supports Durable Objects, services, variables, assets, D1, KV, Queues,
   Workflows, R2, and Images bindings. Each other binding type is not available.
 
 ### [Context](https://developers.cloudflare.com/workers/runtime-apis/context/)
 
-**Partial**
-
 - `passThroughOnException()` has no effect because celld has no CDN fallback.
-- `ctx.facets` is not defined.
+- `ctx.facets` is available only inside a Durable Object.
 
 ### [Handlers](https://developers.cloudflare.com/workers/runtime-apis/handlers/)
 
-**Partial**
-
-- The `tail` and `email` handlers are not available.
+The `tail` and `email` handlers are unavailable.
 
 ### [RPC](https://developers.cloudflare.com/workers/runtime-apis/rpc/)
 
-**Partial**
-
-- A cross-isolate named service binding supports only a single method call. It
-  does not support `fetch()`, awaitable properties, or pipelined paths.
 - An RPC stub cannot cross an isolate boundary.
-- `ctx.exports` contains only the entrypoints that the configuration declares.
+- An `AbortSignal` in a Durable Object RPC call does not cross a node boundary.
+- A remote RPC retries only when the failed peer attempt did not start the
+  method. Use a stable operation ID for an application retry.
 
 ### [Streams](https://developers.cloudflare.com/workers/runtime-apis/streams/)
 
-**Partial**
-
-- `ReadableStream.from()` is not available.
+- celld expires an unclaimed and inactive HTTP stream after 60 seconds. A
+  successful stream operation starts a new 60-second period.
+- An expired or unknown stream reports an error instead of EOF.
 
 ### [WebSockets](https://developers.cloudflare.com/workers/runtime-apis/websockets/)
 
-**Partial**
-
-- `getTags()` is not available.
-- A caller must call `accept()` on the socket from a subrequest upgrade.
-- An outbound Worker socket closes after the response and `waitUntil` work
-  end.
-- celld rejects an upgrade when the response status is not 101.
-- celld removes Worker-supplied protocol and connection headers from an upgrade
-  response.
-- An outbound upgrade combines repeated values for one header name.
-- `acceptWebSocket()` throws when the isolate uses more than 90 percent of its
-  V8 heap limit.
+- An outbound Worker socket closes when its event and `waitUntil` work end. A
+  socket returned in the response stays open.
+- Each isolate-polled input queue has a 1 MiB budget for non-terminal frames. A
+  message larger than 1 MiB uses the complete budget.
+- If the isolate stops polling, celld discards unread frames during cleanup. A
+  later pull reports an abnormal close.
+- A WebSocket transport cannot move to a new cell owner. A client must reconnect
+  with the same application operation ID.
+- A tunneled connection forwards the owner's Close without an additional Close.
+  If the owner connection fails between frames before a Close, the ingress sends
+  code 1012. If a frame is incomplete, the ingress closes the transport instead.
+- `acceptWebSocket()` throws above 90 percent of the V8 heap limit.
 
 ### [Web Crypto](https://developers.cloudflare.com/workers/runtime-apis/web-crypto/)
 
 **Partial** (Phase 0 of `docs/plans/CF-WEB-CRYPTO-100.md`; not Full)
-
 Progress vs the CF “Supported algorithms” matrix:
+- HMAC accepts MD5, SHA-1, SHA-224, SHA-256, SHA-384, and SHA-512.
+- ECDSA supports only the P-256 curve with SHA-256.
+- AES-GCM accepts authentication tags from 96 through 128 bits in 8-bit steps.
+- RSA-OAEP accepts SHA-1, SHA-256, SHA-384, and SHA-512. A nonempty label must
+  contain valid UTF-8.
+- A secret key cannot use `jwk` with `exportKey()` or `wrapKey()`.
 
 - **digest**: SHA-1 / SHA-256 / SHA-384 / SHA-512 / MD5 (CF extension).
 - **AES-GCM / AES-CBC / AES-CTR**: `encrypt` / `decrypt` / `generateKey` / `importKey` (`raw`) / `exportKey` (`raw`).
@@ -322,58 +189,58 @@ Known host notes:
 - RSA-PSS is Web Crypto only; `node:crypto` still does not expose PSS (see Node.js compatibility).
 ### [Web standards](https://developers.cloudflare.com/workers/runtime-apis/web-standards/)
 
-**Partial**
-
-- An `AbortSignal` does not abort an RPC call.
-- `signal.onabort` has no effect. Use `addEventListener("abort", ...)`.
-- `structuredClone()` is not conformant for some exotic types.
-
 ### [Performance and timers](https://developers.cloudflare.com/workers/runtime-apis/performance/)
 
-**Partial**
-
-- An active interval keeps a Worker request open.
-- `performance.now()` has millisecond resolution.
-- The other `performance` properties are stubs.
-
-### [Console](https://developers.cloudflare.com/workers/runtime-apis/console/)
-
-**Partial**
-
-- `debug`, `trace`, `group`, and `table` have no effect.
-- `assert`, `time`, and `count` are not available.
+`performance.timeOrigin` is `0`, and `performance.now()` matches `Date.now()`.
+Both clocks advance at an I/O boundary and stay fixed during JavaScript
+execution.
 
 ### [Node.js compatibility](https://developers.cloudflare.com/workers/runtime-apis/nodejs/)
 
-**Partial**
-
 - celld implements `node:assert`, `node:async_hooks`, `node:buffer`,
-  `node:events`, `node:path`, `node:stream`, `node:timers/promises`, `node:url`,
-  and `node:util` (including their supported bare aliases).
-- `node:url` implements the legacy `parse` / `format` pair and
-  `pathToFileURL` / `fileURLToPath`; other legacy URL helpers remain
-  unsupported.
+  `node:diagnostics_channel`, `node:events`, `node:fs`, `node:os`, `node:path`,
+  `node:stream`, `node:timers/promises`, and `node:util`.
+- `node:diagnostics_channel` does not export messages to a tail Worker.
 - `node:crypto` does not implement Diffie-Hellman, streaming signatures,
   ciphers, RSA-PSS, or DSA signatures and key generation.
-- `node:zlib` implements synchronous gzip/deflate helpers plus callback
-  `gzip` / `gunzip` / `deflate` / `inflate` (sync work deferred via
-  `process.nextTick`; compatible with `util.promisify`). Streaming APIs are
-  not implemented.
-- `node:fs` returns `ENOENT` from each read.
-- Each other Node.js module returns an inert stub. This behavior is a known
-  silent gap.
+- `KeyObject.toCryptoKey()` applies the requested algorithm, extractability,
+  and usages to an asymmetric key.
+- `node:zlib` implements only the synchronous gzip and deflate functions.
+- `node:fs` provides `access`, `mkdir`, `realpath`, `stat`, `lstat`, and
+  `readFile`. It exposes an empty, request-local `/tmp` and a read-only
+  `/bundle` that contains the Worker modules.
+- The global `process` gives each field that it defines the same value that
+  workerd gives it, so a dependency that reads `process.execPath`,
+  `process.argv`, or `process.title` at module scope can load. celld does not
+  define the full workerd surface, so a field such as `process.kill` or
+  `process.features` is undefined.
+- The celld bundler supports a synchronous CommonJS `require()` of a Node.js
+  built-in module. A raw ESM Worker has no global `require()`.
+- A Node.js built-in module object is writable, so a CommonJS dependency that
+  replaces a function on the module at load can start. The `graceful-fs`
+  package replaces `fs.close` this way. A patch stays in the isolate that
+  applies it, therefore another Worker never observes the patch.
+- An import of another Node.js module succeeds, but its first call throws an
+  error.
+
+### [Cache](https://developers.cloudflare.com/workers/runtime-apis/cache/)
+
+celld provides an always-miss cache because it has no shared edge cache.
+`put()` validates and consumes a response but stores nothing, `match()` returns
+`undefined`, and `delete()` returns `false`.
 
 ### [TCP sockets](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/)
 
-**No**
+- A socket cannot outlive its event. A Durable Object must reconnect during a
+  later event.
+- celld verifies a TLS server against its bundled Mozilla root store.
+- celld does not block the destination ports that Cloudflare blocks. The fleet
+  network controls the egress policy.
 
-- `connect()` returns an inert stub. This behavior is a known silent gap.
+### BroadcastChannel
 
-### EventSource, MessageChannel, and BroadcastChannel
-
-**No**
-
-- These classes are inert stubs. This behavior is a known silent gap.
+celld defines the class so that a bundle can load, but its constructor throws an
+error.
 
 ## Compatibility flags
 
@@ -391,19 +258,44 @@ celld accepts each other compatibility flag without effect.
 
 ## Wrangler configuration
 
-`celld deploy` accepts `wrangler.jsonc` or `wrangler.json`. It does not
-accept `wrangler.toml`. The deployment accepts these top-level keys:
+`celld deploy` accepts `wrangler.jsonc` or `wrangler.json`. It does not accept
+`wrangler.toml`.
+
+The `name` value must contain 1 to 63 lowercase ASCII letters, digits, or
+internal hyphens. It cannot start or end with a hyphen.
+
+The deployment accepts these top-level keys:
 
 - `$schema`, `name`, `main`, and `no_bundle`
 - `compatibility_date` and `compatibility_flags`
 - `durable_objects` and `migrations`
 - `assets`, `services`, `triggers`, and `vars`
-- `d1_databases`, `kv_namespaces`, `queues`, `workflows`,
+- `d1_databases`, `kv_namespaces`, `queues`, `workflows`, and
+  `r2_buckets`
+- `worker_loaders` and `containers`
+- `define` and `rules`
   `r2_buckets`, and `images`
 
 Each other top-level key, including `routes`, stops the deployment.
-An asset-only project can omit `main`. celld refuses a symlink or special file
-in an asset directory, and `.assetsignore` requires Wrangler.
+
+`celld deploy` bundles with esbuild, and it gives `define` and `rules` to that
+run. Each `define` value is a JavaScript expression, as it is for Wrangler.
+A rule must have a `type` of `Text`, `Data`, or `CompiledWasm`, and each of its
+globs must have the form `**/*.ext` or `*.ext`: esbuild selects a loader by
+file extension, so celld refuses a glob that selects a different set of files.
+
+Two rules can name one extension only if they give it the same type. Two rules
+that give one extension different types stop the deployment, because no single
+loader satisfies both. celld applies a `CompiledWasm` rule to `**/*.wasm`
+already, so a `CompiledWasm` rule for that extension agrees with the built-in
+rule and the deployment continues. Another type for `**/*.wasm` stops the
+deployment.
+
+`no_bundle` does not run esbuild. A config that sets `no_bundle` with `define`
+or `rules` therefore stops the deployment.
+
+An asset-only project can omit `main`. The native deploy command refuses an
+unsafe asset path, and `.assetsignore` requires Wrangler.
 
 See [Limitations](limitations.md) for the operating-system, networking,
 security, pressure, and update boundaries.

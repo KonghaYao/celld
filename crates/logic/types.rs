@@ -43,6 +43,15 @@ pub struct ActivitySnapshot {
     /// Handoff operations that the executor explicitly rejected. A process
     /// deadline can terminate before this counter changes.
     pub handoff_failed: u64,
+    /// Balancing moves a peer acquired. A subset of `handed_off`.
+    pub rebalanced: u64,
+    /// Balancing moves no peer acquired. A subset of `handoff_failed`; the
+    /// cell stayed unowned and its next request re-reads ownership.
+    pub rebalance_failed: u64,
+    /// Cached owner or capacity routes retired after an observed lease
+    /// deadline. Counts one per retirement, including healthy renewals;
+    /// lease-less adoption replies and explicit invalidations do not count.
+    pub remote_route_refreshes: u64,
 }
 
 /// Management-facing lifecycle state derived atomically from [`State`].
@@ -118,6 +127,23 @@ pub struct Config {
     /// requests past ninety seconds. `None` restores the old behaviour, which
     /// callers use only when they need to observe an indefinite wait.
     pub operation_deadline_ms: Option<u64>,
+    /// How long a cell waits after a failed dead-owner log recovery
+    /// before it re-enters ownership resolution.
+    ///
+    /// A recovery fails precisely when the owner just died with a deep
+    /// open log: the survivors' sweep of that log is what the request
+    /// is really waiting for, and a thousand-cell owner measured
+    /// ~155 s of it. Failing the request instead turns that window
+    /// into minutes of hard errors.
+    pub owner_log_recovery_backoff_ms: u64,
+    /// How many failed recovery cycles a cell may retry before its
+    /// requests fail with `ResolveFailed`.
+    ///
+    /// A bound, not a target: the shell's own request lifetimes cut a
+    /// waiting client far earlier. At the default backoff this covers
+    /// the measured sweep above with a wide margin, so the cap only
+    /// fires on a recovery that is truly wedged.
+    pub owner_log_recovery_attempts: u32,
     /// How close an armed alarm may be before the cell stops being worth
     /// evicting. Inside this window the wake would cost more than the
     /// residency it saves, so the cell is held.
@@ -154,7 +180,8 @@ pub struct NodeLeaseRecord {
     pub expires_ms: u64,
     pub peer_protocol: u16,
     /// Per-process generation; production stores this in
-    /// `ownership_index_generation`.
+    /// `ownership_index_generation` and, as the same value, in
+    /// `probe_public_key`.
     pub generation: String,
     /// The folded node-log state: `None` means this session never opened
     /// a fleet log — it never acked past the bucket. Anything not sealed
@@ -176,6 +203,15 @@ pub struct CapacityPeer {
     pub expires_ms: u64,
     pub peer_protocol: u16,
     pub sampled_ms: u64,
+    /// Confirmed ownership held by this peer, including dormant cells.
+    /// `None` from a peer that predates this field.
+    pub owned_cells: Option<usize>,
+    /// The share of fleet ownership this peer wants, relative to the other
+    /// weights. `None` from a peer that predates rebalancing.
+    pub placement_weight: Option<u64>,
+    /// The newest bucket format this peer reads (`crate::format`). `None`
+    /// from a peer that predates the field, which reads format 1.
+    pub bucket_format: Option<u16>,
     pub resident_cells: usize,
     pub host_websockets: usize,
     pub rss_bytes: u64,
@@ -191,6 +227,34 @@ pub struct CapacityPeer {
     /// This process accepts a signed adoption request and acknowledges it
     /// after it acquires the cell's next ownership epoch.
     pub paced_handoff: bool,
+    /// An operator paused balancing on this node. One paused lease stops
+    /// every move in the fleet, so a pause from any node is fleet-wide.
+    pub rebalance_paused: bool,
+    /// This node is handing its cells away. It is not a receiver: for one
+    /// lease lifetime after it empties it would otherwise look like the
+    /// emptiest node in the fleet, and every cell sent to it fails its
+    /// adoption or leaves with the drain.
+    pub draining: bool,
+}
+
+impl CapacityPeer {
+    /// Whether this peer's own load report leaves room for another cell.
+    ///
+    /// The rebalance planner and the handoff executor must return the same
+    /// answer here, so both read this one predicate. The planner counts a
+    /// peer's room before it releases a batch, and the executor offers each
+    /// released cell only to a peer that has room. A peer the planner counts
+    /// and the executor then refuses leaves the cell unowned with its epoch
+    /// retained, because the release CAS runs before the successor acquire
+    /// and nothing puts the record back.
+    ///
+    /// A saturated ingress-only node is the case that breaks a split rule.
+    /// It owns no cells, so it looks like the emptiest receiver in the
+    /// fleet and the planner gives it the largest room, while the executor
+    /// refuses every cell it is offered.
+    pub fn reports_adoption_capacity(&self) -> bool {
+        !self.pressured && self.memory_headroom != Some(false)
+    }
 }
 
 /// A successor that has acquired a released cell.
@@ -241,6 +305,15 @@ pub enum HaltReason {
     /// The node lease was not renewed inside its TTL, so this node can no
     /// longer prove it owns anything it is serving.
     NodeLeaseExpired,
+    /// A renewal readback found no node lease record, so the record that
+    /// published the authority of this process is gone.
+    NodeLeaseMissing,
+    /// A renewal readback found a node lease record that this process can
+    /// neither recognize nor adopt, so it can no longer prove its authority.
+    /// The record can be a foreign replacement, or a late self-authored write
+    /// that carries a stale folded log stamp; the readback cannot tell them
+    /// apart, so the reason names the observation, not an author.
+    NodeLeaseMismatch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,11 +384,20 @@ pub enum Timer {
         cell: CellId,
         generation: u64,
     },
+    /// Fires to re-enter ownership resolution after a failed dead-owner
+    /// log recovery. Keyed by cell like `QueuedActivation`, because the
+    /// backing-off cell holds no operation; the generation discards a
+    /// stale retry after the cell moved on.
+    OwnerLogRecoveryRetry {
+        cell: CellId,
+        generation: u64,
+    },
 }
 
-/// Every way a cell's state can leave this process.
+/// Every way a cell's state can leave this process, and the one promise the
+/// application treats as if it had.
 ///
-/// This enum lists every external route. It is deliberately not
+/// This enum lists every external route, plus `Sync`. It is deliberately not
 /// `#[non_exhaustive]`, so every exhaustive shell match stops compiling until
 /// somebody decides how a new channel is held and how it is released.
 ///
@@ -334,7 +416,9 @@ pub enum Timer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Channel {
     /// The answer to the cell event itself: an HTTP response, a cell RPC
-    /// reply, or a peer-served reply.
+    /// reply, or a peer-served reply. A response whose body streams takes one
+    /// ticket for its head and one more for each chunk, because a chunk the
+    /// producer makes after the release can reveal a later write.
     Response,
     /// `fetch()` from a handler to a third party.
     Fetch,
@@ -349,8 +433,20 @@ pub enum Channel {
     Service,
     /// A call to another cell: its `fetch` or one of its RPC methods.
     CellRpc,
+    /// An operation that changes an application R2 bucket.
+    R2,
+    /// A connection, write, TLS upgrade, or shutdown on a raw TCP socket.
+    Tcp,
     /// A leased Queue batch leaving its broker for a consumer Worker.
     Queue,
+    /// The promise `storage.sync()` returns to the handler. Nothing leaves
+    /// the process on this route, but the application treats the settled
+    /// promise as a durability statement and acts on it through routes the
+    /// gate cannot hold: a log line, local work, or the next checkpoint. A
+    /// promise that settles before the proof lets the application discard a
+    /// recovery path it still needs. So the promise takes the same ticket an
+    /// egress takes, and its release is the promise settling.
+    Sync,
 }
 
 impl Channel {
@@ -363,7 +459,10 @@ impl Channel {
             Channel::WsSelf => "ws_self",
             Channel::Service => "service",
             Channel::CellRpc => "cellrpc",
+            Channel::R2 => "r2",
+            Channel::Tcp => "tcp",
             Channel::Queue => "queue",
+            Channel::Sync => "sync",
         }
     }
 }
@@ -396,6 +495,28 @@ pub enum WebSocketKind {
     /// application code at a rate the application chooses, so how much of the
     /// node it may hold is budgeted.
     Outbound,
+}
+
+/// How far a wake hint reaches.
+///
+/// Every node lists the fleet's due wake entries on its tick, but only the
+/// node that holds the advisory waker lease may spend I/O on cells it does not
+/// own. `Owned` is every other node's hint: it wakes a cell this node holds
+/// dormant and does nothing else. `Fleet` is the elected waker's hint (and the
+/// boot scan's): it may probe a cell nobody here owns and take over a dead
+/// owner's cell.
+///
+/// The distinction exists because a hint costs an activation permit and an
+/// owner read before the core can learn the cell is someone else's. The
+/// fleet's due set is O(fleet) while a node's own is O(node), so a node that
+/// probed every fleet entry queued its own alarm wakes behind the fleet's:
+/// measured as a 60 s tail against 32 s on seven nodes (2026-09-01).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakeHintScope {
+    /// Wake a dormant cell this node owns; ignore every other cell.
+    Owned,
+    /// Probe ownership and take over a cell whose owner is gone.
+    Fleet,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -511,12 +632,46 @@ pub enum Event {
     /// decide nothing. A cell with nothing outstanding releases it at once,
     /// so an ordinary read pays no durability latency.
     ///
-    /// The epoch is not carried: the core reads it from the pinned cell's
-    /// resident phase, which cannot change while the request holds it.
+    /// `observed` is the committed-write position a read-only output saw when
+    /// it answered, above the cell's published baseline, when a handler had
+    /// advanced it: `None` when the output carries a `position` of its own or
+    /// the cell holds no handler write. The core holds the output until a
+    /// verified proof covers it, so a reader that answers between another
+    /// handler's commit and that handler's ticket waits for the proof the
+    /// writer has not asked for yet.
+    ///
+    /// `epoch` is the activation epoch the shell sampled `position` at, when
+    /// it sampled before the request pinned the cell: an in-handler ticket
+    /// takes its position in the handler's turn and only then acquires a
+    /// request. A reset between the two discards that epoch's unproven writes,
+    /// and the request then activates the next epoch, whose proof cannot cover
+    /// what the ticket asks about. The core refuses a ticket whose epoch is
+    /// not the resident one. `None` when the request was already active on
+    /// the cell at the sample, as the response is: a reset deactivates every
+    /// request of the cell it discards, so a stale one is refused as not
+    /// active rather than by its epoch.
     Output {
         request: RequestId,
         channel: Channel,
         position: Option<u64>,
+        observed: Option<u64>,
+        epoch: Option<Epoch>,
+    },
+    /// The production output event. The monotonic instant keeps the authority
+    /// decision and the release inseparable when a handler outlives the node
+    /// lease under which it started. Untimed simulations can use [`Event::Output`].
+    ///
+    /// `epoch` and `observed` carry the same values as on [`Event::Output`],
+    /// and the core applies the same rules to them. The production shell sends
+    /// only this variant, so both must travel here too; without them, every
+    /// released ticket in a production build would skip those checks.
+    OutputAt {
+        request: RequestId,
+        channel: Channel,
+        position: Option<u64>,
+        observed: Option<u64>,
+        epoch: Option<Epoch>,
+        now_mono_ms: u64,
     },
     /// The shell finished proving a gated write durable. `Ok(position)` reports
     /// the committed-write position the replica has *actually* proved durable;
@@ -551,7 +706,7 @@ pub enum Event {
     },
     AlarmObserved {
         cell: CellId,
-        at_ms: Option<i64>,
+        alarm: wake::AlarmSnapshot,
         covered: bool,
         now_ms: u64,
         now_mono_ms: u64,
@@ -571,13 +726,20 @@ pub enum Event {
         /// covers it, and the position of the consuming commit if the firing
         /// wrote. The position is sampled last, so it covers the consume
         /// itself, and the core proves it durable before the alarm settles.
-        result: Result<(Option<i64>, bool, Option<u64>), Failure>,
+        result: Result<(wake::AlarmSnapshot, bool, Option<u64>), Failure>,
     },
+    /// A due wake entry was found for `cell`. `entry_ms` is the minute the
+    /// entry is filed under, so the node that acts on the hint can adopt
+    /// that exact entry; `scope` says how far the hint reaches.
     WakeHint {
         cell: CellId,
+        entry_ms: i64,
+        scope: WakeHintScope,
     },
     WakeHintAt {
         cell: CellId,
+        entry_ms: i64,
+        scope: WakeHintScope,
         now_mono_ms: u64,
     },
     OwnerRead {
@@ -629,11 +791,11 @@ pub enum Event {
     },
     RuntimeStarted {
         op: OpId,
-        /// The isolate now holding this cell's realm. Placement happens in the
-        /// shell, so the core has to be told; the walk down groups on it to
-        /// empty a heap rather than scatter its cuts across every one. `None`
-        /// when no runtime placed the cell.
-        isolate: Option<crate::isolate::IsolateId>,
+        /// The node-wide identity of the V8 heap now holding this cell's
+        /// realm. Placement happens in the shell, so the core has to be told;
+        /// the walk down groups on it to empty a heap rather than scatter its
+        /// cuts across every one. `None` when no runtime placed the cell.
+        isolate: Option<crate::isolate::HeapId>,
         /// The application generation whose isolate took the cell. The shell
         /// resolves the generation at placement, and a placement that
         /// straddled an adoption lands on the previous one; the swap pump
@@ -664,10 +826,29 @@ pub enum Event {
     RuntimeStopped {
         op: OpId,
     },
-    /// Policy input for this first slice. Later eviction selection emits this
-    /// from the same core rather than an external caller choosing a victim.
+    /// A stop returned an error after its retry deadline. The runtime is
+    /// gone, the database stays open, and the cell restarts on it at the
+    /// same epoch, as a generation swap does. A pending stop emits no result.
+    RuntimeStopFailed {
+        op: OpId,
+    },
+    /// The host rescued the database for new activity instead of completing
+    /// the eviction. The runtime restarts through the failed-stop path.
+    RuntimeStopCancelled {
+        op: OpId,
+    },
+    /// Attempt a policy eviction without a caller result. Deterministic
+    /// policy drivers use this input; the Actor uses `EvictRequested` so a
+    /// refusal or an interrupted operation cannot look like success.
     Evict {
         cell: CellId,
+    },
+    /// Try an explicit eviction now and report admission before its effects
+    /// run, so the executor can bind the caller to the accepted operation.
+    EvictRequested {
+        request: RequestId,
+        cell: CellId,
+        now_mono_ms: u64,
     },
     /// A periodic resource sample from the edge.
     ///
@@ -694,6 +875,12 @@ pub enum Event {
     /// run at most `max_releases` at a time, and a cell that is active when
     /// the drain begins is picked up once its activity finishes.
     ReleaseAll,
+    /// Give up to `cells` idle cells to the fleet through the shutdown
+    /// handoff pipeline without draining. The core picks dormant cells
+    /// first, then hibernatable residents, and skips any cell with work.
+    Rebalance {
+        cells: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -712,10 +899,6 @@ pub enum Route {
 pub struct WorkerRoute {
     pub cell: CellId,
     pub epoch: Epoch,
-    /// A pending durability proof made stale by selecting this still-routable
-    /// resident. The executor uses the ID only to release its effect waiter;
-    /// a late completion is ignored by the core's phase check.
-    pub retired_durability: Option<OpId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -734,10 +917,113 @@ pub enum RequestError {
     DurabilityUnproven,
 }
 
+/// A successful local eviction request. A later request can reactivate the cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictSuccess {
+    /// The awaited eviction completes its runtime stop, including for joined callers.
+    Evicted,
+    /// The Actor finds settled local absence without a pending lifecycle transition.
+    AlreadyAbsent,
+}
+
+/// An eviction refused before an operation starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictRefusal {
+    NodeUnavailable,
+    CellActive,
+    CellTransitioning,
+    AlarmImminent,
+    AlarmUncovered,
+    ConcurrencyLimit,
+}
+
+/// An accepted eviction interrupted by a later lifecycle decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictCancellation {
+    Activity,
+    Alarm,
+    NodeFenced,
+}
+
+/// An eviction whose completion could not be established.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictFailure {
+    Durability,
+    DurabilityTimeout,
+    RuntimeStop,
+    ActorUnavailable,
+    ReplyLost,
+}
+
+/// Refusal and cancellation are expected outcomes, not node malfunctions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictError {
+    Refused(EvictRefusal),
+    Cancelled(EvictCancellation),
+    Failed(EvictFailure),
+}
+
+impl EvictError {
+    /// Stable category shared by Rust diagnostics and HTTP responses.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Refused(_) => "refused",
+            Self::Cancelled(_) => "cancelled",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    /// Stable reason code. Debug output cannot define the wire contract,
+    /// because a Rust variant rename must not change operator clients.
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::Refused(EvictRefusal::NodeUnavailable) => "node_unavailable",
+            Self::Refused(EvictRefusal::CellActive) => "cell_active",
+            Self::Refused(EvictRefusal::CellTransitioning) => "cell_transitioning",
+            Self::Refused(EvictRefusal::AlarmImminent) => "alarm_imminent",
+            Self::Refused(EvictRefusal::AlarmUncovered) => "alarm_uncovered",
+            Self::Refused(EvictRefusal::ConcurrencyLimit) => "eviction_limit",
+            Self::Cancelled(EvictCancellation::Activity) => "new_activity",
+            Self::Cancelled(EvictCancellation::Alarm) => "alarm_activity",
+            Self::Cancelled(EvictCancellation::NodeFenced) => "node_fenced",
+            Self::Failed(EvictFailure::Durability) => "durability_failed",
+            Self::Failed(EvictFailure::DurabilityTimeout) => "durability_timeout",
+            Self::Failed(EvictFailure::RuntimeStop) => "runtime_stop_failed",
+            Self::Failed(EvictFailure::ActorUnavailable) => "actor_unavailable",
+            Self::Failed(EvictFailure::ReplyLost) => "reply_lost",
+        }
+    }
+}
+
+impl std::fmt::Display for EvictError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.kind(), self.reason())
+    }
+}
+
+impl std::error::Error for EvictError {}
+
+/// Admission of an explicit caller. The core keeps its operation binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictionAdmission {
+    Absent,
+    Pending,
+}
+
 /// Work performed outside the core. Every asynchronous effect is versioned;
 /// completion events with an obsolete `op` are ignored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
+    EvictionAdmission {
+        request: RequestId,
+        result: Result<EvictionAdmission, EvictError>,
+    },
+    /// Settle a caller bound to the completed operation. A later activation
+    /// or eviction of the same cell cannot change this result.
+    EvictionFinished {
+        request: RequestId,
+        result: Result<EvictSuccess, EvictError>,
+    },
     ScheduleTimer {
         timer: Timer,
         at_mono_ms: u64,
@@ -795,11 +1081,11 @@ pub enum Effect {
     /// Emitted wherever the alarm settles, which is the only place that
     /// knows. An arm needs an entry; a consumed alarm needs its entry gone,
     /// or every later due scan finds a hint for an alarm that already fired
-    /// and wakes a cell with nothing to do. `next_alarm_ms` is -1 when no
-    /// alarm remains.
+    /// and wakes a cell with nothing to do. The snapshot retains its source
+    /// revision through the proof that permits this effect.
     ReconcileWakeEntry {
         cell: CellId,
-        next_alarm_ms: i64,
+        alarm: wake::AlarmSnapshot,
     },
     /// Publish an evicted cell as unowned, keeping its epoch, so the next
     /// node to want it can take it without waiting for this one to notice.
@@ -816,6 +1102,10 @@ pub enum Effect {
         op: OpId,
         cell: CellId,
         released_epoch: Epoch,
+        /// A balancing move rather than a drain: the successor must be a
+        /// peer below its ownership target, and the search is bounded by
+        /// the operation deadline instead of the process exit.
+        rebalance: bool,
     },
     /// Interrupt the activity which existed when a cell entered its shutdown
     /// handoff batch. The shell maps core request IDs to handler/body aborts
@@ -824,6 +1114,10 @@ pub enum Effect {
         cell: CellId,
         requests: Vec<RequestId>,
         websockets: Vec<WebSocketId>,
+        /// A firing alarm is a handler without a routed request id. Its exact
+        /// operation identifies the shell task to cancel, so a late cancel
+        /// cannot affect the next alarm firing for this cell.
+        alarm: Option<OpId>,
         /// A forced generation swap lists only the regular and outbound
         /// sockets, and the cell stays on this node: its hibernatable sockets
         /// and auto-response pair survive. A shutdown handoff lists every
@@ -851,6 +1145,24 @@ pub enum Effect {
         op: OpId,
         cell: CellId,
         epoch: Epoch,
+        /// Whether a request that arrives during this proof puts the cell back
+        /// into service instead of waiting for a successor. The cell still
+        /// serves while the proof runs, so an arriving request can cancel the
+        /// eviction. A revocable proof is therefore the last point at which
+        /// the node can change its mind, so the shell finishes every remote
+        /// check it needs here rather than after it takes close exclusion. A
+        /// drain has nowhere to put the cell back, so it pays for no check it
+        /// does not need.
+        ///
+        /// The two cancel sites do not test the same thing, which is worth
+        /// knowing before either one changes. `request_authorized` refuses to
+        /// rescue a cell while the node drains. `worker_request` cancels an
+        /// `EnsuringDurability` eviction with no drain test at all. That
+        /// asymmetry is safe only because a drain sets this field false: the
+        /// shell then does no revocable work, so a rescue costs a cancelled
+        /// proof and nothing more, and `LtxRepl::evict` remains the final
+        /// authority on whether the cell may be given up.
+        revocable: bool,
     },
     /// The output gate: prove the cell's committed `position` is replicated so
     /// a withheld local write response can be released. Unlike
@@ -876,6 +1188,30 @@ pub enum Effect {
         cell: CellId,
         epoch: Epoch,
         cause: StopCause,
+        /// After a returned error, the shell stops retrying at its deadline
+        /// and reports `RuntimeStopFailed`. An in-flight release has no
+        /// timeout. A drain and a fence keep retrying returned errors until
+        /// the process ends, because their node is leaving.
+        bounded: bool,
+    },
+    /// Give the cell back instead of finishing this eviction stop.
+    ///
+    /// A request is waiting on a cell in `Phase::Cleaning`, and the stop that
+    /// holds it is a bounded eviction, so the node has somewhere to put the
+    /// cell back. The shell abandons the stop if it can still do so, and it
+    /// reports `RuntimeStopCancelled`, which restarts the cell on its open
+    /// database at the epoch it already had.
+    ///
+    /// The shell decides whether it is still able to. An eviction that has
+    /// made its handoff snapshot visible cannot be abandoned: the snapshot is
+    /// a full image at one txid and it is the successor's restore artifact, so
+    /// a cell that served past it would leave a later restore reading a
+    /// complete database that stops short of an acknowledged write. This
+    /// effect is therefore a request and not an instruction, and a stop that
+    /// declines it reports `RuntimeStopped` as before.
+    AbandonEvictionStop {
+        op: OpId,
+        cell: CellId,
     },
     FireAlarm {
         op: OpId,
@@ -889,7 +1225,7 @@ pub enum Effect {
     },
     /// Release a withheld output now that the writes it can reveal are
     /// decided: `Ok` lets it leave, `Err` refuses it. Emitted only for an
-    /// output the shell held open via [`Event::Output`].
+    /// output the shell held open via [`Event::OutputAt`].
     ///
     /// `channel` is the one the shell supplied, returned unchanged. It selects
     /// which adapter holds this effect and is the only thing the shell needs
@@ -924,6 +1260,13 @@ pub enum Effect {
 pub struct LocalCell {
     pub id: CellId,
     pub epoch: Epoch,
+    /// The epoch's database is open-able as it stands, so a clean reload
+    /// resumes it in place. False for the copy an eviction preserved: it
+    /// proves the node held the cell, which is what the ownership
+    /// confirmation after a restart needs, but it is not a resumable
+    /// epoch. Without it a restarted node confirmed only the cells that
+    /// were resident when it died and hid every hibernated one.
+    pub live: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

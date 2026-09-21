@@ -108,6 +108,64 @@ impl ReplicaClient for FileReplicaClient {
         })
     }
 
+    async fn read_range(
+        &self,
+        level: i32,
+        min: TXID,
+        max: TXID,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut file =
+            tokio::fs::File::open(ltx_file_path(&self.path, level as u32, min, max)).await?;
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let mut bytes = Vec::new();
+        file.take(len).read_to_end(&mut bytes).await?;
+        Ok(bytes)
+    }
+
+    async fn write_ltx_file_from_file(
+        &self,
+        level: i32,
+        min_txid: TXID,
+        max_txid: TXID,
+        file: crate::host::HostFile,
+        host: crate::LtxHost,
+    ) -> Result<FileInfo> {
+        use tokio::io::AsyncWriteExt;
+        let (mut file, first, size) = super::read_upload_chunk(file, &host, 0, 1 << 20).await?;
+        let header = ltx::Header::parse(&first)?;
+        let filename = ltx_file_path(&self.path, level as u32, min_txid, max_txid);
+        tokio::fs::create_dir_all(ltx_level_dir(&self.path, level as u32)).await?;
+        // The named temporary file owns cleanup on errors and cancellation.
+        let temporary = tempfile::NamedTempFile::new_in(ltx_level_dir(&self.path, level as u32))?;
+        let mut output = tokio::fs::File::from_std(temporary.reopen()?);
+        output.write_all(&first).await?;
+        let mut offset = first.len() as u64;
+        drop(first);
+        while offset < size {
+            let (next_file, bytes, _) =
+                super::read_upload_chunk(file, &host, offset, 1 << 20).await?;
+            file = next_file;
+            output.write_all(&bytes).await?;
+            offset += bytes.len() as u64;
+        }
+        output.sync_all().await?;
+        drop(output);
+        temporary
+            .persist(&filename)
+            .map_err(|error| Error::Io(error.error))?;
+        Ok(FileInfo {
+            level,
+            min_txid,
+            max_txid,
+            size: size as i64,
+            created_at: Some(UNIX_EPOCH + Duration::from_millis(header.timestamp.max(0) as u64)),
+            ..Default::default()
+        })
+    }
+
     async fn delete_ltx_files(&self, files: &[FileInfo]) -> Result<()> {
         for info in files {
             let path = ltx_file_path(&self.path, info.level as u32, info.min_txid, info.max_txid);

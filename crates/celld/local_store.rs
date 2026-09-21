@@ -371,12 +371,12 @@ impl PaginatedListStore for LocalStore {
         let limit = options.max_keys.unwrap_or(usize::MAX);
         let mut entries: Vec<(String, Option<Path>, Option<ObjectMeta>)> = Vec::new();
         for object in self.metadata()? {
-            if !object.key.starts_with(prefix)
-                || after.is_some_and(|after| object.key.as_str() <= after)
-            {
+            let Some(remainder) = object.key.strip_prefix(prefix) else {
+                continue;
+            };
+            if after.is_some_and(|after| object.key.as_str() <= after) {
                 continue;
             }
-            let remainder = &object.key[prefix.len()..];
             let common = delimiter.and_then(|delimiter| {
                 remainder.find(delimiter).map(|index| {
                     Path::from(format!("{prefix}{}{}", &remainder[..index], delimiter))

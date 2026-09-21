@@ -1103,6 +1103,6 @@
   };
   posix.win32 = win32.win32 = win32;
   posix.posix = win32.posix = posix;
-  globalThis.__pathModule = posix;
-  globalThis.__pathWin32Module = win32;
+  __celld.__pathModule = posix;
+  __celld.__pathWin32Module = win32;
 })();

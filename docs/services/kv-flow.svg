@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 322" role="img" aria-labelledby="kvFlowTitle kvFlowDesc">
+  <title id="kvFlowTitle">Each namespace resolves to one cell with one owner node and one writer</title>
+  <desc id="kvFlowDesc">Workers on nodes A, B, and C call two namespaces. The calls cross an empty
+dashed layer, marked as the place where celld holds no cache, and reach two
+namespace cells. The VALUES cell has owner node B and one writer, and the
+SESSIONS cell has owner node C and one writer, so a second namespace adds a
+second writer. Under the VALUES cell, a value of 1 MiB or less goes to an inline
+row and a larger value goes to the fleet bucket. Every namespace splits the same
+way.</desc>
+  <style>
+    .d-ink { color: #121212 }
+    .d-soft { color: #3d3b37 }
+    .d-faint { color: #6e6a62 }
+    .d-acc { color: #10803f }
+    .d-panel { color: #ffffff }
+    .d-sunk { color: #f0eee8 }
+    .d-tint { color: #d6efdf }
+    text {
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      font-size: 13px;
+      fill: currentColor;
+    }
+    @media (prefers-color-scheme: dark) {
+      .d-ink { color: #efede7 }
+      .d-soft { color: #c9c6be }
+      .d-faint { color: #928e85 }
+      .d-acc { color: #3fc472 }
+      .d-panel { color: #1a1a19 }
+      .d-sunk { color: #232321 }
+      .d-tint { color: #10301d }
+    }
+  </style>
+  <defs>
+    <marker id="kv-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6"
+      markerHeight="6" orient="auto-start-reverse">
+      <path class="d-soft" fill="currentColor" d="M0 0 L10 5 L0 10 z" />
+    </marker>
+  </defs>
+
+  <!-- Callers: three nodes, two namespaces, reads and writes together. -->
+  <rect class="d-panel" fill="currentColor" x="6" y="8" width="136" height="48" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="6" y="8" width="136" height="48" rx="6" />
+  <text class="d-ink" fill="currentColor" x="74" y="29" text-anchor="middle">Worker · node A</text>
+  <text class="d-soft" fill="currentColor" x="74" y="46" text-anchor="middle">VALUES.get()</text>
+
+  <rect class="d-panel" fill="currentColor" x="152" y="8" width="136" height="48" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="152" y="8" width="136" height="48" rx="6" />
+  <text class="d-ink" fill="currentColor" x="220" y="29" text-anchor="middle">Worker · node B</text>
+  <text class="d-soft" fill="currentColor" x="220" y="46" text-anchor="middle">VALUES.put()</text>
+
+  <rect class="d-panel" fill="currentColor" x="298" y="8" width="136" height="48" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="298" y="8" width="136" height="48" rx="6" />
+  <text class="d-ink" fill="currentColor" x="366" y="29" text-anchor="middle">Worker · node C</text>
+  <text class="d-soft" fill="currentColor" x="366" y="46" text-anchor="middle">SESSIONS.put()</text>
+
+  <!-- The layer Cloudflare fills with a cache, and celld leaves empty. -->
+  <rect class="d-faint" fill="none" stroke="currentColor" stroke-dasharray="5 4"
+    x="6" y="76" width="428" height="48" rx="6" />
+  <text class="d-faint" fill="currentColor" x="220" y="96" text-anchor="middle">no cache layer</text>
+  <text class="d-faint" fill="currentColor" x="220" y="114" text-anchor="middle">every call reaches the owner cell</text>
+
+  <!-- The two callers of one namespace join; the third goes elsewhere. -->
+  <g class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M74 56 V70" />
+    <path d="M220 56 V70" />
+    <path d="M60 70 H220" />
+    <path d="M60 70 V142" marker-end="url(#kv-arrow)" />
+    <path d="M366 56 V70 H380 V142" marker-end="url(#kv-arrow)" />
+  </g>
+
+  <!-- One namespace, one cell, one writer. A second namespace, a second writer. -->
+  <rect class="d-tint" fill="currentColor" x="16" y="146" width="200" height="72" rx="6" />
+  <rect class="d-acc" fill="none" stroke="currentColor" stroke-width="2" x="16" y="146" width="200" height="72" rx="6" />
+  <text class="d-ink" fill="currentColor" x="116" y="169" text-anchor="middle">VALUES cell</text>
+  <text class="d-soft" fill="currentColor" x="116" y="188" text-anchor="middle">owner: node B</text>
+  <text class="d-soft" fill="currentColor" x="116" y="207" text-anchor="middle">one writer</text>
+
+  <rect class="d-tint" fill="currentColor" x="224" y="146" width="200" height="72" rx="6" />
+  <rect class="d-acc" fill="none" stroke="currentColor" stroke-width="2" x="224" y="146" width="200" height="72" rx="6" />
+  <text class="d-ink" fill="currentColor" x="324" y="169" text-anchor="middle">SESSIONS cell</text>
+  <text class="d-soft" fill="currentColor" x="324" y="188" text-anchor="middle">owner: node C</text>
+  <text class="d-soft" fill="currentColor" x="324" y="207" text-anchor="middle">one writer</text>
+
+  <!-- Inside a cell, the value size selects the store. -->
+  <g class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M70 218 V240 H65 V262" marker-end="url(#kv-arrow)" />
+    <path d="M162 218 V240 H167 V262" marker-end="url(#kv-arrow)" />
+  </g>
+
+  <rect class="d-sunk" fill="currentColor" x="16" y="266" width="98" height="46" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="16" y="266" width="98" height="46" rx="6" />
+  <text class="d-ink" fill="currentColor" x="65" y="287" text-anchor="middle">inline row</text>
+  <text class="d-soft" fill="currentColor" x="65" y="304" text-anchor="middle">1 MiB or less</text>
+
+  <rect class="d-sunk" fill="currentColor" x="118" y="266" width="98" height="46" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="118" y="266" width="98" height="46" rx="6" />
+  <text class="d-ink" fill="currentColor" x="167" y="287" text-anchor="middle">fleet bucket</text>
+  <text class="d-soft" fill="currentColor" x="167" y="304" text-anchor="middle">above 1 MiB</text>
+
+  <text class="d-faint" fill="currentColor" x="324" y="287" text-anchor="middle">every namespace splits</text>
+  <text class="d-faint" fill="currentColor" x="324" y="304" text-anchor="middle">the same way</text>
+</svg>

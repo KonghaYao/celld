@@ -12,16 +12,17 @@
 //! Cloudflare-shaped API. Config keys are an allowlist: anything we do not
 //! model is refused, never silently dropped.
 use crate::bucket::Bucket;
+use crate::container::ContainerSpec;
 use crate::note;
 use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, AssetRoutesConfig,
-    DeployPointer, Manifest, ModuleKind, ModuleRef, NativeComponentDescriptor, QueueConsumerAttachment, QueueConsumerConfig,
-    QueueConsumerDeployment, Rollout, RunWorkerFirst, EXECUTION_PROFILE_JS_V8,
-    EXECUTION_PROFILE_NATIVE_HTTP_V1, FEATURE_ASSETS_V1, FEATURE_BINARY_V1,
-    FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_IMAGES_V1, FEATURE_KV_V1, FEATURE_NATIVE_HTTP_V1,
-    FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
-    NATIVE_BASELINE_1, NATIVE_CAPABILITY_CONFIG, NATIVE_CAPABILITY_KV, NATIVE_HTTP_WORLD,
-    QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
+    DeployPointer, Manifest, ModuleKind, ModuleRef, NativeComponentDescriptor,
+    QueueConsumerAttachment, QueueConsumerConfig, QueueConsumerDeployment, Rollout, RunWorkerFirst,
+    EXECUTION_PROFILE_JS_V8, EXECUTION_PROFILE_NATIVE_HTTP_V1, FEATURE_ASSETS_V1,
+    FEATURE_BINARY_V1, FEATURE_CONTAINERS_V1, FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_IMAGES_V1,
+    FEATURE_KV_V1, FEATURE_NATIVE_HTTP_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1,
+    FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1, NATIVE_BASELINE_1, NATIVE_CAPABILITY_CONFIG,
+    NATIVE_CAPABILITY_KV, NATIVE_HTTP_WORLD, QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -69,8 +70,12 @@ const SUPPORTED_KEYS: &[&str] = &[
     "workflows",
     "r2_buckets",
     "images",
+    "worker_loaders",
+    "containers",
     "no_bundle",
     "cellp",
+    "define",
+    "rules",
 ];
 
 /// The Durable Object class every D1 database runs as. It is supplied by the
@@ -198,6 +203,13 @@ const MAX_ASSET_FILE_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_ASSET_DIRECTIVE_BYTES: u64 = 100 * 1024;
 const ASSET_UPLOAD_CONCURRENCY: usize = 16;
 
+/// Wrangler's Worker-name bound. The charset below is ASCII, so the byte and
+/// character counts are identical. This also keeps a generated Workflow class
+/// far below the cell-scope limit.
+const MAX_SCRIPT_NAME_BYTES: usize = 63;
+const _: () =
+    assert!(WORKFLOW_CLASS.len() + 1 + MAX_SCRIPT_NAME_BYTES <= celld_logic::cell::MAX_CELL_SCOPE);
+
 pub struct Options {
     pub config: Option<PathBuf>,
     pub bucket: Option<String>,
@@ -205,6 +217,14 @@ pub struct Options {
     pub region: Option<String>,
     pub dry_run: bool,
     pub json: bool,
+    /// Worker variables that override the `vars` of the config. `celld dev`
+    /// reads them from `.dev.vars`; `celld deploy` supplies none, so a local
+    /// credential cannot reach a fleet.
+    pub vars: BTreeMap<String, String>,
+    /// Keep container images in the local engine instead of saving them to
+    /// the bucket. `celld dev` runs its node on the same engine that built
+    /// them; a fleet needs the tar.
+    pub local_images: bool,
 }
 
 pub fn print_help() {
@@ -222,7 +242,11 @@ Wrangler for route configuration.\n\
 A running node polls the deployment pointer and adopts the new version in\n\
 place; nothing restarts."
     ;
-    let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text).help(text);
+    let text = format!(
+        "{text}\nThe config `name` uses lowercase ASCII letters, digits, and internal hyphens. \
+         It is at most {MAX_SCRIPT_NAME_BYTES} bytes."
+    );
+    let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text).help(&text);
 }
 
 pub fn options_from_arguments(
@@ -234,7 +258,9 @@ pub fn options_from_arguments(
         endpoint: None,
         region: None,
         dry_run: false,
+        local_images: false,
         json: false,
+        vars: BTreeMap::new(),
     };
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -249,7 +275,7 @@ pub fn options_from_arguments(
             }
             "--bucket" => {
                 let value = arguments.next().context("--bucket requires a value")?;
-                options.bucket = Some(value.trim_start_matches("s3://").to_string());
+                options.bucket = Some(value);
             }
             "--endpoint" => {
                 options.endpoint = Some(arguments.next().context("--endpoint requires a value")?);
@@ -278,6 +304,8 @@ struct Project {
     /// bundle, so it must not depend on the working directory celld was
     /// invoked from — identical source would otherwise hash two ways.
     entry: Option<String>,
+    /// What the config's `define` and `rules` add to the esbuild run.
+    bundle: BundleConfig,
     assets: Option<ProjectAssets>,
     metadata: Value,
     do_classes: Vec<String>,
@@ -290,11 +318,93 @@ struct Project {
     has_r2: bool,
     has_images: bool,
     native: Option<NativeProject>,
+    containers: Vec<ContainerDecl>,
 }
 
+/// The experimental `native-http-v1` component, read from disk at deploy time
+/// and carried to the manifest as a module of its own.
 struct NativeProject {
     path: String,
     bytes: Vec<u8>,
+}
+
+/// The two Wrangler bundling knobs that celld forwards to esbuild.
+///
+/// Both are pass-throughs, so celld validates their shape and leaves their
+/// meaning to esbuild. They travel together because both are build inputs and
+/// neither reaches the deployment metadata: a change to either changes the
+/// bundle bytes, and the deployment version hashes those.
+struct BundleConfig {
+    /// `define` as `--define:KEY=VALUE`. Each value is a JavaScript
+    /// expression, which is what Wrangler and esbuild both take.
+    define: BTreeMap<String, String>,
+    /// `rules` as `--loader:.EXT=LOADER`, plus celld's own default rule.
+    loaders: BTreeMap<String, Loader>,
+}
+
+/// The esbuild loaders a Wrangler module rule can ask for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Loader {
+    /// Wrangler's `Text`. The file becomes a string in the bundle.
+    Text,
+    /// Wrangler's `Data`. The file becomes a byte array in the bundle.
+    Binary,
+    /// Wrangler's `CompiledWasm`. The file becomes a sibling module that the
+    /// runtime serves as a compiled `WebAssembly.Module`.
+    Copy,
+}
+
+impl Loader {
+    fn esbuild_name(self) -> &'static str {
+        match self {
+            Loader::Text => "text",
+            Loader::Binary => "binary",
+            Loader::Copy => "copy",
+        }
+    }
+
+    /// The `rules[].type` a config writes for this loader. An error names the
+    /// config's own word, not celld's internal one.
+    fn rule_type(self) -> &'static str {
+        match self {
+            Loader::Text => "Text",
+            Loader::Binary => "Data",
+            Loader::Copy => "CompiledWasm",
+        }
+    }
+}
+
+impl Default for BundleConfig {
+    fn default() -> Self {
+        // Wasm is a sibling module (Wrangler's built-in `CompiledWasm` rule).
+        // The `copy` loader makes esbuild resolve each wasm import like any
+        // other import (importer-relative, node_modules, deduplicated) and
+        // rewrite the specifier to the copied file, so the bundle and the
+        // emitted files agree on names. It lives in the same map as the
+        // configured rules, so a config that gives `.wasm` a conflicting rule
+        // is refused by the same check that catches two conflicting rules,
+        // rather than emitting two `--loader` arguments for one extension.
+        Self {
+            define: BTreeMap::new(),
+            loaders: BTreeMap::from([(".wasm".to_string(), Loader::Copy)]),
+        }
+    }
+}
+
+/// One `containers[]` entry as written, before its image is resolved.
+#[derive(Clone, Debug, serde::Serialize)]
+struct ContainerDecl {
+    class_name: String,
+    /// A Dockerfile path relative to the project, or an image reference.
+    image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instance_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_instances: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime: Option<String>,
 }
 
 struct ProjectAssets {
@@ -319,6 +429,13 @@ pub struct Built {
     pub modules: Vec<(String, Vec<u8>)>,
     pub assets: Option<BuiltAssets>,
     pub bundled_in: Duration,
+    /// The resolved image ids of `containers[]`, in config order.
+    pub images: Vec<String>,
+    /// Save each image to the bucket. `celld dev` leaves them in the local
+    /// engine, which is where the node loads them from.
+    /// See `Manifest::fence_image`; saved beside `images`, reported apart.
+    pub fence_image: Option<String>,
+    pub upload_images: bool,
 }
 
 impl Built {
@@ -344,6 +461,9 @@ impl Built {
                 kib(assets.total_bytes as usize),
                 assets.blobs.len(),
             );
+        }
+        if !self.images.is_empty() {
+            note!("Containers: {} image(s)", self.images.len());
         }
         let bindings = self.bindings();
         if bindings.is_empty() {
@@ -428,6 +548,10 @@ impl Built {
                         Some((format!("env.{name} (R2)"), bucket.to_string()))
                     }
                     Some("images") => Some((format!("env.{name} (Images)"), "Images".to_string())),
+                    Some("worker_loader") => Some((
+                        format!("env.{name} (Worker Loader)"),
+                        "Dynamic Workers".to_string(),
+                    )),
                     Some("plain_text") => Some((
                         format!("env.{name} (Text)"),
                         "Environment Variable".to_string(),
@@ -462,7 +586,42 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .filter(|path| !path.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    let project = read_project(&config_path, &root)?;
+    let mut project = read_project(&config_path, &root, &options.vars)?;
+    // Resolve every image before the version is computed: the id is part of
+    // the deployment's identity, so a rebuilt image is a new deployment.
+    // A fleet deploy builds for the platform the nodes run, which Wrangler
+    // also fixes at linux/amd64; a machine that builds for itself, as
+    // `celld dev` does, passes none.
+    let platform = (!options.local_images).then(|| {
+        std::env::var("CELLD_CONTAINER_PLATFORM").unwrap_or_else(|_| "linux/amd64".to_string())
+    });
+    let images = project
+        .containers
+        .iter()
+        .map(|decl| resolve_image(&root, &decl.image, platform.as_deref()))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let container_specs: Vec<ContainerSpec> = project
+        .containers
+        .iter()
+        .zip(&images)
+        .map(|(decl, image)| ContainerSpec {
+            class_name: decl.class_name.clone(),
+            image: image.clone(),
+            instance_type: decl.instance_type.clone(),
+            max_instances: decl.max_instances,
+            runtime: decl.runtime.clone(),
+        })
+        .collect();
+    if !container_specs.is_empty() {
+        project.metadata["containers"] = json!(container_specs);
+    }
+    // The fence image rides with every deployment that has containers: a
+    // node runs it once, privileged, to fence its bridges before the first
+    // container starts. Built like an app image, keyed by content, so every
+    // deployment made by one celld shares one tar.
+    let fence_image = (!container_specs.is_empty())
+        .then(|| resolve_fence_image(platform.as_deref()))
+        .transpose()?;
     let started = Instant::now();
     let built_assets = project.assets.as_ref().map(build_assets).transpose()?;
     let bundle = project
@@ -481,8 +640,25 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                     .parent()
                     .filter(|dir| !dir.as_os_str().is_empty())
                     .unwrap_or(&root);
-                let (sibling_js, wasm, binary) =
+                let (sibling_js, mut wasm, binary) =
                     collect_no_bundle_siblings(sibling_dir, &path, &bundle)?;
+                // The graph walk above follows the entry's imports. A wasm
+                // file that a bundle imports through a spelling the scan does
+                // not model still has to ship, because esbuild's `copy` loader
+                // emitted it beside the entry: discover the siblings the same
+                // way, and keep the graph walk's entry for a name both found.
+                {
+                    let mut discovered = Vec::new();
+                    collect_unbundled_wasm(sibling_dir, "", &path, &mut discovered)?;
+                    let known: std::collections::BTreeSet<String> =
+                        wasm.iter().map(|(name, _)| name.clone()).collect();
+                    wasm.extend(
+                        discovered
+                            .into_iter()
+                            .filter(|(name, _)| !known.contains(name)),
+                    );
+                    wasm.sort_by(|a, b| a.0.cmp(&b.0));
+                }
                 Ok(BundleOutput {
                     bundle,
                     wasm,
@@ -490,14 +666,13 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                     binary,
                 })
             } else {
-                run_esbuild(&root, entry)
+                run_esbuild(&root, entry, &project.bundle)
             }
         })
         .transpose()?;
     let bundled_in = started.elapsed();
 
-    // esbuild emits one JS module plus a copy of every wasm file the bundle
-    // imports; the copies ship as sibling modules.
+    // Both build paths emit one JS module and its sibling wasm modules.
     let module_name = "index.js".to_string();
     let (mut modules, wasm_modules, sibling_js, binary_modules) = match bundle {
         Some(output) => (
@@ -586,6 +761,8 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             .collect(),
         assets: asset_reference,
         crons: project.crons.clone(),
+        containers: container_specs.clone(),
+        fence_image: fence_image.clone(),
         queue_consumers: project.queue_consumers,
         required_features: {
             let mut features = Vec::new();
@@ -597,6 +774,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if !project.crons.is_empty() {
                 features.push(FEATURE_CRON_V1.to_string());
+            }
+            if !container_specs.is_empty() {
+                features.push(FEATURE_CONTAINERS_V1.to_string());
             }
             if uses_d1 {
                 features.push(FEATURE_D1_V1.to_string());
@@ -645,7 +825,131 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         modules,
         assets: built_assets,
         bundled_in,
+        images,
+        fence_image,
+        upload_images: !options.local_images,
     })
+}
+
+/// Whether `image` names a Dockerfile in the project rather than an image
+/// reference: the file exists. Wrangler draws the same line.
+fn is_dockerfile(root: &Path, image: &str) -> bool {
+    std::fs::symlink_metadata(root.join(image)).is_ok_and(|metadata| metadata.is_file())
+}
+
+fn engine_cli() -> String {
+    std::env::var("CELLD_DOCKER").unwrap_or_else(|_| "docker".to_string())
+}
+
+fn run_engine(args: &[&str], what: &str) -> anyhow::Result<String> {
+    let output = Command::new(engine_cli())
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .with_context(|| {
+            format!(
+                "{what}: run `{}`; is a Docker or Podman CLI on PATH?",
+                engine_cli()
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "{what} failed:\n{}",
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The fleet reference of the image a `containers[].image` names: build
+/// the Dockerfile, or pull the reference, then tag the result by its
+/// content. A platform pins the build and the pull to the nodes'
+/// architecture; without one the engine's own is used, and a reference the
+/// engine already holds is not pulled again.
+///
+/// The engine's own image id is not the identity. Docker's containerd
+/// image store mints a new id for every build of identical content, so an
+/// id would make each deploy a new deployment version and a new tar in the
+/// bucket. The layer digests and the image config are stable across such
+/// builds, so their hash names the image everywhere: in the manifest, in
+/// the bucket key, and as the tag every engine holds it under.
+fn resolve_image(root: &Path, image: &str, platform: Option<&str>) -> anyhow::Result<String> {
+    let platform_args = platform
+        .map(|platform| vec!["--platform", platform])
+        .unwrap_or_default();
+    let id = if is_dockerfile(root, image) {
+        let path = root.join(image);
+        let context = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.to_path_buf());
+        let path = path.display().to_string();
+        let context = context.display().to_string();
+        let mut args = vec!["build", "-q"];
+        args.extend(&platform_args);
+        args.extend(["-f", &path, &context]);
+        run_engine(&args, "build container image")?
+    } else {
+        let inspect = ["image", "inspect", "--format", "{{.Id}}", image];
+        let held = platform.is_none() && run_engine(&inspect, "inspect container image").is_ok();
+        if !held {
+            let mut args = vec!["pull"];
+            args.extend(&platform_args);
+            args.push(image);
+            run_engine(&args, "pull container image")?;
+        }
+        run_engine(&inspect, "inspect container image")?
+    };
+    let content = run_engine(
+        &[
+            "image",
+            "inspect",
+            "--format",
+            "{{json .RootFS.Layers}}{{json .Config}}",
+            &id,
+        ],
+        "inspect container image",
+    )?;
+    let reference = crate::container::image_reference(&format!("{:x}", Sha256::digest(&content)));
+    run_engine(&["tag", &id, &reference], "tag container image")?;
+    Ok(reference)
+}
+
+/// The image the node fences its bridges with: `nft` and nothing else.
+/// Pinned so the content key, and with it the tar in the bucket, is
+/// stable across deployments.
+const FENCE_DOCKERFILE: &str = "FROM alpine:3.20\nRUN apk add --no-cache nftables\n";
+
+/// Build the fence image for `platform` and tag it by content, as
+/// `resolve_image` does for an application image.
+fn resolve_fence_image(platform: Option<&str>) -> anyhow::Result<String> {
+    let context = tempfile::tempdir().context("fence image build context")?;
+    std::fs::write(context.path().join("Dockerfile"), FENCE_DOCKERFILE)
+        .context("write fence Dockerfile")?;
+    resolve_image(context.path(), "Dockerfile", platform).context("build the celld-fence image")
+}
+
+/// Save the image to the bucket under its content key unless it is there.
+/// Saving by the reference writes the tag into the tar, so a node's load
+/// holds the image under the same name.
+async fn ensure_image_tar(bucket: &Bucket, image: &str) -> anyhow::Result<()> {
+    let key = crate::container::image_key(image);
+    if bucket.head(&key).await?.is_some() {
+        return Ok(());
+    }
+    let output = Command::new(engine_cli())
+        .args(["save", image])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("save container image")?;
+    if !output.status.success() {
+        bail!(
+            "save container image failed:\n{}",
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        );
+    }
+    bucket.put(&key, output.stdout).await
 }
 
 pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
@@ -654,6 +958,13 @@ pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
     // version in the bucket that an operator can mistake for a published one.
     let queue_attachments = prepare_queue_attachments(bucket, &built.manifest).await?;
 
+    // Images are fleet-wide and content-addressed like asset bodies, and
+    // they are what a node loads before a container class can start.
+    if built.upload_images {
+        for image in built.images.iter().chain(&built.fence_image) {
+            ensure_image_tar(bucket, image).await?;
+        }
+    }
     // Asset bodies are fleet-wide and content-addressed. Finish every body
     // before publishing the deployment-local index or manifest so a reader
     // can never observe a pointer whose assets are incomplete.
@@ -969,13 +1280,17 @@ pub fn read_d1_project(given: Option<PathBuf>) -> anyhow::Result<D1Project> {
                 Some(Value::String(identity)) if !identity.is_empty() => identity.clone(),
                 Some(_) => bail!("d1 database {name:?} has an invalid `database_id`"),
             };
+            let migrations_dir = match entry.get("migrations_dir") {
+                None => root.join("migrations"),
+                Some(Value::String(directory)) => {
+                    root.join(project_relative_path(directory, "migrations_dir")?)
+                }
+                Some(_) => bail!("d1 database {name:?} has a non-string `migrations_dir`"),
+            };
             databases.push(D1Declaration {
                 database_name: name.to_string(),
                 database_identity,
-                migrations_dir: entry
-                    .get("migrations_dir")
-                    .and_then(Value::as_str)
-                    .map_or_else(|| root.join("migrations"), |dir| root.join(dir)),
+                migrations_dir,
                 migrations_table,
             });
         }
@@ -1049,7 +1364,11 @@ pub(crate) fn resolve_config(given: Option<PathBuf>) -> anyhow::Result<PathBuf> 
     )
 }
 
-fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
+fn read_project(
+    path: &Path,
+    root: &Path,
+    overrides: &BTreeMap<String, String>,
+) -> anyhow::Result<Project> {
     let source =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let config: Value = serde_json::from_str(&strip_jsonc(&source))
@@ -1076,6 +1395,12 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("config has no `name`"))?
         .to_string();
+    if !valid_script_name(&script_name) {
+        bail!(
+            "config `name` must contain 1 to {MAX_SCRIPT_NAME_BYTES} bytes of lowercase \
+             ASCII letters, digits, or internal hyphens: {script_name:?}"
+        );
+    }
     let main = object
         .get("main")
         .map(|value| {
@@ -1102,6 +1427,24 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         bail!("config sets `no_bundle` without `main`");
     }
     let native = read_native_project(object, root)?;
+    let bundle = read_bundle_config(object)?;
+    // `define` and `rules` describe the esbuild run, and `no_bundle` is the
+    // absence of one. Accepting both would produce a deployment that silently
+    // omits every substitution the config asks for, which is the failure the
+    // caller wrote those keys to prevent.
+    if no_bundle {
+        let ignored: Vec<&str> = ["define", "rules"]
+            .into_iter()
+            .filter(|key| object.contains_key(*key))
+            .collect();
+        if !ignored.is_empty() {
+            bail!(
+                "config sets `no_bundle` with `{}`; those keys only change the \
+                 esbuild run, and `no_bundle` does not run esbuild",
+                ignored.join("` and `")
+            );
+        }
+    }
     let assets = object
         .get("assets")
         .map(|value| read_asset_project(value, root, object))
@@ -1600,34 +1943,91 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
             "name": binding,
         }));
     }
-    let vars = match object.get("vars") {
-        None => None,
-        Some(Value::Object(vars)) => Some(vars),
-        Some(_) => bail!("config `vars` must be an object"),
+    // `worker_loaders` is how a Dynamic Workers project asks for a Worker
+    // Loader. workerd declares the loaders in a `List(Binding)`, so a config
+    // can name more than one, and each one holds its own cache of the Workers
+    // it loaded. Two loaders are therefore two cache namespaces and not a
+    // duplicate of one namespace, so celld binds every entry. The shared
+    // binding-name check below refuses two entries that carry the same name.
+    let worker_loaders = match object.get("worker_loaders") {
+        None => &[][..],
+        Some(Value::Array(loaders)) => loaders.as_slice(),
+        Some(_) => bail!("config `worker_loaders` must be an array"),
     };
-    let mut var_count = 0_usize;
-    for (name, value) in vars.into_iter().flatten() {
+    for loader in worker_loaders {
+        let Value::Object(loader) = loader else {
+            bail!("worker loader must be an object with a `binding` name");
+        };
+        let binding = match loader.get("binding") {
+            None => bail!("worker loader has no `binding` name"),
+            Some(Value::String(binding)) => binding.as_str(),
+            Some(_) => bail!("worker loader `binding` must be a string"),
+        };
+        if !valid_binding(binding) {
+            bail!("invalid worker loader binding name: {binding:?}");
+        }
+        // Wrangler's worker_loaders entries contain only a binding name.
+        // Resource limits and tail Fetchers belong to WorkerCode, because the
+        // loader can create Workers with different limits and tail targets.
+        // Refuse misplaced options instead of deploying without their effect.
+        for key in loader.keys() {
+            if key != "binding" {
+                match key.as_str() {
+                    "limits" => bail!("worker loader {binding} sets `limits`; set limits in WorkerCode or getEntrypoint()"),
+                    "tails" => bail!("worker loader {binding} sets `tails`; set tails in WorkerCode"),
+                    "allowExperimental" => bail!("worker loader {binding} sets `allowExperimental`, which celld does not support"),
+                    _ => bail!("worker loader {binding} sets `{key}`, which is not a supported worker_loaders option"),
+                }
+            }
+        }
+        bindings.push(json!({
+            "type": "worker_loader",
+            "name": binding,
+        }));
+    }
+    let mut vars = BTreeMap::new();
+    match object.get("vars") {
+        None => {}
+        Some(Value::Object(object)) => {
+            for (name, value) in object {
+                let value = value
+                    .as_str()
+                    .ok_or_else(|| anyhow!("var binding {name} must be a string"))?;
+                vars.insert(name.as_str(), value);
+            }
+        }
+        Some(_) => bail!("config `vars` must be an object"),
+    }
+    // An asset-only project has no Worker to hand a variable to, so a
+    // `.dev.vars` beside it is residue, not a binding the guard below
+    // should refuse in the config's name.
+    let declared_vars = !vars.is_empty();
+    if main.is_some() {
+        vars.extend(
+            overrides
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        );
+    }
+    for (name, value) in &vars {
         if !valid_binding(name) {
             bail!("invalid var binding name: {name:?}");
         }
-        let value = value
-            .as_str()
-            .ok_or_else(|| anyhow!("var binding {name} must be a string"))?;
         bindings.push(json!({
             "type": "plain_text",
             "name": name,
             "text": value,
         }));
-        var_count += 1;
     }
     if main.is_none()
         && native.is_none()
         && (!do_classes.is_empty()
             || !sqlite_classes.is_empty()
             || service_count > 0
-            || var_count > 0
+            || declared_vars
             || !r2_binding_names.is_empty()
-            || images_binding.is_some())
+            || images_binding.is_some()
+            || !worker_loaders.is_empty())
     {
         bail!("an asset-only project cannot declare Worker bindings");
     }
@@ -1681,10 +2081,12 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         );
     }
 
+    let containers = read_containers(object, &do_classes, &sqlite_classes)?;
     Ok(Project {
         script_name,
         no_bundle,
         entry: main,
+        bundle,
         assets,
         metadata: Value::Object(metadata),
         do_classes,
@@ -1697,7 +2099,228 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         has_r2: !r2_buckets.is_empty(),
         has_images: images_binding.is_some(),
         native,
+        containers,
     })
+}
+
+/// The config's `define` and `rules`, as esbuild arguments.
+///
+/// Wrangler owns the spelling of both keys, so celld reads them as written
+/// rather than inventing a celld-only escape hatch: a project keeps one
+/// config, and a later move back to Wrangler bundles the same way.
+fn read_bundle_config(object: &Map<String, Value>) -> anyhow::Result<BundleConfig> {
+    let mut bundle = BundleConfig::default();
+    match object.get("define") {
+        None => {}
+        Some(Value::Object(entries)) => {
+            for (key, value) in entries {
+                let Some(value) = value.as_str() else {
+                    bail!("config `define` value for {key:?} must be a string");
+                };
+                // esbuild takes one `--define:KEY=VALUE` argument and splits
+                // it at the first `=`. A key carrying `=` would move that
+                // split and define a different name than the config names,
+                // and a key carrying whitespace or a control character cannot
+                // be a JavaScript reference at all.
+                if key.is_empty()
+                    || key.contains('=')
+                    || key.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    bail!("invalid `define` key: {key:?}");
+                }
+                bundle.define.insert(key.clone(), value.to_string());
+            }
+        }
+        Some(_) => bail!("config `define` must be an object"),
+    }
+    let rules = match object.get("rules") {
+        None => &[][..],
+        Some(Value::Array(rules)) => rules.as_slice(),
+        Some(_) => bail!("config `rules` must be an array"),
+    };
+    for rule in rules {
+        let Value::Object(rule) = rule else {
+            bail!("module rule must be an object with a `type` and `globs`");
+        };
+        for key in rule.keys() {
+            if !matches!(key.as_str(), "type" | "globs") {
+                bail!("module rule sets `{key}`, which celld does not have");
+            }
+        }
+        let Some(rule_type) = rule.get("type").and_then(Value::as_str) else {
+            bail!("module rule has no `type` string");
+        };
+        let loader = match rule_type {
+            "Text" => Loader::Text,
+            "Data" => Loader::Binary,
+            "CompiledWasm" => Loader::Copy,
+            other => bail!(
+                "module rule type {other:?} is not supported; celld supports \
+                 Text, Data, and CompiledWasm"
+            ),
+        };
+        let Some(Value::Array(globs)) = rule.get("globs") else {
+            bail!("module rule {rule_type} must have a `globs` array");
+        };
+        if globs.is_empty() {
+            bail!("module rule {rule_type} has no globs");
+        }
+        for glob in globs {
+            let Some(glob) = glob.as_str() else {
+                bail!("module rule glob must be a string");
+            };
+            let extension = rule_extension(glob)?;
+            // Two rules that claim one extension have no single answer, and
+            // picking either silently loads half the files the config lists
+            // the wrong way.
+            if let Some(previous) = bundle.loaders.insert(extension.clone(), loader) {
+                if previous != loader {
+                    bail!(
+                        "two module rules claim {extension:?}: {} and {}",
+                        previous.rule_type(),
+                        loader.rule_type()
+                    );
+                }
+            }
+        }
+    }
+    Ok(bundle)
+}
+
+/// The file extension a Wrangler module glob selects.
+///
+/// esbuild chooses a loader by extension, and Wrangler chooses one by glob, so
+/// only a glob that is exactly an extension match crosses that gap. celld
+/// refuses every other glob rather than load a different set of files than the
+/// config asks for.
+fn rule_extension(glob: &str) -> anyhow::Result<String> {
+    let extension = glob
+        .strip_prefix("**/*")
+        .or_else(|| glob.strip_prefix('*'))
+        .filter(|extension| {
+            extension.strip_prefix('.').is_some_and(|name| {
+                !name.is_empty() && !name.contains(['*', '?', '.', '/', '\\', '[', '{'])
+            })
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "module rule glob {glob:?} is not an extension match; celld \
+                 supports a glob of the form `**/*.ext`"
+            )
+        })?;
+    Ok(extension.to_string())
+}
+
+/// The config's `containers[]`. Each entry attaches a container to one
+/// SQLite-backed Durable Object class of this Worker, which is what
+/// Cloudflare requires too.
+fn read_containers(
+    object: &Map<String, Value>,
+    do_classes: &[String],
+    sqlite_classes: &[String],
+) -> anyhow::Result<Vec<ContainerDecl>> {
+    let Some(value) = object.get("containers") else {
+        return Ok(Vec::new());
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| anyhow!("config `containers` must be an array"))?;
+    let mut declared: Vec<ContainerDecl> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let entry = entry
+            .as_object()
+            .ok_or_else(|| anyhow!("config `containers[{index}]` must be an object"))?;
+        if let Some(key) = entry.keys().find(|key| {
+            !matches!(
+                key.as_str(),
+                "class_name" | "image" | "name" | "instance_type" | "max_instances" | "runtime"
+            )
+        }) {
+            bail!("config `containers[{index}]` declares `{key}`, which celld does not model");
+        }
+        let class_name = entry
+            .get("class_name")
+            .and_then(Value::as_str)
+            .filter(|class| !class.is_empty())
+            .ok_or_else(|| anyhow!("config `containers[{index}].class_name` must be a string"))?;
+        if !do_classes.iter().any(|class| class == class_name) {
+            bail!(
+                "config `containers[{index}].class_name` {class_name:?} is not a Durable Object \
+                 class of this Worker; declare it in `durable_objects.bindings`"
+            );
+        }
+        if !sqlite_classes.iter().any(|class| class == class_name) {
+            bail!(
+                "config `containers[{index}].class_name` {class_name:?} must be SQLite-backed; \
+                 add it to `migrations[].new_sqlite_classes`"
+            );
+        }
+        if declared.iter().any(|decl| decl.class_name == class_name) {
+            bail!("config `containers` names class {class_name:?} twice");
+        }
+        let image = entry
+            .get("image")
+            .and_then(Value::as_str)
+            .filter(|image| !image.is_empty())
+            .ok_or_else(|| anyhow!("config `containers[{index}].image` must be a string"))?;
+        let name = entry
+            .get("name")
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("config `containers[{index}].name` must be a string"))
+            })
+            .transpose()?;
+        let instance_type = entry
+            .get("instance_type")
+            .map(|value| {
+                let name = value.as_str().ok_or_else(|| {
+                    anyhow!("config `containers[{index}].instance_type` must be a string")
+                })?;
+                if crate::container::instance_resources(name).is_none() {
+                    bail!(
+                        "config `containers[{index}].instance_type` {name:?} is not an instance type"
+                    );
+                }
+                Ok(name.to_string())
+            })
+            .transpose()?;
+        let max_instances = entry
+            .get("max_instances")
+            .map(|value| {
+                value.as_u64().ok_or_else(|| {
+                    anyhow!(
+                        "config `containers[{index}].max_instances` must be a non-negative integer"
+                    )
+                })
+            })
+            .transpose()?;
+        let runtime = entry
+            .get("runtime")
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|runtime| !runtime.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "config `containers[{index}].runtime` must be a non-empty string, \
+                             the name of an OCI runtime the node's daemon has, such as `runsc`"
+                        )
+                    })
+            })
+            .transpose()?;
+        declared.push(ContainerDecl {
+            class_name: class_name.to_string(),
+            image: image.to_string(),
+            name,
+            instance_type,
+            max_instances,
+            runtime,
+        });
+    }
+    Ok(declared)
 }
 
 fn reject_queue_keys(value: &Value, accepted: &[&str], kind: &str) -> anyhow::Result<()> {
@@ -1761,7 +2384,7 @@ fn optional_queue_u32(value: &Value, field: &str) -> anyhow::Result<Option<u32>>
 /// the same rule for a second reason: the name becomes a key prefix inside the
 /// fleet bucket, and this rule is what keeps it a single path segment, so a
 /// binding cannot address the fleet's own deployment, cell, or lease keys.
-fn valid_resource_name(name: &str) -> bool {
+pub(crate) fn valid_resource_name(name: &str) -> bool {
     name.len() <= 64
         && name
             .chars()
@@ -1771,6 +2394,24 @@ fn valid_resource_name(name: &str) -> bool {
             .chars()
             .skip(1)
             .all(|value| value == '_' || value == '-' || value.is_ascii_alphanumeric())
+}
+
+/// The Wrangler-compatible Worker name that is safe in every place where
+/// celld reuses it. Checking only the generated Workflow class would leave
+/// deployment keys and operator output with a different accepted language.
+fn valid_script_name(name: &str) -> bool {
+    name.len() <= MAX_SCRIPT_NAME_BYTES
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && name
+            .bytes()
+            .last()
+            .is_some_and(|last| last.is_ascii_lowercase() || last.is_ascii_digit())
+        && name
+            .bytes()
+            .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || value == b'-')
 }
 
 /// `triggers.crons`, validated here so a malformed expression stops the deploy
@@ -2011,7 +2652,10 @@ fn read_asset_project(
     })
 }
 
-fn read_native_project(object: &Map<String, Value>, root: &Path) -> anyhow::Result<Option<NativeProject>> {
+fn read_native_project(
+    object: &Map<String, Value>,
+    root: &Path,
+) -> anyhow::Result<Option<NativeProject>> {
     let Some(cellp) = object.get("cellp") else {
         return Ok(None);
     };
@@ -2300,6 +2944,10 @@ fn collect_asset_files(
         if child_relative.len() + 1 > 1024 {
             bail!("asset path exceeds 1024 bytes: /{child_relative}");
         }
+        let asset_path = format!("/{child_relative}");
+        if !crate::assets::is_canonical_asset_path(&asset_path) {
+            bail!("asset path is not canonical: {asset_path:?}");
+        }
         let file_type = entry
             .file_type()
             .with_context(|| format!("inspect asset {}", entry.path().display()))?;
@@ -2357,8 +3005,7 @@ fn asset_content_type(path: &Path) -> Option<&'static str> {
     })
 }
 
-/// esbuild's outputs: the bundled entry module, and the wasm files its
-/// imports were resolved to (each under the name the rewritten import uses).
+/// The entry module and wasm files, keyed by their deployed module names.
 struct BundleOutput {
     bundle: Vec<u8>,
     wasm: Vec<(String, Vec<u8>)>,
@@ -2368,48 +3015,134 @@ struct BundleOutput {
     binary: Vec<(String, Vec<u8>)>,
 }
 
-fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
+/// Wrangler's default unbundled WASM rule discovers `**/*.wasm` and
+/// `**/*.wasm?module` below the entry directory. Discover files rather than
+/// parsing JavaScript or running esbuild: the caller's toolchain owns the
+/// source and its import spellings.
+fn collect_unbundled_wasm(
+    directory: &Path,
+    relative: &str,
+    entry_path: &Path,
+    wasm: &mut Vec<(String, Vec<u8>)>,
+) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(directory)
+        .with_context(|| format!("read wasm directory {}", directory.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        // The entry already occupies the main-module slot. If it has a WASM
+        // suffix, collecting it again creates two modules from one file.
+        if path == entry_path {
+            continue;
+        }
+        let is_wasm = path
+            .extension()
+            .is_some_and(|extension| extension == "wasm")
+            || path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".wasm?module"));
+        // Never follow directory symlinks or read special files. Unrelated
+        // files do not participate in module discovery.
+        if !file_type.is_dir() && !is_wasm {
+            continue;
+        }
+        let name = entry.file_name().into_string().map_err(|_| {
+            anyhow!(
+                "wasm path contains a non-UTF-8 name under {}",
+                directory.display()
+            )
+        })?;
+        // Wrangler excludes its state tree. The other exclusions prevent a
+        // project-root entry from turning repository or celld state into an
+        // application module when celld performs the same recursive scan.
+        if file_type.is_dir() && matches!(name.as_str(), ".git" | ".celld" | ".wrangler") {
+            continue;
+        }
+        if name.contains(['\\', '\0']) {
+            bail!("invalid wasm path component: {name:?}");
+        }
+        let name = if relative.is_empty() {
+            name
+        } else {
+            format!("{relative}/{name}")
+        };
+        if file_type.is_dir() {
+            collect_unbundled_wasm(&path, &name, entry_path, wasm)?;
+        } else if file_type.is_file() {
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("read wasm module {}", path.display()))?;
+            wasm.push((name, bytes));
+        } else {
+            bail!("wasm module {} is not a regular file", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn run_esbuild(root: &Path, entry: &str, config: &BundleConfig) -> anyhow::Result<BundleOutput> {
     // node: builtins stay external. Wrangler polyfills them with unenv; celld
     // implements the workerd `nodejs_compat` subset itself, so the runtime
     // provides them.
     let binary = std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
     let outdir = tempfile::tempdir().context("create esbuild output directory")?;
-    let output = Command::new(&binary)
-        .current_dir(root)
-        .arg(entry)
-        .arg("--bundle")
-        .arg("--format=esm")
-        .arg("--platform=browser")
-        .arg("--target=es2024")
-        .arg("--conditions=workerd,worker,browser")
-        .arg("--external:node:*")
-        .arg("--external:cloudflare:*")
-        .args(
-            crate::js::BARE_NODE_BUILTINS
-                .iter()
-                .map(|specifier| format!("--external:{specifier}")),
-        )
-        // Wasm becomes a sibling module (Wrangler's CompiledWasm rule). The
-        // `copy` loader makes esbuild resolve each wasm import like any other
-        // import (importer-relative, node_modules, deduplicated) and rewrite
-        // the specifier to the copied file, so the bundle and the emitted
-        // files agree on names; the runtime serves each file as a compiled
-        // WebAssembly.Module default export.
-        .arg("--loader:.wasm=copy")
-        .arg(format!("--outdir={}", outdir.path().display()))
-        .arg("--entry-names=index")
-        .output()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                anyhow!(
-                    "esbuild not found ({binary}).\n\
+    // esbuild leaves an external builtin from a CommonJS dependency behind
+    // its synchronous __require helper. Workerd's Wrangler plugin rewrites
+    // that call to an ESM import, but the esbuild CLI has no equivalent
+    // plugin hook. Give only this generated bundle a lexical bridge to the
+    // same builtin table. A runtime global would make require visible to raw
+    // ESM Workers, which Workerd does not do.
+    let commonjs_builtin_bridge = r#"var require = (id) => {
+  const name = String(id);
+  const builtin = process.getBuiltinModule(name);
+  if (builtin === undefined) {
+    const error = new Error(`Cannot find module '${name}'`);
+    error.code = "MODULE_NOT_FOUND";
+    throw error;
+  }
+  return builtin;
+};"#;
+    let output =
+        Command::new(&binary)
+            .current_dir(root)
+            .arg(entry)
+            .arg("--bundle")
+            .arg("--format=esm")
+            .arg("--platform=browser")
+            .arg("--target=es2024")
+            .arg("--conditions=workerd,worker,browser")
+            .arg(format!("--banner:js={commonjs_builtin_bridge}"))
+            .arg("--external:node:*")
+            .arg("--external:cloudflare:*")
+            .args(
+                crate::js::BARE_NODE_BUILTINS
+                    .iter()
+                    .map(|specifier| format!("--external:{specifier}")),
+            )
+            .args(config.loaders.iter().map(|(extension, loader)| {
+                format!("--loader:{extension}={}", loader.esbuild_name())
+            }))
+            .args(
+                config
+                    .define
+                    .iter()
+                    .map(|(key, value)| format!("--define:{key}={value}")),
+            )
+            .arg(format!("--outdir={}", outdir.path().display()))
+            .arg("--entry-names=index")
+            .output()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    anyhow!(
+                        "esbuild not found ({binary}).\n\
                      `celld deploy` bundles with esbuild; install it and retry,\n\
                      or set CELLD_ESBUILD to its path."
-                )
-            } else {
-                anyhow!("run esbuild: {error}")
-            }
-        })?;
+                    )
+                } else {
+                    anyhow!("run esbuild: {error}")
+                }
+            })?;
     if !output.status.success() {
         bail!(
             "esbuild failed:\n{}",
@@ -2418,7 +3151,18 @@ fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
     }
     let bundle =
         std::fs::read(outdir.path().join("index.js")).context("read esbuild output bundle")?;
-    let wasm = read_wasm_modules_from_dir(outdir.path())?;
+    // Only the `copy` loader emits a sibling file — `text` and `binary` put the
+    // file inside the bundle — so the emitted set follows the same extension
+    // map the run used and not a fixed `.wasm` test: a config that gives
+    // `.wasm` another rule emits no wasm, and a `CompiledWasm` rule on another
+    // extension emits one under that extension.
+    let copied: BTreeSet<&str> = config
+        .loaders
+        .iter()
+        .filter(|(_, loader)| **loader == Loader::Copy)
+        .map(|(extension, _)| extension.as_str())
+        .collect();
+    let wasm = read_wasm_modules_from_dir(outdir.path(), &copied)?;
     Ok(BundleOutput {
         bundle,
         wasm,
@@ -2427,22 +3171,35 @@ fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
     })
 }
 
-/// Sibling `*.wasm` files in `dir`, keyed by basename — the name esbuild's
-/// `copy` loader and wrangler pre-bundles use for `import x from "./x.wasm"`.
-fn read_wasm_modules_from_dir(dir: &Path) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+/// Sibling modules esbuild's `copy` loader emitted beside the bundle, keyed by
+/// basename — the name its rewritten imports use. `copied` is the extension map
+/// the run used, so a config that gives `.wasm` another rule emits nothing, and
+/// a `CompiledWasm` rule on another extension emits a file under that one.
+fn read_wasm_modules_from_dir(
+    dir: &Path,
+    copied: &BTreeSet<&str>,
+) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     let mut wasm = Vec::new();
     for dirent in
         std::fs::read_dir(dir).with_context(|| format!("read wasm directory {}", dir.display()))?
     {
         let path = dirent?.path();
+        let is_copied = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                // The bundle already holds the main-module slot. A rule that
+                // claims `.js` would otherwise deploy it a second time.
+                name != "index.js" && copied.iter().any(|extension| name.ends_with(extension))
+            });
+        if !is_copied {
+            continue;
+        }
         let name = path
             .file_name()
             .expect("read_dir entries have a file name")
             .to_string_lossy()
             .into_owned();
-        if !is_wasm_module_name(&name) {
-            continue;
-        }
         let bytes =
             std::fs::read(&path).with_context(|| format!("read wasm module {}", path.display()))?;
         wasm.push((name, bytes));
@@ -2752,6 +3509,8 @@ mod no_bundle_wasm_tests {
             region: None,
             dry_run: false,
             json: false,
+            vars: BTreeMap::new(),
+            local_images: false,
         })
         .unwrap();
 
@@ -2800,6 +3559,8 @@ mod no_bundle_wasm_tests {
             region: None,
             dry_run: false,
             json: false,
+            vars: BTreeMap::new(),
+            local_images: false,
         })
         .unwrap();
 
@@ -2845,6 +3606,8 @@ mod no_bundle_wasm_tests {
             region: None,
             dry_run: false,
             json: false,
+            vars: BTreeMap::new(),
+            local_images: false,
         }) {
             Ok(_) => panic!("symlink escaping the deployment root must be rejected"),
             Err(error) => error,
@@ -2887,6 +3650,8 @@ mod no_bundle_wasm_tests {
             region: None,
             dry_run: false,
             json: false,
+            vars: BTreeMap::new(),
+            local_images: false,
         })
         .unwrap();
 
@@ -2934,6 +3699,8 @@ mod no_bundle_wasm_tests {
             region: None,
             dry_run: false,
             json: false,
+            vars: BTreeMap::new(),
+            local_images: false,
         })
         .unwrap();
 
@@ -2984,6 +3751,8 @@ mod no_bundle_wasm_tests {
             region: None,
             dry_run: false,
             json: false,
+            vars: BTreeMap::new(),
+            local_images: false,
         })
         .unwrap();
 
@@ -3031,6 +3800,8 @@ mod no_bundle_wasm_tests {
             region: None,
             dry_run: false,
             json: false,
+            vars: BTreeMap::new(),
+            local_images: false,
         })
         .unwrap();
 
@@ -3072,6 +3843,8 @@ mod no_bundle_wasm_tests {
             region: None,
             dry_run: false,
             json: false,
+            vars: BTreeMap::new(),
+            local_images: false,
         }) {
             Ok(_) => panic!("expected missing module error"),
             Err(error) => error.to_string(),
@@ -3167,6 +3940,8 @@ export * from "./star.js";
             region: None,
             dry_run: false,
             json: false,
+            vars: BTreeMap::new(),
+            local_images: false,
         }) {
             Ok(_) => panic!("expected missing reexport target"),
             Err(error) => error.to_string(),
@@ -3198,6 +3973,8 @@ export * from "./star.js";
             region: None,
             dry_run: false,
             json: false,
+            vars: BTreeMap::new(),
+            local_images: false,
         })
         .unwrap();
 
@@ -3235,10 +4012,17 @@ export * from "./star.js";
             region: None,
             dry_run: false,
             json: false,
+            vars: BTreeMap::new(),
+            local_images: false,
         }) {
             Ok(_) => panic!("expected images remote key to be refused"),
             Err(error) => error.to_string(),
         };
         assert!(error.contains("remote"), "{error}");
     }
+}
+
+#[cfg(all(test, celld_internal_tests))]
+mod deploy_contract {
+    include!(env!("CELLD_INTERNAL_DEPLOY_TESTS"));
 }

@@ -415,6 +415,7 @@ impl AssetResolver {
                 headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
                 websocket: None,
                 write_position: None,
+                observed_position: None,
             });
         }
         let path = url::Url::parse(url).context("invalid assets binding URL")?;
@@ -466,6 +467,7 @@ impl AssetResolver {
                 .collect(),
             websocket: None,
             write_position: None,
+            observed_position: None,
         })
     }
 
@@ -1016,12 +1018,18 @@ fn parse_redirect_rules(value: &str) -> anyhow::Result<Vec<RedirectRule>> {
 }
 
 fn strip_port(host: &str) -> &str {
-    if host.starts_with('[') {
-        return host.find(']').map_or(host, |end| &host[1..end]);
+    let original = host;
+    if let Some(host) = host.strip_prefix('[') {
+        return host.split_once(']').map_or(original, |(host, _)| host);
     }
     host.rsplit_once(':')
         .filter(|(_, port)| port.bytes().all(|byte| byte.is_ascii_digit()))
         .map_or(host, |(host, _)| host)
+}
+
+#[cfg(all(test, celld_internal_tests))]
+mod internal_tests {
+    include!(env!("CELLD_INTERNAL_ASSETS_TESTS"));
 }
 
 fn route(index: &AssetIndex, path: &str, include_not_found: bool) -> Route {
@@ -1394,7 +1402,7 @@ fn validate_index(index: &AssetIndex, reference: &AssetManifestRef) -> anyhow::R
     }
     let mut total = 0_u64;
     for (path, entry) in &index.entries {
-        if decode_path(path).as_deref() != Some(path.as_str())
+        if !is_canonical_asset_path(path)
             || path == "/"
             || asset_blob_key(&entry.sha256).is_none()
             || entry.bytes > 25 * 1024 * 1024
@@ -1460,6 +1468,11 @@ fn worker_first_for_routes(rules: &[String], path: &str) -> bool {
             .iter()
             .filter(|rule| !rule.starts_with('!'))
             .any(|rule| route_pattern_matches(rule, path))
+}
+
+/// 已存储的路径必须在请求路径解码后保持不变。
+pub(crate) fn is_canonical_asset_path(path: &str) -> bool {
+    decode_path(path).as_deref() == Some(path)
 }
 
 fn route_pattern_matches(pattern: &str, path: &str) -> bool {

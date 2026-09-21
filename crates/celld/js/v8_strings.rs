@@ -36,9 +36,11 @@ macro_rules! v8_static_strings {
 // `Sync` and isolate-independent, so a key declared twice would be two
 // resources for one string with nothing to keep them in step.
 v8_static_strings!(
-    // The harness's runtime-state object, reached from the global by name in
-    // nine places.
+    // The harness's runtime-state object, a property of the internals object.
     CELL = "__cell",
+    // The internals object itself: the first parameter of every internal
+    // script, and the only `__`-prefixed global a test build has.
+    INTERNALS = "__celld",
     ENV = "env",
     // `op_url_parse` writes all nine on every `new URL(...)`.
     URL_PROTOCOL = "protocol",
@@ -62,4 +64,14 @@ pub(crate) fn key<'s>(
     constant: &'static v8::OneByteConst,
 ) -> v8::Local<'s, v8::String> {
     v8::String::new_from_onebyte_const(scope, constant).expect("static key string")
+}
+
+/// Materialise a fixed internal JavaScript source without copying its bytes
+/// into the isolate. The `OneByteConst` constructor checks the source encoding
+/// at compile time, so this path also makes ASCII a structural invariant.
+pub(super) fn source<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    constant: &'static v8::OneByteConst,
+) -> v8::Local<'s, v8::String> {
+    v8::String::new_from_onebyte_const(scope, constant).expect("static JavaScript source")
 }

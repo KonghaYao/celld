@@ -158,6 +158,27 @@ impl Output {
         self.finish()
     }
 
+    /// One opaque payload that arrives in pieces, byte for byte.
+    ///
+    /// The same contract as [`Self::bytes`], and separate from it because an
+    /// R2 object can be far larger than the memory the command runs in. A
+    /// closed reader ends the drain rather than reading the rest of a
+    /// multi-gigabyte body nobody wants.
+    pub async fn stream(
+        mut self,
+        mut body: impl futures_util::Stream<Item = Result<Vec<u8>, String>> + Unpin,
+    ) -> anyhow::Result<()> {
+        use futures_util::StreamExt as _;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(anyhow::Error::msg)?;
+            self.sink.write(|data| data.write_all(&chunk))?;
+            if self.sink.closed {
+                break;
+            }
+        }
+        self.finish()
+    }
+
     /// Write one formatted line and flush it before returning.
     ///
     /// The method takes `fmt::Arguments`, so a protocol caller can format the

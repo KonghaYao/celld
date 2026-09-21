@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 600" role="img" aria-labelledby="dwFlowTitle dwFlowDesc">
+  <title id="dwFlowTitle">What a loader grants a Dynamic Worker, and what it withholds</title>
+  <desc id="dwFlowDesc">One celld node runs one process that holds two V8 isolates, and not two machines and not a virtual machine. The host Worker isolate holds the deployment's bindings, vars, and secrets, and it calls env.LOADER.get(id, getCode), whose getCode runs once per id in that isolate. Only two things cross the boundary into the loaded isolate: the modules map with its mainModule, at most 64 MiB and compiled once, and the env and props values, which carry structured-clone values and capabilities up to 1 MiB. Everything else stops at the boundary: the deployment's KV, D1, R2, Queues, and Durable Object bindings, its vars and secrets, a Worker Loader binding of its own, and the host's globals and host ops. The loaded Worker isolate therefore has no ambient binding, and env is the whole of its reach. A capability call returns to the host isolate as an RPC, which is the only path back. Below, globalOutbound decides what the loaded code can dial: unspecified inherits the host's egress policy, null makes fetch() and connect() throw, and a Fetcher brokers fetch() while connect() and a WebSocket are refused.</desc>
+  <style>
+    svg { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    text { font-size: 13px; fill: currentColor; }
+    tspan { fill: currentColor; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .lead { font-weight: 600; }
+    .d-ink { color: #121212; }
+    .d-soft { color: #3d3b37; }
+    .d-faint { color: #6e6a62; }
+    .d-acc { color: #10803f; }
+    .d-panel { color: #ffffff; }
+    .d-sunk { color: #f0eee8; }
+    .d-tint { color: #d6efdf; }
+    @media (prefers-color-scheme: dark) {
+      .d-ink { color: #efede7; }
+      .d-soft { color: #c9c6be; }
+      .d-faint { color: #928e85; }
+      .d-acc { color: #3fc472; }
+      .d-panel { color: #1a1a19; }
+      .d-sunk { color: #232321; }
+      .d-tint { color: #10301d; }
+    }
+  </style>
+  <defs>
+    <marker id="dw-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6"
+      markerHeight="6" orient="auto-start-reverse">
+      <path class="d-soft" fill="currentColor" d="M0 0 L10 5 L0 10 z" />
+    </marker>
+  </defs>
+
+  <!-- Both isolates live in one process on one node. The picture says how
+       strong the boundary is, because the prose cannot show its scale. -->
+  <rect class="d-sunk" fill="currentColor" x="8" y="8" width="424" height="444" rx="12" />
+  <rect class="d-faint" fill="none" stroke="currentColor" x="8" y="8" width="424" height="444" rx="12" />
+  <text class="d-ink lead" fill="currentColor" x="24" y="34">One celld node, one process</text>
+  <text class="d-faint" fill="currentColor" x="24" y="54">two V8 isolates, not two machines and not a virtual machine</text>
+
+  <rect class="d-panel" fill="currentColor" x="22" y="68" width="372" height="104" rx="8" />
+  <rect class="d-faint" fill="none" stroke="currentColor" x="22" y="68" width="372" height="104" rx="8" />
+  <text class="d-faint" fill="currentColor" x="34" y="92">Host Worker isolate</text>
+  <text class="d-ink mono" fill="currentColor" x="34" y="114">MY_KV  MY_DB  MY_BUCKET  vars  secrets</text>
+  <text class="d-acc mono" fill="currentColor" x="34" y="140">env.LOADER.get(id, getCode)</text>
+  <text class="d-faint" fill="currentColor" x="34" y="160">getCode runs once per id in this isolate</text>
+
+  <!-- One arrow crosses; the other stops at a bar. The contrast is the fact. -->
+  <g class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M114 172 V196" marker-end="url(#dw-arrow)" />
+  </g>
+  <g class="d-faint" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M302 172 V188" />
+    <path d="M288 192 H316" stroke-width="2.5" />
+  </g>
+
+  <rect class="d-tint" fill="currentColor" x="22" y="200" width="184" height="142" rx="8" />
+  <rect class="d-acc" fill="none" stroke="currentColor" stroke-width="2" x="22" y="200" width="184" height="142" rx="8" />
+  <text class="d-acc lead" fill="currentColor" x="34" y="224">crosses the boundary</text>
+  <text class="d-ink mono" fill="currentColor" x="34" y="248">modules, mainModule</text>
+  <text class="d-faint" fill="currentColor" x="34" y="266">64 MiB, compiled once</text>
+  <text class="d-ink mono" fill="currentColor" x="34" y="292">env, props</text>
+  <text class="d-faint" fill="currentColor" x="34" y="310">structured-clone values</text>
+  <text class="d-faint" fill="currentColor" x="34" y="328">and capabilities, 1 MiB</text>
+
+  <rect class="d-panel" fill="currentColor" x="210" y="200" width="184" height="142" rx="8" />
+  <rect class="d-faint" fill="none" stroke="currentColor" stroke-dasharray="5 4"
+    x="210" y="200" width="184" height="142" rx="8" />
+  <text class="d-faint lead" fill="currentColor" x="222" y="224">stays in the host</text>
+  <text class="d-soft" fill="currentColor" x="222" y="248">KV, D1, R2, Queues,</text>
+  <text class="d-soft" fill="currentColor" x="222" y="266">and Durable Objects</text>
+  <text class="d-soft" fill="currentColor" x="222" y="292">vars and secrets</text>
+  <text class="d-soft" fill="currentColor" x="222" y="310">a Worker Loader binding</text>
+  <text class="d-soft" fill="currentColor" x="222" y="328">the host's globals, ops</text>
+
+  <g class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M114 342 V356" marker-end="url(#dw-arrow)" />
+  </g>
+
+  <rect class="d-panel" fill="currentColor" x="22" y="360" width="372" height="76" rx="8" />
+  <rect class="d-acc" fill="none" stroke="currentColor" stroke-width="2" x="22" y="360" width="372" height="76" rx="8" />
+  <text class="d-faint" fill="currentColor" x="34" y="384">Loaded Worker isolate</text>
+  <text class="d-ink" fill="currentColor" x="34" y="406">no ambient binding: env is the whole of its reach</text>
+  <text class="d-soft" fill="currentColor" x="34" y="426">a capability call is an RPC back to the host</text>
+
+  <!-- The only path back into the host isolate. -->
+  <g class="d-acc" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M394 400 C 424 400 424 130 398 130" marker-end="url(#dw-arrow)" />
+  </g>
+
+  <g class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M220 452 V464" marker-end="url(#dw-arrow)" />
+  </g>
+
+  <!-- Egress is a third state, and celld's answer differs per protocol. -->
+  <rect class="d-panel" fill="currentColor" x="8" y="468" width="424" height="124" rx="8" />
+  <rect class="d-faint" fill="none" stroke="currentColor" x="8" y="468" width="424" height="124" rx="8" />
+  <text class="d-ink lead" fill="currentColor" x="24" y="492">globalOutbound decides what the loaded code can dial</text>
+  <text class="d-soft mono" fill="currentColor" x="24" y="516">unspecified</text>
+  <text class="d-soft" fill="currentColor" x="150" y="516">inherits the host's egress policy</text>
+  <text class="d-soft mono" fill="currentColor" x="24" y="538">null</text>
+  <text class="d-soft" fill="currentColor" x="150" y="538">fetch() and connect() throw</text>
+  <text class="d-acc mono" fill="currentColor" x="24" y="560">a Fetcher</text>
+  <text class="d-soft" fill="currentColor" x="150" y="560">brokers fetch()</text>
+  <text class="d-faint" fill="currentColor" x="150" y="578">connect() and a WebSocket are refused</text>
+</svg>

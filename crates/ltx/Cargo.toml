@@ -46,6 +46,11 @@ futures-util.workspace = true
 lz4_flex.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+crc-fast.workspace = true
+ureq = "3.4.0"
+http = "1"
+percent-encoding = "2"
+tempfile.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

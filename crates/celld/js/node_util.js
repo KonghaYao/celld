@@ -1,8 +1,8 @@
-// node:util for Cells — a port of Workerd's implementation at commit
+// node:util for Cells -- a port of Workerd's implementation at commit
 // 191a27f941300dd8956f2afeb66c10a651108c0b:
 //
 //   src/node/util.ts                      (module surface)
-//   src/node/internal/internal_inspect.ts (util.inspect / util.format —
+//   src/node/internal/internal_inspect.ts (util.inspect / util.format --
 //                                          itself Workerd's port of Node's
 //                                          lib/internal/util/inspect.js)
 //   src/node/internal/internal_utils.ts   (callbackify, parseEnv,
@@ -25,9 +25,9 @@
 //   types and are never probed for entries().
 // - MIMEType/MIMEParams (native in Workerd) are a compact JS equivalent.
 // - getCallSites uses Error.prepareStackTrace instead of a C++ stack walk.
-// - `types.isKeyObject` checks node:crypto's KeyObject class through the
-//   `__nodeKeyObjectClass` hidden global (false until node:crypto loads —
-//   no KeyObject can exist before that).
+// - `types.isKeyObject` checks node:crypto's KeyObject class through
+//   `__celld.__nodeKeyObjectClass` (false until node:crypto loads -- no
+//   KeyObject can exist before that).
 //
 // Injected lazily into the generated stub module, so an isolate that never
 // imports node:util (or node:util/types) pays nothing.
@@ -107,8 +107,8 @@
     typeof CryptoKey === "function" && v instanceof CryptoKey;
   // node:crypto (lazy) publishes its KeyObject class on this hidden global.
   const isKeyObject = (v) =>
-    typeof globalThis.__nodeKeyObjectClass === "function" &&
-    v instanceof globalThis.__nodeKeyObjectClass;
+    typeof __celld.__nodeKeyObjectClass === "function" &&
+    v instanceof __celld.__nodeKeyObjectClass;
 
   // Byte compare for internal_comparisons (Workerd imports Buffer.compare).
   const compare = (a, b) => globalThis.Buffer.compare(a, b);
@@ -3262,9 +3262,9 @@ function hasEntries(value) {
 }
 // Registry-driven inspect for Cells platform objects. Workerd generates
 // this from its C++ JSG class registrations; Cells' platform classes are
-// plain JS with own data properties, so the equivalent registration data —
+// plain JS with own data properties, so the equivalent registration data --
 // an ordered [name, getter] list, optional `hidden` inspect-only entries
-// rendered in [brackets], and `entries: true` for map-like rendering — is
+// rendered in [brackets], and `entries: true` for map-like rendering -- is
 // declared per class in the stamps at the end of this file.
 function formatJsgResourceType(config, depth, options) {
     const name = config.name;
@@ -4628,6 +4628,6 @@ const utilModule = {
   isUndefined: eolIsUndefined,
 };
 utilModule.default = utilModule;
-globalThis.__utilModule = utilModule;
-globalThis.__utilTypesModule = { ...types, default: types };
+__celld.__utilModule = utilModule;
+__celld.__utilTypesModule = { ...types, default: types };
 })();

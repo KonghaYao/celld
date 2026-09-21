@@ -20,7 +20,7 @@
 // difference, the effect was sticky, and the ratio was
 // the ratio between V8's interpreter and its optimizing
 // tier. The mechanism was not traced further, so no claim
-// is made about which feedback caused it — but the
+// is made about which feedback caused it -- but the
 // traffic that provoked it was ordinary, and no shape of
 // the JS decoder resisted it. Two decoders for one
 // encoding also owe a byte-for-byte equivalence proof,
@@ -158,12 +158,12 @@
         #nativeId;
         constructor(label = 'utf-8', options = {}) {
             // Per WHATWG encoding: strip ASCII whitespace
-            // only (not Unicode — \v, NBSP, etc. stay).
+            // only (not Unicode -- \v, NBSP, etc. stay).
             label = String(label)
                 .replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '')
                 .toLowerCase();
             // The WHATWG label set for utf-8 and utf-16, resolved here to
-            // keep a host call out of `new TextDecoder()` — which every
+            // keep a host call out of `new TextDecoder()` -- which every
             // `request.text()` makes. A miss (e.g. 'ansi_x3.4-1968',
             // which the standard maps to windows-1252 rather than utf-8)
             // resolves through the host's encoding_rs label table
@@ -188,7 +188,7 @@
             let enc = aliases[label];
             if (!enc) {
                 // undefined covers unknown labels and the replacement
-                // encoding — both RangeError per spec. A resolved name
+                // encoding -- both RangeError per spec. A resolved name
                 // is canonical lowercase, and the alias lookup then
                 // normalizes the utf names to the spelling above.
                 const name = _tdLabel(label);
@@ -228,7 +228,7 @@
                 // else is a type-coercion error. Pre-fix
                 // the fallback `new Uint8Array(input, 0,
                 // input.length)` interpreted a number as
-                // a length-N allocation of zero bytes —
+                // a length-N allocation of zero bytes --
                 // `.decode(42)` returned 42 NUL chars,
                 // `.decode("hello")` returned "" (no
                 // .length on a string maps to a 0-length
@@ -242,7 +242,7 @@
         }
         // One op per decode(), for every label. Streaming state (a split
         // multibyte sequence, a BOM, ISO-2022-JP mode) lives in the
-        // native decoder; a fatal error frees it, matching Workerd — the
+        // native decoder; a fatal error frees it, matching Workerd -- the
         // next decode starts clean.
         _decodeNative(b, stream) {
             let id = this.#nativeId;

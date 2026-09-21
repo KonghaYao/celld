@@ -20,6 +20,7 @@
 //! one thing this runtime refuses to do.
 
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use std::sync::Mutex;
 use std::sync::RwLock;
 
 use anyhow::Result;
+use celld_logic::isolate::HeapId;
 use celld_logic::isolate::IsolateId;
 use celld_logic::isolate::IsolateLoad;
 use celld_logic::isolate::Placement;
@@ -36,10 +38,25 @@ use celld_logic::isolate::Refusal;
 
 use crate::js;
 
-/// One Queue producer event can execute while one successor waits. A third
-/// event cannot enter the isolate queue, because producer work must not hide
-/// the alarms and settlements that drain the durable backlog.
-pub(crate) const MAX_QUEUE_PRODUCER_EVENTS_PER_CELL: usize = 2;
+/// Heap identity is process-wide because pressure policy compares cells from
+/// every script pool and every draining generation. A counter inside `Pool`
+/// would reproduce the collision this identity prevents. The core treats the
+/// value as opaque, so its allocation order is not a deterministic decision.
+static NEXT_HEAP_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_heap_id() -> HeapId {
+    let value = NEXT_HEAP_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .expect("V8 heap identity space exhausted");
+    HeapId::new(value)
+}
+
+/// Bound the producer replies that can wait for one Queue's shared commit and
+/// durability proof. Four 64-call groups can overlap, and a stopped bucket
+/// still cannot retain an unbounded number of promises or copied bodies.
+pub(crate) const MAX_QUEUE_PRODUCER_EVENTS_PER_CELL: usize = 256;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum TurnLane {
@@ -137,24 +154,17 @@ pub(crate) struct QueueProducerPermit {
 
 impl Drop for QueueProducerPermit {
     fn drop(&mut self) {
-        let mut producers = self
-            .slot
-            .queue_producers
-            .lock()
-            .expect("Queue producer admission poisoned");
-        let active = producers
-            .get_mut(&self.scope)
-            .expect("a Queue producer permit has an admission");
-        *active -= 1;
-        if *active == 0 {
-            producers.remove(&self.scope);
-        }
+        self.slot.release_queue_producer(&self.scope);
     }
 }
 
 /// One isolate, and everything the decision core needs to know about it.
 pub struct Slot {
+    /// The index used only inside this pool's placement snapshot and slot
+    /// vector. Distinct pools can use the same value.
     pub id: IsolateId,
+    /// The identity reported to node-wide Actor and pressure policy.
+    heap_id: HeapId,
     /// The async gate, holding the isolate it guards. Locking this is what
     /// makes the V8 `Locker` beneath it uncontended.
     ///
@@ -174,6 +184,9 @@ pub struct Slot {
     /// cell stays until it is evicted or handed to another node, which is
     /// why `retire` refuses an isolate holding any.
     cells: AtomicUsize,
+    // Reservations can adopt out of order; only completed adoptions count
+    // toward the collection boundary. Residency drop retires both counts.
+    adopted_cells: AtomicUsize,
     retiring: AtomicBool,
     #[cfg(celld_internal_tests)]
     turn_observations: Mutex<Vec<String>>,
@@ -228,23 +241,37 @@ impl Slot {
         f(worker)
     }
 
-    /// Reserve one of the two producer positions before the event can wait
-    /// for an isolate turn. The permit spans the complete cell event, so a
-    /// suspended producer still occupies its position.
-    pub(crate) fn try_queue_producer(self: &Arc<Self>, scope: &str) -> Option<QueueProducerPermit> {
+    /// Reserve one event through its complete lifetime, including the reply
+    /// gate. Releasing at the gate would let stalled storage retain unbounded
+    /// promises and copied bodies. Cell turn fairness is enforced separately.
+    pub(crate) fn queue_producer(self: &Arc<Self>, scope: &str) -> Option<QueueProducerPermit> {
         let mut producers = self
             .queue_producers
             .lock()
             .expect("Queue producer admission poisoned");
-        let active = producers.entry(scope.to_string()).or_default();
-        if *active >= MAX_QUEUE_PRODUCER_EVENTS_PER_CELL {
+        let outstanding = producers.entry(scope.to_string()).or_default();
+        if *outstanding >= MAX_QUEUE_PRODUCER_EVENTS_PER_CELL {
             return None;
         }
-        *active += 1;
+        *outstanding += 1;
         Some(QueueProducerPermit {
             slot: self.clone(),
             scope: scope.to_string(),
         })
+    }
+
+    fn release_queue_producer(&self, scope: &str) {
+        let mut producers = self
+            .queue_producers
+            .lock()
+            .expect("Queue producer admission poisoned");
+        let outstanding = producers
+            .get_mut(scope)
+            .expect("a Queue producer permit has an admission");
+        *outstanding -= 1;
+        if *outstanding == 0 {
+            producers.remove(scope);
+        }
     }
 
     /// Mark a request as living in this isolate. Held for the request's whole
@@ -262,6 +289,7 @@ impl Slot {
     pub(crate) fn standalone(worker: js::Worker) -> Arc<Self> {
         Arc::new(Slot {
             id: 0,
+            heap_id: next_heap_id(),
             worker: tokio::sync::Mutex::new(Some(worker)),
             turn_scheduler: TurnScheduler::default(),
             queue_producers: Mutex::new(std::collections::HashMap::new()),
@@ -269,6 +297,7 @@ impl Slot {
             requests: AtomicUsize::new(0),
             freed: Arc::new(tokio::sync::Notify::new()),
             cells: AtomicUsize::new(0),
+            adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
             #[cfg(celld_internal_tests)]
             turn_observations: Mutex::new(Vec::new()),
@@ -278,6 +307,24 @@ impl Slot {
     #[cfg(celld_internal_tests)]
     pub fn for_test(worker: js::Worker) -> Arc<Self> {
         Self::standalone(worker)
+    }
+
+    #[cfg(all(test, celld_internal_tests))]
+    pub(crate) fn vacant_for_request_cancellation_test() -> Arc<Self> {
+        Arc::new(Slot {
+            id: 0,
+            heap_id: HeapId::new(0),
+            worker: tokio::sync::Mutex::new(None),
+            turn_scheduler: TurnScheduler::default(),
+            queue_producers: Mutex::new(std::collections::HashMap::new()),
+            turns: AtomicUsize::new(0),
+            requests: AtomicUsize::new(0),
+            freed: Arc::new(tokio::sync::Notify::new()),
+            cells: AtomicUsize::new(0),
+            adopted_cells: AtomicUsize::new(0),
+            retiring: AtomicBool::new(false),
+            turn_observations: Mutex::new(Vec::new()),
+        })
     }
 
     #[cfg(celld_internal_tests)]
@@ -306,13 +353,23 @@ impl Slot {
 
     /// Give this isolate a cell's realm. Held for as long as the cell lives
     /// here, which is what stops the isolate being retired underneath it.
-    fn house(self: &Arc<Self>) -> Residency {
-        self.cells.fetch_add(1, Ordering::Relaxed);
-        Residency(self.clone())
+    fn house(self: &Arc<Self>, max_cells: usize) -> Residency {
+        let cells = self.cells.fetch_add(1, Ordering::Relaxed) + 1;
+        debug_assert!(cells <= max_cells);
+        Residency {
+            slot: self.clone(),
+            max_cells,
+            adopted: false,
+        }
     }
 
     pub fn is_retiring(&self) -> bool {
         self.retiring.load(Ordering::Relaxed)
+    }
+
+    /// The node-wide identity of this slot's currently installed V8 heap.
+    pub fn heap_id(&self) -> HeapId {
+        self.heap_id
     }
 
     fn is_reusable(&self) -> bool {
@@ -348,21 +405,84 @@ impl Drop for Affiliation {
 /// The counterpart of [`Affiliation`], and the difference between them is
 /// the whole reason both exist: an affiliation lasts one request, a
 /// residency lasts until the cell is evicted or moves node.
-pub struct Residency(Arc<Slot>);
+pub struct Residency {
+    slot: Arc<Slot>,
+    max_cells: usize,
+    adopted: bool,
+}
 
 impl Residency {
     pub fn slot(&self) -> &Arc<Slot> {
-        &self.0
+        &self.slot
+    }
+
+    /// Open a reserved cell's storage and return its residency with its alarm snapshot.
+    /// Collection follows the last completed adoption, because reservation
+    /// order can differ from the order in which activation futures resume.
+    pub(crate) async fn adopt(
+        mut self,
+        cell: &str,
+        storage: js::CellStorage<'_>,
+    ) -> Result<(Self, celld_logic::wake::AlarmSnapshot)> {
+        anyhow::ensure!(!self.adopted, "cell residency already adopted");
+        let slot = self.slot.clone();
+        let alarm = slot
+            .turn(|worker| -> Result<celld_logic::wake::AlarmSnapshot> {
+                let alarm = worker.own_cell(cell, Some(storage))?;
+                // There is no await between adoption and accounting. Cancellation
+                // before this turn drops only the reservation; afterward the
+                // residency owns both counters, including on an error unwind.
+                self.adopted = true;
+                let adopted = slot.adopted_cells.fetch_add(1, Ordering::Relaxed) + 1;
+                debug_assert!(adopted <= self.max_cells);
+                if adopted == self.max_cells {
+                    worker.settle_heap();
+                }
+                Ok(alarm)
+            })
+            .await?;
+        Ok((self, alarm))
     }
 }
 
 impl Drop for Residency {
     fn drop(&mut self) {
-        self.0.cells.fetch_sub(1, Ordering::Relaxed);
+        if self.adopted {
+            self.slot.adopted_cells.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.slot.cells.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 type Build = Box<dyn Fn() -> Result<js::Worker> + Send + Sync>;
+
+/// One pool's isolates by state, as `/state` reports them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PoolCensus {
+    /// Isolates that accept placement and work.
+    pub live: usize,
+    /// Live isolates that house no cell. The next maintenance pass retires
+    /// them, so a count that persists across passes means the pass is not
+    /// running.
+    pub live_empty: usize,
+    /// Retiring isolates whose heap is still installed, because a turn, a
+    /// request, or a cell holds it.
+    pub retiring: usize,
+    /// Slots whose heap has been freed.
+    pub freed: usize,
+    /// Cells housed across the pool.
+    pub cells: usize,
+    /// Request affiliations across the pool, running or suspended.
+    pub requests: usize,
+    /// Turns in flight across the pool.
+    pub turns: usize,
+    /// Physical memory V8 has committed to the heaps of the isolates a turn
+    /// did not hold at the sample.
+    pub heap_bytes: u64,
+    /// External memory those isolates track: array buffer stores and the
+    /// like, which live outside the V8 heap.
+    pub external_bytes: u64,
+}
 
 pub struct Pool {
     slots: RwLock<Vec<Arc<Slot>>>,
@@ -442,8 +562,10 @@ impl Pool {
         // than with every isolate created during the process lifetime.
         let reusable = slots.iter().position(|slot| slot.is_reusable());
         let id = reusable.unwrap_or(slots.len());
+        let heap_id = next_heap_id();
         let slot = Arc::new(Slot {
             id,
+            heap_id,
             worker: tokio::sync::Mutex::new(Some(worker)),
             turn_scheduler: TurnScheduler::default(),
             queue_producers: Mutex::new(std::collections::HashMap::new()),
@@ -451,6 +573,7 @@ impl Pool {
             requests: AtomicUsize::new(0),
             freed: self.freed.clone(),
             cells: AtomicUsize::new(0),
+            adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(self.retired.load(Ordering::Relaxed)),
             #[cfg(celld_internal_tests)]
             turn_observations: Mutex::new(Vec::new()),
@@ -460,7 +583,7 @@ impl Pool {
         } else {
             slots.push(slot.clone());
         }
-        tracing::info!(isolate = id, total = slots.len(), "isolate started");
+        tracing::info!(isolate = %heap_id, slot = id, total = slots.len(), "isolate started");
         Ok(slot)
     }
 
@@ -559,7 +682,7 @@ impl Pool {
         // Cell isolates have no arbitrary total cap. The resident-cell and
         // RSS limits bound node memory before placement. The lock keeps this
         // reservation exact and prevents maintenance from retiring the slot.
-        Ok(self.resolve(placement, None)?.house())
+        Ok(self.resolve(placement, None)?.house(self.limits.max_cells))
     }
 
     /// One maintenance pass: give back an isolate the pool no longer needs,
@@ -586,6 +709,10 @@ impl Pool {
     /// an empty cell heap carries no warm request capacity worth preserving.
     pub fn reap_empty(&self) {
         let Ok(_maintenance) = self.maintenance.try_write() else {
+            tracing::debug!(
+                event = "isolate_reap_skipped",
+                "a cell start holds the pool; empty isolates wait for the next pass"
+            );
             return;
         };
         while self.retire_one() {}
@@ -602,7 +729,7 @@ impl Pool {
         self.retired.store(true, Ordering::Relaxed);
         for slot in self.slots.read().expect("pool poisoned").iter() {
             if !slot.retiring.swap(true, Ordering::Relaxed) {
-                tracing::info!(isolate = slot.id, "isolate retiring");
+                tracing::info!(isolate = %slot.heap_id, slot = slot.id, "isolate retiring");
             }
         }
         self.free_retired();
@@ -625,7 +752,7 @@ impl Pool {
         };
         let slot = self.get(id);
         if !slot.retiring.swap(true, Ordering::Relaxed) {
-            tracing::info!(isolate = id, "isolate retiring");
+            tracing::info!(isolate = %slot.heap_id, slot = id, "isolate retiring");
         }
         true
     }
@@ -643,7 +770,7 @@ impl Pool {
                 continue;
             };
             if worker.take().is_some() {
-                tracing::info!(isolate = slot.id, "isolate freed");
+                tracing::info!(isolate = %slot.heap_id, slot = slot.id, "isolate freed");
             }
         }
     }
@@ -656,6 +783,51 @@ impl Pool {
             .iter()
             .filter(|slot| !slot.is_retiring())
             .count()
+    }
+
+    /// What the pool holds right now, for `/state`.
+    ///
+    /// The count an operator of a hibernation-heavy node needs and could
+    /// not get: a dormant cell keeps about 160 KB more than its own records
+    /// explain (GCE, 2026-09-03), and the one O(cells) structure
+    /// that fits is the isolate. `live_empty` is what `reap_empty` retires
+    /// on its next pass and `retiring` is what `may_free` still refuses, so
+    /// either staying positive across passes names the leak.
+    pub fn census(&self) -> PoolCensus {
+        let mut census = PoolCensus::default();
+        for slot in self.slots.read().expect("pool poisoned").iter() {
+            let load = slot.observe();
+            census.cells += load.cells;
+            census.requests += load.requests;
+            census.turns += load.turns;
+            // A heap is gone once its worker was taken. A worker a turn
+            // holds right now is installed, so a failed `try_lock` counts
+            // as a heap and never as freed; its size is unknown this pass.
+            // Holding the guard is the permit a turn holds, which is what
+            // makes the V8 lock inside `heap_bytes` uncontended.
+            match slot.worker.try_lock() {
+                Ok(worker) if worker.is_none() => {
+                    census.freed += 1;
+                    continue;
+                }
+                Ok(worker) => {
+                    if let Some(heap) = worker.as_ref().and_then(js::Worker::heap_bytes) {
+                        census.heap_bytes += heap.physical;
+                        census.external_bytes += heap.external;
+                    }
+                }
+                Err(_) => {}
+            }
+            if load.retiring {
+                census.retiring += 1;
+            } else {
+                census.live += 1;
+                if load.cells == 0 {
+                    census.live_empty += 1;
+                }
+            }
+        }
+        census
     }
 }
 

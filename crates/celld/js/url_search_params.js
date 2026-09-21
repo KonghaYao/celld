@@ -1,8 +1,8 @@
 // URLSearchParams (WHATWG spec subset)
 {
 // Decode application/x-www-form-urlencoded per spec:
-// + → space, percent-decode to bytes (only strict 2-hex
-// sequences — stray % is literal), UTF-8 decode with
+// + -> space, percent-decode to bytes (only strict 2-hex
+// sequences -- stray % is literal), UTF-8 decode with
 // replacement. ignoreBOM so a leading U+FEFF survives
 // round-trip through percent-encoding.
 const _hexRe = /^[0-9A-Fa-f]{2}$/;
@@ -52,9 +52,9 @@ const _toUSVString = (s) => {
           continue;
         }
       }
-      out += '�';
+      out += '\uFFFD';
     } else if (c >= 0xDC00 && c <= 0xDFFF) {
-      out += '�';
+      out += '\uFFFD';
     } else {
       out += s[i];
     }
@@ -125,7 +125,7 @@ class URLSearchParams {
       } else {
         // Record conversion: USVString-normalize keys
         // and dedupe (last value wins, first position
-        // kept — matches WebIDL ordered-map semantics).
+        // kept -- matches WebIDL ordered-map semantics).
         const byKey = new Map();
         const order = [];
         for (const [k, v] of Object.entries(init)) {

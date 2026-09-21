@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 416" role="img" aria-labelledby="r2FlowTitle r2FlowDesc">
+  <title id="r2FlowTitle">Two R2 bindings share one fleet object store under reserved prefixes</title>
+  <desc id="r2FlowDesc">Two Workers each hold an R2 binding. The binding FILES has the bucket name example-files, and the binding CACHE has the bucket name renders. Both Workers write the same key, photo.png. Both bindings use one fleet object-store bucket, which is an s3, gs, or az bucket, so that store gives the binding its durability. celld turns each key into r2 slash bucket name slash key, so the two writes become the separate objects r2/example-files/photo.png and r2/renders/photo.png. The fleet's own keys, under deploy, cells, nodes, and wake, live in the same bucket outside every r2 prefix, and no binding can reach them.</desc>
+  <style>
+    svg { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    text { font-size: 13px; fill: currentColor; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .lead { font-weight: 600; }
+    .d-ink { color: #121212; }
+    .d-soft { color: #3d3b37; }
+    .d-faint { color: #6e6a62; }
+    .d-acc { color: #10803f; }
+    .d-panel { color: #ffffff; }
+    .d-sunk { color: #f0eee8; }
+    .d-tint { color: #d6efdf; }
+    @media (prefers-color-scheme: dark) {
+      .d-ink { color: #efede7; }
+      .d-soft { color: #c9c6be; }
+      .d-faint { color: #928e85; }
+      .d-acc { color: #3fc472; }
+      .d-panel { color: #1a1a19; }
+      .d-sunk { color: #232321; }
+      .d-tint { color: #10301d; }
+    }
+  </style>
+
+  <!-- Two Workers, two bindings, the same key -->
+  <rect class="d-panel" x="8" y="10" width="200" height="86" rx="10" fill="currentColor" />
+  <rect class="d-faint" x="8" y="10" width="200" height="86" rx="10" fill="none" stroke="currentColor" />
+  <text class="d-faint" x="20" y="34">Worker A, binding FILES</text>
+  <text class="d-ink mono" x="20" y="58">put("photo.png")</text>
+  <text class="d-acc" x="20" y="80">bucket_name: example-files</text>
+
+  <rect class="d-panel" x="232" y="10" width="200" height="86" rx="10" fill="currentColor" />
+  <rect class="d-faint" x="232" y="10" width="200" height="86" rx="10" fill="none" stroke="currentColor" />
+  <text class="d-faint" x="244" y="34">Worker B, binding CACHE</text>
+  <text class="d-ink mono" x="244" y="58">put("photo.png")</text>
+  <text class="d-acc" x="244" y="80">bucket_name: renders</text>
+
+  <!-- Both bindings fan in to one store -->
+  <path class="d-faint" d="M108 96 C108 134 220 130 220 156" fill="none" stroke="currentColor" stroke-width="1.5" />
+  <path class="d-faint" d="M332 96 C332 134 220 130 220 156" fill="none" stroke="currentColor" stroke-width="1.5" />
+  <path class="d-faint" d="M220 168 L214 154 L226 154 Z" fill="currentColor" />
+  <text class="d-faint" x="220" y="130" text-anchor="middle">one store</text>
+
+  <!-- The fleet object store -->
+  <rect class="d-sunk" x="8" y="172" width="424" height="234" rx="12" fill="currentColor" />
+  <rect class="d-faint" x="8" y="172" width="424" height="234" rx="12" fill="none" stroke="currentColor" />
+  <text class="d-ink lead" x="24" y="198">Fleet object-store bucket</text>
+  <text class="d-faint" x="24" y="218">s3:// gs:// az:// — durability comes from here</text>
+
+  <rect class="d-tint" x="22" y="228" width="396" height="108" rx="8" fill="currentColor" />
+  <rect class="d-acc" x="22" y="228" width="396" height="108" rx="8" fill="none" stroke="currentColor" stroke-dasharray="5 4" />
+  <text class="d-acc" x="36" y="252">reserved r2/ prefixes, one per bucket_name</text>
+  <text class="d-ink mono" x="36" y="280"><tspan class="d-acc" fill="currentColor">r2/example-files/</tspan>photo.png</text>
+  <text class="d-faint" x="404" y="280" text-anchor="end">FILES</text>
+  <text class="d-ink mono" x="36" y="304"><tspan class="d-acc" fill="currentColor">r2/renders/</tspan>photo.png</text>
+  <text class="d-faint" x="404" y="304" text-anchor="end">CACHE</text>
+  <text class="d-ink mono" x="36" y="328"><tspan class="d-acc" fill="currentColor">r2/renders/</tspan>tile-04.png</text>
+  <text class="d-faint" x="404" y="328" text-anchor="end">CACHE</text>
+
+  <text class="d-soft mono" x="24" y="366">deploy/ cells/ nodes/ wake/</text>
+  <text class="d-faint" x="24" y="388">fleet keys, outside every binding's reach</text>
+</svg>

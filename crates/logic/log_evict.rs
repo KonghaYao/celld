@@ -38,9 +38,9 @@ pub struct EvictionPolicy {
     pub sustain_ms: u64,
     /// The hard backstop: any single append outstanding this long evicts
     /// immediately, sustain or none. The default covers the measured
-    /// append tail, not a guess: the S5c kill-validation corpus's worst
-    /// uncensored append is 923 ms with the tail right-censored above the
-    /// old 400 ms deadline (issue #295), and the 2026-08-24 stream-fleet
+    /// append tail, not a guess: the worst uncensored measured append is
+    /// 923 ms with the tail right-censored above the
+    /// old 400 ms deadline, and the 2026-08-24 stream-fleet
     /// verification took the same fleet from two gray evictions of
     /// healthy members and 14.5% bucket-proof acks at 400 ms to zero and
     /// 0.94% at this value. A truly dead member still evicts well inside

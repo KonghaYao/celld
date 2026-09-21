@@ -1,9 +1,9 @@
 # Testing
 
-celld makes three important promises:
+celld makes three promises:
 
 - An acknowledged write is durable.
-- A cell has one writer at a time. It never has two.
+- A cell has one writer at a time.
 - Code written for Cloudflare Workers and Durable Objects operates the
   same on celld.
 
@@ -16,21 +16,18 @@ on live fleets.
 
 ## Conformance: two runtimes, one output
 
-We test the compatibility promise differentially. We run each Workers and
-Durable Objects program twice: once on workerd, the runtime binary that
-Cloudflare operates in production, and once on celld, on identical bytes.
-The two outputs must be equal. This shows two facts at once: the program
-is real Cloudflare code, because workerd accepts it, and celld obeys the
-contract, because the outputs are equal. A test cannot agree with our own
-runtime by accident.
+We run the same Workers and Durable Objects program on both workerd,
+Cloudflare's production runtime, and celld. The two outputs must match,
+so each test checks celld against the Cloudflare runtime.
+The reference output comes from workerd, so the expected behavior does
+not depend on the celld implementation.
 
-The corpus only grows. When celld gets a new API surface, we add fixtures
-for that surface, and the fixtures must give equal output on the two
-engines. We also port test suites from workerd itself: the Durable
-Objects contract, the web-platform globals, and the upstream Web Platform
-Tests. Before a release, we also replay scenarios through the full
-`celld` binary in each deployment mode: storage, SQL, alarms, streams,
-WebSockets, and lifecycle.
+We expand the corpus with fixtures for each new API, and each fixture must
+give the same output on both engines. We also port test suites from workerd:
+the Durable Objects contract, the web-platform globals, and the upstream
+Web Platform Tests. Before a release, we replay storage, SQL, alarm,
+stream, WebSocket, and lifecycle scenarios through the full `celld` binary
+in each deployment mode.
 
 ## Specification: exhaustive at small size
 
@@ -45,16 +42,14 @@ the implementation a linearizable object store and perfect shared
 clocks, so a violation it finds needs no clock skew and no storage
 anomaly to occur. The invariants are the first two promises at the top
 of this page: one writer for each epoch, and no acknowledged write
-lost. The fencing argument itself — that a stale owner's late writes
-cannot cost an acknowledged write, because the epoch in the key keeps
-its lineage apart — is checked, not asserted.
+lost. The checker also verifies that the epoch in the key prevents a stale
+owner's late writes from causing the loss of an acknowledged write.
 
 Every configuration carries a pinned expected verdict, and most of the
 verdicts are failures: each failing configuration models a bug the
 protocol once had, or a deliberately broken checker, and the model
-must produce the counterexample. A configuration that stops failing
-has lost its tooth. One tooth had already fallen out when the
-specifications arrived; we repaired it.
+must produce the counterexample. If a configuration stops producing its
+expected failure, we investigate and repair the check.
 
 Some specifications model a proposed protocol before it is built. When
 the fence on write acknowledgments was redesigned, the design-stage
@@ -66,17 +61,16 @@ pinned failure.
 
 The checker has also removed code: celld once sealed a cell's durable
 history at restore, and the verdicts showed the seal defended only the
-return of a write that was never acknowledged — an outcome celld does
-not promise to prevent — while its permanent cut could turn a
-recoverable ordering slip into a permanent loss. The seal is gone.
+return of an unacknowledged write, which celld does not promise to prevent.
+The seal could also turn a recoverable ordering error into permanent data
+loss, so celld no longer uses it.
 
-The specifications are a hand-synced snapshot, deliberately not in
-continuous integration: a silently stale gate is worse than none. In
-practice their updates have landed in the same changes that moved the
-protocol, and a delta ledger records what the model does not yet
-describe, including places where the model is weaker than the code
-rather than wrong. Simulation remains the per-commit ratchet; the
-model is its exhaustive small-configuration complement.
+We update the specifications manually alongside the protocol changes.
+They do not run in continuous integration, because an outdated model can
+give false confidence. A separate record tracks what the model does not
+yet describe, including guarantees weaker than those in the code.
+Simulation checks each commit, and model checking adds exhaustive coverage
+of small configurations.
 
 ## Simulation: the protocol under adversarial schedules
 
@@ -94,18 +88,17 @@ drift apart; a node can crash at each await point. Scripted adversaries
 play the cells: a handler that never returns, a write stream that stops
 halfway. V8 stays out of the simulation, because V8 is not deterministic.
 
-A seeded scheduler drives each run, so a failure is not a fluke: the seed
-replays it exactly, every time, and we keep the seed until the bug is
-dead. We examine each property for safety (two writers in one epoch, a
-lost acknowledged write, an expired lease that comes back) and for
-liveness (each armed alarm fires, and ownership settles on one node after
-a crash). A property must survive tens of thousands of seeds, and the
-core protocols have run through millions of different schedules.
+A seeded scheduler drives each run, so we can reproduce a failure exactly
+and keep its seed until we fix the bug. We check safety properties for
+two writers in one epoch, a lost acknowledged write, and an expired lease
+that returns. We also check liveness: each armed alarm fires, and ownership
+settles on one node after a crash. A property must survive tens of thousands
+of seeds, and the core protocols have run through millions of different
+schedules.
 
-Simulation has a known failure mode: the checker that cannot fail. So
-we also test the checkers: we run deliberately broken variants of the
-protocol against the properties, and the properties must find the damage.
-A suite that stays green against a broken protocol is a broken suite.
+We also run deliberately broken variants of the protocol to verify that
+the checkers detect the faults. A checker that accepts a broken protocol
+cannot protect the corresponding property.
 
 ## Live fleets: what simulation cannot see
 
@@ -116,18 +109,16 @@ and a real bucket. The workloads rotate: chat rooms under many WebSocket
 connections, working sets that shift across tens of thousands of cells
 (each cell has a unique checksum), deployment cutovers under load, and
 runs that fill the nodes to the memory limit. The lab qualifies each
-release, and between releases it pushes the density and the fault
-coverage further. Each run makes an archived evidence bundle: the
-configuration, the verification sweeps, the node journals, the kernel
-logs, and the phase timings. We keep a red run with the same care as a
-green run, because a failure that the harness caught is a result, not a
-retry.
+release and tests greater density and more faults between releases. We
+archive each run's configuration, verification sweeps, node journals,
+kernel logs, and phase timings. We preserve failed runs as well as
+successful ones, because both provide evidence of the system's behavior.
 
 We inject the faults between verification passes. A pass fetches each
 cell through different nodes and compares the durable state exactly: the
-status, the body, and the full message ledger. Each run therefore has a
-clean picture before the fault and after it. A cell can be unavailable
-for a short time while its ownership moves, but its committed state must
+status, the body, and the full message ledger. Each run therefore records
+the state before and after the fault. A cell can be unavailable for a short
+time while its ownership moves, but its committed state must
 stay complete, and a live node must serve that state again.
 
 The scenarios attack every seam that we know:
@@ -156,8 +147,8 @@ faults, zero status faults, and zero lost messages.
 
 ## A few numbers we trust
 
-Each number includes the condition of its measurement. A number without
-its conditions has no value.
+Each number includes its measurement conditions, so you can assess whether
+it applies to your workload.
 
 - **The epoch fence holds under contention.** Five hundred claimants
   tried at the same time to own the same cells: 5,500 attempts, one
@@ -187,15 +178,10 @@ its conditions has no value.
 
 ## The failure edges we intend to find
 
-We must also know where a policy stops, so we record the edges instead of
-tuning them away. The clearest edge is the reserve headroom: a fleet that
-is full to its resident limit has no space for the cells of a lost node,
-so a failure of more than one node at the limit degrades the service,
-and a fleet with headroom does not. We measure both sides of that line,
-the good restoration with reserve and the red case without, because this
-measurement is part of the work.
+A fleet at its resident limit has no space for the cells of a lost node,
+so the loss of multiple nodes degrades the service. We test recovery with
+and without reserve capacity to measure this limit.
 
-If you find an edge that we did not find, tell us: a schedule that breaks
-a promise, a fault that we did not inject, a number that you cannot
-reproduce. That is exactly the bug report that we want:
-[github.com/denoland/celld/issues](https://github.com/denoland/celld/issues).
+Report a schedule that breaks a guarantee, a fault that we do not test,
+or a measurement that you cannot reproduce in the
+[issue tracker](https://github.com/denoland/celld/issues).

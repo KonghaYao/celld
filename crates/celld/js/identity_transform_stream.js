@@ -1,4 +1,4 @@
-// IdentityTransformStream / FixedLengthStream — Cloudflare's byte
+// IdentityTransformStream / FixedLengthStream -- Cloudflare's byte
 // pass-through streams. Not spec TransformStreams: in Workerd these are
 // "internal" (native) byte streams, and celld matches that
 // contract. The readable supports one pending read at a time (a second
@@ -11,7 +11,7 @@
 //
 // Compiled on first access (see LAZY_GLOBALS); a bundle that never names
 // either global never pays for this file.
-(() => {
+return (() => {
 
 const NOT_BYTES =
   'This TransformStream is being used as a byte stream, but received ' +
@@ -173,7 +173,7 @@ class InternalController {
     });
   }
 
-  // sink.close — only reachable with no write in flight.
+  // sink.close -- only reachable with no write in flight.
   _close() {
     const s = this._stream;
     s._finishClose();
@@ -323,7 +323,7 @@ function internalCancel(reason) {
 }
 
 // FixedLengthStream's expected length, handed to the base constructor
-// across super(). A field would arrive too late — super() builds the
+// across super(). A field would arrive too late -- super() builds the
 // sink that enforces it.
 let expected;
 
@@ -403,7 +403,7 @@ Object.setPrototypeOf(IdentityTransformStream, TransformStream);
 class FixedLengthStream extends IdentityTransformStream {
   constructor(expectedLength, queuingStrategy) {
     // Workerd coerces through jsg's integer conversion, so
-    // a fraction truncates (0.00001 → 0) and -0 is 0.
+    // a fraction truncates (0.00001 -> 0) and -0 is 0.
     const length = Math.trunc(Number(expectedLength));
     if (!Number.isInteger(length) || length < 0 ||
         length > Number.MAX_SAFE_INTEGER)

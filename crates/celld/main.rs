@@ -55,11 +55,37 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// the complete shutdown grace.
 const CONNECTION_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Retry a failed shutdown accept quickly enough to keep peer and health
+/// traffic available, then reduce repeated error work while the listener is
+/// unavailable. The complete shutdown deadline still bounds every retry.
+const SHUTDOWN_ACCEPT_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(10);
+const SHUTDOWN_ACCEPT_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The lossy stdout writer's flush handle. Every exit path uses
 /// `std::process::exit`, which skips destructors — but the last lines before
 /// an exit are the fence forensics, exactly the lines that must survive.
 static LOG_GUARD: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> =
     std::sync::Mutex::new(None);
+
+#[cfg(all(test, celld_internal_tests))]
+// Keep the client open until the child exits, so the accepted connection
+// reaches the real drain-time HTTP path instead of closing immediately.
+static SHUTDOWN_ACCEPT_FAILURE_CLIENT: std::sync::Mutex<Option<std::net::TcpStream>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, celld_internal_tests))]
+fn shutdown_accept_failure_test_checkpoint(active: bool, step: &'static str) {
+    if active {
+        // The tracing writer is deliberately lossy and asynchronous. This
+        // process regression needs every cleanup checkpoint to remain
+        // visible and ordered when the child exits through process::exit.
+        celld::cli_output::Output::new(celld::cli_output::Format::Text)
+            .line(format_args!(
+                "shutdown accept failure test checkpoint: {step}"
+            ))
+            .expect("write the shutdown accept failure test checkpoint");
+    }
+}
 
 static CONNECTION_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONNECTION_ERRORS_REPORTED: AtomicU64 = AtomicU64::new(0);
@@ -132,6 +158,43 @@ where
         return None;
     }
     tokio::time::timeout(remaining, future).await.ok()
+}
+
+/// Finish process-wide WebSocket frame work before connection tasks can
+/// unregister the sockets that receive those frames.
+async fn flush_shutdown_connections<Frames, Connections>(
+    process_deadline: tokio::time::Instant,
+    flush_frames: Frames,
+    flush_connections: Connections,
+) where
+    Frames: std::future::Future<Output = ()>,
+    Connections: std::future::Future<Output = ()>,
+{
+    // The frames a flush still holds are behind a durability gate, and a
+    // socket whose peer is gone can never deliver them: a `celld dev` stop
+    // on OrbStack sat here for its whole process deadline once the
+    // container behind an outbound socket had been destroyed. The grace is
+    // for frames that can still land; the durability of the writes behind
+    // them is the quiesce that follows, not this wait.
+    match before_process_deadline(
+        process_deadline,
+        tokio::time::timeout(CONNECTION_DRAIN_GRACE, flush_frames),
+    )
+    .await
+    {
+        None => return,
+        Some(Err(_)) => tracing::warn!(
+            event = "shutdown_frame_flush_cut",
+            grace_ms = CONNECTION_DRAIN_GRACE.as_millis() as u64,
+            "WebSocket frames still held at the flush grace were dropped"
+        ),
+        Some(Ok(())) => {}
+    }
+    let _ = before_process_deadline(
+        process_deadline,
+        tokio::time::timeout(CONNECTION_DRAIN_GRACE, flush_connections),
+    )
+    .await;
 }
 
 // Keep the runtime owner and the follower fallback in one consumed selection.
@@ -323,6 +386,32 @@ impl std::error::Error for StalePeerRoute {}
 #[derive(Debug)]
 struct RoutedRequestError(RequestError);
 
+/// The gate's verdict as the answer's error, with the handler's own failure
+/// kept below it when the answer was one: the client needs the verdict, and
+/// the operator reading the chain needs what the handler said too. The
+/// verdict stays on top, so the routed-error match still finds it.
+fn local_request_error(failure: LocalRequestFailure) -> anyhow::Error {
+    match failure {
+        LocalRequestFailure::Handler(error) => error,
+        LocalRequestFailure::OutputGate { verdict, handler } => match handler {
+            Some(handler) => handler.context(RoutedRequestError(verdict)),
+            None => anyhow::Error::new(RoutedRequestError(verdict)),
+        },
+    }
+}
+
+/// Preserve the owner's durability verdict and handler failure in a peer reply.
+fn peer_gate_failure(verdict: RequestError, handler: Option<&anyhow::Error>) -> HttpReply {
+    let detail = match handler {
+        Some(handler) => format!("; the handler failed: {handler:#}"),
+        None => String::new(),
+    };
+    peer_response(response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("durability unproven: {verdict:?}{detail}"),
+    ))
+}
+
 impl std::fmt::Display for RoutedRequestError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "route failed: {:?}", self.0)
@@ -332,7 +421,11 @@ impl std::fmt::Display for RoutedRequestError {
 impl std::error::Error for RoutedRequestError {}
 
 fn classify_remote_attempt(error: &anyhow::Error) -> celld_logic::routing::Attempt {
-    if error.downcast_ref::<StalePeerRoute>().is_some() {
+    if error.downcast_ref::<StalePeerRoute>().is_some()
+        || error
+            .downcast_ref::<peer_tunnel::StaleTunnelRoute>()
+            .is_some()
+    {
         celld_logic::routing::Attempt::NotOwner
     } else if error
         .downcast_ref::<reqwest::Error>()
@@ -341,6 +434,146 @@ fn classify_remote_attempt(error: &anyhow::Error) -> celld_logic::routing::Attem
         celld_logic::routing::Attempt::NeverConnected
     } else {
         celld_logic::routing::Attempt::Ambiguous
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteRetryAction {
+    Stop,
+    Redispatch,
+    WaitForOwner,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteRetryOutcome {
+    Ready,
+    Stop,
+    Cancelled,
+}
+
+/// Keep the one-retry transport policy, but do not spend that retry on an
+/// ownership generation which a reachable peer already rejected.
+///
+/// A replacement can bind the prior address while the prior session's lease
+/// is still live. The new process then gives a definitive `NotOwner` answer
+/// for the old `(node, epoch)`. An immediate redispatch resolves that same
+/// generation and fails a safe application retry before ownership can move.
+struct RemoteRouteRetry {
+    dispatcher: celld_logic::routing::Dispatcher,
+    generation: Option<(String, u64)>,
+    blocked: bool,
+    deadline_ms: u64,
+    next_wait_ms: u64,
+}
+
+impl RemoteRouteRetry {
+    const INITIAL_WAIT_MS: u64 = 10;
+    const MAX_WAIT_MS: u64 = 250;
+
+    fn new(operation_deadline_ms: u64) -> Self {
+        Self {
+            dispatcher: celld_logic::routing::Dispatcher::default(),
+            generation: None,
+            blocked: false,
+            deadline_ms: celld::asyncrt::mono_ms().saturating_add(operation_deadline_ms),
+            next_wait_ms: Self::INITIAL_WAIT_MS,
+        }
+    }
+
+    /// Return true when this route is known not to be usable yet.
+    fn observe(&mut self, node: &str, epoch: u64) -> bool {
+        let changed = self
+            .generation
+            .as_ref()
+            .is_none_or(|(current_node, current_epoch)| {
+                current_node != node || *current_epoch != epoch
+            });
+        if changed {
+            self.generation = Some((node.to_string(), epoch));
+            self.blocked = false;
+            self.dispatcher = celld_logic::routing::Dispatcher::default();
+            self.next_wait_ms = Self::INITIAL_WAIT_MS;
+        }
+        self.blocked
+    }
+
+    fn failed(&mut self, attempt: celld_logic::routing::Attempt) -> RemoteRetryAction {
+        match attempt {
+            celld_logic::routing::Attempt::Ambiguous => RemoteRetryAction::Stop,
+            celld_logic::routing::Attempt::NotOwner => {
+                if !self.dispatcher.redispatch(attempt) {
+                    return RemoteRetryAction::Stop;
+                }
+                self.blocked = true;
+                RemoteRetryAction::WaitForOwner
+            }
+            celld_logic::routing::Attempt::NeverConnected
+                if self.dispatcher.redispatch(attempt) =>
+            {
+                RemoteRetryAction::Redispatch
+            }
+            celld_logic::routing::Attempt::NeverConnected => RemoteRetryAction::Stop,
+        }
+    }
+
+    /// Apply one failed attempt's policy, then invalidate only when another
+    /// dispatch is allowed. The observed generation ties the retry budget,
+    /// diagnostic, and invalidation to the same owner.
+    async fn retry(
+        &mut self,
+        app: &AppHandle,
+        scope: &str,
+        attempt: celld_logic::routing::Attempt,
+        cancel: Option<&mut oneshot::Receiver<()>>,
+        surface: Option<&'static str>,
+    ) -> RemoteRetryOutcome {
+        let action = self.failed(attempt);
+        let (node, epoch) = self.generation.as_ref().expect("an observed remote route");
+        tracing::warn!(
+            event = "remote_route_retry",
+            %scope,
+            %node,
+            epoch,
+            ?attempt,
+            ?action,
+            surface,
+            "a peer attempt changed the remote route retry state"
+        );
+        let outcome = match action {
+            RemoteRetryAction::Stop => RemoteRetryOutcome::Stop,
+            RemoteRetryAction::Redispatch => RemoteRetryOutcome::Ready,
+            RemoteRetryAction::WaitForOwner => self.wait(cancel).await,
+        };
+        if outcome == RemoteRetryOutcome::Ready {
+            self.invalidate(app, scope).await;
+        }
+        outcome
+    }
+
+    async fn invalidate(&self, app: &AppHandle, scope: &str) {
+        let (node, epoch) = self.generation.as_ref().expect("an observed remote route");
+        app.invalidate_remote(scope.to_string(), node.clone(), *epoch)
+            .await;
+    }
+
+    async fn wait(&mut self, cancel: Option<&mut oneshot::Receiver<()>>) -> RemoteRetryOutcome {
+        let remaining_ms = self.deadline_ms.saturating_sub(celld::asyncrt::mono_ms());
+        if remaining_ms == 0 {
+            return RemoteRetryOutcome::Stop;
+        }
+        let wait = std::time::Duration::from_millis(remaining_ms.min(self.next_wait_ms));
+        self.next_wait_ms = self.next_wait_ms.saturating_mul(2).min(Self::MAX_WAIT_MS);
+        match cancel {
+            Some(cancel) => celld::asyncrt::select_biased! {
+                "a lifecycle cancellation wins a tie with route retry backoff";
+                _ = cancel => RemoteRetryOutcome::Cancelled,
+                _ = celld::asyncrt::sleep(wait) => RemoteRetryOutcome::Ready,
+            },
+            None => {
+                celld::asyncrt::sleep(wait).await;
+                RemoteRetryOutcome::Ready
+            }
+        }
     }
 }
 
@@ -396,10 +629,6 @@ impl WebSocketRouteTiming {
 /// decides. `Ok` releases the held effect; `Err` breaks the call, as a routed
 /// gate failure would.
 async fn dispatch_gate(app: AppHandle, req: celld::js::GateReq) {
-    if !app.output_gate {
-        let _ = req.reply.send(Ok(()));
-        return;
-    }
     let routed = match app.request(req.scope.clone()).await {
         Ok(routed) => routed,
         Err(error) => {
@@ -411,8 +640,7 @@ async fn dispatch_gate(app: AppHandle, req: celld::js::GateReq) {
     // branch does not leak the just-acquired request.
     let _activity = app.activity(routed.request, req.scope.clone());
     let result = if routed.route == Route::Local {
-        app.gate_output(routed.request, req.channel, req.position)
-            .await
+        app.gate_output(routed.request, req.ticket).await
     } else {
         // The owning isolate should route the cell locally; if it moved off the
         // node mid-call, fail closed rather than acknowledge an unproven write.
@@ -644,7 +872,6 @@ async fn adopt_deployment(
     };
     let id = runtime.next_generation_id();
     let options = GenerationOptions {
-        loader_binding: worker_loader_binding(),
         node: node.to_string(),
         region: region.to_string(),
     };
@@ -770,6 +997,16 @@ fn start_pointer_watcher(
 /// `POST /reload`: adopt the pointer's deployment now and report the outcome.
 /// Forced, so an unchanged pointer still builds a new generation and a vars
 /// file edit takes effect.
+/// Pause or resume balancing. The node publishes the flag in its lease, and
+/// one paused lease stops every donor in the fleet, so an operator pauses
+/// the fleet from any node and resumes it from the same one.
+fn internal_rebalance_switch(paused: bool) -> HttpReply {
+    if !celld::ownership_store::set_rebalance_paused(paused) {
+        return response(StatusCode::CONFLICT, "this node publishes no lease");
+    }
+    response(StatusCode::OK, format!("{{\"rebalance_paused\":{paused}}}"))
+}
+
 async fn internal_reload(app: AppHandle) -> HttpReply {
     let (reply, receive) = tokio::sync::oneshot::channel();
     let sent = app
@@ -833,6 +1070,17 @@ async fn internal_reload(app: AppHandle) -> HttpReply {
     response(status, body.to_string())
 }
 
+fn local_dispatch_request_id(
+    request_id: Option<celld::js::RequestId>,
+) -> Option<celld::js::RequestId> {
+    // Internal Queue, cron, alarm, and peer calls have no client request ID,
+    // but a local handler still needs an identity in the abort registry. The
+    // drain cancels by core request and resolves that identity through the
+    // activity pin; leaving it absent makes a busy internal handler impossible
+    // to stop before the process deadline.
+    Some(request_id.unwrap_or_else(celld::js::next_request_id))
+}
+
 async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
     let DoCallReq {
         request_id,
@@ -870,7 +1118,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
             celld_logic::cell::valid_cell_scope(&scope),
             "cell scope is malformed or exceeds the fleet storage limit"
         );
-        let mut dispatcher = celld_logic::routing::Dispatcher::default();
+        let mut dispatcher = RemoteRouteRetry::new(app.operation_deadline_ms);
         loop {
             if let Some(timing) = websocket_timing.as_mut() {
                 timing.attempts = timing.attempts.saturating_add(1);
@@ -918,78 +1166,58 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
             let (node, addr, epoch, peer_protocol) = match route {
                 Route::Local => {
                     let dispatch_started = Instant::now();
-                    let activity = app.activity_for(request, scope.clone(), request_id, "local");
-                    let result = async {
-                        let runtime = app.runtime.as_ref().context("no cell runtime")?;
-                        let response = runtime
-                            .fetch_cell(
-                                scope.clone(),
-                                name,
-                                RuntimeFetch {
-                                    url,
-                                    method,
-                                    body,
-                                    headers,
-                                    request_id,
-                                    // Moved on the first attempt and gone on
-                                    // a retry, which is right: a retry is a
-                                    // second delivery of a call whose place
-                                    // in the order was already taken.
-                                    order: order.take(),
-                                    parent,
-                                },
-                                cancel.take(),
-                            )
-                            .await?;
-                        // `fetch_cell` cannot return a response until the cell
-                        // has installed its request context. That context now
-                        // owns an unread tail through its waitUntil work.
-                        body_guard.disarm();
-                        if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
-                            let kind = if celld::js::ws_hibernatable(target.id).unwrap_or(false) {
-                                WebSocketKind::Hibernatable
-                            } else {
-                                WebSocketKind::Regular
-                            };
-                            app.websocket_opened(target.scope.clone(), target.id, kind)
-                                .await?;
-                        }
-                        Ok(response)
-                    }
-                    .await;
-                    // Output gate (RPO=0): a handler that advanced the cell's
-                    // write position has its response held until the core proves
-                    // the cell durable. The request is still pinned (the
-                    // activity guard has not dropped), so it fails rather than
-                    // acknowledges a write the node cannot prove durable.
-                    let result = match result {
-                        Ok(response) if app.output_gate => {
-                            activity.set_phase("output_gate", false, false);
-                            if let Some(position) = response.write_position {
-                                activity.gate_started(position);
-                            }
-                            let gated = app
-                                .gate_output(
-                                    request,
-                                    celld_logic::Channel::Response,
-                                    response.write_position,
+                    let local_request_id = local_dispatch_request_id(request_id);
+                    let local =
+                        app.local_request(request, scope.clone(), local_request_id, "local");
+                    let completed = local
+                        .run(async {
+                            let runtime = app.runtime.as_ref().context("no cell runtime")?;
+                            let response = runtime
+                                .fetch_cell(
+                                    scope.clone(),
+                                    name,
+                                    RuntimeFetch {
+                                        url,
+                                        method,
+                                        body,
+                                        headers,
+                                        request_id: local_request_id,
+                                        // Moved on the first attempt and gone on
+                                        // a retry, which is right: a retry is a
+                                        // second delivery of a call whose place
+                                        // in the order was already taken.
+                                        order: order.take(),
+                                        parent,
+                                    },
+                                    cancel.take(),
                                 )
-                                .await;
-                            activity.gate_finished(gated.is_ok());
-                            match gated {
-                                Ok(()) => Ok(response),
-                                Err(error) => Err(anyhow::Error::new(RoutedRequestError(error))),
+                                .await?;
+                            // `fetch_cell` cannot return a response until the cell
+                            // has installed its request context. That context now
+                            // owns an unread tail through its waitUntil work.
+                            body_guard.disarm();
+                            if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
+                                let kind = if celld::js::ws_hibernatable(target.id).unwrap_or(false)
+                                {
+                                    WebSocketKind::Hibernatable
+                                } else {
+                                    WebSocketKind::Regular
+                                };
+                                app.websocket_opened(target.scope.clone(), target.id, kind)
+                                    .await?;
                             }
-                        }
-                        Ok(response) => Ok(response),
-                        Err(error) => Err(error),
-                    };
+                            Ok(response)
+                        })
+                        .await;
+                    let activity = completed.activity;
+                    let result = completed.result.map_err(local_request_error);
                     let result = match result {
                         Ok(mut response) => {
                             let body_active = response.stream.is_some();
                             activity.set_phase("response_body", true, body_active);
                             if let Some(stream) = response.stream.take() {
-                                response.stream = Some(local_response_stream(stream, activity));
+                                response.stream =
+                                    Some(local_response_stream(stream, activity, || {}));
                             } else {
                                 drop(activity);
                             }
@@ -1019,6 +1247,27 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                     peer_protocol,
                 } => (node, addr, epoch, peer_protocol),
             };
+            if dispatcher.observe(&node, epoch) {
+                let cancel = if deliver_abort_to_handler {
+                    None
+                } else {
+                    cancel.as_mut()
+                };
+                match dispatcher.wait(cancel).await {
+                    RemoteRetryOutcome::Ready => {
+                        dispatcher.invalidate(&app, &scope).await;
+                        continue;
+                    }
+                    RemoteRetryOutcome::Cancelled => {
+                        break Err(anyhow::anyhow!("Durable Object call cancelled"));
+                    }
+                    RemoteRetryOutcome::Stop => {
+                        break Err(anyhow::anyhow!(
+                            "remote owner remained stale until the retry deadline"
+                        ));
+                    }
+                }
+            }
             let dispatch_started = Instant::now();
             let streamed_attempt = matches!(body, celld::js::RequestBody::Stream(_));
             let remote_call = async {
@@ -1122,6 +1371,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                             })),
                             stream: None,
                             write_position: None,
+                            observed_position: None,
                         });
                     }
                     let response_headers = response
@@ -1147,6 +1397,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         // A proxied remote response wrote on the owner, not
                         // here.
                         write_position: None,
+                        observed_position: None,
                     })
                 }
             };
@@ -1197,10 +1448,20 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                         continue;
                     }
-                    let attempt = classify_remote_attempt(&error);
-                    if dispatcher.redispatch(attempt) {
-                        app.invalidate_remote(scope.clone(), node, epoch).await;
-                        continue;
+                    let cancel = if deliver_abort_to_handler {
+                        None
+                    } else {
+                        cancel.as_mut()
+                    };
+                    match dispatcher
+                        .retry(&app, &scope, classify_remote_attempt(&error), cancel, None)
+                        .await
+                    {
+                        RemoteRetryOutcome::Ready => continue,
+                        RemoteRetryOutcome::Cancelled => {
+                            break Err(anyhow::anyhow!("Durable Object call cancelled"));
+                        }
+                        RemoteRetryOutcome::Stop => {}
                     }
                     if let Some(timing) = websocket_timing.as_ref() {
                         timing.emit(&app, &scope, request_id, "error", "remote", &node);
@@ -1227,7 +1488,7 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
             celld_logic::cell::valid_cell_scope(&scope),
             "cell scope is malformed or exceeds the fleet storage limit"
         );
-        let mut dispatcher = celld_logic::routing::Dispatcher::default();
+        let mut dispatcher = RemoteRouteRetry::new(app.operation_deadline_ms);
         loop {
             let Routed { request, route } = app
                 .request(scope.clone())
@@ -1235,28 +1496,18 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                 .map_err(|error| anyhow::anyhow!("route RPC {scope}: {error:?}"))?;
             let (node, addr, epoch, peer_protocol) = match route {
                 Route::Local => {
-                    let _activity = app.activity(request, scope.clone());
-                    let outcome = app
-                        .runtime
-                        .as_ref()
-                        .context("no cell runtime")?
-                        .rpc(scope, name, method, args)
-                        .await?;
-                    // Output gate (RPO=0): an RPC method that advanced the
-                    // cell's write position has its reply held until the core
-                    // proves the cell durable, exactly as fetch does. The
-                    // activity guard is still alive, so the cell stays pinned
-                    // across the wait.
-                    if app.output_gate {
-                        app.gate_output(
-                            request,
-                            celld_logic::Channel::Response,
-                            outcome.write_position,
-                        )
-                        .await
-                        .map_err(|error| anyhow::Error::new(RoutedRequestError(error)))?;
-                    }
-                    return Ok(outcome.data);
+                    let local_request_id = local_dispatch_request_id(None);
+                    let completed = app
+                        .local_request(request, scope.clone(), local_request_id, "local")
+                        .run(async {
+                            app.runtime
+                                .as_ref()
+                                .context("no cell runtime")?
+                                .rpc(scope, name, method, args, local_request_id)
+                                .await
+                        })
+                        .await;
+                    return Ok(completed.result.map_err(local_request_error)?.data);
                 }
                 Route::Remote {
                     node,
@@ -1265,6 +1516,18 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                     peer_protocol,
                 } => (node, addr, epoch, peer_protocol),
             };
+            if dispatcher.observe(&node, epoch) {
+                match dispatcher.wait(None).await {
+                    RemoteRetryOutcome::Ready => {
+                        dispatcher.invalidate(&app, &scope).await;
+                        continue;
+                    }
+                    RemoteRetryOutcome::Stop => {
+                        anyhow::bail!("remote RPC owner remained stale until the retry deadline")
+                    }
+                    RemoteRetryOutcome::Cancelled => unreachable!("RPC route waits have no cancel"),
+                }
+            }
             anyhow::ensure!(
                 peer_protocol == peer_auth::PROTOCOL_VERSION,
                 "peer {node} speaks incompatible protocol {peer_protocol}"
@@ -1284,28 +1547,37 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                     &args,
                 )
                 .await;
-                let response = match response {
-                    Ok(response) => response,
-                    Err(error) => {
-                        let attempt = classify_remote_attempt(&error);
-                        if dispatcher.redispatch(attempt) {
-                            app.invalidate_remote(scope.clone(), node, epoch).await;
-                            continue;
-                        }
-                        return Err(anyhow::anyhow!("remote RPC transport failed: {error:#}"));
+                // Classify failures before response decoding. An explicit stale
+                // owner ran nothing; a failed or truncated reply after execution
+                // remains ambiguous and cannot justify another RPC invocation.
+                let attempt = match &response {
+                    Err(error) => Some(classify_remote_attempt(error)),
+                    Ok(response)
+                        if response
+                            .headers()
+                            .get(STALE_ROUTE_HEADER)
+                            .is_some_and(|value| value == STALE_ROUTE_VALUE) =>
+                    {
+                        Some(celld_logic::routing::Attempt::NotOwner)
                     }
+                    Ok(_) => None,
                 };
-                if response
-                    .headers()
-                    .get(STALE_ROUTE_HEADER)
-                    .is_some_and(|value| value == STALE_ROUTE_VALUE)
-                {
-                    if dispatcher.redispatch(celld_logic::routing::Attempt::NotOwner) {
-                        app.invalidate_remote(scope.clone(), node, epoch).await;
-                        continue;
+                if let Some(attempt) = attempt {
+                    match dispatcher
+                        .retry(&app, &scope, attempt, None, Some("rpc"))
+                        .await
+                    {
+                        RemoteRetryOutcome::Ready => continue,
+                        RemoteRetryOutcome::Cancelled => {
+                            unreachable!("RPC route waits have no cancel")
+                        }
+                        RemoteRetryOutcome::Stop => match response {
+                            Err(error) => anyhow::bail!("remote RPC transport failed: {error:#}"),
+                            Ok(_) => anyhow::bail!("remote RPC owner was stale"),
+                        },
                     }
-                    anyhow::bail!("remote RPC owner was stale");
                 }
+                let response = response?;
                 if response.status() == StatusCode::SERVICE_UNAVAILABLE
                     && response
                         .headers()
@@ -1495,7 +1767,14 @@ async fn ingress_payload(
         ));
     }
     let (url, method, body, headers, held) =
-        ingress_payload_parts(request, trust_forwarded_headers, max_body_bytes);
+        ingress_payload_parts(request, trust_forwarded_headers, max_body_bytes).map_err(
+            |error| {
+                response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("request body stream: {error}"),
+                )
+            },
+        )?;
     // The host collects a small body here. A read failure at this point
     // can still return status 400. A streamed body has no such point,
     // because that body fails while the handler reads it. The failure
@@ -1510,17 +1789,19 @@ async fn ingress_payload(
     Ok((url, method, body, headers))
 }
 
-fn ingress_payload_parts(
-    request: Request<Incoming>,
-    trust_forwarded_headers: bool,
-    max_body_bytes: usize,
-) -> (
+type IngressPayloadParts = (
     String,
     String,
     celld::js::RequestBody,
     Vec<(String, String)>,
     Option<Incoming>,
-) {
+);
+
+fn ingress_payload_parts(
+    request: Request<Incoming>,
+    trust_forwarded_headers: bool,
+    max_body_bytes: usize,
+) -> Result<IngressPayloadParts, String> {
     let (parts, body) = request.into_parts();
     let headers = worker_request_headers(&parts, trust_forwarded_headers);
     let url = request_url(&parts, trust_forwarded_headers);
@@ -1539,13 +1820,13 @@ fn ingress_payload_parts(
         hyper::Method::GET | hyper::Method::HEAD | hyper::Method::DELETE
     ) || declared == Some(0);
     if bodyless || declared.is_some_and(|length| length < INGRESS_STREAM_THRESHOLD) {
-        return (
+        return Ok((
             url,
             method,
             celld::js::RequestBody::Bytes(Bytes::new()),
             headers,
             Some(body),
-        );
+        ));
     }
     let chunks = Limited::new(body, max_body_bytes)
         .into_data_stream()
@@ -1561,14 +1842,14 @@ fn ingress_payload_parts(
                 }
             })
         });
-    let stream_id = celld::js::register_body_stream(Box::pin(chunks));
-    (
+    let stream_id = celld::js::register_body_stream(Box::pin(chunks))?;
+    Ok((
         url,
         method,
         celld::js::RequestBody::Stream(stream_id),
         headers,
         None,
-    )
+    ))
 }
 
 /// The refusal every path arm gives a cell scope that fails the charset gate.
@@ -1979,7 +2260,7 @@ pub(crate) async fn dispatch_forwarded_fetch(
             request,
             route: Route::Local,
         }) => {
-            let activity = app.activity_for(request, scope.clone(), request_id, "forwarded");
+            let local = app.local_request(request, scope.clone(), request_id, "forwarded");
             let Some(runtime) = &app.runtime else {
                 return ForwardedFetchOutcome::Reply(response(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2000,53 +2281,46 @@ pub(crate) async fn dispatch_forwarded_fetch(
                 drain_pins: app.drain_pins.clone(),
                 handler_active: true,
             };
-            match runtime
-                .fetch_cell(
-                    scope,
-                    name,
-                    RuntimeFetch {
-                        url,
-                        method,
-                        body: request_body,
-                        headers,
-                        request_id,
-                        // A peer's call has no caller in this process, and the
-                        // peer protocol does not carry trace context.
-                        order: None,
-                        parent: None,
-                    },
-                    None,
-                )
-                .await
-            {
-                Ok(mut worker_response) => {
+            let completed = local
+                .run(async {
+                    let result = runtime
+                        .fetch_cell(
+                            scope,
+                            name,
+                            RuntimeFetch {
+                                url,
+                                method,
+                                body: request_body,
+                                headers,
+                                request_id,
+                                // A peer's call has no caller in this process, and the
+                                // peer protocol does not carry trace context.
+                                order: None,
+                                parent: None,
+                            },
+                            None,
+                        )
+                        .await;
+                    // The handler has answered in both arms; a hang-up during the
+                    // gate wait below cancels the request's remaining work, not a
+                    // handler that is still running.
                     abort.handler_answered();
-                    // Output gate (RPO=0): a peer-served handler that advanced
-                    // the cell's committed position holds its reply until the
-                    // cell is proven durable, exactly as the local dispatch
-                    // path does. This path used to acknowledge unproven writes
-                    // and could lose them during takeover. The activity guard
-                    // is still alive, so the request stays pinned across the wait.
-                    if app.output_gate {
-                        activity.set_phase("output_gate", false, false);
-                        if let Some(position) = worker_response.write_position {
-                            activity.gate_started(position);
-                        }
-                        let gated = app
-                            .gate_output(
-                                request,
-                                celld_logic::Channel::Response,
-                                worker_response.write_position,
-                            )
-                            .await;
-                        activity.gate_finished(gated.is_ok());
-                        if let Err(error) = gated {
-                            return ForwardedFetchOutcome::Reply(peer_response(response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("durability unproven: {error:?}"),
-                            )));
-                        }
-                    }
+                    result
+                })
+                .await;
+            let activity = completed.activity;
+            let result = match completed.result {
+                Ok(answer) => Ok(answer),
+                Err(LocalRequestFailure::Handler(error)) => Err(error),
+                Err(LocalRequestFailure::OutputGate { verdict, handler }) => {
+                    return ForwardedFetchOutcome::Reply(peer_gate_failure(
+                        verdict,
+                        handler.as_ref(),
+                    ));
+                }
+            };
+            match result {
+                Ok(mut worker_response) => {
                     if let Some(HttpResponseWebSocket::Cell(target)) = &worker_response.websocket {
                         let kind = if celld::js::ws_hibernatable(target.id).unwrap_or(false) {
                             WebSocketKind::Hibernatable
@@ -2077,7 +2351,9 @@ pub(crate) async fn dispatch_forwarded_fetch(
                     activity.set_phase("response_body", true, body_active);
                     if let Some(stream) = worker_response.stream.take() {
                         worker_response.stream =
-                            Some(owner_response_stream(stream, activity, abort));
+                            Some(local_response_stream(stream, activity, move || {
+                                abort.disarm()
+                            }));
                     } else {
                         abort.disarm();
                         drop(activity);
@@ -2197,33 +2473,20 @@ pub(crate) async fn dispatch_forwarded_rpc(
             request,
             route: Route::Local,
         }) => {
-            let _activity = app.activity(request, scope.clone());
+            let local_request_id = local_dispatch_request_id(None);
+            let local = app.local_request(request, scope.clone(), local_request_id, "local");
             let Some(runtime) = &app.runtime else {
                 return peer_response(response(StatusCode::SERVICE_UNAVAILABLE, "no cell runtime"));
             };
-            // Output gate on the owner side, so a proxied RPC write is durable
-            // before the calling node sees the reply -- the same rule the peer
-            // fetch path follows.
-            match runtime.rpc(scope, name, rpc_method, args).await {
-                Ok(outcome) => {
-                    if app.output_gate {
-                        if let Err(error) = app
-                            .gate_output(
-                                request,
-                                celld_logic::Channel::Response,
-                                outcome.write_position,
-                            )
-                            .await
-                        {
-                            return peer_response(response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("durability unproven: {error:?}"),
-                            ));
-                        }
-                    }
-                    Ok(outcome.data)
+            let completed = local
+                .run(runtime.rpc(scope, name, rpc_method, args, local_request_id))
+                .await;
+            match completed.result {
+                Ok(outcome) => Ok(outcome.data),
+                Err(LocalRequestFailure::Handler(error)) => Err(error),
+                Err(LocalRequestFailure::OutputGate { verdict, handler }) => {
+                    return peer_gate_failure(verdict, handler.as_ref());
                 }
-                Err(error) => Err(error),
             }
         }
         Ok(Routed {
@@ -2390,6 +2653,7 @@ async fn dispatch_service_call(app: AppHandle, call: SvcCallReq) {
                 .fetch_service(ServiceFetch {
                     generation: call.generation,
                     script: call.script,
+                    entrypoint: call.entrypoint,
                     url: call.url,
                     method: call.method,
                     body: call.body,
@@ -2416,8 +2680,8 @@ async fn dispatch_service_rpc(app: AppHandle, call: SvcRpcReq) {
                     call.generation,
                     &call.script,
                     call.entrypoint,
-                    call.method,
-                    call.args,
+                    call.props,
+                    call.operation,
                 )
                 .await
         }
@@ -2829,6 +3093,9 @@ async fn handle_internal(
 ) -> Result<HttpReply, Infallible> {
     let path = request.uri().path().to_string();
     let draining = app.is_draining();
+    let do_scope = path.strip_prefix("/do/");
+    let cell_scope = path.strip_prefix("/cell/");
+    let evict_scope = path.strip_prefix("/evict/");
     let result = match path.as_str() {
         "/peer/probe" => internal_probe(request, app).await,
         "/peer/handoff" => internal_handoff(request, app).await,
@@ -2838,6 +3105,12 @@ async fn handle_internal(
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
         "/reload" => internal_reload(app).await,
+        "/rebalance/pause" | "/rebalance/resume" if request.method() != hyper::Method::POST => {
+            response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+        }
+        "/rebalance/pause" | "/rebalance/resume" => {
+            internal_rebalance_switch(path == "/rebalance/pause")
+        }
         "/shutdown" if request.method() != hyper::Method::POST => {
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
@@ -2948,9 +3221,10 @@ async fn handle_internal(
             )
             .await
         }
-        _ if path.starts_with("/do/") && app.runtime.is_some() => {
+        _ if do_scope.is_some() && app.runtime.is_some() => {
             let runtime = app.runtime.as_ref().expect("checked runtime");
-            let cell = match runtime.cell_scope(&path[4..]) {
+            let scope = do_scope.expect("checked prefix");
+            let cell = match runtime.cell_scope(scope) {
                 Ok(cell) => cell,
                 Err(error) => {
                     return Ok(response(StatusCode::BAD_REQUEST, format!("{error:#}")));
@@ -2989,12 +3263,13 @@ async fn handle_internal(
             };
             dispatch_cell_fetch(cell, None, url, method, body, headers).await
         }
-        _ if path.starts_with("/cell/") && !celld_logic::cell::valid_cell_scope(&path[6..]) => {
-            malformed_scope()
-        }
-        _ if path.starts_with("/cell/") => {
-            let cell = path[6..].to_string();
-            match app.request(cell.clone()).await {
+        _ if cell_scope.is_some() => {
+            let cell = cell_scope.expect("checked prefix");
+            if !celld_logic::cell::valid_cell_scope(cell) {
+                malformed_scope()
+            } else {
+                let cell = cell.to_string();
+                match app.request(cell.clone()).await {
                 Ok(Routed {
                     request,
                     route: Route::Local,
@@ -3020,18 +3295,20 @@ async fn handle_internal(
                         "{{\"route\":\"remote\",\"node\":{node:?},\"addr\":{addr:?},\"epoch\":{epoch},\"peer_protocol\":{peer_protocol}}}"
                     ),
                 ),
-                Err(error) => response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("{{\"error\":\"{error:?}\"}}"),
-                ),
+                    Err(error) => response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("{{\"error\":\"{error:?}\"}}"),
+                    ),
+                }
             }
         }
-        _ if path.starts_with("/evict/") && !celld_logic::cell::valid_cell_scope(&path[7..]) => {
-            malformed_scope()
-        }
-        _ if path.starts_with("/evict/") => {
-            app.evict(path[7..].to_string()).await;
-            response(StatusCode::OK, "{\"ok\":true}")
+        _ if evict_scope.is_some() => {
+            let cell = evict_scope.expect("checked prefix");
+            if !celld_logic::cell::valid_cell_scope(cell) {
+                malformed_scope()
+            } else {
+                eviction_response(app.evict(cell.to_string()).await)
+            }
         }
         _ => response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}"),
     };
@@ -3053,10 +3330,31 @@ async fn handle_internal(
     Ok(result)
 }
 
+fn eviction_response(result: Result<EvictSuccess, EvictError>) -> HttpReply {
+    let Err(error) = result else {
+        return response(StatusCode::OK, r#"{"ok":true}"#);
+    };
+    let status = match error {
+        EvictError::Refused(EvictRefusal::NodeUnavailable | EvictRefusal::ConcurrencyLimit)
+        | EvictError::Failed(EvictFailure::ActorUnavailable) => StatusCode::SERVICE_UNAVAILABLE,
+        EvictError::Refused(_) | EvictError::Cancelled(_) => StatusCode::CONFLICT,
+        EvictError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    response(
+        status,
+        serde_json::json!({
+            "ok": false,
+            "error": { "kind": error.kind(), "reason": error.reason() }
+        })
+        .to_string(),
+    )
+}
+
 #[derive(Clone, Copy)]
 enum HttpSurface {
     Public,
     Internal,
+    Recovery,
 }
 
 impl HttpSurface {
@@ -3064,8 +3362,106 @@ impl HttpSurface {
         match self {
             Self::Public => "public",
             Self::Internal => "internal",
+            Self::Recovery => "recovery",
         }
     }
+}
+
+struct ShutdownConnection {
+    stream: tokio::net::TcpStream,
+    surface: HttpSurface,
+    received: oneshot::Sender<()>,
+    #[cfg(all(test, celld_internal_tests))]
+    recovered_after_error: bool,
+}
+
+fn spawn_shutdown_acceptor(
+    listener: tokio::net::TcpListener,
+    surface: HttpSurface,
+    connections: mpsc::Sender<ShutdownConnection>,
+    #[cfg(all(test, celld_internal_tests))] mut fail_next_for_test: bool,
+) {
+    // Shutdown selects finish whenever a timer, request, or actor message
+    // wins. Keep each listener's accept and retry waits in one task so those
+    // unrelated events cannot cancel a wait or reset its retry delay.
+    tokio::spawn(async move {
+        let mut retry_delay = SHUTDOWN_ACCEPT_RETRY_INITIAL;
+        let mut recovering = false;
+        #[cfg(all(test, celld_internal_tests))]
+        let mut connect_after_failure_for_test = false;
+        loop {
+            #[cfg(all(test, celld_internal_tests))]
+            let inject_failure = std::mem::take(&mut fail_next_for_test);
+            #[cfg(all(test, celld_internal_tests))]
+            let accepted = if inject_failure {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "injected listener accept failure during shutdown",
+                ))
+            } else if std::mem::take(&mut connect_after_failure_for_test) {
+                let retry_address = listener
+                    .local_addr()
+                    .expect("read the shutdown accept failure test listener address");
+                // Connect before polling accept, so the injected transition
+                // does not depend on an operating-system readiness-
+                // notification race after the error.
+                let connection = std::net::TcpStream::connect(retry_address)
+                    .expect("connect after the injected shutdown accept failure");
+                *SHUTDOWN_ACCEPT_FAILURE_CLIENT
+                    .lock()
+                    .expect("lock the shutdown accept failure test connection") = Some(connection);
+                listener.accept().await
+            } else {
+                listener.accept().await
+            };
+            #[cfg(not(all(test, celld_internal_tests)))]
+            let accepted = listener.accept().await;
+            match accepted {
+                Ok((stream, _)) => {
+                    if recovering {
+                        tracing::info!(
+                            event = "shutdown_accept_recovered",
+                            surface = surface.name(),
+                            "accepted {} connection after a shutdown accept error",
+                            surface.name()
+                        );
+                    }
+                    let (received, wait_until_received) = oneshot::channel();
+                    let connection = ShutdownConnection {
+                        stream,
+                        surface,
+                        received,
+                        #[cfg(all(test, celld_internal_tests))]
+                        recovered_after_error: recovering,
+                    };
+                    if connections.send(connection).await.is_err() {
+                        return;
+                    }
+                    let _ = wait_until_received.await;
+                    retry_delay = SHUTDOWN_ACCEPT_RETRY_INITIAL;
+                    recovering = false;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        event = "shutdown_accept_failed",
+                        surface = surface.name(),
+                        retry_ms = retry_delay.as_millis(),
+                        %error,
+                        "could not accept {} connection during shutdown; retrying",
+                        surface.name()
+                    );
+                    #[cfg(all(test, celld_internal_tests))]
+                    if inject_failure {
+                        shutdown_accept_failure_test_checkpoint(true, "listener failure observed");
+                        connect_after_failure_for_test = true;
+                    }
+                    recovering = true;
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = retry_delay.saturating_mul(2).min(SHUTDOWN_ACCEPT_RETRY_MAX);
+                }
+            }
+        }
+    });
 }
 
 fn serve_http_connection(
@@ -3097,6 +3493,18 @@ fn serve_http_connection(
                     match surface {
                         HttpSurface::Public => handle_public(request, app, service_requests).await,
                         HttpSurface::Internal => handle_internal(request, app, shutdown).await,
+                        HttpSurface::Recovery => {
+                            let path = request.uri().path().to_string();
+                            Ok(match path.as_str() {
+                                "/peer/log/seal" | "/peer/log/tail" => {
+                                    internal_log(request, app, path).await
+                                }
+                                _ => response(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "predecessor recovery in progress",
+                                ),
+                            })
+                        }
                     }
                 }
             });
@@ -3132,9 +3540,70 @@ fn serve_http_connection(
         let _ = served.await;
     })
 }
+
+/// Serve the surviving follower disks before recovering this node's own
+/// predecessor. After a correlated restart, every predecessor can need a
+/// fragment on another restarting node. Waiting to accept until recovery
+/// finishes makes those intact disks look lost and seals out acked writes.
+/// Only authenticated seal and tail requests run here: the actor has no
+/// lease yet, so neither application work nor new log appends can run.
+async fn recover_with_follower_listener(
+    listener: &tokio::net::TcpListener,
+    app: AppHandle,
+    recovery: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    let (drain_tx, drain_rx) = watch::channel(false);
+    let (shutdown_tx, _shutdown_rx) = mpsc::unbounded_channel();
+    let mut connections: FuturesUnordered<ConnectionFuture> = FuturesUnordered::new();
+    tokio::pin!(recovery);
+    let result = loop {
+        celld::asyncrt::select! {
+            result = &mut recovery => break result,
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _)) => connections.push(serve_http_connection(
+                        stream,
+                        HttpSurface::Recovery,
+                        app.clone(),
+                        shutdown_tx.clone(),
+                        drain_rx.clone(),
+                        CONNECTION_DRAIN_GRACE,
+                    )),
+                    Err(error) => break Err(error.into()),
+                }
+            }
+            Some(()) = connections.next(), if !connections.is_empty() => {}
+        }
+    };
+    // Retire the recovery-only keep-alives on either outcome, so no stale
+    // service survives into normal operation or an unsuccessful boot.
+    let _ = drain_tx.send(true);
+    while connections.next().await.is_some() {}
+    result
+}
 #[path = "main/cli.rs"]
 mod cli;
-use cli::{action_from_process, print_help, worker_loader_binding, Action};
+use cli::{action_from_process, print_help, Action};
+
+#[cfg(all(test, celld_internal_tests))]
+fn shutdown_accept_failure_test_action() -> Action {
+    let listen = std::env::var("CELLD_DRAIN_ACCEPT_FAILURE_LISTEN")
+        .map(celld::startup::Listen::Explicit)
+        .unwrap_or(celld::startup::Listen::LoopbackEphemeral);
+    Action::Run(cli::Settings {
+        control_plane: false,
+        bucket: None,
+        load_deployment: false,
+        endpoint: None,
+        region: "test".to_string(),
+        listen,
+        internal_listen: celld::startup::Listen::LoopbackEphemeral,
+        advertise: None,
+        unsafe_public_advertise: false,
+        trust_forwarded_headers: false,
+        dev_store: None,
+    })
+}
 
 fn node_bucket(
     settings: &cli::Settings,
@@ -3169,18 +3638,21 @@ fn node_bucket(
     }
 }
 
-/// Cold routes are I/O concurrency, but must stay below the point where they
-/// can starve the node lease heartbeat or object store.
-const DEFAULT_MAX_CONCURRENT_ACTIVATIONS: usize = 128;
-/// celld's own default. Evictions are bounded far tighter than activations
-/// because each one carries a durability proof, and a node that lets its whole
-/// working set prove durability at once turns a walk down into a thundering
-/// herd against the bucket.
-const DEFAULT_MAX_CONCURRENT_EVICTIONS: usize = 4;
-/// The shutdown handoff bound covers the successor's complete restore and
-/// publication. A small batch keeps the surviving nodes responsive while it
-/// still overlaps object-store latency.
-const DEFAULT_MAX_CONCURRENT_RELEASES: usize = 8;
+/// The shutdown handoff parks the successor dormant, so the batch does not
+/// start restore work there. The fleet drain token also admits one donor at a
+/// time. Keep enough ownership operations in flight to overlap object-store
+/// latency: a width of 8 evacuated only about 110 cells inside the default
+/// 40-second process deadline.
+const DEFAULT_MAX_CONCURRENT_RELEASES: usize = 128;
+/// The actor refreshes the counts a node lease publishes once per sample.
+const LOAD_SAMPLE_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+/// How often a node with balancing off samples the fleet leases for the
+/// bucket-format gate: the balancing default, one shared fleet sample.
+const FORMAT_GATE_SAMPLE_MS: u64 = 5_000;
+/// One lease renewal plus one load sample bound how stale a peer's count is,
+/// so a batch every five seconds sees its predecessor before it plans.
+const DEFAULT_REBALANCE_INTERVAL_MS: u64 = 5_000;
+const DEFAULT_REBALANCE_BATCH_CELLS: usize = 32;
 /// Preserved SQLite snapshots make a same-node wake a rename instead of a
 /// remote restore, but must not grow with the lifetime population of a node.
 /// The walk is O(cached cells), so keep it off the hot maintenance cadence.
@@ -3206,6 +3678,17 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyhow::Result<()> {
+    #[cfg(all(test, celld_internal_tests))]
+    let shutdown_accept_failure_test_active =
+        std::env::var_os("CELLD_DRAIN_ACCEPT_FAILURE_CHILD").is_some();
+    #[cfg(all(test, celld_internal_tests))]
+    let action = if shutdown_accept_failure_test_active {
+        shutdown_accept_failure_test_action()
+    } else {
+        action_from_process()?
+    };
+    #[cfg(not(all(test, celld_internal_tests)))]
+    let action = action_from_process()?;
     celld::asyncrt::set_host_handle(tokio::runtime::Handle::current());
     // Docker and journald can stop consuming the process pipe during a log
     // burst. Logging must lose diagnostics under that backpressure rather
@@ -3213,7 +3696,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // Parsed before the subscriber exists, because where the log goes depends
     // on which invocation this is: a node logs to stdout, and a CLI subcommand
     // must keep stdout for its answer.
-    let action = action_from_process()?;
     let log_filter = if matches!(
         &action,
         Action::Dev(arguments) if !arguments.iter().any(|argument| argument == "--logs")
@@ -3251,8 +3733,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         .init();
     // After the subscriber, because this reports whether the allocator agreed
     // to return freed pages on a timer. A node without that thread holds
-    // retention until a thread allocates again, which is the condition behind
-    // issue #36, so the operator has to be able to read the answer.
+    // retention until a thread allocates again, so the operator has to be
+    // able to read whether that cleanup thread started.
     celld::memory::tune_allocator();
     let mut settings = match action {
         Action::Deploy(arguments) => return fleet::run_deploy(arguments).await,
@@ -3395,26 +3877,29 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let internal_listener = internal.listener;
     let mut adapter_credential_version = None;
     let managed_storage = if settings.control_plane {
-        // The control plane issues and validates S3-compatible storage
-        // only. celld's GCS client authenticates with OAuth and its Azure
-        // client with an Azure identity or account key, and the control
-        // plane's S3-shaped credentials provide neither.
-        for scheme in ["gs://", "az://"] {
-            if settings
-                .bucket
-                .as_deref()
-                .is_some_and(|bucket| bucket.starts_with(scheme))
-            {
-                anyhow::bail!(
-                    "--control-plane storage is S3-compatible; a {scheme} bucket runs without it"
-                );
-            }
-        }
-        // The control plane issues one bucket per fleet and its enrollment
-        // API rejects a bucket name holding a slash, so a prefix has neither
-        // a purpose nor a path through. Say so instead of failing enrollment.
-        if settings.bucket.as_deref().is_some_and(|b| b.contains('/')) {
-            anyhow::bail!("--control-plane does not accept a --bucket prefix");
+        if let Some(spec) = settings.bucket.take() {
+            let (backend, name, prefix) = celld::bucket::split_spec(&spec);
+            // The control plane issues and validates S3-compatible storage
+            // only. Parse through the same seam as Bucket::open so scheme
+            // case cannot change this decision or the eventual backend.
+            anyhow::ensure!(
+                backend == celld::bucket::StorageBackend::S3,
+                "--control-plane storage is S3-compatible; a {}:// bucket runs without it",
+                match backend {
+                    celld::bucket::StorageBackend::Gcs => "gs",
+                    celld::bucket::StorageBackend::Azure => "az",
+                    celld::bucket::StorageBackend::S3 => "s3",
+                    celld::bucket::StorageBackend::Local => "dev",
+                }
+            );
+            // The control plane issues one bucket per fleet and its enrollment
+            // API rejects a prefix. Install the parsed S3 name because the API
+            // accepts a name, while every engine bucket path accepts a spec.
+            anyhow::ensure!(
+                prefix.is_empty(),
+                "--control-plane does not accept a --bucket prefix"
+            );
+            settings.bucket = Some(name.to_string());
         }
         let requested_byo =
             settings
@@ -3458,10 +3943,10 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let (tx, rx) = mpsc::unbounded_channel();
     let sample_tx = tx.clone();
     let alarm_tx = tx.clone();
-    let alarm_observer: celld::runtime::AlarmObserver = Arc::new(move |cell, at_ms| {
+    let alarm_observer: celld::runtime::AlarmObserver = Arc::new(move |cell, alarm| {
         let _ = alarm_tx.send(Message::AlarmObserved {
             cell,
-            at_ms,
+            alarm,
             covered: false,
         });
     });
@@ -3470,15 +3955,33 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let clean_reload_node = node.clone();
     celld::control_plane::install_reexec_node_session_id(&node)?;
     let probe_public_key = celld::peer_probe::install_signer()?;
+    // Cold routes are object-store latency, not compute: the default is
+    // derived from the thread count but far above it. See
+    // `machine::default_max_activations` for the measurements.
     let max_activations =
         celld::env_vars::positive::<usize>("CELLD_ACTIVATIONS")?.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(usize::from)
-                .unwrap_or(1)
-                .min(DEFAULT_MAX_CONCURRENT_ACTIVATIONS)
+            celld::machine::default_max_activations(
+                std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(1),
+            )
         });
-    let max_evictions = celld::env_vars::positive::<usize>("CELLD_EVICTIONS")?
-        .unwrap_or(DEFAULT_MAX_CONCURRENT_EVICTIONS);
+    let placement_weight = celld::env_vars::positive::<u64>("CELLD_PLACEMENT_WEIGHT")?
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|cpus| cpus.get() as u64)
+                .unwrap_or(1)
+        });
+    let rebalance_interval_ms = celld::env_vars::optional::<u64>("CELLD_REBALANCE_INTERVAL_MS")?
+        .unwrap_or(DEFAULT_REBALANCE_INTERVAL_MS);
+    // The shared fleet sample's interval: the balancing interval, or the
+    // format gate's when balancing is off. Every reader of the sample, the
+    // balancing tick, placement and recruitment, judges freshness by it.
+    let fleet_sample_ms = if rebalance_interval_ms > 0 {
+        rebalance_interval_ms
+    } else {
+        FORMAT_GATE_SAMPLE_MS
+    };
     let max_releases = celld::env_vars::positive::<usize>("CELLD_RELEASES")?
         .unwrap_or(DEFAULT_MAX_CONCURRENT_RELEASES);
     let data_dir = std::env::var_os("CELLD_TEST_DATA_DIR")
@@ -3498,17 +4001,21 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             } else {
                 fleet::validate_bucket(&client).await?;
             }
-            // The list above proves the bucket answers; it does not prove
-            // the store enforces the conditional write this node fences
-            // with. A store that ignores it makes the node self-fence in
-            // a restart loop, so test it once, here, before serving.
-            if settings.storage_probe {
-                fleet::probe_storage_before_serving(&client, settings.control_plane).await?;
-            }
+            celld::wake_format::ensure_ready(&client).await?;
+            // The list above proves the bucket answers; it does not prove the
+            // store enforces the conditional writes or ranged reads that a
+            // cell needs. Test both contracts here before the node serves.
+            fleet::probe_storage_before_serving(&client, settings.control_plane).await?;
             let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
             if settings.control_plane {
                 celld::control_plane::wait_for_initial_deployment(&client).await?;
                 deploy_agent = Some(client.clone());
+            } else {
+                // A self-hosted node can start before its first `celld
+                // deploy`; wait for the pointer instead of exiting, or
+                // systemd restarts the node in a loop until a deployment
+                // exists. Managed mode already waited above.
+                fleet::wait_for_deployment_pointer(&client).await?;
             }
             let peer_key = peer_auth::load_or_create(&client).await?;
             let graph = DeploymentGraph::load(&client, node.clone()).await?;
@@ -3539,7 +4046,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 FIRST_GENERATION,
                 graph,
                 GenerationOptions {
-                    loader_binding: worker_loader_binding(),
                     node: node.clone(),
                     region: settings.region.clone(),
                 },
@@ -3553,14 +4059,22 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     alarm_observer: alarm_observer.clone(),
                     node: node.clone(),
                     region: settings.region.clone(),
+                    bucket: Some(client.clone()),
                 },
             )?;
-            let wake_scan = Some((client.clone(), wake.clone()));
             let deploy_bucket = Some(client.clone());
-            let ownership = Ownership::Bucket(Arc::new(
-                BucketOwnership::new(client, lease_client, node.clone(), probe_public_key.clone())
-                    .with_lease_ttl_ms(lease_ttl_ms_from_environment()),
-            ));
+            let bucket_ownership = Arc::new(
+                BucketOwnership::new(
+                    client.clone(),
+                    lease_client,
+                    node.clone(),
+                    probe_public_key.clone(),
+                )
+                .with_lease_ttl_ms(lease_ttl_ms_from_environment())
+                .with_fleet_sample_ms(fleet_sample_ms),
+            );
+            let wake_scan = Some((client, bucket_ownership.clone()));
+            let ownership = Ownership::Bucket(bucket_ownership);
             (
                 Some(runtime),
                 Some(ownership),
@@ -3704,6 +4218,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             };
             let (ownership, peer_key, wake, wake_scan) = if settings.bucket.is_some() {
                 let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
+                celld::wake_format::ensure_ready(&client).await?;
                 let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
                 let peer_key = peer_auth::load_or_create(&client).await?;
                 let wake = Arc::new(celld::wake::WakeFlusher::new());
@@ -3712,17 +4227,19 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     flusher: wake.clone(),
                 });
                 celld::js::set_r2_store(client.clone());
-                let wake_scan = Some((client.clone(), wake.clone()));
+                let bucket_ownership = Arc::new(
+                    BucketOwnership::new(
+                        client.clone(),
+                        lease_client,
+                        node.clone(),
+                        probe_public_key.clone(),
+                    )
+                    .with_lease_ttl_ms(lease_ttl_ms_from_environment())
+                    .with_fleet_sample_ms(fleet_sample_ms),
+                );
+                let wake_scan = Some((client, bucket_ownership.clone()));
                 (
-                    Some(Ownership::Bucket(Arc::new(
-                        BucketOwnership::new(
-                            client,
-                            lease_client,
-                            node.clone(),
-                            probe_public_key.clone(),
-                        )
-                        .with_lease_ttl_ms(lease_ttl_ms_from_environment()),
-                    ))),
+                    Some(Ownership::Bucket(bucket_ownership)),
                     peer_key,
                     Some(wake),
                     wake_scan,
@@ -3741,13 +4258,28 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     version: "local".to_string(),
                     prefix: script_path.clone(),
                     asset_binding: None,
+                    // A bare script has no wrangler config, so this names the
+                    // loaders the way `CELLD_TEST_DO_CLASSES` names a class:
+                    // a comma-separated list, because a config can declare
+                    // more than one loader. It is the local-script equivalent
+                    // of `worker_loaders`, and not a production switch: a
+                    // deployed project reaches a loader only through its own
+                    // config.
+                    loader_bindings: std::env::var("CELLD_TEST_WORKER_LOADER")
+                        .unwrap_or_default()
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .collect(),
                     assets: None,
                     services: Vec::new(),
                     crons,
                     native: None,
+                    containers: Vec::new(),
+                    fence_image: None,
                 }),
                 GenerationOptions {
-                    loader_binding: worker_loader_binding(),
                     node: node.clone(),
                     region: settings.region.clone(),
                 },
@@ -3762,6 +4294,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         alarm_observer: alarm_observer.clone(),
                         node: node.clone(),
                         region: settings.region.clone(),
+                        bucket: None,
                     },
                 )?),
                 ownership,
@@ -3772,6 +4305,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         } else {
             let (ownership, peer_key) = if settings.bucket.is_some() {
                 let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
+                celld::wake_format::ensure_ready(&client).await?;
                 let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
                 let peer_key = peer_auth::load_or_create(&client).await?;
                 (
@@ -3782,7 +4316,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                             node.clone(),
                             probe_public_key.clone(),
                         )
-                        .with_lease_ttl_ms(lease_ttl_ms_from_environment()),
+                        .with_lease_ttl_ms(lease_ttl_ms_from_environment())
+                        .with_fleet_sample_ms(fleet_sample_ms),
                     ))),
                     peer_key,
                 )
@@ -3792,13 +4327,13 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             (None, ownership, peer_key, None, None)
         };
     if let Some(config) = &telemetry_config {
-        let sink_bucket = match config.sink {
+        let sink_bucket = match &config.sink {
             celld::telemetry::SinkChoice::Bucket => {
                 if settings.bucket.is_none() {
                     anyhow::bail!(
                         "CELLD_OTEL=1 but this node has no bucket; the \
                          bucket sink needs one (CELLD_BUCKET), or choose \
-                         CELLD_OTEL_SINK=otlp"
+                         CELLD_OTEL=http://collector:4318"
                     );
                 }
                 // Its own client even for the fleet bucket: each open is its
@@ -3816,7 +4351,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 })
             }
             // The collector path needs no bucket at all.
-            celld::telemetry::SinkChoice::Otlp => None,
+            celld::telemetry::SinkChoice::Otlp { .. } => None,
         };
         celld::telemetry::init(config, sink_bucket, node.clone(), settings.region.clone())?;
     }
@@ -3831,10 +4366,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         .tcp_nodelay(true)
         .build()
         .unwrap();
-    let paced_handoff = !matches!(
-        std::env::var("CELLD_PACED_HANDOFF").as_deref(),
-        Ok("0" | "off" | "false")
-    );
     let resume_generation = celld::runtime::take_clean_reload_generation(&data_dir, &node);
     let clean_reload_candidate = resume_generation.is_some();
     let drain_pins = DrainPinRegistry::default();
@@ -3842,8 +4373,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         AdmissionLimits {
             resident: max_resident,
             activations: max_activations,
-            evictions: max_evictions,
             releases: max_releases,
+            placement_weight,
         },
         fail_publish_once,
         fence_tx,
@@ -3853,7 +4384,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             ownership,
             peer_http: peer_http.clone(),
             peer_auth: peer_auth.clone(),
-            paced_handoff,
         },
         ActorIdentity {
             node: node.clone(),
@@ -3891,6 +4421,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         }
         _ => None,
     };
+    #[cfg(all(test, celld_internal_tests))]
+    let follower = follower.or_else(|| {
+        shutdown_accept_failure_test_active
+            .then(|| Arc::new(celld::node_log::FollowerStore::new(&data_dir, None, &node)))
+    });
     let app = AppHandle {
         tx,
         runtime,
@@ -3904,15 +4439,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         public_in_flight: Arc::new(AtomicUsize::new(0)),
         drain_pins,
         trust_forwarded_headers: settings.trust_forwarded_headers,
-        // RPO=0 is the default. An operator can disable the output gate to
-        // remove object-store replication latency from the write response,
-        // explicitly accepting that an acknowledged write can be lost.
-        output_gate: celld::env_vars::flag("CELLD_OUTPUT_GATE", true)?,
         max_outbound_websockets: celld::env_vars::positive_or(
             "CELLD_MAX_OUTBOUND_WEBSOCKETS",
             DEFAULT_MAX_OUTBOUND_WEBSOCKETS,
         )?,
         max_request_body_bytes,
+        operation_deadline_ms: celld::actor::operation_deadline_ms()?,
         follower: follower.clone(),
     };
 
@@ -3920,17 +4452,10 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // every posture — a bucket-posture node can take over from a
     // fleet-posture one and must find a complete bucket — while shipping
     // requires the explicit fleet posture.
-    // Fleet is the DEFAULT (decided 2026-08-14): a single node behaves
-    // exactly like sync-to-bucket — no peers means no record, no shipper,
-    // and bucket-proven acks — and once TWO peers appear the maintenance
-    // tick recruits them and fleet replication turns on. Two, not one:
-    // `maintain` takes(2) from a member set that excludes self, and
-    // `NodeLogManager::healthy` wants members.len() >= 2, so the posture
-    // engages at three nodes and not before. A one- or two-node fleet
-    // therefore asks for `fleet` and keeps bucket-proven acks, which is
-    // correct and much slower. One value serves the hobbyist's first node
-    // and the fleet it grows into; CELLD_DURABILITY=bucket remains the
-    // explicit opt-out.
+    // Fleet is the default: without a healthy follower, writes need bucket
+    // proof. Maintenance recruits up to two followers; one healthy follower
+    // is sufficient for fleet proof. CELLD_DURABILITY=bucket always requires
+    // bucket proof, including when peers are available.
     let durability = std::env::var("CELLD_DURABILITY").unwrap_or_else(|_| "fleet".into());
     anyhow::ensure!(
         matches!(durability.as_str(), "bucket" | "fleet"),
@@ -3947,9 +4472,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             let ltx = replication.ltx();
             // Bundle the paced tiering: one PUT per node-flush instead of
             // one per cell-transaction — the Class A collapse, measured at
-            // 208x against per-transaction PUTs. On by default; 0 is the
-            // opt-out.
-            let bundle_mode = celld::env_vars::flag("CELLD_LOG_BUNDLE", true)?;
+            // 208x against per-transaction PUTs. The shipper and the bundle
+            // sink are installed as one durability registration.
             let nudge_tx = app.tx.clone();
             let own_log = Arc::new(celld::node_log::OwnLog {
                 ownership: bucket_ownership.clone(),
@@ -3964,7 +4488,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 own_log,
                 ltx.clone(),
                 app.peer_auth.clone(),
-                bundle_mode,
                 celld::node_log::eviction_policy_from_env()?,
             ));
             *actor.node_log.lock().unwrap() = Some(manager.clone());
@@ -3975,17 +4498,20 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             // the install erases the only evidence recovery was needed.
             // The ladder waits out the predecessor's own lease because the
             // fence recheck refuses a live lease, retries with backoff,
-            // and exits on exhaustion; systemd restarts while peers'
-            // follower stores come back. No hostage problem — this node
-            // has no lease yet, and peers may race the same
-            // CAS-idempotent recovery.
-            {
+            // and exits on exhaustion. Serve the retained follower disks
+            // throughout the ladder, including retry backoffs, so a fleet
+            // restart can recover without waiting for another node's lease.
+            recover_with_follower_listener(&internal_listener, app.clone(), async {
                 let ttl_backoff =
                     std::time::Duration::from_millis(actor.lease_spec.ttl_ms.max(1_000));
                 let mut recovered = Ok(());
+                // A boot waits behind a peer's live recovery claim and takes
+                // it over only once its heartbeat is stale, so one attempt
+                // can legitimately last as long as the peer's gather. The
+                // bound is a backstop against a wedge, not a pace.
                 for attempt in 1..=4u32 {
                     recovered = match tokio::time::timeout(
-                        std::time::Duration::from_secs(180),
+                        std::time::Duration::from_secs(15 * 60),
                         manager.recover_self(),
                     )
                     .await
@@ -4009,10 +4535,10 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         "refusing to install a lease over an unrecovered \
                          predecessor log: {error:#}"
                     )
-                })?;
-            }
-            let mut owner =
-                celld::node_log::DurabilityOwner::new(manager, durability == "fleet", bundle_mode);
+                })
+            })
+            .await?;
+            let mut owner = celld::node_log::DurabilityOwner::new(manager, durability == "fleet");
             owner.start_background(follower.clone());
             durability_owner.install_runtime(owner);
         }
@@ -4064,12 +4590,18 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // nothing. Everything downstream of the numbers -- the latch, the target,
     // which cell goes -- is in the core, so a sample sequence replays.
     {
-        const LOAD_SAMPLE_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
         celld::asyncrt::spawn(async move {
             let mut tick = celld::asyncrt::interval(LOAD_SAMPLE_PERIOD);
             tick.set_missed_tick_behavior(celld::asyncrt::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
+                // What SQLite freed when a cell stopped stays on the C
+                // allocator's free lists, and the sample would count it as
+                // the node's: 5,000 hibernated cells kept RSS at 1.6 GB with
+                // 1.5 GB of it free (GCE, 2026-09-04). Trimmed here,
+                // ahead of the sample, on a blocking thread because a trim
+                // walks every free chunk.
+                let _ = tokio::task::spawn_blocking(celld::memory::trim_c_heap_if_retained).await;
                 if sample_tx.send(Message::SampleLoad).is_err() {
                     return;
                 }
@@ -4080,10 +4612,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
 
     // The fleet-aware first-readiness gate: withhold the first health 200
     // until no donor is mid-handoff and every live peer publishes successor
-    // capacity, bounded by CELLD_READY_FLEET_GATE_MS. Orchestrators key rollout
-    // advance on readiness, so this paces a stock rolling update against fleet
-    // recovery. One-shot: once open, fleet state never demotes readiness, and
-    // a gated node still serves its owned cells through peers.
+    // capacity. CELLD_READY_FLEET_GATE_MS bounds the silent wait before celld
+    // reports the blocking condition, but it cannot make an unsafe fleet
+    // ready. Orchestrators key rollout advance on readiness, so a fail-open
+    // deadline would erase the only signal that prevents another donor. The
+    // gate is one-shot: once open, fleet state never demotes readiness, and a
+    // gated node still serves its owned cells through peers.
     let ready_gate_ms: u64 = celld::env_vars::with_default("CELLD_READY_FLEET_GATE_MS", 120_000)?;
     match (&ready_ownership, ready_gate_ms) {
         (Some(ownership), gate_ms) if gate_ms > 0 => {
@@ -4094,6 +4628,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             let max_restoring = max_activations as u64;
             tokio::spawn(async move {
                 let started = std::time::Instant::now();
+                let mut deadline_reported = false;
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
@@ -4137,7 +4672,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         );
                         return;
                     }
-                    if waited_ms >= gate_ms {
+                    if waited_ms >= gate_ms && !deadline_reported {
+                        deadline_reported = true;
                         let holder = current
                             .as_ref()
                             .ok()
@@ -4145,15 +4681,13 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                             .and_then(|current| current.token.as_ref())
                             .map(|token| token.node.as_str())
                             .unwrap_or_default();
-                        gate_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                         tracing::warn!(
                             event = "ready_gate_expired",
                             holder,
                             reason = ?status.err(),
                             waited_ms,
-                            "the ready-gate deadline expired with the fleet unsettled; falling open"
+                            "the ready-gate observation deadline expired; readiness stays closed"
                         );
-                        return;
                     }
                 }
             });
@@ -4163,7 +4697,109 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             .store(true, std::sync::atomic::Ordering::SeqCst),
     }
 
-    if let Some((client, wake)) = wake_scan {
+    // Ownership balancing. Each node reads the shared fleet sample and, when it
+    // is the densest node and a peer has room, hands a bounded batch of idle
+    // cells through the drain's release-and-adopt pipeline. Cell moves need
+    // no fleet-wide lock: the per-cell ownership CAS is the authority, and the
+    // densest-node rule elects one donor per consistent sample. A donor
+    // plans again only from leases sampled after its last batch had one
+    // load-sample period to reach them, so no plan mixes counts from before
+    // a batch with counts from after it.
+    //
+    // The same lease sample carries the bucket-format gate
+    // (celld_logic::format): a node pages a large takeover only while every
+    // live lease reads a paged epoch. The loop therefore runs even with
+    // balancing off, at the balancing interval or FORMAT_GATE_SAMPLE_MS, and
+    // the gate is judged before any balancing condition can skip the tick.
+    // Off until the first sample, so a takeover in the first seconds of a
+    // process clones, which is always safe.
+    if let Some(ownership) = ready_ownership.clone() {
+        let app = app.clone();
+        let node = node.clone();
+        let replication = explorer_replication.clone();
+        let sample_ms = fleet_sample_ms;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(sample_ms));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut settled_after_ms = 0;
+            loop {
+                tick.tick().await;
+                let now_ms = celld::ownership_store::now_ms();
+                // The view is judged at the instant the sample was taken.
+                // Its leases are copies that age while the real nodes renew,
+                // and nodes started together renew in lock-step, so judged
+                // at this node's clock a view a few seconds old shows every
+                // lease dead at once: on the 2026-09-05 fleet that closed the
+                // gate and skipped balancing on a third of the ticks.
+                let (view_ms, peers) = match ownership.read_shared_capacity_peers(sample_ms).await {
+                    Ok(view) => view,
+                    Err(error) => {
+                        // At info with the chain: a failed tick closes the
+                        // format gate, and a fleet run has to say why.
+                        tracing::info!(event = "fleet_sample_failed", error = format!("{error:#}"));
+                        // A missing or in-flight refresh cannot keep granting
+                        // format permission from an earlier fleet membership.
+                        (now_ms, Vec::new())
+                    }
+                };
+                if let Some(replication) = &replication {
+                    let format = celld_logic::format::BUCKET_FORMAT;
+                    let open = celld_logic::format::fleet_reads(&peers, view_ms, format);
+                    if replication.set_paged_fleet(open) != open {
+                        tracing::info!(
+                            event = "paged_gate",
+                            open,
+                            format,
+                            live_leases = peers.iter().filter(|p| p.expires_ms > view_ms).count(),
+                            view_age_ms = now_ms.saturating_sub(view_ms),
+                            "every live lease reads a paged epoch, or one does not"
+                        );
+                    }
+                }
+                if rebalance_interval_ms == 0 {
+                    continue;
+                }
+                let paused = ownership
+                    .live()
+                    .rebalance_paused
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if !app.fleet_ready() || app.is_draining() || paused {
+                    continue;
+                }
+                // One batch outstanding at a time, but one cell must not
+                // hold the fleet: a cell whose proof cannot finish stays in
+                // flight for a long time, and the densest node is the only
+                // donor. Plan around it with the rest of the batch.
+                let status = app.drain_status().await;
+                let in_flight =
+                    status.quiescing + status.evicting + status.releasing + status.adopting;
+                if in_flight >= DEFAULT_REBALANCE_BATCH_CELLS {
+                    continue;
+                }
+                let Some(cells) = celld_logic::rebalance::surplus(
+                    &peers,
+                    &node,
+                    view_ms,
+                    ownership.lease_ttl_ms(),
+                    settled_after_ms,
+                    DEFAULT_REBALANCE_BATCH_CELLS - in_flight,
+                ) else {
+                    continue;
+                };
+                tracing::info!(
+                    event = "rebalance_batch",
+                    cells,
+                    "handing idle cells to peers below their ownership target"
+                );
+                if app.tx.send(Message::Rebalance { cells }).is_err() {
+                    return;
+                }
+                settled_after_ms = now_ms + LOAD_SAMPLE_PERIOD.as_millis() as u64;
+            }
+        });
+    }
+
+    if let Some((client, ownership)) = wake_scan {
         let authority_wait_seconds = if clean_reload_candidate { 60 } else { 10 };
         let deadline = Instant::now() + std::time::Duration::from_secs(authority_wait_seconds);
         while !app.healthy().await {
@@ -4172,9 +4808,20 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        for (cell, due_ms) in celld::wake::due_scan(&client, now_ms() as i64).await {
-            wake.adopt(&cell, due_ms);
-            let _ = app.tx.send(Message::WakeHint { cell });
+        // The boot scan acts for the fleet: it is what finds the alarms this
+        // node's previous incarnation left behind, and any orphan that came
+        // due while nothing was watching. It probes like the elected waker
+        // does, so a rolling restart does not send every node the whole
+        // fleet's due set once each.
+        let boot_ms = now_ms();
+        let live = celld::dead_node_gc::live_nodes(&client, boot_ms).await;
+        let due = celld::wake::due_scan(&client, boot_ms as i64).await;
+        for (cell, entry_ms) in celld::wake::elected_due(&ownership, &node, &live, due).await {
+            let _ = app.tx.send(Message::WakeHint {
+                cell,
+                entry_ms,
+                scope: celld_logic::WakeHintScope::Fleet,
+            });
         }
 
         // And again, on a timer, for the rest of the process's life.
@@ -4186,32 +4833,29 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         // restarted -- an alarm silently not firing, which is the one thing a
         // Durable Object is not allowed to do.
         //
-        // Every decision about a due entry stays in the core: a hint for a
-        // cell this node already serves is ignored, and one for a cell with a
-        // live owner elsewhere resolves to that owner rather than stealing
-        // it. The scan only reports what the bucket says is due.
-        let scan_app = app.clone();
-        let waker_node = node.clone();
+        // Every node lists the due entries on its tick, because a node's own
+        // dormant cells can carry alarms it has never loaded (a cell that
+        // arrived by an ownership-only handoff), and only that node can wake
+        // them. But only the node that holds the advisory waker role acts for
+        // the fleet: it reads each due cell's owner outside the activation
+        // queue and hints the orphans, while every other node hints with
+        // `Owned` scope, which the core answers from memory. Before that
+        // split, every node pushed the whole fleet's due set through its own
+        // activation queue, one permit and one owner read per entry, and its
+        // own alarm wakes queued behind them.
+        //
+        // Every decision about a hinted entry still stays in the core: a
+        // hint for a cell this node already serves is ignored, and one for a
+        // cell with a live owner elsewhere resolves to that owner rather
+        // than stealing it.
         let tick_ms = celld::env_vars::positive::<u64>("CELLD_WAKER_TICK_MS")?.unwrap_or(60_000);
-        let period = std::time::Duration::from_millis(tick_ms);
-        celld::asyncrt::spawn(async move {
-            let mut tick = celld::asyncrt::interval(period);
-            tick.set_missed_tick_behavior(celld::asyncrt::MissedTickBehavior::Delay);
-            tick.tick().await;
-            let mut dead_node_gc = celld::dead_node_gc::DeadNodeGc::default();
-            loop {
-                tick.tick().await;
-                dead_node_gc
-                    .run_elected_pass(&client, &waker_node, tick_ms)
-                    .await;
-                for (cell, due_ms) in celld::wake::due_scan(&client, now_ms() as i64).await {
-                    wake.adopt(&cell, due_ms);
-                    if scan_app.tx.send(Message::WakeHint { cell }).is_err() {
-                        return;
-                    }
-                }
-            }
-        })
+        celld::asyncrt::spawn(celld::wake::run_periodic(
+            client,
+            ownership,
+            node.clone(),
+            app.tx.clone(),
+            tick_ms,
+        ))
         .detach();
     }
 
@@ -4256,17 +4900,20 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         app.advertise
     ))?;
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
+    #[cfg(all(test, celld_internal_tests))]
+    if shutdown_accept_failure_test_active {
+        let _ = shutdown_tx.send(ShutdownMode::Handoff);
+    }
     // A SIGTERM (systemd stop, `docker stop`, a Kubernetes pod delete) or a
     // SIGINT begins the same graceful shutdown as `POST /shutdown`, so the
     // orchestrator's ordinary stop drains and hands off instead of killing.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let (connection_drain_tx, connection_drain) = watch::channel(false);
-    let drain_ms: u64 = celld::env_vars::positive("CELLD_SHUTDOWN_DRAIN_MS")?.unwrap_or(25_000);
-    let shutdown_total_ms: u64 =
-        celld::env_vars::positive("CELLD_SHUTDOWN_TOTAL_MS")?.unwrap_or(40_000);
-    let drain_token_wait_ms: u64 =
-        celld::env_vars::with_default("CELLD_DRAIN_TOKEN_WAIT_MS", 30_000)?;
+    let shutdown_timing = celld::env_vars::shutdown_timing()?;
+    let drain_ms = shutdown_timing.drain_no_progress_ms;
+    let shutdown_total_ms = shutdown_timing.total_ms;
+    let drain_token_wait_ms = shutdown_timing.drain_token_wait_ms;
     // A hung connection must not consume the whole preserve budget: the
     // semantic drain and the clean-reload certificate come out of the same
     // deadline.
@@ -4449,8 +5096,23 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // shutdown. Progress can extend only the inner stall deadline. The
     // absolute bound leaves the orchestrator time to observe an orderly exit
     // instead of replacing a progressing donor with SIGKILL.
-    let process_deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_millis(shutdown_total_ms);
+    let shutdown_started = tokio::time::Instant::now();
+    let process_deadline = shutdown_started + std::time::Duration::from_millis(shutdown_total_ms);
+    // A donor normally spends its complete budget making safe handoff
+    // progress. Reserve at most one second, and never more than ten percent of
+    // a short configured budget, for the token CAS. Otherwise a deadline-cut
+    // donor leaves the replacement behind the 120-second token TTL and turns
+    // serialization into artificial rollout recovery.
+    let token_release_reserve_ms = if shutdown_mode == ShutdownMode::Handoff
+        && fleet_bucket.is_some()
+        && drain_token_wait_ms > 0
+    {
+        (shutdown_total_ms / 10).min(1_000)
+    } else {
+        0
+    };
+    let handoff_deadline =
+        process_deadline - std::time::Duration::from_millis(token_release_reserve_ms);
     // Stop public admission immediately. Before a handoff changes any cell
     // lifecycle, finish the public requests which crossed the old admission
     // gate. A DO call reaches its output gate only after it writes, so
@@ -4465,6 +5127,44 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // it could serve a health response or authenticated peer request.
     let (drain_connection_tx, drain_connection) = watch::channel(false);
     let mut drain_connections: FuturesUnordered<ConnectionFuture> = FuturesUnordered::new();
+    // Each acceptor waits until this loop receives its previous connection.
+    // One surface therefore cannot occupy both slots and block the other.
+    let (shutdown_connection_tx, mut shutdown_connection_rx) = mpsc::channel(2);
+    #[cfg(all(test, celld_internal_tests))]
+    let mut shutdown_accept_failure_recovered_for_test = !shutdown_accept_failure_test_active;
+    #[cfg(all(test, celld_internal_tests))]
+    shutdown_accept_failure_test_checkpoint(
+        shutdown_accept_failure_test_active,
+        "listener failure armed",
+    );
+    #[cfg(all(test, celld_internal_tests))]
+    {
+        spawn_shutdown_acceptor(
+            listener,
+            HttpSurface::Public,
+            shutdown_connection_tx.clone(),
+            shutdown_accept_failure_test_active,
+        );
+        spawn_shutdown_acceptor(
+            internal_listener,
+            HttpSurface::Internal,
+            shutdown_connection_tx,
+            false,
+        );
+    }
+    #[cfg(not(all(test, celld_internal_tests)))]
+    {
+        spawn_shutdown_acceptor(
+            listener,
+            HttpSurface::Public,
+            shutdown_connection_tx.clone(),
+        );
+        spawn_shutdown_acceptor(
+            internal_listener,
+            HttpSurface::Internal,
+            shutdown_connection_tx,
+        );
+    }
     let mut drain_token_hold: Option<celld::drain_token::Hold> = None;
     let handoff_started = if shutdown_mode == ShutdownMode::Handoff {
         // Serialize donors: claim the fleet drain token beside the
@@ -4479,10 +5179,53 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 let bucket = bucket.clone();
                 let slot = drain_token.clone();
                 let token_node = clean_reload_node.clone();
+                let baseline_ownership = ready_ownership.clone();
                 let wait = std::time::Duration::from_millis(drain_token_wait_ms)
-                    .min(process_deadline.saturating_duration_since(tokio::time::Instant::now()));
+                    .min(handoff_deadline.saturating_duration_since(tokio::time::Instant::now()));
                 tokio::spawn(async move {
-                    let outcome = celld::drain_token::acquire(&bucket, &token_node, wait).await;
+                    let now_ms = celld::ownership_store::now_ms();
+                    let restoration_baseline = match baseline_ownership {
+                        Some(ownership) => match ownership.read_capacity_peers().await {
+                            Ok(peers) => {
+                                let mut baseline = peers
+                                    .into_iter()
+                                    .filter(|peer| peer.expires_ms > now_ms)
+                                    .map(|peer| celld_logic::drain::RestorationBaseline {
+                                        node: peer.node,
+                                        restoring: peer.restoring,
+                                    })
+                                    .collect::<Vec<_>>();
+                                baseline.sort_by(|left, right| left.node.cmp(&right.node));
+                                baseline
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    event = "drain_restoration_baseline_unavailable",
+                                    %error,
+                                    "the donor could not snapshot the pre-drain restore baseline"
+                                );
+                                Vec::new()
+                            }
+                        },
+                        None => Vec::new(),
+                    };
+                    tracing::info!(
+                        event = "drain_restoration_baseline",
+                        nodes = restoration_baseline.len(),
+                        maximum = restoration_baseline
+                            .iter()
+                            .map(|baseline| baseline.restoring)
+                            .max()
+                            .unwrap_or(0),
+                        "captured the pre-drain restore baseline"
+                    );
+                    let outcome = celld::drain_token::acquire(
+                        &bucket,
+                        &token_node,
+                        wait,
+                        restoration_baseline,
+                    )
+                    .await;
                     *slot.lock().expect("drain token slot") = Some(outcome);
                 });
             }
@@ -4491,7 +5234,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     Some(celld::drain_token::Outcome::Disabled);
             }
         }
-        let pre_drain_deadline = (tokio::time::Instant::now() + stall_window).min(process_deadline);
+        let pre_drain_deadline = (tokio::time::Instant::now() + stall_window).min(handoff_deadline);
         let mut pre_drain_tick = tokio::time::interval(std::time::Duration::from_millis(5));
         let mut admitted = None;
         let admitted_drained = loop {
@@ -4499,7 +5242,10 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 admitted = Some(true);
             }
             if let Some(admitted_drained) = admitted {
-                if drain_token.lock().expect("drain token slot").is_some() {
+                let token_ready = drain_token.lock().expect("drain token slot").is_some();
+                #[cfg(all(test, celld_internal_tests))]
+                let token_ready = token_ready && shutdown_accept_failure_recovered_for_test;
+                if token_ready {
                     break admitted_drained;
                 }
             }
@@ -4507,29 +5253,25 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 _ = tokio::time::sleep_until(pre_drain_deadline), if admitted.is_none() => {
                     admitted = Some(false);
                 }
-                _ = tokio::time::sleep_until(process_deadline) => break false,
+                _ = tokio::time::sleep_until(handoff_deadline) => break false,
                 _ = pre_drain_tick.tick() => {}
-                connection = listener.accept() => {
-                    let (stream, _) = connection?;
+                connection = shutdown_connection_rx.recv() => {
+                    let Some(connection) = connection else {
+                        anyhow::bail!("shutdown listener tasks stopped during pre-drain");
+                    };
                     drain_connections.push(serve_http_connection(
-                        stream,
-                        HttpSurface::Public,
+                        connection.stream,
+                        connection.surface,
                         app.clone(),
                         shutdown_tx.clone(),
                         drain_connection.clone(),
                         connection_grace,
                     ));
-                }
-                connection = internal_listener.accept() => {
-                    let (stream, _) = connection?;
-                    drain_connections.push(serve_http_connection(
-                        stream,
-                        HttpSurface::Internal,
-                        app.clone(),
-                        shutdown_tx.clone(),
-                        drain_connection.clone(),
-                        connection_grace,
-                    ));
+                    #[cfg(all(test, celld_internal_tests))]
+                    if connection.recovered_after_error {
+                        shutdown_accept_failure_recovered_for_test = true;
+                    }
+                    let _ = connection.received.send(());
                 }
                 Some(_) = drain_connections.next(), if !drain_connections.is_empty() => {}
                 Some(_) = connections.next(), if !connections.is_empty() => {}
@@ -4621,25 +5363,26 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // Progress extends the stall deadline, but never the complete process
     // deadline. A deadline-cut cell keeps its durable owner record and follows
     // the same lease-expiry recovery path as an abrupt process loss.
-    let mut stall_deadline = (tokio::time::Instant::now() + stall_window).min(process_deadline);
+    let mut stall_deadline = (tokio::time::Instant::now() + stall_window).min(handoff_deadline);
     let mut handed_off = 0;
     let mut process_deadline_fired = false;
     let mut handoff = tokio::time::interval(std::time::Duration::from_millis(50));
+    let mut containers_reaped = false;
     let drained = if shutdown_mode == ShutdownMode::Handoff && !handoff_started {
         false
     } else {
         loop {
-            let shell_drained = connections.is_empty()
+            let requests_drained = connections.is_empty()
                 && do_calls.is_empty()
                 && gate_calls.is_empty()
                 && service_calls.is_empty()
                 && queue_calls.is_empty()
-                && asset_calls.is_empty()
-                && websockets.is_empty();
+                && asset_calls.is_empty();
+            let shell_drained = requests_drained && websockets.is_empty();
             // The actor can be busy driving an immediate-effect failure loop, so
             // a status request is not itself allowed to bypass the drain deadline.
             let status = before_process_deadline(
-                process_deadline,
+                handoff_deadline,
                 tokio::time::timeout(std::time::Duration::from_millis(50), app.drain_status()),
             )
             .await
@@ -4648,7 +5391,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 && status.is_some_and(|status| status.handed_off > handed_off)
             {
                 handed_off = status.expect("checked drain status").handed_off;
-                stall_deadline = (tokio::time::Instant::now() + stall_window).min(process_deadline);
+                stall_deadline = (tokio::time::Instant::now() + stall_window).min(handoff_deadline);
             }
             // A drain that makes progress can outlive the token TTL, so the
             // holder renews and only a dead holder lets the token lapse.
@@ -4659,7 +5402,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 let mut lost = false;
                 if let (Some(bucket), Some(hold)) = (&fleet_bucket, drain_token_hold.as_mut()) {
                     let Some(renewed) = before_process_deadline(
-                        process_deadline,
+                        handoff_deadline,
                         celld::drain_token::renew(bucket, &clean_reload_node, hold),
                     )
                     .await
@@ -4691,33 +5434,40 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             if completely_drained {
                 break true;
             }
+            // A preserve drain keeps its objects resident, so a socket an
+            // object holds into its container never ends on its own and
+            // the drain would sit out its whole deadline on it (the Sandbox
+            // SDK's RPC transport is one such socket). The containers are
+            // destroyed at exit anyway; destroying them once every request
+            // has answered ends those sockets now.
+            if !containers_reaped
+                && shutdown_mode == ShutdownMode::Preserve
+                && requests_drained
+                && core_drained
+            {
+                containers_reaped = true;
+                before_process_deadline(handoff_deadline, celld::container::shutdown()).await;
+                continue;
+            }
             celld::asyncrt::select! {
                 _ = tokio::time::sleep_until(stall_deadline) => {
-                    process_deadline_fired = tokio::time::Instant::now() >= process_deadline;
+                    process_deadline_fired = tokio::time::Instant::now() >= handoff_deadline;
                     break false;
                 },
                 _ = handoff.tick() => {}
-                connection = listener.accept() => {
-                    let (stream, _) = connection?;
+                connection = shutdown_connection_rx.recv() => {
+                    let Some(connection) = connection else {
+                        anyhow::bail!("shutdown listener tasks stopped during drain");
+                    };
                     drain_connections.push(serve_http_connection(
-                        stream,
-                        HttpSurface::Public,
+                        connection.stream,
+                        connection.surface,
                         app.clone(),
                         shutdown_tx.clone(),
                         drain_connection.clone(),
                         connection_grace,
                     ));
-                }
-                connection = internal_listener.accept() => {
-                    let (stream, _) = connection?;
-                    drain_connections.push(serve_http_connection(
-                        stream,
-                        HttpSurface::Internal,
-                        app.clone(),
-                        shutdown_tx.clone(),
-                        drain_connection.clone(),
-                        connection_grace,
-                    ));
+                    let _ = connection.received.send(());
                 }
                 Some(_) = drain_connections.next(), if !drain_connections.is_empty() => {}
                 Some(_) = connections.next(), if !connections.is_empty() => {}
@@ -4819,6 +5569,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             );
         }
     }
+    #[cfg(all(test, celld_internal_tests))]
+    shutdown_accept_failure_test_checkpoint(
+        shutdown_accept_failure_test_active,
+        "drain token release finished",
+    );
     if !handoff_started {
         tracing::error!(
             event = "shutdown_handoff_not_started",
@@ -4893,14 +5648,19 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // then cut, so a drain-window internal route must never dispatch into a
     // cell. Today none does — /state, /health, and /peer/abort answer from the
     // shell.
+    // The backstop for a handoff cut by its deadline: a cell left behind
+    // must not leave its container running until the next start of this
+    // node reaps it. Idempotent after the preserve drain's own call.
+    before_process_deadline(process_deadline, celld::container::shutdown()).await;
     let flush_connections = async {
         while drain_connections.next().await.is_some() {}
         while connections.next().await.is_some() {}
         while websockets.next().await.is_some() {}
     };
-    let _ = before_process_deadline(
+    flush_shutdown_connections(
         process_deadline,
-        tokio::time::timeout(CONNECTION_DRAIN_GRACE, flush_connections),
+        celld::js::ws_await_all_flushes(),
+        flush_connections,
     )
     .await;
     // The graceful-shutdown drain point: seal our node-log record so the
@@ -4921,6 +5681,14 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     } else {
         true
     };
+    #[cfg(all(test, celld_internal_tests))]
+    shutdown_accept_failure_test_checkpoint(
+        shutdown_accept_failure_test_active,
+        "durability quiesce finished",
+    );
+    // Preparation captures and uploads each stopped cell's exact database
+    // position. A failed proof abandons the marker and leaves normal startup
+    // to reconcile the preserved files against bucket coverage.
     if clean_reload_is_eligible(durability_quiesced, drained, shutdown_mode) {
         let presence = before_process_deadline(process_deadline, app.presence()).await;
         let prepared = match (&app.runtime, presence) {
@@ -4988,6 +5756,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             eprintln!("celld local durability shutdown exceeded the process deadline");
         }
     }
+    #[cfg(all(test, celld_internal_tests))]
+    shutdown_accept_failure_test_checkpoint(
+        shutdown_accept_failure_test_active,
+        "local durability shutdown finished",
+    );
     // Exit without unwinding. Returning from here drops the tokio runtime
     // and the V8 platform underneath tasks and isolates that are still
     // alive -- on a deadline-cut drain that teardown segfaults (status 139
@@ -4995,6 +5768,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // every release the drain completed proved durability first, and a
     // cell the deadline cut off keeps its owner record exactly as a kill
     // would have left it.
+    #[cfg(all(test, celld_internal_tests))]
+    shutdown_accept_failure_test_checkpoint(
+        shutdown_accept_failure_test_active,
+        "final log flush reached",
+    );
     exit_flushed(0);
 }
 
@@ -5080,48 +5858,18 @@ fn forwarder_response_stream(
     ))
 }
 
-fn owner_response_stream(
-    stream: celld::js::HttpChunkStream,
-    activity: ActivityGuard,
-    abort: AbortPeerFetchOnHangUp,
-) -> celld::js::HttpChunkStream {
-    let cancellation = activity.cancellation();
-    Box::pin(futures_util::stream::unfold(
-        (stream, Some(activity), Some(abort), cancellation),
-        |(mut stream, activity, mut abort, mut cancellation)| async move {
-            let chunk = if *cancellation.borrow() {
-                None
-            } else {
-                celld::asyncrt::select! {
-                    chunk = stream.next() => chunk,
-                    changed = cancellation.changed() => {
-                        let _ = changed;
-                        None
-                    }
-                }
-            };
-            match chunk {
-                Some(chunk) => Some((chunk, (stream, activity, abort, cancellation))),
-                None => {
-                    if let Some(mut abort) = abort.take() {
-                        abort.disarm();
-                    }
-                    drop(activity);
-                    None
-                }
-            }
-        },
-    ))
-}
-
+// The body owns the activity until EOF, cancellation, or drop. A forwarded
+// body also owns its peer-abort guard: disarm it at EOF, but retain it on a
+// dropped body so the owner cancels work for the disconnected peer.
 fn local_response_stream(
     stream: celld::js::HttpChunkStream,
     activity: ActivityGuard,
+    on_finish: impl FnOnce() + Send + 'static,
 ) -> celld::js::HttpChunkStream {
     let cancellation = activity.cancellation();
     Box::pin(futures_util::stream::unfold(
-        (stream, Some(activity), cancellation),
-        |(mut stream, activity, mut cancellation)| async move {
+        (stream, activity, on_finish, cancellation),
+        |(mut stream, activity, on_finish, mut cancellation)| async move {
             let chunk = if *cancellation.borrow() {
                 None
             } else {
@@ -5134,8 +5882,9 @@ fn local_response_stream(
                 }
             };
             match chunk {
-                Some(chunk) => Some((chunk, (stream, activity, cancellation))),
+                Some(chunk) => Some((chunk, (stream, activity, on_finish, cancellation))),
                 None => {
+                    on_finish();
                     drop(activity);
                     None
                 }

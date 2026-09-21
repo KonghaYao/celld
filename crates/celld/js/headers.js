@@ -2,7 +2,7 @@ const _tokenRe = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 // Token validation is memoized by name: a Worker sends the same handful of
 // header names on every subrequest, so the regex would run once per header
 // per request forever. The cache is a null-prototype object because the key
-// is an attacker-controlled header name — see the note on `_newList` — and it
+// is an attacker-controlled header name -- see the note on `_newList` -- and it
 // is emptied wholesale at a bound so a caller that invents a fresh name per
 // request cannot grow it without limit.
 let _nameCache = { __proto__: null };
@@ -25,7 +25,7 @@ function _checkName(name) {
       "Invalid header name: " + name);
   // The name is returned as written. Lower-casing here would put celld's
   // spelling on the wire instead of the author's, which anything that
-  // canonicalizes over the received bytes can see — an AWS SigV4 signer
+  // canonicalizes over the received bytes can see -- an AWS SigV4 signer
   // over `SignedHeaders` being the case that breaks.
   return name;
 }
@@ -36,7 +36,7 @@ function _lower(name) {
 }
 // Byte sequence, minus NUL/LF/CR. Strip HTTP
 // whitespace (HT/LF/CR/SP) from both ends first per
-// WHATWG fetch — trailing LF/CR are permitted input.
+// WHATWG fetch -- trailing LF/CR are permitted input.
 function _checkValue(value) {
   value = String(value).replace(
     /^[\t\n\r ]+|[\t\n\r ]+$/g, '');
@@ -53,7 +53,7 @@ function _checkValue(value) {
 // Enumerable function-valued brand, shared by
 // every instance: V8's structured clone throws
 // on functions, so a Headers can never silently
-// flatten into a plain object — RPC
+// flatten into a plain object -- RPC
 // serialization lifts it natively instead.
 const _noClone = () => {};
 
@@ -62,7 +62,7 @@ const _noClone = () => {};
 // `list` is a flat array of `[name, value]` pairs in insertion order, with
 // each name exactly as it was written. `lower` is a parallel array holding
 // the lower-cased form of `list[i][0]`, and it exists only so a comparison
-// never lower-cases a name again. Both arrays are always mutated together —
+// never lower-cases a name again. Both arrays are always mutated together --
 // an entry with no matching `lower` slot would silently stop being findable.
 //
 // Two things forced this shape over a name-keyed structure. First, the list
@@ -90,7 +90,7 @@ function _pairs(state) {
   const pairs = [];
   // Combining by a single pass needs a name-keyed index. A null-prototype
   // object is the only name-keyed object allowed here, for the reason on
-  // `_newList` — `seen["constructor"]` must be undefined, not a function.
+  // `_newList` -- `seen["constructor"]` must be undefined, not a function.
   const seen = { __proto__: null };
   for (let i = 0; i < state.list.length; i++) {
     const name = state.lower[i];
@@ -159,8 +159,8 @@ class Headers {
       }
     } else {
       // Record: explicit Reflect walk so Proxy handlers
-      // see the WebIDL es-to-record trace exactly —
-      // ownKeys → for each key, getOwnPropertyDescriptor;
+      // see the WebIDL es-to-record trace exactly --
+      // ownKeys -> for each key, getOwnPropertyDescriptor;
       // if enumerable, coerce key to ByteString (throws
       // for Symbols), then [[Get]], then validate value.
       for (const k of Reflect.ownKeys(init)) {
@@ -258,7 +258,7 @@ class Headers {
   }
   // The verbatim header list every outbound path serializes: insertion
   // order, original casing, one entry per append. The iteration view above
-  // is lossy for a wire request — it lower-cases, sorts, and combines — so
+  // is lossy for a wire request -- it lower-cases, sorts, and combines -- so
   // this is a second, deliberately different view, not a convenience.
   //
   // A class accessor, so it is non-enumerable and a record walk over a
@@ -273,7 +273,7 @@ class Headers {
     return out;
   }
   // Iteration: per WHATWG the header list stays live,
-  // so each step reads the current list — see the
+  // so each step reads the current list -- see the
   // `pairs` memo above. Uses a hand-rolled iterator so
   // `next` has enumerable=true per WebIDL (generators
   // would be enumerable=false).
@@ -290,7 +290,7 @@ class Headers {
   }
 }
 
-// Headers iterator prototype — chained to
+// Headers iterator prototype -- chained to
 // %IteratorPrototype% so prototype-chain checks pass.
 // kind: 0=keys, 1=values, 2=entries.
 const _headersIterProto = Object.create(
@@ -302,7 +302,7 @@ Object.defineProperty(_headersIterProto, "next", {
     // The index into the current pair list is all the
     // iterator carries, so a name added after the
     // cursor is emitted and a name deleted before it
-    // shifts the rest back — the WHATWG live-list
+    // shifts the rest back -- the WHATWG live-list
     // semantics the plain-object version also had.
     const pairs = _pairs(this._list);
     if (this._cnt >= pairs.length)

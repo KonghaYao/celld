@@ -8,18 +8,196 @@
 
 use anyhow::{anyhow, bail};
 
+pub const DEFAULT_SHUTDOWN_TOTAL_MS: u64 = 40_000;
+/// One process stop budget and the internal waits derived from it.
+/// The absolute deadline also bounds progress extensions, so neither wait
+/// grants time beyond the supervisor-facing process budget.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShutdownTiming {
+    pub total_ms: u64,
+    pub drain_token_wait_ms: u64,
+    pub drain_no_progress_ms: u64,
+}
+
+impl ShutdownTiming {
+    fn from_total_ms(total_ms: u64) -> Self {
+        // Preserve the 30-second token wait and 25-second no-progress window
+        // at the default 40-second bound. Derive both when that bound changes:
+        // independent defaults made a shorter supervisor grace fail startup.
+        // Split the arithmetic so even the largest accepted u64 cannot wrap.
+        let drain_token_wait_ms = (total_ms / 4) * 3 + (total_ms % 4) * 3 / 4;
+        let drain_no_progress_ms = ((total_ms / 8) * 5 + (total_ms % 8) * 5 / 8).max(1);
+        Self {
+            total_ms,
+            drain_token_wait_ms,
+            drain_no_progress_ms,
+        }
+    }
+}
+
+/// A variable celld no longer reads, and the sentence that names what an
+/// operator must write instead.
+///
+/// The lists below enumerate the names celld knows, so a name that is not on
+/// one of them is never looked at and never reported. That is correct for a
+/// name celld never had, but wrong for one it removed: the operator set the
+/// removed name on purpose, and the behaviour it bought is gone. A node whose
+/// unit file still carries the name would boot clean, log nothing, and serve a
+/// deployment that no longer has the binding, so the defect would surface as a
+/// `TypeError` in a request handler on a node the operator believes they just
+/// configured. Refusing the boot moves that failure to the moment the operator
+/// can still read the unit file.
+struct Removed {
+    name: &'static str,
+    /// What the operator must write in place of the line they delete.
+    replacement: &'static str,
+    /// Whether the removed reader ignored an empty value. Only a value that
+    /// once changed the node is stale, so this decides whether `NAME=` is a
+    /// line to delete or a line that never did anything. It is a property of
+    /// the reader that went away, so each entry must state it for itself: a
+    /// removed variable whose reader treated `NAME=` as meaningful sets
+    /// `false`, and an operator who templated it to an empty string then still
+    /// gets the refusal they need.
+    empty_was_inert: bool,
+}
+
+/// Variables this fork keeps as live contracts, which upstream v0.5.1 refuses.
+///
+/// `CELLD_VARS_FILE` and the `CELLD_VAR_<NAME>` family are how the cellp
+/// control plane hands a version its Worker variables: `cellpd` writes the
+/// file per version and passes `CELLD_VAR_PROJECT_ID` / `CELLD_VAR_VERSION_ID`
+/// for every managed process (`cellp/internal/runtime/manager.go`,
+/// `celld_exec.go`), and `celld d1 branch` reads the project id back. Removing
+/// them here would refuse to start every managed node, so the readers in
+/// `fleet::worker_vars` and `cell_branch` stay and the names stay accepted.
+///
+/// `CELLD_AI_BINDING` / `CELLD_AI_URL` are the same case: this fork retains
+/// celld 0.4.0's `ai` binding (`fleet::configured_ai_binding`), so a node that
+/// configured one must not be refused.
+///
+/// Everything else below was removed upstream with no reader in this tree;
+/// each entry keeps upstream's empty-value rule.
+const REMOVED: &[Removed] = &[
+    Removed {
+        name: "CELLD_TEST_OTEL_SWEEP_MS",
+        replacement: "remove this setting; celld manages the telemetry retention cadence",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_OTEL_SINK",
+        replacement: "set CELLD_OTEL=1 for the fleet bucket or CELLD_OTEL=<collector URL> for OTLP",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_PACED_HANDOFF",
+        replacement:
+            "remove this setting; celld hands off ownership within CELLD_SHUTDOWN_TOTAL_MS",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_LOG_GROUP_COMMIT_MS",
+        replacement: "remove this setting; celld uses its built-in Queue batching policy",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_QUEUE_PRODUCER_GROUP_MS",
+        replacement: "remove this setting; celld uses its built-in Queue batching policy",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_LOG_BUNDLE",
+        replacement: "remove this setting; fleet durability uses bundled tiering",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_PRESENCE_SHADOW",
+        replacement:
+            "remove this setting; managed presence no longer compares a shadow lease report",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_STORAGE_PROBE",
+        replacement: "remove this setting; celld checks the storage contract before serving",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_EVICTIONS",
+        replacement: "remove this setting; celld uses its built-in scheduling limits",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_LOG_CAPTURE_WORKERS",
+        replacement: "remove this setting; celld uses its built-in scheduling limits",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_REBALANCE_BATCH_CELLS",
+        replacement: "remove this setting; celld uses its built-in scheduling limits",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_CLOUD_RESTART_ON_DEPLOY",
+        replacement: "remove this setting; managed deployments are adopted in place",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_OUTPUT_GATE",
+        replacement: "remove this setting; celld always waits for durability proof",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_DRAIN_TOKEN_WAIT_MS",
+        replacement: "set only CELLD_SHUTDOWN_TOTAL_MS; celld derives the drain-token wait",
+        // Zero disabled the token wait, and an empty value failed parsing.
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_SHUTDOWN_DRAIN_MS",
+        replacement:
+            "set only CELLD_SHUTDOWN_TOTAL_MS; celld derives the handoff no-progress interval",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_MAX_LOADED_WORKERS",
+        replacement: "remove this setting; celld manages Dynamic Worker admission",
+        // Even an empty value failed in the old typed reader. Refuse it rather
+        // than silently changing the operator's configured admission policy.
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_WORKER_LOADER",
+        replacement: "declare `worker_loaders` in the project config",
+        // The reader this replaced was
+        // `var("CELLD_WORKER_LOADER").ok().filter(|name| !name.is_empty())`, so
+        // an empty value never bound a loader. A deployment system that
+        // templates every known name to an empty string must not lose an
+        // upgrade on a node that never used the feature.
+        empty_was_inert: true,
+    },
+];
+
+
 /// Validate every typed production variable before the runtime starts.
 ///
 /// Some consumers cache a value or read it from a synchronous callback, so
 /// they cannot return a configuration error at the point of use. This pass
 /// makes those reads infallible without giving malformed values a default.
 pub fn validate() -> anyhow::Result<()> {
+    // Each entry carries its own empty-value rule, because whether `NAME=` was
+    // inert is a property of the reader that went away and not of removal.
+    for removed in REMOVED {
+        let Some(value) = std::env::var_os(removed.name) else {
+            continue;
+        };
+        if removed.empty_was_inert && value.is_empty() {
+            continue;
+        }
+        bail!("{} is removed; {}", removed.name, removed.replacement);
+    }
     for name in [
         "CELLD_CLOUD",
-        "CELLD_CLOUD_RESTART_ON_DEPLOY",
         "CELLD_LTX_COMPACTION",
-        "CELLD_OUTPUT_GATE",
-        "CELLD_PRESENCE_SHADOW",
+        "CELLD_LTX_PAGED",
         "CELLD_TRUST_FORWARDED_HEADERS",
         "CELLD_UNSAFE_PUBLIC_ADVERTISE",
     ] {
@@ -29,25 +207,23 @@ pub fn validate() -> anyhow::Result<()> {
     for name in [
         "CELLD_ACTIVATIONS",
         "CELLD_DEPLOY_POLL_S",
-        "CELLD_EVICTIONS",
         "CELLD_FETCH_TIMEOUT_S",
         "CELLD_HANDLER_BUDGET_S",
         "CELLD_IDLE_EVICT_S",
-        "CELLD_LOG_CAPTURE_WORKERS",
         "CELLD_LOG_PIPELINE",
         "CELLD_LTX_COMPACTIONS",
         "CELLD_LTX_COMPACTION_MIN_TXIDS",
         "CELLD_LTX_DURABILITY_TIMEOUT_SECS",
-        "CELLD_MAX_LOADED_WORKERS",
         "CELLD_MAX_CELL_REQUESTS",
         "CELLD_MAX_OUTBOUND_WEBSOCKETS",
         "CELLD_MAX_REQUEST_BODY_BYTES",
         "CELLD_MAX_REQUESTS",
+        "CELLD_RECOVERY_RETRY_MS",
+        "CELLD_RECOVERY_RETRIES",
         "CELLD_MAX_STATELESS_ISOLATES",
         "CELLD_OPERATION_DEADLINE_MS",
+        "CELLD_PLACEMENT_WEIGHT",
         "CELLD_RELEASES",
-        "CELLD_SHUTDOWN_DRAIN_MS",
-        "CELLD_SHUTDOWN_TOTAL_MS",
         "CELLD_TOKIO_THREADS",
         "CELLD_TTL_MS",
         "CELLD_WAKER_TICK_MS",
@@ -60,7 +236,6 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_ALARM_RESIDENT_MS",
         "CELLD_ASSET_CACHE_BYTES",
         "CELLD_DEPLOY_MAX_AGE_S",
-        "CELLD_DRAIN_TOKEN_WAIT_MS",
         "CELLD_LOCAL_CACHE_MAX_BYTES",
         "CELLD_LTX_TRUNCATE_PAGES",
         "CELLD_LOG_HEDGE_MS",
@@ -69,9 +244,12 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_MAX_RESIDENT_CELLS",
         "CELLD_MAX_RSS_MB",
         "CELLD_READY_FLEET_GATE_MS",
+        "CELLD_REBALANCE_INTERVAL_MS",
     ] {
         optional::<u64>(name)?;
     }
+
+    shutdown_timing()?;
 
     if let Some(value) = optional::<u64>("CELLD_PRESENCE_HEARTBEAT_MS")? {
         if !(50..=30_000).contains(&value) {
@@ -96,7 +274,19 @@ pub fn validate() -> anyhow::Result<()> {
             bail!("CELLD_PRESSURE_OWNERSHIP must be release or sticky, not {value:?}");
         }
     }
+    if let Some(node) = value("CELLD_NODE")? {
+        crate::machine::validate_node_name(&node).map_err(|error| anyhow!("CELLD_NODE {error}"))?;
+    }
     Ok(())
+}
+
+/// Resolve all shutdown timing from the operator's complete process bound.
+/// Token acquisition consumes at most three quarters of that bound. The
+/// no-progress interval is five eighths, with a one-millisecond minimum.
+/// The process deadline still caps every shutdown phase and progress reset.
+pub fn shutdown_timing() -> anyhow::Result<ShutdownTiming> {
+    let total_ms = positive("CELLD_SHUTDOWN_TOTAL_MS")?.unwrap_or(DEFAULT_SHUTDOWN_TOTAL_MS);
+    Ok(ShutdownTiming::from_total_ms(total_ms))
 }
 
 pub fn value(name: &str) -> anyhow::Result<Option<String>> {
@@ -179,4 +369,44 @@ where
     T::Err: std::fmt::Display,
 {
     Ok(positive(name)?.unwrap_or(default))
+}
+
+#[cfg(test)]
+mod removed_names_tests {
+    use super::REMOVED;
+
+    /// The names this fork's platform contract still reads. A future merge
+    /// that restores an upstream refusal for one of them would refuse to start
+    /// every managed node, so the table is asserted here.
+    #[test]
+    fn platform_contract_names_are_not_refused() {
+        for name in [
+            "CELLD_VARS_FILE",
+            "CELLD_VAR_PROJECT_ID",
+            "CELLD_VAR_VERSION_ID",
+            "CELLD_AI_BINDING",
+            "CELLD_AI_URL",
+        ] {
+            assert!(
+                !REMOVED.iter().any(|removed| removed.name == name),
+                "{name} is read by this fork and must stay accepted"
+            );
+        }
+    }
+
+    /// The prefix cannot be asserted through the table, so the accepted set is
+    /// stated once here: any `CELLD_VAR_<NAME>` becomes a Worker variable.
+    #[test]
+    fn cell_var_prefix_is_a_contract_not_a_removal() {
+        let names = std::env::vars_os()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("CELLD_VAR_"))
+            .collect::<Vec<_>>();
+        for name in names {
+            assert!(
+                !REMOVED.iter().any(|removed| removed.name == name),
+                "{name} is a platform Worker variable"
+            );
+        }
+    }
 }

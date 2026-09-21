@@ -1,0 +1,148 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 676" role="img" aria-labelledby="cronFlowTitle cronFlowDesc">
+  <title id="cronFlowTitle">Every node arms one reserved cron cell, its single alarm row carries the earliest occurrence, a shared deadline runs one invocation for each matching expression, and the re-arm takes the earlier of the next occurrence and the failure backoff</title>
+  <desc id="cronFlowDesc">The first panel shows three nodes of one fleet. Each node calls the same
+reserved cell, named .cron:cron from the class and the script name, once after
+its deployment loads. The ownership record in the fleet bucket accepts one
+caller, and the other nodes route to that owner, so celld needs no election and
+no reserved cron node. The second panel shows three cron expressions of one
+script at 12:35 UTC. Two of them come due at 13:00 and one comes due on the
+next Monday at 09:00, and the one alarm row of the cell arms for 13:00, the
+earliest occurrence across the whole list. The third panel shows the 13:00
+deadline firing. Both expressions that match that minute get their own call of
+scheduled(controller, env, ctx), each with its own controller.cron, and the two
+calls run one after another inside the cell because a cell runs one event at a
+time. controller.scheduledTime is 13:00 for both calls and never the instant
+the attempt started. The fourth panel shows the re-arm after a failed 13:00
+run. For the expression */30 * * * * the retry backoff of 4 seconds is earlier
+than the next occurrence at 13:30, so the retry is armed. For the expression
+* * * * * the next occurrence at 13:01 is earlier than a grown backoff of 128
+seconds, so the occurrence is armed and the retry is dropped. A backoff
+therefore never delays or skips a scheduled occurrence.</desc>
+  <style>
+    svg { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    text { font-size: 13px; fill: currentColor; }
+    tspan { fill: currentColor; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .lead { font-weight: 600; }
+    .sm { font-size: 12px; }
+    .d-ink { color: #121212; }
+    .d-soft { color: #3d3b37; }
+    .d-faint { color: #6e6a62; }
+    .d-acc { color: #10803f; }
+    .d-panel { color: #ffffff; }
+    .d-sunk { color: #f0eee8; }
+    .d-tint { color: #d6efdf; }
+    @media (prefers-color-scheme: dark) {
+      .d-ink { color: #efede7; }
+      .d-soft { color: #c9c6be; }
+      .d-faint { color: #928e85; }
+      .d-acc { color: #3fc472; }
+      .d-panel { color: #1a1a19; }
+      .d-sunk { color: #232321; }
+      .d-tint { color: #10301d; }
+    }
+  </style>
+  <defs>
+    <marker id="cron-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6"
+      markerHeight="6" orient="auto-start-reverse">
+      <path class="d-soft" fill="currentColor" d="M0 0 L10 5 L0 10 z" />
+    </marker>
+  </defs>
+
+  <!-- Panel one: the fan-in. Every node arms, and one ownership CAS decides. -->
+  <rect class="d-sunk" fill="currentColor" x="8" y="8" width="424" height="186" rx="10" />
+  <rect class="d-faint" fill="none" stroke="currentColor" x="8" y="8" width="424" height="186" rx="10" />
+  <text class="d-ink lead" fill="currentColor" x="22" y="32">Every node arms the same reserved cell</text>
+  <text class="d-faint sm" fill="currentColor" x="22" y="50">no election, and no reserved cron node</text>
+
+  <g>
+    <rect class="d-panel" fill="currentColor" x="22" y="64" width="122" height="38" rx="8" />
+    <rect class="d-soft" fill="none" stroke="currentColor" x="22" y="64" width="122" height="38" rx="8" />
+    <text class="d-ink" fill="currentColor" x="83" y="88" text-anchor="middle">node A</text>
+    <rect class="d-panel" fill="currentColor" x="159" y="64" width="122" height="38" rx="8" />
+    <rect class="d-soft" fill="none" stroke="currentColor" x="159" y="64" width="122" height="38" rx="8" />
+    <text class="d-ink" fill="currentColor" x="220" y="88" text-anchor="middle">node B</text>
+    <rect class="d-panel" fill="currentColor" x="296" y="64" width="122" height="38" rx="8" />
+    <rect class="d-soft" fill="none" stroke="currentColor" x="296" y="64" width="122" height="38" rx="8" />
+    <text class="d-ink" fill="currentColor" x="357" y="88" text-anchor="middle">node C</text>
+  </g>
+
+  <g class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M83 102 V122 H220" />
+    <path d="M357 102 V122 H220" />
+    <path d="M220 102 V136" marker-end="url(#cron-arrow)" />
+  </g>
+  <text class="d-faint sm" fill="currentColor" x="228" y="118">arm</text>
+
+  <rect class="d-tint" fill="currentColor" x="110" y="140" width="220" height="46" rx="8" />
+  <rect class="d-acc" fill="none" stroke="currentColor" stroke-width="2" x="110" y="140" width="220" height="46" rx="8" />
+  <text class="d-ink mono" fill="currentColor" x="220" y="162" text-anchor="middle">.cron:cron</text>
+  <text class="d-soft sm" fill="currentColor" x="220" y="179" text-anchor="middle">one owner, by ownership CAS</text>
+
+  <!-- Panel two: many expressions, one alarm row, the earliest deadline. -->
+  <text class="d-ink lead" fill="currentColor" x="22" y="226">One alarm row holds one deadline</text>
+  <text class="d-faint sm mono" fill="currentColor" x="22" y="244">now 12:35 UTC</text>
+
+  <text class="d-soft mono" fill="currentColor" x="26" y="272">*/30 * * * *</text>
+  <text class="d-ink mono" fill="currentColor" x="150" y="272">13:00</text>
+  <text class="d-soft mono" fill="currentColor" x="26" y="292">0 * * * *</text>
+  <text class="d-ink mono" fill="currentColor" x="150" y="292">13:00</text>
+  <text class="d-soft mono" fill="currentColor" x="26" y="312">0 9 * * MON</text>
+  <text class="d-faint mono" fill="currentColor" x="150" y="312">Mon 09:00</text>
+
+  <path class="d-acc" fill="none" stroke="currentColor" stroke-width="2"
+    d="M214 260 H222 V298 H214" />
+  <path class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5"
+    d="M224 279 H244" marker-end="url(#cron-arrow)" />
+
+  <rect class="d-panel" fill="currentColor" x="252" y="253" width="178" height="52" rx="8" />
+  <rect class="d-acc" fill="none" stroke="currentColor" stroke-width="2" x="252" y="253" width="178" height="52" rx="8" />
+  <text class="d-ink" fill="currentColor" x="341" y="276" text-anchor="middle">armed for 13:00</text>
+  <text class="d-soft sm" fill="currentColor" x="341" y="294" text-anchor="middle">the earliest of the three</text>
+
+  <!-- Panel three: the fan-out. One deadline, one call per matching expression. -->
+  <text class="d-ink lead" fill="currentColor" x="22" y="350">A deadline that two expressions share runs twice</text>
+
+  <rect class="d-tint" fill="currentColor" x="22" y="364" width="142" height="52" rx="8" />
+  <rect class="d-acc" fill="none" stroke="currentColor" stroke-width="2" x="22" y="364" width="142" height="52" rx="8" />
+  <text class="d-ink" fill="currentColor" x="93" y="388" text-anchor="middle">the alarm fires</text>
+  <text class="d-soft sm mono" fill="currentColor" x="93" y="406" text-anchor="middle">13:00 UTC</text>
+
+  <g class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M164 390 H182 V380 H194" marker-end="url(#cron-arrow)" />
+    <path d="M164 390 H182 V436 H194" marker-end="url(#cron-arrow)" />
+  </g>
+
+  <rect class="d-panel" fill="currentColor" x="200" y="356" width="232" height="48" rx="8" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="200" y="356" width="232" height="48" rx="8" />
+  <text class="d-ink mono" fill="currentColor" x="316" y="378" text-anchor="middle">scheduled(controller, env, ctx)</text>
+  <text class="d-acc sm mono" fill="currentColor" x="316" y="396" text-anchor="middle">cron: "*/30 * * * *"</text>
+
+  <rect class="d-panel" fill="currentColor" x="200" y="412" width="232" height="48" rx="8" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="200" y="412" width="232" height="48" rx="8" />
+  <text class="d-ink mono" fill="currentColor" x="316" y="434" text-anchor="middle">scheduled(controller, env, ctx)</text>
+  <text class="d-acc sm mono" fill="currentColor" x="316" y="452" text-anchor="middle">cron: "0 * * * *"</text>
+
+  <text class="d-soft sm" fill="currentColor" x="22" y="436">one after the other,</text>
+  <text class="d-soft sm" fill="currentColor" x="22" y="452">inside the one cell</text>
+  <text class="d-faint sm" fill="currentColor" x="22" y="486">scheduledTime is the occurrence 13:00 for both calls, never the</text>
+  <text class="d-faint sm" fill="currentColor" x="22" y="502">instant an attempt started</text>
+
+  <!-- Panel four: the re-arm race, where the answer flips with the interval. -->
+  <text class="d-ink lead" fill="currentColor" x="22" y="536">The re-arm takes whichever deadline is earlier</text>
+  <text class="d-faint sm" fill="currentColor" x="22" y="554">both lines start at a failed 13:00 run</text>
+
+  <text class="d-soft mono" fill="currentColor" x="22" y="586">*/30 * * * *</text>
+  <path class="d-faint" fill="none" stroke="currentColor" stroke-width="1.5" d="M120 582 H424" />
+  <path class="d-faint" fill="none" stroke="currentColor" d="M170 574 V590 M390 574 V590" />
+  <circle class="d-acc" fill="currentColor" cx="170" cy="582" r="5" />
+  <text class="d-acc sm" fill="currentColor" x="170" y="606" text-anchor="middle">retry +4 s</text>
+  <text class="d-faint sm" fill="currentColor" x="424" y="606" text-anchor="end">next 13:30</text>
+
+  <text class="d-soft mono" fill="currentColor" x="22" y="638">* * * * *</text>
+  <path class="d-faint" fill="none" stroke="currentColor" stroke-width="1.5" d="M120 634 H424" />
+  <path class="d-faint" fill="none" stroke="currentColor" d="M210 626 V642 M330 626 V642" />
+  <circle class="d-acc" fill="currentColor" cx="210" cy="634" r="5" />
+  <text class="d-acc sm" fill="currentColor" x="210" y="658" text-anchor="middle">next 13:01</text>
+  <text class="d-faint sm" fill="currentColor" x="424" y="658" text-anchor="end">retry +128 s</text>
+</svg>

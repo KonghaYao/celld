@@ -1,4 +1,4 @@
-// node:async_hooks for Cells — real AsyncLocalStorage/AsyncResource over
+// node:async_hooks for Cells -- real AsyncLocalStorage/AsyncResource over
 // V8 continuation-preserved embedder data, the same primitive Workerd's
 // jsg::AsyncContextFrame rides (src/workerd/jsg/async-context.c++). The
 // CPED value is the current async-context frame: a Map from
@@ -12,10 +12,10 @@
 // Injected lazily into the generated stub module, so an isolate that
 // never imports it pays nothing.
 (() => {
-  const getFrame = globalThis.__als_get;
-  const setFrame = globalThis.__als_set;
+  const getFrame = __als_get;
+  const setFrame = __als_set;
 
-  // Enter `frame`, call, restore — Workerd's AsyncContextFrame::Scope.
+  // Enter `frame`, call, restore -- Workerd's AsyncContextFrame::Scope.
   const call = (frame, fn, thisArg, args) => {
     const prior = getFrame();
     setFrame(frame);
@@ -136,7 +136,7 @@
       .map((name) => [name, 0]),
   );
 
-  globalThis.__asyncHooksModule = {
+  __celld.__asyncHooksModule = {
     AsyncLocalStorage,
     AsyncResource,
     asyncWrapProviders,

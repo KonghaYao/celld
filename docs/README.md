@@ -1,13 +1,16 @@
-# celld documentation
+# celld
 
 celld is a stateful distributed system. It runs server-side JavaScript on
 your machines, and it stores the long-term state in a bucket that you own:
 S3-compatible, Google Cloud Storage, or Azure Blob Storage. The JavaScript
-API follows the API of Cloudflare Workers and Durable Objects.
+API and the configuration follow Cloudflare Workers: Workers, Durable
+Objects, KV, Queues, D1, R2, Workflows, Cron Triggers, and static assets.
+
+## Cells and nodes
 
 In Cloudflare terms, a cell is a Durable Object: a small server with a
-name and a private SQLite database. You make one cell for each user, each
-document, each chat room, or each AI agent. A cell serves HTTP, holds
+name and a private SQLite database. You make one cell for each user,
+document, chat room, or AI agent. A cell serves HTTP, holds
 WebSocket connections, sets alarms, and makes outbound connections. Cells
 share no database, so the application divides into cells from the start.
 Each cell runs on one thread: a second request interleaves only while the
@@ -19,9 +22,14 @@ and the nodes that share one bucket are a **fleet**. Any node can serve
 any cell, so you add capacity by starting another node against the same
 bucket.
 
+## Cell lifecycle
+
 A cell has the same states as a Durable Object. A **resident** cell is in
 memory: it is **active** while it does work, and **idle** when it waits.
-celld removes an idle cell from memory. A cell that then keeps its
+celld removes an idle cell from memory after `CELLD_IDLE_EVICT_S` seconds
+without work, and earlier under memory pressure or at the residency cap.
+Without `CELLD_IDLE_EVICT_S`, an idle cell stays in memory until pressure
+or the cap removes it. A cell that then keeps its
 hibernatable WebSocket clients, and stays on its node, is **hibernated**.
 A cell that no node holds is **inactive**. An inactive cell is only an
 object in the bucket, so it costs almost zero, and every cell starts in
@@ -35,21 +43,22 @@ it stays on its node.
 One 8 GB node holds 1,000 resident cells, so one resident cell costs
 approximately $0.05 each month.
 
+## Ownership and durability
+
 Exactly one node serves a cell at a time. The nodes do not elect a leader
 or keep a membership list: a node claims a cell by writing a small record
-to the bucket, and it writes that record with a condition the storage
-enforces — the write succeeds only if nobody else changed the record
-first. Object storage therefore decides who wins, and two nodes cannot
-both claim the same cell. The claim expires unless the node keeps
-renewing it, so a machine that dies releases its cells without anyone
-having to declare it dead.
+to the bucket. The store accepts the write only if no other node changed
+the record first. Object storage therefore decides who wins, and two nodes
+cannot both claim the same cell. The claim expires unless the node renews
+it, so a failed machine releases its cells without a separate failure
+detector.
 
 celld does not answer a write until the data survives a failure, so no
 write you were told succeeded is ever lost. That guarantee is called
 RPO=0, for a recovery point of zero.
 
-How celld earns it depends on how many nodes you run. One node writes the
-data to the bucket first, which costs one storage round trip. Two or more
+The durability mechanism depends on how many nodes you run. One node
+writes the data to the bucket first, which costs one storage round trip. Two or more
 nodes are faster: the node serving the cell sends each write to another
 node as well, and answers as soon as that node has the data on its own
 disk. celld uploads the data to the bucket afterwards, so the bucket
@@ -64,9 +73,21 @@ from a complete history. The [guarantees](guarantees.md) page
 gives the full mechanism and the exact properties that the bucket must
 provide.
 
+## Alarms
+
 When an event sets an alarm before its response boundary, celld does not send a
 successful response until a durable wake entry covers the alarm. celld does
 not let a later `waitUntil` alarm delay another event's response.
+Each committed installation requires its own publication PUT, including an
+alarm that moves later within the same minute. Each entry has a separate
+identity, so delayed processing of an older alarm state cannot remove the
+entry that covers a newer alarm.
+
+A hibernated cell fires its alarm on the node that owns it. One node in the
+fleet holds the waker role at a time. The waker reads the due wake entries of
+the whole fleet, and it wakes only the cells whose owner node has stopped. Every
+other node wakes only its own hibernated cells, so the alarm load of the fleet
+does not queue on one node.
 
 ## What do you build with cells
 
@@ -87,17 +108,22 @@ A cell fits a workload that divides into named, stateful units:
 
 ## Contents
 
+- [Cells and nodes](#cells-and-nodes)
+- [Cell lifecycle](#cell-lifecycle)
+- [Ownership and durability](#ownership-and-durability)
+- [Alarms](#alarms)
 - [What do you build with cells](#what-do-you-build-with-cells)
 - [Install](#install)
 - [Configure object storage](#configure-object-storage)
 - [Deploy an application](#deploy-an-application)
-- [Operate D1 and KV](#operate-d1-and-kv)
+- [Operate D1, KV, and R2](#operate-d1-kv-and-r2)
 - [Start a node](#start-a-node)
 - [Add nodes](#add-nodes)
 - [Shut down and roll out a node](#shut-down-and-roll-out-a-node)
 - [Diagnose a fleet](#diagnose-a-fleet)
 - [List Durable Objects](#list-durable-objects)
 - [Environment variables](#environment-variables)
+- [Services](#services)
 - [Cloudflare compatibility](cloudflare-compat.md)
 - [What celld guarantees](guarantees.md)
 - [Limitations](limitations.md)
@@ -105,7 +131,24 @@ A cell fits a workload that divides into named, stateful units:
 - [Telemetry](telemetry.md)
 - [Testing](testing.md)
 - [WebAssembly](wasm.md)
-- [Rust library API](library-api.md)
+
+## Services
+
+Each service page contains a runnable example and the known differences from
+the Cloudflare service.
+
+- [Workers](services/workers.md)
+- [Durable Objects / Cells](services/durable-objects.md)
+- [Durable Object Facets](services/durable-object-facets.md)
+- [KV](services/kv.md)
+- [Queues](services/queues.md)
+- [D1](services/d1.md)
+- [R2](services/r2.md)
+- [Workflows](services/workflows.md)
+- [Cron Triggers](services/cron-triggers.md)
+- [Static assets](services/static-assets.md)
+- [Dynamic Workers](services/dynamic-workers.md)
+- [Containers](services/containers.md)
 
 ## Install
 
@@ -125,10 +168,15 @@ has a GitHub Actions build attestation: verify a downloaded file with
 
 ## Configure object storage
 
+The `s3://`, `gs://`, and `az://` scheme names are case-insensitive.
+celld ignores leading and trailing whitespace in `CELLD_BUCKET`.
+
 For an S3-compatible bucket, celld uses the standard AWS credential
-chain. On Amazon EKS, celld reads the Pod Identity credentials from the
-injected environment variables and the authorization-token file. For
-Cloudflare R2: create a bucket, create an S3 API token with access to
+chain. Paged restores also use this chain, so an EC2 instance role does
+not require static access keys for a large cell. On Amazon EKS, celld
+reads the Pod Identity credentials from the injected environment
+variables and the authorization-token file. For Cloudflare R2: create
+a bucket, create an S3 API token with access to
 that bucket, and set these variables:
 
 ```sh
@@ -165,10 +213,9 @@ export AZURE_STORAGE_ACCOUNT_KEY=...
 export CELLD_BUCKET=az://YOUR-CONTAINER
 ```
 
-celld accepts three Azure credential families — a storage account key, a
-managed identity, and a workload identity — and you must configure
-exactly one. A system-assigned managed identity needs only the account
-name. A user-assigned managed identity needs exactly one selector among
+You must configure exactly one Azure credential family: a storage account
+key, a managed identity, or a workload identity. A system-assigned managed
+identity needs only the account name. A user-assigned managed identity needs exactly one selector among
 `AZURE_CLIENT_ID`, `AZURE_OBJECT_ID`, and `AZURE_MSI_RESOURCE_ID`,
 because two selectors can name two different identities. An identity
 must hold the Azure Blob data-plane permission to read, write, list, and
@@ -185,18 +232,18 @@ standard AKS workload identity environment (`AZURE_AUTHORITY_HOST`,
 works with the public authority host, `https://login.microsoftonline.com`,
 with or without a trailing slash; celld rejects a sovereign or custom
 host. celld also rejects each recognized Azure configuration variable
-outside these families — another credential source, an endpoint override,
-the OneLake endpoint — and it ignores an `AZURE_*` name that
+outside these families, including another credential source, an endpoint
+override, or the OneLake endpoint. It ignores an `AZURE_*` name that
 `object_store` 0.12 does not recognize, because that name cannot change
 the client.
 
 An `az://` bucket takes no `S3_ENDPOINT` and no `AWS_*` credentials, and
 celld ignores the storage region. celld qualifies an `az://` bucket for
-a production fleet: the conditional-write contract and the multipart
-upload path were tested against a live Azure account on 2026-08-18 (see
-[guarantees](guarantees.md)). For local development against
-Azurite, set `AZURE_STORAGE_USE_EMULATOR=true`; Azurite is a development
-store, so celld does not qualify it for a fleet either.
+a production fleet. The startup test verifies the conditional writes and
+ranged reads. A live Azure test from 2026-08-18 covers the multipart upload
+path. See [guarantees](guarantees.md). For local development against Azurite,
+set `AZURE_STORAGE_USE_EMULATOR=true`; Azurite is a development store, so
+celld does not qualify it for a fleet either.
 
 The bucket credentials give full control of the fleet, so keep them
 safe. The bucket contains the deployments, the SQLite replicas, the
@@ -207,9 +254,10 @@ object of the fleet then goes below `PREFIX/`, so two fleets can share one
 bucket. A bucket value without a prefix keeps the objects at the root of
 the bucket, therefore an existing fleet does not move its data.
 
-The store must provide conditional writes and read-after-write
-consistency, because the ownership records depend on them. Amazon S3,
-Cloudflare R2, Google Cloud Storage, Tigris, and Azure Blob Storage
+The store must provide conditional writes. A ranged read must return the
+exact requested bytes. The store must also provide read-after-write
+consistency. Cell ownership and stored data depend on these properties.
+Amazon S3, Cloudflare R2, Google Cloud Storage, Tigris, and Azure Blob Storage
 qualify; Backblaze B2, Hetzner, and DigitalOcean Spaces do not. MinIO
 (the community edition) passes the storage test, but celld has not
 qualified it for production; do not use RELEASE.2025-09-06T17-38-46Z,
@@ -233,14 +281,20 @@ celld deploy . \
 ```
 
 `celld deploy` accepts module Workers, Durable Object bindings, service
-bindings, variables, cron triggers, D1 databases, KV namespaces, Workflows,
-WebAssembly modules, and static assets. An asset project can include a
+bindings, variables, cron triggers, D1 databases, KV namespaces, Queues,
+R2 buckets, Workflows, WebAssembly modules, and static assets. An asset project can include a
 Worker or be asset-only, and the asset functions include the assets
 binding, HTML handling, not-found handling, worker-first routes,
 `_headers`, `_redirects`, and `_routes.json`. If the Wrangler configuration contains an
 unknown key, the deploy stops with an error. See the
 [Cloudflare compatibility](cloudflare-compat.md) page for the complete
 deployment boundary.
+
+A new deployment manifest records the full SHA-256 digest of each JavaScript
+or WebAssembly module. A node verifies each module before it builds the
+deployment, so changed module bytes cannot become active. A node also accepts
+a legacy 16-character digest and verifies that prefix, so an upgrade can load
+an existing deployment.
 
 A running node does not restart for a new deployment. Each node reads
 `deploy/current.json` every 30 seconds (`CELLD_DEPLOY_POLL_S`) and adopts
@@ -251,8 +305,7 @@ deployment in one step. A request that started on the previous deployment
 finishes on it. A deployment that does not build leaves the current
 deployment serving, and the node reports the failure in its log and in
 the `/reload` response. `POST /reload` also rebuilds an unchanged
-deployment, so an edit to `CELLD_VARS_FILE` takes effect without a
-restart.
+deployment.
 
 A Durable Object that is not resident runs the new deployment at its
 next activation. A resident Durable Object moves to the new deployment
@@ -280,9 +333,12 @@ celld dev
 ```
 
 The command opens a local object store, deploys the application, and starts
-one celld node. It does not require Docker or a cloud bucket. The Worker
-listener uses `http://127.0.0.1:9876` by default. Use `--port` to select a
-different port:
+one celld node. It does not require Docker or a cloud bucket. The supervisor
+stops the node when the command finishes or returns an error. On Linux, the
+kernel also stops the node if the supervisor exits abruptly.
+
+The Worker listener uses `http://127.0.0.1:9876` by default. Use `--port` to
+select a different port:
 
 ```sh
 celld dev --port 3000
@@ -317,11 +373,39 @@ configuration file:
 celld dev ./examples/counter
 ```
 
+The command reads a `.dev.vars` file beside the Wrangler configuration, as
+`wrangler dev` does. Each line of the file has the form `NAME=value`. A
+value can be wrapped in double or single quotes, and the command removes
+the quotes. The command does not read the other dotenv features, such as a
+comment after a value or a value on more than one line. An entry becomes a
+Worker variable, and it overrides an entry of the same name in the `vars`
+of the configuration. Only `celld dev` reads the file, so a local
+credential does not reach a fleet through `celld deploy`. Add `.dev.vars`
+to the application's `.gitignore` file. A change to the file rebuilds the
+application, so a new value takes effect without a restart. The command
+writes each value into the local deployment record under `.celld/dev`, and
+`--clean` deletes that record.
+
 The command stores the local objects and the celld work files in `.celld/dev`
 below the project directory. Add `.celld/` to the application's `.gitignore`
 file. A normal shutdown keeps this directory, so the next invocation uses the
-same durable application state. Delete `.celld/dev` while `celld dev` is
-stopped to reset that state.
+same durable application state.
+
+This persistence holds across a configuration change, and celld does not
+migrate the stored state to match the new configuration. An object therefore
+keeps a value that the previous configuration wrote, and the application can
+reject that value and fail. The error names the stored value and not the
+configuration, so the failure can look unrelated to the change you made. Use
+`--clean` to start the command from an empty local state:
+
+```sh
+celld dev --clean
+```
+
+The flag deletes `.celld/dev` before the server starts, and it deletes nothing
+else below `.celld`. The command reports the outcome on the console. An absent
+`.celld/dev` directory is the wanted result, so the flag succeeds on a project
+that never ran `celld dev`.
 
 The command does not expose the local object store through a fleet flag. A
 regular node or an operator subcommand must use a supported cloud bucket.
@@ -331,12 +415,19 @@ change builds a new deployment and restarts the local node. The current
 application continues to run during the build, and a failed build does
 not replace it. The restart retains the durable application state.
 
-The watcher ignores `.celld`, `.git`, `node_modules`, and `target`
-directories at each depth. It does not watch a source file outside the
-project directory. Worker projects need `esbuild` on `PATH`, and
-asset-only projects do not need it.
+A read of a project file is not a change, so a tool that only reads the project
+does not start a build.
 
-## Operate D1 and KV
+The watcher ignores `.celld`, `.git`, `.wrangler`, `node_modules`, and `target`
+directories at each depth. Use `--watch-ignore PATTERN` to ignore an additional
+project-relative glob, and repeat the option to add more globs. The
+`--watch-ignore` option cannot be used with `--no-watch`. Use `--no-watch` to
+disable all automatic builds and restarts.
+
+The watcher does not watch a source file outside the project directory. Worker
+projects need `esbuild` on `PATH`, and asset-only projects do not need it.
+
+## Operate D1, KV, and R2
 
 `celld d1` runs SQL and migrations against a deployed D1 database. The
 command uses the fleet bucket to find a node, and the node routes the
@@ -346,6 +437,9 @@ operation to the database cell.
 celld d1 migrations apply ledger --bucket "$CELLD_BUCKET"
 ```
 
+The `migrations_dir` value must be a relative path inside the project. An
+absolute path or a path with a `..` component is invalid.
+
 `celld kv` reads and writes a deployed KV namespace. The bulk commands use
 the Wrangler file format, so `wrangler kv bulk get` can export data for
 `celld kv bulk put`.
@@ -354,11 +448,45 @@ the Wrangler file format, so `wrangler kv bulk get` can export data for
 celld kv bulk put sessions wrangler-export.json --bucket "$CELLD_BUCKET"
 ```
 
+`celld kv bulk get` writes each row before it reads the next value, so the
+command does not retain the complete namespace. A named output file changes
+only after the export completes. If a stdout export fails, the output remains
+an incomplete JSON array and a consumer cannot import it as a complete export.
+
 `celld kv list` prints at most 1000 keys, because a namespace can hold
 many more keys than an operator wants to read. The command reports on
 stderr that more keys exist, and it gives the `--after KEY` that continues
 the listing. Pass `--all` to read every key, or `--json` for one JSON
 object per key.
+
+`celld r2` reads and writes the objects behind an `r2_buckets` binding. The
+binding serves the fleet bucket under the reserved `r2/<bucket_name>/`
+prefix, and this command reads the same prefix directly. It therefore needs
+no running node, so a release pipeline can publish an artifact before it
+deploys the Worker.
+
+```sh
+celld r2 put assets app.zip --path dist/app.zip \
+  --content-type application/zip \
+  --metadata '{"release":"1.2.3"}' \
+  --bucket "$CELLD_BUCKET"
+```
+
+The first argument is the `bucket_name` from the project's `r2_buckets`
+entry, not the binding name. An object this command writes carries the same
+record as an object `env.BUCKET.put()` writes, so `--metadata` becomes
+`customMetadata` and the content flags become `httpMetadata`. Another tool
+can write an object into the prefix, and the binding still reads it: the
+object's user metadata becomes its `customMetadata`, and its headers become
+its `httpMetadata`. Such an object carries no `cacheExpiry` and no
+checksums, because a store has no place for either.
+
+`celld r2 get` writes the object to stdout as bytes, and it reads the body
+as a stream, so an artifact larger than the available memory still
+transfers. `celld r2 list` prints at most 1000 keys and reports on stderr
+how to continue, the same as `celld kv list`. The `celld r2 head` command
+prints the object's stored record. With `--json`, the `http` and `custom`
+fields contain the binding's `httpMetadata` and `customMetadata` values.
 
 Every celld command writes its data to stdout and its messages to stderr,
 so a redirect or a pipe carries only data:
@@ -424,6 +552,142 @@ internal listener also has an unauthenticated operator API, so it must not
 reach the public internet. See the [security](security.md) page for the
 complete boundary.
 
+The listener that receives a request decides where a new cell activates,
+so a load balancer must include a new node in its rotation. A node below
+its residency cap keeps every cell that activates on it. A node at its
+cap, and a node that sheds under memory pressure, hands the activation to
+the peer with the lowest load, and an empty node wins that comparison. A
+shed eviction releases the ownership record
+(`CELLD_PRESSURE_OWNERSHIP=release`, the default), so the next request
+can move the cell. An idle eviction keeps the ownership record, so an
+idle cell wakes on its own node. The node proves the cell durable before
+it stops the runtime, and the cell answers requests through that proof. A
+request that arrives before the stop therefore cancels the eviction, and
+the cell keeps its runtime and its epoch. A bucket proof confirms the
+cell's objects before the stop, so it makes this first window longer than
+a fleet proof does. A request that arrives during the stop can also keep
+the epoch. The node stops the runtime, and then it writes a handoff
+snapshot to the bucket. Before that write the node has published nothing,
+so it gives the cell back and starts it again on the same database at the
+same epoch. After that write the snapshot is the restore source for the
+next owner, so a request waits for the cell to start again at a new
+epoch. The two durability postures behave the same way during the stop,
+because both write the same snapshot at the same point. An idle eviction
+must stop the runtime within `CELLD_OPERATION_DEADLINE_MS`. If the
+runtime does not stop in time, the node keeps the cell resident at its
+current epoch. The node waits one more idle period before the next
+attempt, and it waits the same period after it gives a cell back.
+
+A new node also receives existing idle cells. Every node reads a shared
+fleet sample every five seconds (`CELLD_REBALANCE_INTERVAL_MS`; `0`
+disables balancing). One node claims each refresh through a conditional
+write and reads the node leases for the fleet. The other nodes read
+the result from `fleet/capacity-v1.json`. A node judges the leases in a
+sample at the moment the sample was taken, because the copied leases age
+while the nodes renew the originals. A sample expires after one
+configured interval. A node that reads during a refresh keeps the
+previous sample while that sample is less than three intervals old. A
+refresher that fails puts the previous sample back, so the next reader
+refreshes at once. A refresher that stops holds its claim for three
+intervals, or for 30 seconds if that period is shorter. This claim
+lifetime does not exceed the maximum accepted age of a previous sample.
+A stopped refresher can leave the other nodes without a sample until the
+claim expires. An unavailable sample stops balancing and closes the
+bucket-format gate.
+With balancing disabled, the format check still reads the shared sample
+every five seconds. A node that hands an activation to a peer reads the
+same shared sample, so a burst of activations at a full node costs one
+read each. Readiness, a drain, follower recruitment, and lease authority
+read the node leases directly.
+
+Each node has an ownership target: the fleet's owned cells, divided in
+proportion to the node weights
+(`CELLD_PLACEMENT_WEIGHT`, default: the CPU count). The node with the
+most owned cells per unit of weight hands at most 32 idle cells
+to the peer that is furthest below its
+target, and it hands over no more cells than the receivers have room
+for. A receiver fills to 2% below its target, so a stale sample cannot
+make two nodes trade the same cells. Only a hibernated cell moves. Its
+move is one ownership record write and one signed acquire, it stays
+hibernated on the new owner, and its parked hibernatable WebSockets close
+with code 1012 so the clients reconnect to the new owner. A resident cell
+does not move: it hibernates through idle eviction first
+(`CELLD_IDLE_EVICT_S`) and moves after. Therefore a fleet without idle
+eviction balances only the cells that hibernate on their own. A request
+that arrives for a moving cell waits for the new owner and then follows
+the normal route to it. A node that drains receives no cell, and a node
+with cold activations queued behind its activation ceiling (`restoring` in
+its lease) receives no cell until that backlog clears. The fleet moves nothing while a
+node reports a lease without a weight, so a rolling upgrade to this
+version completes before the first move. An operator can pause the fleet with
+`POST /rebalance/pause` on the internal listener of any node.
+
+## Feed an autoscaler
+
+celld does not scale itself. An external system starts and stops the
+nodes, and celld hands the cells off. Two surfaces report the numbers
+that a scaling decision needs.
+
+Each node writes its lease to `nodes/<node>.json` in the bucket, and
+each renewal refreshes it (`CELLD_TTL_MS`, default 10000, renewed at
+one third of the lifetime). The lease carries a load block:
+`owned_cells`, `placement_weight`, `resident_cells`, `host_websockets`,
+`rss_bytes`, `in_use_bytes`, `cpu_percent_x100`, `open_fds`, `pressured`,
+`memory_headroom`, `shed_cells`, and `restoring`. A script can read these
+objects with the
+bucket credentials alone, and `sampled_ms` dates each sample. The
+`owned_cells` value includes the dormant cells and the cells that are waking
+from dormancy. A started node omits the value until it has read the
+ownership record of every cell on its own disk, so a restarted node does
+not report an empty node while it still owns its hibernated cells. The
+`resident_cells` value includes only the cells that consume the local
+runtime capacity.
+
+The internal listener answers `GET /state` with the live counters:
+`owned_cells`, `occupied`, `capacity_waiting`, `activation_waiting`, `restoring`,
+`shedding`, and the memory values. The `allocator` object reports the
+Rust allocator's own counters in bytes: `allocated_bytes` is the memory
+that Rust code holds, `resident_bytes` adds the freed pages that the
+allocator keeps for reuse, and `mapped_bytes` and `retained_bytes` are its
+address space. V8 maps its heaps itself, so `rss_bytes` includes them and
+`allocated_bytes` does not. On Linux the `libc_malloc` object reports the
+C allocator that SQLite and V8 use: `in_use_bytes` is what they hold, and
+`free_bytes` is what glibc keeps for them after a free. The `handed_off` counter is the number of
+cells this node gave to a peer, `rebalanced` is the part of that number
+that balancing moved, and `rebalance_failed` is the number of balancing
+moves that no peer acquired. A positive `capacity_waiting` means
+that the node queues activations behind its residency cap, and that is
+the direct signal to add a node. A `pressured` lease is the memory form
+of the same signal. Scale down only when every remaining node reports
+`memory_headroom` and a small `restoring` backlog. A drain into a fleet
+without spare capacity parks the cells dormant on the survivors, and
+each later activation must then shed a resident cell to run.
+
+The `remote_route_refreshes` counter counts cached owner or capacity routes
+that expire and start a new lookup. It increases once for each retired
+route, so it also increases during normal lease renewal. An adoption
+without a lease and an explicit invalidation do not increase it.
+
+The `deployment.isolates` object reports the V8 isolates of the current
+deployment, and each entry of `deployment.draining` reports the isolates
+of one superseded deployment. The `cells` map has one entry for each
+Worker script, and the `stateless` and `services` entries cover the
+request handlers. Each entry counts the isolates that accept work
+(`live`), the live isolates that house no cell (`live_empty`), the
+retiring isolates that still hold a heap (`retiring`), and the freed
+slots (`freed`), with the cells, requests, and turns that they hold.
+`heap_bytes` is the physical memory that V8 has committed to those heaps,
+and `external_bytes` is the memory that the isolates track outside them. A
+dormant cell holds no isolate, and celld retires an empty cell isolate on
+its next maintenance pass, so a `live_empty` count that persists for more
+than 30 seconds means that the pass does not run. A `retiring` count that
+persists means that a turn or a request still holds the heap.
+
+The public `/.well-known/celld/health` path stays a boolean. It reports
+503 during a drain and before a joining node settles, so an
+orchestrator can gate a rolling update on it, but it carries no
+utilization number.
+
 ## Shut down and roll out a node
 
 celld shuts a node down gracefully on SIGTERM or SIGINT, the signals that
@@ -444,54 +708,87 @@ can send SIGKILL before celld completes the handoff.
 The handoff works in batches. The node reserves a batch of cells and
 stops new local routes to them: an accepted request stays local until it
 finishes, and a new request waits for the successor route. The node
-proves the batch durable and tries to publish one full snapshot of each
-closed database. The snapshot is an L9 object, so the successor does not
-replay the complete transaction history. The remote L0 chain remains an
-additive fallback. If the snapshot retry window expires, the node releases
-the cell with this proven L0 chain. The node then releases each ownership
+also cancels each firing alarm in the batch. The alarm runtime records a retry
+and arms its wake entry, so the successor can run the alarm at least once.
+The node cancels an active internal fetch or RPC handler before the durability
+proof, so a Queue broker cannot retain the batch until the process stops.
+The node proves the batch durable in the live durability ensemble, and it
+then closes each database. The node publishes one full L9 snapshot of the
+closed database and verifies that the bucket contains a restore object. The
+successor therefore does not replay the complete transaction history. If the
+snapshot fails, the node materializes the additive L0 chain within the same
+durability deadline. A database larger than the deadline can upload, 80 MiB
+at the default deadline of 10 seconds, skips the snapshot and hands off
+through its L0 chain at once, and a snapshot that fails once is not retried
+for that cell. The node does not release the cell unless one complete
+restore path is visible. The node then releases each ownership
 record and asks a
 compatible peer to acquire it. The peer acknowledges after the ownership
 update and keeps the cell dormant, so the handoff does not restore an
 unused runtime; a later request starts the cell under the peer activation
 limit. The donor starts the next batch after each acknowledgement.
 
-Four settings pace this work. `CELLD_RELEASES` sets the maximum number
-of complete handoffs in progress (default 8), covering activity
-cancellation, the durability proof, the final snapshot, the ownership
-release, and the successor update; `CELLD_ACTIVATIONS` limits the
-demand-driven restore and startup work. `CELLD_SHUTDOWN_DRAIN_MS` sets
-the maximum interval without a completed handoff (default 25000). Each
-successor acknowledgement starts the interval again, so a large handoff
-can continue while it makes progress. `CELLD_SHUTDOWN_TOTAL_MS` sets a 40000 ms
-default bound for the complete process stop. An orchestrator stop grace must
-be longer than this bound, so celld can finish its local durability shutdown.
-A same-node preserve operation uses the shorter drain value as its semantic
-limit because it has no successor acknowledgements.
+celld orders the resident cells by their local request count. The newest local
+request ID resolves an equal count, and the cell ID resolves an unused cell.
+Therefore, a total stop bound moves shared resources before one-time resources.
 
-Simultaneous stop signals do not flood the surviving nodes. A draining
-node claims a fleet drain token in the bucket before it releases cells,
-so concurrent donors hand off one node at a time. A donor that cannot
-claim the token within `CELLD_DRAIN_TOKEN_WAIT_MS` milliseconds (default
-30000; `0` disables the token) proceeds without it, because the
-orchestrator grace is finite. The token is advisory: a dead holder's
-claim expires, and a handoff without the token is still safe.
+`CELLD_RELEASES` limits the complete handoffs in progress (default 128).
+Each handoff includes activity cancellation, a durability proof, a final
+snapshot, an ownership release, and a successor update. `CELLD_ACTIVATIONS`
+limits the demand-driven restores and the startup work.
+
+`CELLD_SHUTDOWN_TOTAL_MS` sets the complete process stop bound (default
+40000 ms). The orchestrator stop grace must exceed this bound, so celld can
+finish its local durability shutdown. celld derives its internal waits from
+this one value. The token wait is three quarters of the bound (default
+30000 ms). The handoff no-progress interval is five eighths of the bound
+(default 25000 ms), with a minimum of one millisecond. Fractional milliseconds
+are rounded down before the minimum applies.
+
+Each successor acknowledgement restarts the no-progress interval. The total
+stop bound still limits the complete shutdown, so progress cannot extend the
+process lifetime beyond the configured grace. A handoff reserves the smaller
+of one second and ten percent of the total bound for the drain-token release.
+A same-node preserve operation uses the no-progress interval as its semantic
+limit because it has no successor acknowledgements. The token-release reserve
+does not apply to a same-node preserve.
+
+celld rejects the removed `CELLD_SHUTDOWN_DRAIN_MS` and
+`CELLD_DRAIN_TOKEN_WAIT_MS` variables at startup. Remove these variables and
+set only `CELLD_SHUTDOWN_TOTAL_MS` when the default total bound is unsuitable.
+The `CELLD_PACED_HANDOFF` switch is also removed. A bucket-backed node
+attempts ownership handoff within this budget. If no successor can accept
+the cells, the existing no-progress and total stop bounds still apply.
+
+Simultaneous stop signals do not flood the surviving nodes. A draining node
+claims a fleet drain token before it releases cells, so concurrent donors
+hand off one node at a time. A donor that cannot claim the token within its
+derived wait proceeds without it because the orchestrator grace is finite.
+The token is advisory: a dead holder's claim expires, and a handoff without
+the token is still safe.
 
 A fresh process also holds its first healthy response until the fleet is
 settled. The process requires its live node lease, no active donor, and memory
-below every pressure low watermark on each live node. It also requires a total
-restore backlog no larger than one `CELLD_ACTIVATIONS` budget. The incumbent
+below every pressure low watermark on each live node. A donor records each
+node's restore backlog before it releases ownership. The replacement permits
+one `CELLD_ACTIVATIONS` budget above each recorded value. The incumbent
 ownership counts must remain within one equal successor share above the fleet
 mean. A joining process can satisfy this condition when it advertises paced
 handoff support and owns fewer cells than the busiest incumbent. The process
 publishes this successor capacity before readiness, so an idle rollout can
 repair the ownership distribution during the next donor handoff.
 
+An initial spare has no drain token, so it has no rollout restore baseline to
+check. It still requires memory headroom and acceptable ownership distribution.
+
 An older peer does not publish the low-watermark result, so the gate uses that
 peer's pressure latch during a mixed-version update. An unreadable fleet or an
-unsettled condition holds readiness for up to `CELLD_READY_FLEET_GATE_MS`
-milliseconds (default 120000; `0` disables the gate). The process then reports
-healthy with a `ready_gate_expired` event. After the first healthy response,
-fleet state does not remove readiness again.
+unsettled condition keeps the process unhealthy until the condition clears.
+`CELLD_READY_FLEET_GATE_MS` sets the observation deadline in milliseconds
+(default 120000; `0` disables the gate). celld emits `ready_gate_expired` once
+at that deadline, but readiness stays closed. Set an orchestrator rollout
+deadline so a persistent capacity problem fails the rollout. After the first
+healthy response, fleet state does not remove readiness again.
 
 A deadline-cut handoff can leave a node-log recovery for the replacement.
 One process reads and uploads that dead session, and the other processes wait
@@ -501,9 +798,33 @@ recovery store error keeps the session unsealed, so a later recovery must read
 every retained bundle before the replacement can restore the acknowledged
 state.
 
+Recovery records a checkpoint after each group of 32 completed cell epochs.
+A later attempt uses these checkpoints to skip repeated coverage checks and
+uploads for the recorded transactions. Each checkpoint follows the data uploads,
+so an interrupted upload cannot create a checkpoint for incomplete data.
+An unavailable or invalid checkpoint causes recovery to check the cell coverage
+again. A checkpoint write failure does not stop recovery. The checkpoints do
+not replace the follower evidence or the session seal, and different sessions
+continue to recover independently.
+
 The internal listener continues to accept `/state` requests during the
 drain, and the response reports the handoff and restore counters. The
 public health response identifies the active drain with a 503 status.
+
+A remote cell call can resolve an owner generation that a replacement process
+rejects. celld then waits for a different `(node, epoch)` and refreshes the
+route. The wait uses `CELLD_OPERATION_DEADLINE_MS` as its total bound (default
+15000). celld retries only a peer attempt that proves that the handler did not
+start. It does not retry an ambiguous attempt because the handler can have
+completed without returning its response.
+
+A marked stale-owner response to the outer peer tunnel proves that the
+application request did not start. celld can therefore refresh that route for
+an HTTP, an RPC, or a WebSocket request.
+
+An application must keep one stable operation ID when it retries an ambiguous
+fetch, RPC, D1, or service operation. A WebSocket transport cannot move between
+owners, so a client must reconnect and keep the same application operation ID.
 
 To roll out a new version, use the rolling update of your orchestrator:
 stop each node with SIGTERM, wait for its replacement to report healthy,
@@ -531,24 +852,42 @@ Some upgrades are exceptions:
   contains `node-log close: sealed epoch`. A graceful stop attempts this
   seal, but a stop under load can leave the record open, and a v0.2.x
   binary cannot read writes that wait in the replicated log or bundle
-  objects — this downgrade can lose acknowledged writes.
+  objects. Therefore, this downgrade can lose acknowledged writes.
 - The upgrade from v0.3.0 to v0.4.0 must not use a rolling update. Stop
   every v0.3.0 node, and then start the v0.4.0 nodes. v0.4.0 moves every
-  proxied cell call — the fetch, the RPC, and the WebSocket — onto one
-  tunneled connection that carries plain HTTP, and the peer protocol
-  refuses a different version, so the two versions cannot proxy calls to
-  each other. v0.4.0 also stores each new large KV value under its ownership
+  proxied fetch, RPC, and WebSocket call onto one tunneled connection that
+  carries plain HTTP. The peer protocol refuses a different version, so the
+  two versions cannot proxy calls to each other. v0.4.0 also stores each new large KV value under its ownership
   epoch and writes an epoch-qualified row reference. A v0.3.0 node cannot
   read that reference, so a mixed fleet can make a committed KV value
   unavailable. The tunnel establishment carries the version, so a later
   protocol change can negotiate instead of refuse.
+- The upgrade from v0.4.0 to v0.4.1 can use a rolling update. v0.4.1
+  restores a large cell by paging, and a paged epoch continues the chain
+  of the epoch before it instead of opening with a whole-database snapshot.
+  A v0.4.0 node cannot restore such an epoch. Each v0.4.1 node therefore
+  publishes the bucket format it reads in its lease, and it pages a
+  takeover only while every live lease reads that format. A v0.4.1 node in
+  a mixed fleet clones a large cell the way v0.4.0 does, and paging starts
+  on its own one lease lifetime after the last v0.4.0 node stops. Do not
+  start a v0.4.0 binary after that point: a cell that paged in has no
+  epoch a v0.4.0 node can restore, and it stays unavailable on that node
+  until a v0.4.1 node takes it over.
 
 The internal listener also provides an alpha operator API. `/state`
-reports the node state, `POST /reload` adopts the deployment pointer now,
+reports the node state, and its `node_load` object is the same load sample
+that the node lease publishes. `POST /reload` adopts the deployment pointer now,
 and `POST /shutdown` starts the same graceful
-handoff. The `POST /shutdown?handoff=preserve` request prepares a clean
-same-node reload and keeps the ownership records. A release can change
-this API, so keep the operator tooling and the celld release together.
+handoff. `POST /rebalance/pause` stops balancing. The node publishes the
+pause in its lease, and one paused lease stops every move in the fleet, so
+a pause on one node pauses the fleet. `POST /rebalance/resume` on the same
+node resumes it. The `POST /shutdown?handoff=preserve` request prepares a clean
+same-node reload and keeps the ownership records. The preserve operation cancels
+a cold activation, including a wait for a recovery retry, because the activation
+has no runtime to retain. celld writes the reload marker
+only after it uploads each stopped database position to the bucket. If an upload
+fails, the next process uses the normal recovery path. A release can change this
+API, so keep the operator tooling and the celld release together.
 
 ## Diagnose a fleet
 
@@ -573,7 +912,10 @@ an activation permit or wait for one (a capacity waiter already holds a
 permit, so each cold route counts once). During a rolling update, wait
 for every node to report `restoring=0` before you restart the next node,
 so one restart's cold work finishes before the next restart removes more
-warm capacity.
+warm capacity. A node that restarts recovers its previous session's log
+before it takes a lease. If a peer is already recovering that log, the
+node waits behind the peer while the peer's heartbeat is fresh, and it
+takes the recovery over only when the heartbeat stops.
 
 ## List Durable Objects
 
@@ -589,9 +931,10 @@ celld cell list \
 Each line is a `Class:ID` cell scope. The ID is the Durable Object ID: a
 64-character hash unless the application supplies its own name. Give a
 class name to list only that class, and pass `--json` for one JSON object
-per line. An instance appears after the first event reaches it, because
-its owner then writes an ownership record to the bucket; an ID that an
-application only derives does not appear.
+per line. The command puts the class in the storage prefix, so `--limit`
+applies only to that class. An instance appears after the first event reaches
+it, because its owner then writes an ownership record to the bucket. An ID
+that an application only derives does not appear.
 
 The listing also shows celld's own cells. A D1 database, a KV namespace,
 and a Workflow are each a cell in a reserved class, and their names start
@@ -637,18 +980,25 @@ celld cell list --all --json --bucket "$CELLD_BUCKET" > cells.ndjson
 
 ## Hot-cell overload
 
-celld admits a maximum of 64 concurrent fetch events for one Durable Object
-or Queue broker. Set `CELLD_MAX_CELL_REQUESTS` to use a different positive
-limit.
+celld admits a maximum of 64 concurrent fetch events for one Durable Object.
+Set `CELLD_MAX_CELL_REQUESTS` to use a different positive limit.
+
+A Queue broker admits a maximum of 256 concurrent producer calls. It commits
+at most 64 calls in one transaction, and four transactions can overlap their
+durability proofs. These fixed bounds limit the copied message bodies while a
+storage proof is slow.
 
 celld returns HTTP status `503` when the target reaches this limit, and it
 does not start the excess event. The response contains `Retry-After: 1` and
 `X-Celld-Overload: cell`, so the application can retry or reject the work.
-A local or remote Queue owner uses the same status and headers when it refuses
-producer admission. The Queue response body is
+A local or remote Queue owner uses the same status and headers when its
+producer reservations are full. The Queue response body is
 `{"error":"cell admission refused"}`. A fixed-rate client must count the
 response as rejected work, so an immediate retry does not increase the
 configured offered rate.
+
+A caught Queue producer error contains `cell overload: admission refused`, so
+the Worker can return the same admission response to the client.
 
 The runtime writes a `cell_overload_refused` log event when a target becomes
 saturated. The event contains the cell scope, the node, the region, the
@@ -674,31 +1024,79 @@ For the full list, run `celld -h`. This table shows the primary settings:
 | `CELLD_INTERNAL_ADDR` | The peer and operator listener. The same as `--internal-listen` |
 | `CELLD_ADVERTISE` | The internal address that peers can reach. The same as `--advertise` |
 | `CELLD_UNSAFE_PUBLIC_ADVERTISE` | Set to `1` to permit a literal public IP in `CELLD_ADVERTISE`. This setting does not resolve a DNS name or restrict the internal listener |
-| `CELLD_NODE` | An explicit node-session ID |
+| `CELLD_NODE` | An explicit node-session ID. Use 1 to 128 ASCII letters, numbers, dots, dashes, or underscores. The value cannot be `.` or `..` |
 | `CELLD_WATCH` | The local work directory for SQLite and replication |
 | `CELLD_ESBUILD` | The path of the esbuild executable |
-| `CELLD_ACTIVATIONS` | The limit for concurrent cold-cell activations (default: the available CPU count or 128, whichever is smaller) |
+| `CELLD_ACTIVATIONS` | The limit for concurrent cold-cell activations (default: 8 for each available CPU, at least 16 and at most 128). A cold activation waits on the object store for most of its time, so the default is above the CPU count |
 | `CELLD_DEPLOY_POLL_S` | The interval in seconds at which a node reads the deployment pointer and adopts a new deployment in place (default: 30) |
 | `CELLD_DEPLOY_MAX_AGE_S` | How long a resident Durable Object can keep the previous deployment's code after an adoption before celld forces the move (default: 60; 0 forces at once) |
 | `CELLD_OPERATION_DEADLINE_MS` | The deadline for a non-restore operation (default: 15000) |
-| `CELLD_WORKER_LOADER` | Bind a Worker Loader (Code Mode) at this `env` name. A Worker can then start isolates at runtime. Off unless set (experimental) |
-| `CELLD_MAX_LOADED_WORKERS` | The limit for concurrent loaded workers (default: 256) |
 | `CELLD_MAX_CELL_REQUESTS` | The concurrent fetch limit for one Durable Object or Queue broker (default: 64) |
 | `CELLD_MAX_REQUEST_BODY_BYTES` | The body limit for a public Worker request or a direct Durable Object request (default: 1 GiB) |
 | `CELLD_MAX_RESIDENT_CELLS` | The hard limit for resident cells, enforced at admission |
+| `CELLD_IDLE_EVICT_S` | The age in seconds after which an idle resident cell leaves memory and hibernates (unset: only pressure or the residency cap removes an idle cell) |
+| `CELLD_PLACEMENT_WEIGHT` | The ownership share of this node, relative to the other nodes' weights (default: the CPU count) |
+| `CELLD_REBALANCE_INTERVAL_MS` | The interval between shared fleet sample reads and the maximum sample age, in milliseconds (default: 5000; 0 disables balancing) |
 | `CELLD_MAX_RSS_MB` | The memory threshold for pressure shedding, applied to the greater of the allocator-adjusted RSS and the allocator-adjusted active cgroup working set (default: 80% of the available memory; 0 disables the threshold and the absolute cap) |
-| `CELLD_OUTPUT_GATE` | The default is `1`, so celld proves each write durable before it acknowledges the write. Set `0` to remove the replication wait and accept possible loss of an acknowledged write |
 | `CELLD_DURABILITY` | How celld proves a write durable before it answers. The default is `fleet`: the node serving the cell sends the write to one or two other nodes and answers once they hold it on disk, or once the bucket upload finishes, whichever comes first. This needs two or more nodes; a single node has nobody to send to, so every write waits for the bucket. Set `bucket` to always wait for the bucket |
-| `CELLD_LOG_CAPTURE_WORKERS` | The limit for concurrent log-capture workers (default: 8) |
 | `CELLD_LOG_PIPELINE` | The limit for fleet log rounds that can be in flight (default: 4) |
 | `CELLD_LOG_HEDGE_MS` | The wait before a leader sends a second copy of a slow log append to a follower. The default is adaptive: celld derives the wait from the slowest recent append in the ensemble (4 times that append, at least 250 ms, and always below the eviction backstop), so a loaded fleet does not send copies for honest slow appends. Set a value to use a fixed wait in milliseconds, and set `0` to disable the second copy. An append is idempotent per sequence, so the copy is safe, and the leader uses the answer that arrives first and confirms |
-| `CELLD_LTX_TRUNCATE_PAGES` | The WAL size, in pages, at which celld truncates an ordinary cell's WAL file at the next checkpoint (default: 128, a 512 KiB cap). A passive checkpoint does not shrink the WAL file, so each capture reads the stale region after a restart. The truncate keeps the read small. Queue cells use passive checkpoints because a truncate boundary emits a full database image. Set `0` to disable the truncate for all cells |
+| `CELLD_LTX_TRUNCATE_PAGES` | The WAL size, in pages, at which celld truncates an ordinary cell's WAL file at the next checkpoint (default: 128, a 512 KiB cap). A passive checkpoint does not shrink the WAL file, so each capture reads the stale region after a restart. The truncate keeps the read small. A truncate ends in a full image of the database, so a database larger than 4 MiB also waits until its WAL is larger than the database. Queue cells use passive checkpoints only. Set `0` to disable the truncate for all cells |
 | `CELLD_LTX_COMPACTION` | The default is `1`: celld creates additive L1 objects, and a takeover reads tens of objects instead of thousands. Set `0` on every node of a mixed fleet until all nodes can read v0.5.2 block objects, because an old reader cannot take over a cell after its first L1 publication |
 | `CELLD_LTX_COMPACTION_MIN_TXIDS` | The durable TXID distance that queues a background L1 attempt (default: 256) |
+| `CELLD_LTX_COMPACTION_MIN_MB` | The L0 bytes since the last fold that queue a background L1 attempt, in MiB (default: 32, at most 64). The byte threshold lets a cell with large rows compact before it reaches the transaction threshold |
+| `CELLD_LTX_PAGED` | The default is `1`: celld restores a taken-over cell by paging when its chain is at least `CELLD_LTX_PAGED_MIN_MB`. It opens the database through a fault-in VFS that reads each page from the bucket on first use, instead of downloading the whole restore chain first, and a smaller chain is cloned. Set `0` to clone every chain. A paged cell's local file is a cache, so celld does not preserve it as an eviction snapshot and does not publish a handoff snapshot from it. A paged epoch continues the chain it paged in. celld uploads a small marker object at the next transaction before the cell serves, and its later objects follow it, so a restore composes the epochs. Set `0` on every node of a mixed fleet until all nodes run v0.4.1 or later, because a paged epoch holds no whole-database snapshot and a node before v0.4.1 restores one epoch only. Such a node refuses the activation of that cell, and the refusal is permanent for the cell. A full activation opens its epoch with a whole-database snapshot. A node pages only while every live lease in the fleet publishes a bucket format that reads a paged epoch, so a rolling update from a release without paged restore clones until that release has left the fleet; the `paged_gate` log event reports each change. A clean reload does not keep a paged cell resident; the next process pages it in again. An inspect of a paged cell must read the bucket, because celld does not copy the cell's sparse file in place. After the activation, celld fills the rest of the file in the background at `CELLD_LTX_HYDRATE_MBPS`, so a cell that stays resident soon reads only its local file |
+| `CELLD_LTX_PAGED_MIN_MB` | The chain size, in MiB, from which a restore pages instead of cloning (default: 256). A clone of a smaller chain takes seconds and fits the node's memory, so it needs no fault path and no hydration. Set `0` to page every chain |
+| `CELLD_LTX_HYDRATE_MBPS` | The rate, in MiB per second, at which a paged cell's file fills in the background (default: 16). One cell fills at a time per node. Set `0` to keep a paged cell sparse, so every cold page is read from the bucket on first use |
 | `CELLD_LTX_COMPACTIONS` | The node-wide limit for concurrent background L1 attempts (default: 2). `CELLD_RELEASES` bounds final handoff snapshots |
-| `CELLD_LTX_DURABILITY_TIMEOUT_SECS` | The deadline for a durability proof and the final snapshot retry window, in seconds (default: 10). A slow or busy object store can need a longer deadline for a large write burst |
-| `CELLD_VAR_*`, `CELLD_VARS_FILE` | Worker variable overrides |
+| `CELLD_LTX_DURABILITY_TIMEOUT_SECS` | The budget for one durability proof, in seconds (default: 10). The budget runs from the moment the node starts to upload the write. A write that waits behind the uploads of other cells waits while the node proves other writes, for at most six budgets. The same budget bounds the final snapshot or L0 fallback of a handoff. A slow object store can need a longer budget for a large write |
 | `RUST_LOG` | The runtime log filter |
+
+Each L1 compaction attempt merges at most 256 source objects. The buffer
+budget for the source data is 64 MiB. If one source object exceeds this
+budget, celld compacts that object through temporary files in the cell's
+local LTX directory. The node must have free disk space for the source copy
+and the output file. The codec keeps the page index in memory, so its memory
+use increases with the page count. Compaction keeps the source objects and
+publishes a continuous L1 range, including when a source overlaps an existing
+L1 object.
+
+`CELLD_OUTPUT_GATE` is removed. Remove the variable from the environment,
+including a value of `1` or an empty value. celld always waits for the
+configured durability proof before it acknowledges a write.
+
+These settings are also removed. Remove them from the environment, including
+an empty value or a value that matches the former default.
+
+| Removed setting | Current behavior |
+| --- | --- |
+| `CELLD_OTEL_SINK` | Set `CELLD_OTEL=1` for the fleet bucket or set `CELLD_OTEL` to the collector base URL for OTLP. |
+| `CELLD_AI_BINDING`, `CELLD_AI_URL` | The experimental AI adapter is removed. Call the provider from application code and remove the AI binding declaration. |
+| `CELLD_CLOUD_RESTART_ON_DEPLOY` | A managed deployment adopts the new code in place. Credential rotation can still restart the process. |
+| `CELLD_STORAGE_PROBE` | A node checks the storage contract before it serves a bucket-backed deployment. |
+| `CELLD_EVICTIONS` | A node runs at most four concurrent evictions. |
+| `CELLD_LOG_CAPTURE_WORKERS` | A node uses at most eight workers for log capture. |
+| `CELLD_REBALANCE_BATCH_CELLS` | A balancing batch moves at most 32 idle cells. The release limit and the receiver capacity can reduce this count. |
+| `CELLD_PRESENCE_SHADOW` | A managed node sends its serving status and its owned-cell count. It does not send a separate bucket comparison. |
+| `CELLD_LOG_BUNDLE` | Fleet durability uses bundled tiering. A node still uses per-cell uploads when the bucket must prove a write. |
+| `CELLD_QUEUE_PRODUCER_GROUP_MS` | A Queue owner uses a 4 ms timer to group concurrent producer calls into a SQLite transaction. |
+| `CELLD_LOG_GROUP_COMMIT_MS` | A node waits 1 ms before a fleet log capture when Queue writes are pending. |
+| `CELLD_PACED_HANDOFF` | A bucket-backed node attempts ownership handoff within the shutdown budget. Set `CELLD_SHUTDOWN_TOTAL_MS` to match the supervisor grace. |
+
+The Queue batching timers do not set a response deadline. A Queue still waits
+for the wake-entry proof and the configured write durability proof.
+
+Fleet uploads combine changes from multiple cells into shared bucket objects.
+`CELLD_DURABILITY=bucket` still requires a bucket proof for every acknowledged
+write, even when peers are available. Recovery can read the existing bundles
+and the per-cell objects.
+
+The storage check still distinguishes a contract violation from an ambiguous
+transport error. A violation prevents startup. After the existing retries,
+an ambiguous error produces a warning and permits startup.
+
+Use `celld diagnose --read-only` to check the bucket leases and the peers.
+A managed presence report does not prove that a node holds a bucket lease.
 
 The help output also shows the advanced tuning switches and their
 defaults.

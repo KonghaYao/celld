@@ -283,7 +283,7 @@
     });
   };
 
-  // `node:assert/strict` — the loose forms alias the strict ones.
+  // `node:assert/strict` -- the loose forms alias the strict ones.
   const strict = Object.assign(
     function strict(value, message) { assert.ok(value, message); },
     assert,
@@ -297,6 +297,6 @@
   strict.strict = strict;
   assert.strict = strict;
 
-  globalThis.__assertModule = assert;
-  globalThis.__assertStrictModule = strict;
+  __celld.__assertModule = assert;
+  __celld.__assertStrictModule = strict;
 })();

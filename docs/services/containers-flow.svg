@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 478" role="img" aria-labelledby="containerFlowTitle containerFlowDesc">
+  <title id="containerFlowTitle">One node runs the cell and its container, behind a fence on the bridge</title>
+  <desc id="containerFlowDesc">A Worker on any node calls MY_CONTAINER.get(id), and celld routes the call to the node that owns the cell. The fleet bucket holds the image as deploy slash images slash key dot tar, and the node loads it into its container engine once. On that one owner node, two runtimes run side by side: a V8 isolate that holds the cell, the Durable Object, with ctx.container and getTcpPort(8080), and a container process with the image from the bucket, port 8080, and an ephemeral disk. The call crosses the node's container engine socket, which is a local socket and not the network. Below both runtimes, an nftables fence on the node's bridge allows a connection out to the Internet and blocks a connection to any node and to every private range. A move, a restart, or a reset destroys the container, and the new owner starts a fresh one, so the disk never survives.</desc>
+  <style>
+    svg { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    text { font-size: 13px; fill: currentColor; }
+    tspan { fill: currentColor; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .lead { font-weight: 600; }
+    .d-ink { color: #121212; }
+    .d-soft { color: #3d3b37; }
+    .d-faint { color: #6e6a62; }
+    .d-acc { color: #10803f; }
+    .d-panel { color: #ffffff; }
+    .d-sunk { color: #f0eee8; }
+    .d-tint { color: #d6efdf; }
+    @media (prefers-color-scheme: dark) {
+      .d-ink { color: #efede7; }
+      .d-soft { color: #c9c6be; }
+      .d-faint { color: #928e85; }
+      .d-acc { color: #3fc472; }
+      .d-panel { color: #1a1a19; }
+      .d-sunk { color: #232321; }
+      .d-tint { color: #10301d; }
+    }
+  </style>
+  <defs>
+    <marker id="ct-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6"
+      markerHeight="6" orient="auto-start-reverse">
+      <path class="d-soft" fill="currentColor" d="M0 0 L10 5 L0 10 z" />
+    </marker>
+  </defs>
+
+  <!-- The caller, and the image the node needs before it can answer the caller. -->
+  <rect class="d-panel" fill="currentColor" x="8" y="8" width="196" height="54" rx="8" />
+  <rect class="d-faint" fill="none" stroke="currentColor" x="8" y="8" width="196" height="54" rx="8" />
+  <text class="d-faint" fill="currentColor" x="20" y="30">Worker, on any node</text>
+  <text class="d-ink mono" fill="currentColor" x="20" y="50">MY_CONTAINER.get(id)</text>
+
+  <rect class="d-panel" fill="currentColor" x="236" y="8" width="196" height="54" rx="8" />
+  <rect class="d-faint" fill="none" stroke="currentColor" x="236" y="8" width="196" height="54" rx="8" />
+  <text class="d-faint" fill="currentColor" x="248" y="30">Fleet bucket, no registry</text>
+  <text class="d-ink mono" fill="currentColor" x="248" y="50">deploy/images/&lt;key&gt;.tar</text>
+
+  <g class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M106 62 V108" marker-end="url(#ct-arrow)" />
+    <path d="M334 62 V108" marker-end="url(#ct-arrow)" />
+  </g>
+  <text class="d-faint" fill="currentColor" x="116" y="80">routed to the owner</text>
+  <text class="d-faint" fill="currentColor" x="324" y="100" text-anchor="end">loaded once per node</text>
+
+  <!-- One node holds the cell and the container together. -->
+  <rect class="d-sunk" fill="currentColor" x="8" y="112" width="424" height="284" rx="12" />
+  <rect class="d-faint" fill="none" stroke="currentColor" x="8" y="112" width="424" height="284" rx="12" />
+  <text class="d-ink lead" fill="currentColor" x="24" y="138">Owner node</text>
+  <text class="d-faint" fill="currentColor" x="24" y="158">the cell and its container never separate</text>
+
+  <text class="d-acc" fill="currentColor" x="220" y="176" text-anchor="middle">container engine socket</text>
+
+  <rect class="d-panel" fill="currentColor" x="22" y="184" width="176" height="112" rx="8" />
+  <rect class="d-faint" fill="none" stroke="currentColor" x="22" y="184" width="176" height="112" rx="8" />
+  <text class="d-faint" fill="currentColor" x="34" y="206">V8 isolate</text>
+  <text class="d-ink" fill="currentColor" x="34" y="228">cell, a Durable Object</text>
+  <text class="d-acc mono" fill="currentColor" x="34" y="252">ctx.container</text>
+  <text class="d-soft mono" fill="currentColor" x="34" y="276">getTcpPort(8080)</text>
+
+  <rect class="d-tint" fill="currentColor" x="242" y="184" width="176" height="112" rx="8" />
+  <rect class="d-acc" fill="none" stroke="currentColor" stroke-width="2" x="242" y="184" width="176" height="112" rx="8" />
+  <text class="d-faint" fill="currentColor" x="254" y="206">container process</text>
+  <text class="d-ink" fill="currentColor" x="254" y="228">the bucket's image</text>
+  <text class="d-soft mono" fill="currentColor" x="254" y="252">EXPOSE 8080</text>
+  <text class="d-soft" fill="currentColor" x="254" y="276">ephemeral disk</text>
+
+  <path class="d-faint" fill="none" stroke="currentColor" stroke-dasharray="5 4"
+    d="M220 184 V296" />
+  <g class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M198 222 H238" marker-end="url(#ct-arrow)" />
+    <path d="M242 270 H202" marker-end="url(#ct-arrow)" />
+  </g>
+
+  <!-- The fence is on the node, outside every container and every runtime. -->
+  <rect class="d-acc" fill="none" stroke="currentColor" stroke-dasharray="5 4"
+    x="22" y="310" width="396" height="70" rx="8" />
+  <text class="d-acc" fill="currentColor" x="34" y="332">nftables fence on the node's bridge</text>
+  <text class="d-soft" fill="currentColor" x="34" y="352">out to the Internet: allowed</text>
+  <text class="d-soft" fill="currentColor" x="34" y="372">to any node, to a private range: blocked</text>
+
+  <g class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M220 396 V412" marker-end="url(#ct-arrow)" />
+  </g>
+
+  <!-- The container belongs to one ownership epoch on one node. -->
+  <rect class="d-panel" fill="currentColor" x="8" y="418" width="424" height="56" rx="8" />
+  <rect class="d-faint" fill="none" stroke="currentColor" x="8" y="418" width="424" height="56" rx="8" />
+  <text class="d-ink" fill="currentColor" x="24" y="442">A move, a restart, or a reset destroys the container.</text>
+  <text class="d-faint" fill="currentColor" x="24" y="463">The new owner starts a fresh one; the disk never survives.</text>
+</svg>

@@ -1,0 +1,125 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 420" role="img" aria-labelledby="wfFlowTitle wfFlowDesc">
+  <title id="wfFlowTitle">A replay re-enters run() from the top, and the ledger answers for every finished step</title>
+  <desc id="wfFlowDesc">A workflow instance starts when create() makes the first run, and it starts again every time the cell alarm fires on the node that owns the cell at that moment. Each run re-executes run(event, step) from the first line. The instance cell holds a ledger under the __wf prefix, with one record per step occurrence. The first two steps, step.do("fetch") and step.do("charge"), read their stored results out of the ledger records step.1.fetch and step.1.charge, so their callbacks do not run again. A key counts the occurrences of one step name, so each of these names is at its first occurrence. The third step, step.sleep("wait"), reads the record step.1.wait, finds the stored wake time, and blocks because the deadline is not due. The run then arms the cell alarm at the earliest blocked deadline and returns, so the cell hibernates and a fleet wake entry holds the time instead of an isolate. No isolate waits for the deadline, and the node that owns the cell when the alarm fires runs the next replay. The loop closes from the hibernated cell back to the alarm on every resume.</desc>
+  <style>
+    svg { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    text { font-size: 12.5px; fill: currentColor; }
+    tspan { fill: currentColor; }
+    .sm { font-size: 11.5px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
+    .d-ink { color: #121212; }
+    .d-soft { color: #3d3b37; }
+    .d-faint { color: #6e6a62; }
+    .d-acc { color: #10803f; }
+    .d-panel { color: #ffffff; }
+    .d-sunk { color: #f0eee8; }
+    .d-tint { color: #d6efdf; }
+    @media (prefers-color-scheme: dark) {
+      .d-ink { color: #efede7; }
+      .d-soft { color: #c9c6be; }
+      .d-faint { color: #928e85; }
+      .d-acc { color: #3fc472; }
+      .d-panel { color: #1a1a19; }
+      .d-sunk { color: #232321; }
+      .d-tint { color: #10301d; }
+    }
+  </style>
+  <defs>
+    <marker id="wf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6"
+      markerHeight="6" orient="auto-start-reverse">
+      <path class="d-soft" fill="currentColor" d="M0 0 L10 5 L0 10 z" />
+    </marker>
+  </defs>
+
+  <!-- The two entries into a run: the first create, and every later alarm. -->
+  <rect class="d-tint" fill="currentColor" x="36" y="6" width="216" height="44" rx="6" />
+  <rect class="d-acc" fill="none" stroke="currentColor" stroke-width="2" x="36" y="6" width="216" height="44" rx="6" />
+  <text class="d-ink" fill="currentColor" x="144" y="26" text-anchor="middle">the alarm fires</text>
+  <text class="d-soft sm" fill="currentColor" x="144" y="42" text-anchor="middle">on the node that owns the cell</text>
+
+  <rect class="d-panel" fill="currentColor" x="288" y="6" width="152" height="44" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="288" y="6" width="152" height="44" rx="6" />
+  <text class="d-ink mono" fill="currentColor" x="364" y="26" text-anchor="middle">create()</text>
+  <text class="d-soft sm" fill="currentColor" x="364" y="42" text-anchor="middle">starts the first run</text>
+
+  <g class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M364 50 V56 H144" />
+    <path d="M144 50 V62" marker-end="url(#wf-arrow)" />
+  </g>
+
+  <!-- The replay: one invocation that always begins at the first line. -->
+  <rect class="d-sunk" fill="currentColor" x="36" y="62" width="216" height="206" rx="8" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="36" y="62" width="216" height="206" rx="8" />
+  <text class="d-ink mono" fill="currentColor" x="144" y="84" text-anchor="middle">run(event, step)</text>
+  <text class="d-faint sm" fill="currentColor" x="144" y="101" text-anchor="middle">re-executed from the top</text>
+
+  <rect class="d-panel" fill="currentColor" x="46" y="112" width="196" height="44" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="46" y="112" width="196" height="44" rx="6" />
+  <text class="d-ink mono" fill="currentColor" x="58" y="131">step.do("fetch")</text>
+  <text class="d-acc sm" fill="currentColor" x="58" y="148">ledger hit, callback skipped</text>
+
+  <rect class="d-panel" fill="currentColor" x="46" y="164" width="196" height="44" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="46" y="164" width="196" height="44" rx="6" />
+  <text class="d-ink mono" fill="currentColor" x="58" y="183">step.do("charge")</text>
+  <text class="d-acc sm" fill="currentColor" x="58" y="200">ledger hit, callback skipped</text>
+
+  <rect class="d-tint" fill="currentColor" x="46" y="216" width="196" height="44" rx="6" />
+  <rect class="d-acc" fill="none" stroke="currentColor" stroke-width="2" x="46" y="216" width="196" height="44" rx="6" />
+  <text class="d-ink mono" fill="currentColor" x="58" y="235">step.sleep("wait")</text>
+  <text class="d-soft sm" fill="currentColor" x="58" y="252">not due, so it blocks</text>
+
+  <!-- The ledger in the instance cell: one record per step occurrence. -->
+  <rect class="d-sunk" fill="currentColor" x="288" y="62" width="152" height="206" rx="8" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="288" y="62" width="152" height="206" rx="8" />
+  <text class="d-ink" fill="currentColor" x="364" y="84" text-anchor="middle">instance cell</text>
+  <text class="d-faint mono" fill="currentColor" x="364" y="101" text-anchor="middle">__wf ledger</text>
+
+  <rect class="d-panel" fill="currentColor" x="296" y="112" width="136" height="44" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="296" y="112" width="136" height="44" rx="6" />
+  <text class="d-soft mono" fill="currentColor" x="306" y="131">step.1.fetch</text>
+  <text class="d-ink mono" fill="currentColor" x="306" y="148">{bytes: 812}</text>
+
+  <rect class="d-panel" fill="currentColor" x="296" y="164" width="136" height="44" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="296" y="164" width="136" height="44" rx="6" />
+  <text class="d-soft mono" fill="currentColor" x="306" y="183">step.1.charge</text>
+  <text class="d-ink mono" fill="currentColor" x="306" y="200">{ok: true}</text>
+
+  <rect class="d-tint" fill="currentColor" x="296" y="216" width="136" height="44" rx="6" />
+  <rect class="d-acc" fill="none" stroke="currentColor" stroke-width="2" x="296" y="216" width="136" height="44" rx="6" />
+  <text class="d-soft mono" fill="currentColor" x="306" y="235">step.1.wait</text>
+  <text class="d-ink mono" fill="currentColor" x="306" y="252">wake at 09:00</text>
+
+  <!-- The ledger answers; the callback never starts. -->
+  <g class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M288 134 H254" marker-end="url(#wf-arrow)" />
+    <path d="M288 186 H254" marker-end="url(#wf-arrow)" />
+    <path d="M288 238 H254" marker-end="url(#wf-arrow)" />
+    <path d="M144 268 V292" marker-end="url(#wf-arrow)" />
+    <path d="M144 344 V356" marker-end="url(#wf-arrow)" />
+  </g>
+
+  <!-- The blocked step ends the invocation instead of waiting inside it. -->
+  <rect class="d-panel" fill="currentColor" x="36" y="292" width="216" height="52" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="36" y="292" width="216" height="52" rx="6" />
+  <text class="d-ink" fill="currentColor" x="144" y="313" text-anchor="middle">arm the cell alarm at the</text>
+  <text class="d-ink" fill="currentColor" x="144" y="331" text-anchor="middle">earliest blocked deadline</text>
+
+  <rect class="d-sunk" fill="currentColor" x="36" y="356" width="216" height="52" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="36" y="356" width="216" height="52" rx="6" />
+  <text class="d-ink" fill="currentColor" x="144" y="377" text-anchor="middle">the cell hibernates</text>
+  <text class="d-soft sm" fill="currentColor" x="144" y="395" text-anchor="middle">a fleet wake entry holds the time</text>
+
+  <rect class="d-faint" fill="none" stroke="currentColor" stroke-dasharray="5 4"
+    x="288" y="292" width="152" height="116" rx="8" />
+  <text class="d-faint sm" fill="currentColor" x="364" y="318" text-anchor="middle">no isolate waits</text>
+  <text class="d-faint sm" fill="currentColor" x="364" y="336" text-anchor="middle">for the deadline.</text>
+  <text class="d-faint sm" fill="currentColor" x="364" y="360" text-anchor="middle">the owner at that</text>
+  <text class="d-faint sm" fill="currentColor" x="364" y="378" text-anchor="middle">moment runs the</text>
+  <text class="d-faint sm" fill="currentColor" x="364" y="396" text-anchor="middle">next replay.</text>
+
+  <!-- The back edge: the loop that makes this a replay and not a sequence. -->
+  <path class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5"
+    stroke-dasharray="6 4" d="M36 382 H10 V28 H36" marker-end="url(#wf-arrow)" />
+  <text class="d-faint sm" fill="currentColor" x="26" y="200" text-anchor="middle"
+    transform="rotate(-90 26 200)">every resume</text>
+</svg>

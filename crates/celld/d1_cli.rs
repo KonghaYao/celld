@@ -395,6 +395,13 @@ impl Reachable {
             .await
     }
 }
+
+fn has_sql_extension(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("sql"))
+}
+
 fn read_migrations(directory: &std::path::Path) -> anyhow::Result<Vec<Migration>> {
     if !directory.exists() {
         bail!(
@@ -414,12 +421,9 @@ fn read_migrations(directory: &std::path::Path) -> anyhow::Result<Vec<Migration>
         if path.is_dir() {
             let nested = std::fs::read_dir(&path)
                 .map(|entries| {
-                    entries.flatten().any(|entry| {
-                        entry
-                            .path()
-                            .extension()
-                            .is_some_and(|extension| extension == "sql")
-                    })
+                    entries
+                        .flatten()
+                        .any(|entry| has_sql_extension(&entry.path()))
                 })
                 .unwrap_or(false);
             if nested {
@@ -432,7 +436,7 @@ fn read_migrations(directory: &std::path::Path) -> anyhow::Result<Vec<Migration>
             }
             continue;
         }
-        if path.extension().is_none_or(|extension| extension != "sql") {
+        if !has_sql_extension(&path) {
             continue;
         }
         let name = path
@@ -752,9 +756,10 @@ the SQLite format 3 header, must not have `-wal` or `-shm` sidecars, and must
 be at most 512 MiB (override with CELLD_D1_IMPORT_MAX_MB). `execute --file`
 accepts SQL text only; pass a `.db` file to `import` instead.
 
-Migration files are `NNNN_description.sql` in `migrations/`, applied in the
-order of their numeric prefixes as wrangler applies them. `migrations_dir` on
-the d1_databases entry moves the directory, and `migrations_table` renames the
+Migration files are `NNNN_description.sql` in `migrations/`. The `sql`
+extension is ASCII case-insensitive. celld applies the files in the order of
+their numeric prefixes as wrangler applies them. `migrations_dir` on the
+d1_databases entry moves the directory, and `migrations_table` renames the
 bookkeeping table. celld records applied migrations in that table
 (`d1_migrations` by default), the same table and columns
 `wrangler d1 migrations` uses.

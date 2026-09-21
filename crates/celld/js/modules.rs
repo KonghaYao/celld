@@ -8,6 +8,80 @@
 //! a worker that never touches `node:zlib` never compiles it.
 use super::*;
 
+macro_rules! static_source {
+    ($name:ident, $file:literal) => {
+        static $name: v8::OneByteConst =
+            v8::String::create_external_onebyte_const(include_bytes!($file));
+    };
+}
+
+static_source!(NODE_ASSERT_SOURCE, "node_assert.js");
+static_source!(NODE_TIMERS_SOURCE, "node_timers.js");
+static_source!(NODE_TEST_SOURCE, "node_test.js");
+static_source!(NODE_UTIL_SOURCE, "node_util.js");
+static_source!(NODE_EVENTS_SOURCE, "node_events.js");
+static_source!(NODE_OS_SOURCE, "node_os.js");
+static_source!(NODE_PATH_SOURCE, "node_path.js");
+static_source!(NODE_BUFFER_SOURCE, "node_buffer.js");
+static_source!(NODE_CRYPTO_SOURCE, "node_crypto.js");
+static_source!(NODE_ASYNC_HOOKS_SOURCE, "node_async_hooks.js");
+static_source!(
+    NODE_DIAGNOSTICS_CHANNEL_SOURCE,
+    "node_diagnostics_channel.js"
+);
+static_source!(NODE_STREAM_SOURCE, "node_stream.js");
+static_source!(
+    IDENTITY_TRANSFORM_STREAM_SOURCE,
+    "identity_transform_stream.js"
+);
+static_source!(COMPRESSION_STREAMS_SOURCE, "compression_streams.js");
+static_source!(BYTE_STREAMS_SOURCE, "byte_streams.js");
+static_source!(SET_IMMEDIATE_SOURCE, "set_immediate.js");
+static_source!(URL_PATTERN_SOURCE, "url_pattern.js");
+// The Node shims this fork adds for OpenNext / Nitro / Vite SSR bundles.
+static_source!(NODE_TIMERS_CALLBACK_SOURCE, "node_timers_callback.js");
+static_source!(NODE_URL_SOURCE, "node_url.js");
+static_source!(NODE_QUERYSTRING_SOURCE, "node_querystring.js");
+static_source!(NODE_HTTP_SOURCE, "node_http.js");
+
+#[cfg(all(test, celld_internal_tests))]
+static INTERNAL_MODULE_SOURCES: &[(&str, &v8::OneByteConst)] = &[
+    ("node_assert.js", &NODE_ASSERT_SOURCE),
+    ("node_timers.js", &NODE_TIMERS_SOURCE),
+    ("node_test.js", &NODE_TEST_SOURCE),
+    ("node_util.js", &NODE_UTIL_SOURCE),
+    ("node_events.js", &NODE_EVENTS_SOURCE),
+    ("node_os.js", &NODE_OS_SOURCE),
+    ("node_path.js", &NODE_PATH_SOURCE),
+    ("node_buffer.js", &NODE_BUFFER_SOURCE),
+    ("node_crypto.js", &NODE_CRYPTO_SOURCE),
+    ("node_async_hooks.js", &NODE_ASYNC_HOOKS_SOURCE),
+    (
+        "node_diagnostics_channel.js",
+        &NODE_DIAGNOSTICS_CHANNEL_SOURCE,
+    ),
+    ("node_stream.js", &NODE_STREAM_SOURCE),
+    (
+        "identity_transform_stream.js",
+        &IDENTITY_TRANSFORM_STREAM_SOURCE,
+    ),
+    ("compression_streams.js", &COMPRESSION_STREAMS_SOURCE),
+    ("byte_streams.js", &BYTE_STREAMS_SOURCE),
+    ("set_immediate.js", &SET_IMMEDIATE_SOURCE),
+    ("url_pattern.js", &URL_PATTERN_SOURCE),
+];
+
+#[cfg(all(test, celld_internal_tests))]
+pub(super) fn internal_sources_for_test<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Vec<(&'static str, v8::Local<'s, v8::String>)> {
+    let mut sources = Vec::with_capacity(INTERNAL_MODULE_SOURCES.len());
+    for &(name, source) in INTERNAL_MODULE_SOURCES {
+        sources.push((name, v8_strings::source(scope, source)));
+    }
+    sources
+}
+
 pub(super) fn compile_module<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
@@ -35,9 +109,8 @@ pub(super) fn compile_module<'s>(
     Some(compiled)
 }
 
-/// specifier -> pre-compiled stub module, consulted by `resolve_external`
-/// while V8 statically links a real worker bundle's imports, and by
-/// `dynamic_namespace` as its once-per-isolate cache.
+/// specifier -> pre-compiled module. Plain keys serve static resolution, and
+/// `dyn:` keys serve dynamic resolution and cache full-surface builtins.
 ///
 /// **An isolate slot, not a thread-local.** These are `Global<Module>`
 /// handles into *one* isolate's heap. Under D1 several isolates are built and
@@ -47,17 +120,104 @@ pub(super) fn compile_module<'s>(
 /// different isolate — not a wrong answer but an invalid one. The registry
 /// belongs to the isolate because its contents do.
 #[derive(Default)]
-pub(super) struct ModuleRegistry(
-    Mutex<HashMap<String, v8::Global<v8::Module>>>,
-    Mutex<HashMap<std::num::NonZeroI32, String>>,
-);
+pub(super) struct ModuleRegistry {
+    modules: Mutex<HashMap<String, v8::Global<v8::Module>>>,
+    /// Compiled-module identity hash -> the specifier it was compiled under.
+    /// A `no_bundle` deployment imports its own sibling chunks by relative
+    /// specifier, and the referrer is only known as a module object, so this
+    /// is what turns a referrer into a path the lookup can resolve from.
+    spec_by_identity: Mutex<HashMap<std::num::NonZeroI32, String>>,
+    /// The host-generated stubs: the only modules whose `celld:internals`
+    /// import resolves. A user module that names the specifier is refused
+    /// by [`resolve_external`], so the internals object stays out of reach
+    /// of every bundle and every loaded worker.
+    trusted: Mutex<Vec<v8::Global<v8::Module>>>,
+    internals: Mutex<Option<v8::Global<v8::Module>>>,
+}
 
 fn record_module_spec(scope: &mut v8::PinScope, module: v8::Local<v8::Module>, name: &str) {
     modreg(scope)
-        .1
+        .spec_by_identity
         .lock()
         .unwrap()
         .insert(module.get_identity_hash(), name.to_string());
+}
+
+impl ModuleRegistry {
+    /// Register `module` under every spec in `specs`. `trusted` admits it to
+    /// `celld:internals`, and is the only way in: every host-generated stub
+    /// registers here, and a user module never passes `true`.
+    fn register(
+        &self,
+        scope: &mut v8::PinScope,
+        specs: impl IntoIterator<Item = String>,
+        module: v8::Local<v8::Module>,
+        trusted: bool,
+    ) {
+        let global = v8::Global::new(scope, module);
+        if trusted {
+            self.trusted.lock().unwrap().push(global.clone());
+        }
+        let mut modules = self.modules.lock().unwrap();
+        for spec in specs {
+            modules.insert(spec, global.clone());
+        }
+    }
+
+    fn trusts(&self, scope: &mut v8::PinScope, module: v8::Local<v8::Module>) -> bool {
+        self.trusted
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|trusted| v8::Local::new(scope, trusted) == module)
+    }
+}
+
+/// The specifier the stubs import the internals object from. It is not a
+/// builtin: `is_external` does not know it, so a dynamic import() of it
+/// rejects, and a static import from a user module fails to link.
+const INTERNALS_SPECIFIER: &str = "celld:internals";
+
+/// One synthetic module per isolate whose default export is the internals
+/// object, built the first time a stub links.
+fn internals_module<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Module> {
+    let registry = modreg(scope);
+    let cached = registry
+        .internals
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|module| v8::Local::new(scope, module));
+    if let Some(module) = cached {
+        return module;
+    }
+    let name = v8::String::new(scope, INTERNALS_SPECIFIER).unwrap();
+    let default = v8::String::new(scope, "default").unwrap();
+    let module =
+        v8::Module::create_synthetic_module(scope, name, &[default], internals_evaluation_steps);
+    *registry.internals.lock().unwrap() = Some(v8::Global::new(scope, module));
+    module
+}
+
+fn internals_evaluation_steps<'s>(
+    context: v8::Local<'s, v8::Context>,
+    module: v8::Local<'s, v8::Module>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    v8::callback_scope!(unsafe scope, context);
+    let internals = internals(scope);
+    let default = v8::String::new(scope, "default").unwrap();
+    module.set_synthetic_module_export(scope, default, internals.into())?;
+    Some(v8::undefined(scope).into())
+}
+
+/// Compile a host-generated stub that imports `celld:internals` and register
+/// it under `spec` as a trusted referrer.
+fn register_internal_stub(scope: &mut v8::PinScope, spec: &str, source: &str) {
+    let Some(module) = compile_module(scope, spec, source) else {
+        tracing::warn!(%spec, "module stub failed to compile");
+        return;
+    };
+    modreg(scope).register(scope, [spec.to_string()], module, true);
 }
 
 fn modreg(scope: &mut v8::PinScope) -> Arc<ModuleRegistry> {
@@ -87,7 +247,10 @@ fn is_external(spec: &str) -> bool {
 /// cost once for the main module and once more for each sibling module of a
 /// Worker Loader bundle — on every isolate build.
 static IMPORT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r#"import\s+([^;]*?)\s*from\s*["']([^"']+)["']"#).unwrap()
+    // A minifier can join `import` to `{` or `*`, but a default binding must
+    // keep whitespace. Preserve that token boundary so an identifier that
+    // starts with `import` cannot look like an import statement.
+    regex::Regex::new(r#"\bimport(\s+[^;]*?|\s*[{*][^;]*?)\s*from\s*["']([^"']+)["']"#).unwrap()
 });
 static IMPORT_BRACES_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"\{([^}]*)\}").unwrap());
@@ -173,44 +336,45 @@ pub(super) fn scan_external_imports(src: &str) -> ExternalImports {
 /// A module Cells really implements in JS. Its source is injected into the
 /// generated stub module, and `register_stubs` only builds stubs for
 /// specifiers a bundle actually imports — so an isolate that never imports it
-/// pays nothing at load. `global` is what the source defines and doubles as
-/// the redefinition guard when a bundle imports several aliases.
+/// pays nothing at load. `global` is the internals property the source
+/// defines and doubles as the redefinition guard when a bundle imports
+/// several aliases.
 struct LazyModule {
     specs: &'static [&'static str],
     global: &'static str,
-    source: &'static str,
+    source: &'static v8::OneByteConst,
 }
 
 const LAZY_MODULES: &[LazyModule] = &[
     LazyModule {
         specs: &["assert", "node:assert"],
         global: "__assertModule",
-        source: include_str!("node_assert.js"),
+        source: &NODE_ASSERT_SOURCE,
     },
     LazyModule {
         specs: &["assert/strict", "node:assert/strict"],
         global: "__assertStrictModule",
-        source: include_str!("node_assert.js"),
+        source: &NODE_ASSERT_SOURCE,
     },
     LazyModule {
         specs: &["timers", "node:timers"],
         global: "__timersModule",
-        source: include_str!("node_timers_callback.js"),
+        source: &NODE_TIMERS_CALLBACK_SOURCE,
     },
     LazyModule {
         specs: &["timers/promises", "node:timers/promises"],
         global: "__timersPromises",
-        source: include_str!("node_timers.js"),
+        source: &NODE_TIMERS_SOURCE,
     },
     LazyModule {
         specs: &["test", "node:test", "node:test/reporters"],
         global: "__nodeTest",
-        source: include_str!("node_test.js"),
+        source: &NODE_TEST_SOURCE,
     },
     LazyModule {
         specs: &["util", "node:util"],
         global: "__utilModule",
-        source: include_str!("node_util.js"),
+        source: &NODE_UTIL_SOURCE,
     },
     // Same source, different namespace: node:util/types has the type
     // predicates as its named exports. The shared source defines both
@@ -218,33 +382,38 @@ const LAZY_MODULES: &[LazyModule] = &[
     LazyModule {
         specs: &["util/types", "node:util/types"],
         global: "__utilTypesModule",
-        source: include_str!("node_util.js"),
+        source: &NODE_UTIL_SOURCE,
     },
     LazyModule {
         specs: &["events", "node:events"],
         global: "__eventsModule",
-        source: include_str!("node_events.js"),
+        source: &NODE_EVENTS_SOURCE,
+    },
+    LazyModule {
+        specs: &["os", "node:os"],
+        global: "__osModule",
+        source: &NODE_OS_SOURCE,
     },
     LazyModule {
         specs: &["path", "node:path", "path/posix", "node:path/posix"],
         global: "__pathModule",
-        source: include_str!("node_path.js"),
+        source: &NODE_PATH_SOURCE,
     },
     // Same source; either entry's guard covers the other.
     LazyModule {
         specs: &["path/win32", "node:path/win32"],
         global: "__pathWin32Module",
-        source: include_str!("node_path.js"),
+        source: &NODE_PATH_SOURCE,
     },
     LazyModule {
         specs: &["url", "node:url"],
         global: "__urlModule",
-        source: include_str!("node_url.js"),
+        source: &NODE_URL_SOURCE,
     },
     LazyModule {
         specs: &["querystring", "node:querystring"],
         global: "__querystringModule",
-        source: include_str!("node_querystring.js"),
+        source: &NODE_QUERYSTRING_SOURCE,
     },
     // Shares its source with the `Buffer` LAZY_GLOBALS entry; the script
     // is self-guarded, so whichever seam runs first wins and the other
@@ -252,49 +421,54 @@ const LAZY_MODULES: &[LazyModule] = &[
     LazyModule {
         specs: &["buffer", "node:buffer"],
         global: "__buffer",
-        source: include_str!("node_buffer.js"),
+        source: &NODE_BUFFER_SOURCE,
     },
     LazyModule {
         specs: &["crypto", "node:crypto"],
         global: "__cryptoModule",
-        source: include_str!("node_crypto.js"),
+        source: &NODE_CRYPTO_SOURCE,
     },
     LazyModule {
         specs: &["async_hooks", "node:async_hooks"],
         global: "__asyncHooksModule",
-        source: include_str!("node_async_hooks.js"),
+        source: &NODE_ASYNC_HOOKS_SOURCE,
+    },
+    LazyModule {
+        specs: &["diagnostics_channel", "node:diagnostics_channel"],
+        global: "__diagnosticsChannelModule",
+        source: &NODE_DIAGNOSTICS_CHANNEL_SOURCE,
     },
     // One source defines the whole stream family; whichever entry runs
     // first, its guard covers the others.
     LazyModule {
         specs: &["stream", "node:stream"],
         global: "__streamModule",
-        source: include_str!("node_stream.js"),
+        source: &NODE_STREAM_SOURCE,
     },
     LazyModule {
         specs: &["stream/promises", "node:stream/promises"],
         global: "__streamPromises",
-        source: include_str!("node_stream.js"),
+        source: &NODE_STREAM_SOURCE,
     },
     LazyModule {
         specs: &["stream/web", "node:stream/web"],
         global: "__streamWeb",
-        source: include_str!("node_stream.js"),
+        source: &NODE_STREAM_SOURCE,
     },
     LazyModule {
         specs: &["stream/consumers", "node:stream/consumers"],
         global: "__streamConsumers",
-        source: include_str!("node_stream.js"),
+        source: &NODE_STREAM_SOURCE,
     },
     LazyModule {
         specs: &["http", "node:http"],
         global: "__httpModule",
-        source: include_str!("node_http.js"),
+        source: &NODE_HTTP_SOURCE,
     },
     LazyModule {
         specs: &["https", "node:https"],
         global: "__httpsModule",
-        source: include_str!("node_http.js"),
+        source: &NODE_HTTP_SOURCE,
     },
 ];
 
@@ -305,17 +479,17 @@ const LAZY_MODULES: &[LazyModule] = &[
 /// see it.
 struct LazyGlobal {
     names: &'static [&'static str],
-    source: &'static str,
+    source: &'static v8::OneByteConst,
 }
 
 const LAZY_GLOBALS: &[LazyGlobal] = &[
     LazyGlobal {
         names: &["IdentityTransformStream", "FixedLengthStream"],
-        source: include_str!("identity_transform_stream.js"),
+        source: &IDENTITY_TRANSFORM_STREAM_SOURCE,
     },
     LazyGlobal {
         names: &["CompressionStream", "DecompressionStream"],
-        source: include_str!("compression_streams.js"),
+        source: &COMPRESSION_STREAMS_SOURCE,
     },
     LazyGlobal {
         names: &[
@@ -323,19 +497,19 @@ const LAZY_GLOBALS: &[LazyGlobal] = &[
             "ReadableStreamBYOBReader",
             "ReadableStreamBYOBRequest",
         ],
-        source: include_str!("byte_streams.js"),
+        source: &BYTE_STREAMS_SOURCE,
     },
     LazyGlobal {
         names: &["Buffer"],
-        source: include_str!("node_buffer.js"),
+        source: &NODE_BUFFER_SOURCE,
     },
     LazyGlobal {
         names: &["setImmediate", "clearImmediate"],
-        source: include_str!("set_immediate.js"),
+        source: &SET_IMMEDIATE_SOURCE,
     },
     LazyGlobal {
         names: &["URLPattern"],
-        source: include_str!("url_pattern.js"),
+        source: &URL_PATTERN_SOURCE,
     },
 ];
 
@@ -350,9 +524,9 @@ fn lazy_global_getter(
 ) {
     let index = args.data().integer_value(scope).unwrap();
     let group = &LAZY_GLOBALS[index as usize];
-    let code = v8::String::new(scope, group.source).unwrap();
-    let script = v8::Script::compile(scope, code, None).unwrap();
-    let exports = script.run(scope).unwrap();
+    let code = v8_strings::source(scope, group.source);
+    let arguments = internal_arguments(scope);
+    let exports = super::bootstrap::run_internal_script(scope, None, code, &arguments).unwrap();
     let exports: v8::Local<v8::Object> = exports.try_into().unwrap();
     // The group's other names are still lazy; define them now or reading one
     // would compile the same script again. Not this one — V8 asserts the
@@ -392,17 +566,58 @@ pub(super) fn install_lazy_globals(scope: &mut v8::PinScope) -> Result<()> {
 /// Globals already installed by the src/js/harness for partially supported
 /// builtins. These cost every isolate, so new modules belong in
 /// `LAZY_MODULES` instead.
+///
+/// Each value is the whole expression the stub binds from, not a name to
+/// prefix: `process` is the real global the harness installs, while the
+/// others live on the internals object the generated stubs already import.
 fn eager_module_global(spec: &str) -> Option<&'static str> {
     Some(match spec {
         "process" | "node:process" => "globalThis.process",
-        "fs" | "node:fs" | "fs/promises" | "node:fs/promises" => "globalThis.__fs",
-        "zlib" | "node:zlib" => "globalThis.__zlibModule",
+        // `fs` and `fs/promises` are separate surfaces on the harness, so a
+        // stub for one must not hand back the other's object.
+        "fs" | "node:fs" => "__celld.__fs",
+        "fs/promises" | "node:fs/promises" => "__celld.__fsPromises",
+        "zlib" | "node:zlib" => "__celld.__zlibModule",
         _ => return None,
     })
 }
 
+/// Materialize an imported builtin from its external source before its small
+/// ES module wrapper links. The old wrapper concatenated the full setup text,
+/// which turned a shared static source back into one owned string per isolate.
+fn install_lazy_module(scope: &mut v8::PinScope, spec: &str) -> Option<&'static LazyModule> {
+    let module = LAZY_MODULES
+        .iter()
+        .find(|module| module.specs.contains(&spec))?;
+    if internal_value(scope, module.global).is_some() {
+        return Some(module);
+    }
+    let code = v8_strings::source(scope, module.source);
+    let arguments = internal_arguments(scope);
+    super::bootstrap::run_internal_script(scope, None, code, &arguments).ok()?;
+    // The shims this fork vendors for OpenNext and Nitro publish themselves on
+    // `globalThis` (see `node_url.js`, `node_querystring.js`,
+    // `node_timers_callback.js`), because a bundle also reaches them through
+    // the global. A stub binds from the internals object, so mirror the global
+    // once: both spellings then name the same module, and the presence check
+    // above sees it on the next call.
+    if internal_value(scope, module.global).is_none() {
+        let name = v8::String::new(scope, module.global).unwrap();
+        let global = scope
+            .get_current_context()
+            .global(scope)
+            .get(scope, name.into());
+        if let Some(value) = global.filter(|value| !value.is_undefined()) {
+            let key = v8::String::new(scope, module.global).unwrap();
+            internals(scope).set(scope, key.into(), value);
+        }
+    }
+    Some(module)
+}
+
 fn stub_source(spec: &str, names: &std::collections::BTreeSet<String>) -> String {
     let cf = spec == "cloudflare:workers";
+    let cf_sockets = spec == "cloudflare:sockets";
     // `cloudflare:workflows` is real, not a pass-through proxy: its one
     // export is `NonRetryableError`, and a proxy standing in for an Error
     // subclass would make `throw new NonRetryableError(...)` throw a value
@@ -411,59 +626,52 @@ fn stub_source(spec: &str, names: &std::collections::BTreeSet<String>) -> String
     let lazy = LAZY_MODULES.iter().find(|m| m.specs.contains(&spec));
     let eager = eager_module_global(spec);
     let base = if cf {
-        "globalThis.__cf".to_string()
+        "__celld.__cf".to_string()
+    } else if cf_sockets {
+        "__celld.__cfSockets".to_string()
     } else if cf_workflows {
-        "globalThis.__cfWorkflows".to_string()
+        "__celld.__cfWorkflows".to_string()
     } else if let Some(m) = lazy {
-        format!("globalThis.{}", m.global)
+        format!("__celld.{}", m.global)
     } else if let Some(global) = eager {
         global.to_string()
     } else {
-        "globalThis.__nodeStub".to_string()
+        // Unsupported: a path-carrying stub whose property walks stay
+        // inert but whose calls throw, so first use fails loudly with the
+        // specifier in the message instead of silently passing through.
+        format!(
+            "__celld.__nodeStubFor({})",
+            serde_json::to_string(spec).unwrap()
+        )
     };
-    let real = cf || cf_workflows || lazy.is_some() || eager.is_some();
-    let mut out = String::new();
-    if let Some(m) = lazy {
-        out.push_str(&format!("if (!globalThis.{}) {{\n", m.global));
-        out.push_str(m.source);
-        out.push_str("}\n");
-    }
+    let mut out = internals_import();
     for n in names {
         if n == "*" {
             continue; // namespace imports take the full-surface path
         } else if n == "default" {
             out.push_str(&format!("export default {base};\n"));
-        } else if cf
-            && matches!(
-                n.as_str(),
-                "DurableObject" | "RpcTarget" | "WorkerEntrypoint" | "env" | "exports"
-            )
-        {
-            out.push_str(&format!("export const {n} = globalThis.__cf.{n};\n"));
-        } else if real {
-            out.push_str(&format!("export const {n} = {base}.{n};\n"));
         } else {
-            out.push_str(&format!("export const {n} = globalThis.__nodeStub;\n"));
+            out.push_str(&format!("export const {n} = {base}.{n};\n"));
         }
     }
     out
+}
+
+/// The first line of every host-generated stub.
+fn internals_import() -> String {
+    format!("import __celld from {INTERNALS_SPECIFIER:?};\n")
 }
 
 /// Compile one stub module per external specifier into the isolate's module
 /// registry. Run before
 /// instantiating a real bundle; `resolve_external` then serves them.
 pub(super) fn register_stubs(scope: &mut v8::PinScope, config: &WorkerConfig) {
-    modreg(scope).0.lock().unwrap().clear();
-    modreg(scope).1.lock().unwrap().clear();
-    let reg = |spec: String, source: String, scope: &mut v8::PinScope| {
-        if let Some(m) = compile_module(scope, &spec, &source) {
-            let g = v8::Global::new(scope, m);
-            modreg(scope).0.lock().unwrap().insert(spec, g);
-        } else {
-            tracing::warn!(%spec, "module stub failed to compile");
-        }
-    };
+    let registry = modreg(scope);
+    registry.modules.lock().unwrap().clear();
+    registry.spec_by_identity.lock().unwrap().clear();
+    registry.trusted.lock().unwrap().clear();
     for (spec, names) in &config.main_imports {
+        install_lazy_module(scope, spec);
         // `import * as x` binds the whole namespace, so the stub's exports
         // must be the module's full surface — probed from the backing
         // object, like dynamic import() — not just the scanned names.
@@ -472,7 +680,7 @@ pub(super) fn register_stubs(scope: &mut v8::PinScope, config: &WorkerConfig) {
         } else {
             stub_source(spec, names)
         };
-        reg(spec.clone(), s, scope);
+        register_internal_stub(scope, spec, &s);
     }
     // sibling text modules (wrangler Text rule: `import md from './x.md'`)
     for (spec, source) in &config.modules {
@@ -483,10 +691,13 @@ pub(super) fn register_stubs(scope: &mut v8::PinScope, config: &WorkerConfig) {
             "export default {};",
             serde_json::to_string(content).unwrap()
         );
-        reg(spec.clone(), s, scope);
+        match compile_module(scope, spec, &s) {
+            Some(m) => modreg(scope).register(scope, [spec.clone()], m, false),
+            None => tracing::warn!(%spec, "text module failed to compile"),
+        }
     }
     tracing::debug!(
-        mods = modreg(scope).0.lock().unwrap().len(),
+        mods = modreg(scope).modules.lock().unwrap().len(),
         "registered import stubs + text modules"
     );
 }
@@ -494,16 +705,17 @@ pub(super) fn register_stubs(scope: &mut v8::PinScope, config: &WorkerConfig) {
 /// Compile `source` and insert it into the isolate's module registry under
 /// both `name` and `./name`, so bare and relative sibling imports resolve to
 /// one module.
-fn register_sibling_module(scope: &mut v8::PinScope, name: &str, source: &str) {
+fn register_sibling_module(scope: &mut v8::PinScope, name: &str, source: &str, trusted: bool) {
     let Some(m) = compile_module(scope, name, source) else {
         tracing::warn!(%name, "sibling module failed to compile");
         return;
     };
-    let g = v8::Global::new(scope, m);
-    let registry = modreg(scope);
-    let mut reg = registry.0.lock().unwrap();
-    reg.insert(name.to_string(), g.clone());
-    reg.insert(format!("./{name}"), g);
+    // The dynamic key makes the same module available to import() without
+    // making a narrow static builtin stub look like a full namespace.
+    let specs = [name.to_string(), format!("./{name}")]
+        .into_iter()
+        .flat_map(|spec| [format!("dyn:{spec}"), spec]);
+    modreg(scope).register(scope, specs, m, trusted);
 }
 
 /// Compiled-wasm modules shared process-wide: the first isolate to see a blob
@@ -579,7 +791,7 @@ fn compile_wasm<'s>(
 /// whose default export is the compiled `WebAssembly.Module` — the shape
 /// workerd gives a `CompiledWasm` module import, which is what
 /// wasm-bindgen/workers-rs bundles expect from `import x from "./x.wasm"`.
-/// Each stub reads its compiled module from `globalThis.__wasmModules`, and
+/// Each stub reads its compiled module from `__celld.__wasmModules`, and
 /// its one-time evaluation consumes that entry.
 pub(super) fn register_wasm_modules(scope: &mut v8::PinScope, modules: &[(String, ModuleSource)]) {
     static COMPILED: OnceLock<Mutex<CompiledWasmCache>> = OnceLock::new();
@@ -591,18 +803,10 @@ pub(super) fn register_wasm_modules(scope: &mut v8::PinScope, modules: &[(String
     let cache = COMPILED.get_or_init(Default::default);
     for (name, bytes) in wasm {
         let table = *table.get_or_insert_with(|| {
-            // Non-enumerable, like every host-injected global (see the
-            // `ops!` macro): a bundle walking `globalThis` must not find
-            // runtime internals.
-            let global = scope.get_current_context().global(scope);
+            let internals = internals(scope);
             let table = v8::Object::new(scope);
             let table_key = v8::String::new(scope, "__wasmModules").unwrap();
-            global.define_own_property(
-                scope,
-                table_key.into(),
-                table.into(),
-                v8::PropertyAttribute::DONT_ENUM,
-            );
+            internals.set(scope, table_key.into(), table.into());
             table
         });
         use sha2::Digest;
@@ -625,11 +829,13 @@ pub(super) fn register_wasm_modules(scope: &mut v8::PinScope, modules: &[(String
             Ok(module) => {
                 let key = v8::String::new(scope, name).unwrap();
                 table.set(scope, key.into(), module.into());
-                format!(
-                    "const m = globalThis.__wasmModules[{quoted}];\n\
-                     delete globalThis.__wasmModules[{quoted}];\n\
+                let mut source = internals_import();
+                source.push_str(&format!(
+                    "const m = __celld.__wasmModules[{quoted}];\n\
+                     delete __celld.__wasmModules[{quoted}];\n\
                      export default m;"
-                )
+                ));
+                source
             }
             // The importing module reports the failure, matching the eager
             // `new WebAssembly.Module(bytes)` stub this replaces.
@@ -640,7 +846,7 @@ pub(super) fn register_wasm_modules(scope: &mut v8::PinScope, modules: &[(String
                 format!("throw new WebAssembly.CompileError({message});")
             }
         };
-        register_sibling_module(scope, name, &source);
+        register_sibling_module(scope, name, &source, true);
     }
 }
 
@@ -682,7 +888,7 @@ pub(super) fn register_binary_modules(
         let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
         let key = v8::String::new(scope, name).unwrap();
         table.set(scope, key.into(), buffer.into());
-        register_sibling_module(scope, name, &binary_module_eval_source(name));
+        register_sibling_module(scope, name, &binary_module_eval_source(name), false);
     }
 }
 
@@ -695,22 +901,20 @@ pub(super) fn register_binary_modules(
 pub(super) fn register_loader_modules(scope: &mut v8::PinScope, config: &WorkerConfig) {
     for (_name, _source, imports) in config.es_modules() {
         for (spec, names) in imports {
-            if modreg(scope).0.lock().unwrap().contains_key(spec) {
+            if modreg(scope).modules.lock().unwrap().contains_key(spec) {
                 continue;
             }
+            install_lazy_module(scope, spec);
             let s = if names.contains("*") {
                 full_surface_source(scope, spec, names).unwrap_or_else(|| stub_source(spec, names))
             } else {
                 stub_source(spec, names)
             };
-            if let Some(m) = compile_module(scope, spec, &s) {
-                let g = v8::Global::new(scope, m);
-                modreg(scope).0.lock().unwrap().insert(spec.clone(), g);
-            }
+            register_internal_stub(scope, spec, &s);
         }
     }
     for (name, source, _imports) in config.es_modules() {
-        register_sibling_module(scope, name, source);
+        register_sibling_module(scope, name, source, false);
     }
 }
 
@@ -722,7 +926,7 @@ fn ensure_external_stub(scope: &mut v8::PinScope, spec: &str) {
     }
     let registry = modreg(scope);
     {
-        let reg = registry.0.lock().unwrap();
+        let reg = registry.modules.lock().unwrap();
         if reg.contains_key(spec) {
             return;
         }
@@ -731,8 +935,7 @@ fn ensure_external_stub(scope: &mut v8::PinScope, spec: &str) {
     names.insert("*".into());
     let s = full_surface_source(scope, spec, &names).unwrap_or_else(|| stub_source(spec, &names));
     if let Some(m) = compile_module(scope, spec, &s) {
-        let g = v8::Global::new(scope, m);
-        registry.0.lock().unwrap().insert(spec.to_string(), g);
+        registry.register(scope, [spec.to_string()], m, true);
     } else {
         tracing::warn!(%spec, "on-demand external stub failed to compile");
     }
@@ -807,18 +1010,34 @@ pub(super) fn resolve_external<'s>(
     let spec = specifier.to_rust_string_lossy(scope);
     let registry = modreg(scope);
     let referrer_spec = registry
-        .1
+        .spec_by_identity
         .lock()
         .unwrap()
         .get(&referrer.get_identity_hash())
         .cloned()
         .unwrap_or_default();
+    if spec == INTERNALS_SPECIFIER {
+        if registry.trusts(scope, referrer) {
+            return Some(internals_module(scope));
+        }
+        // A user module named the stubs' private specifier. Refuse with a
+        // message: the bare miss below reports no exception, and a link
+        // error that says nothing sends the author looking for a typo.
+        let message = v8::String::new(scope, "celld:internals is not importable").unwrap();
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+        return None;
+    }
+    // A `no_bundle` deployment arrives as sibling files that import each other
+    // by relative specifier, and a chunk may name a builtin the entry never
+    // listed. Both are resolved from the referrer's own specifier, so a link
+    // cannot escape into another script's registry.
     for candidate in module_lookup_candidates(&referrer_spec, &spec) {
-        if !registry.0.lock().unwrap().contains_key(&candidate) && is_external(&candidate) {
+        if !registry.modules.lock().unwrap().contains_key(&candidate) && is_external(&candidate) {
             ensure_external_stub(scope, &candidate);
         }
         if let Some(m) = registry
-            .0
+            .modules
             .lock()
             .unwrap()
             .get(&candidate)
@@ -827,32 +1046,42 @@ pub(super) fn resolve_external<'s>(
             return Some(m);
         }
     }
-    if is_external(&spec) {
+    let m = registry
+        .modules
+        .lock()
+        .unwrap()
+        .get(&spec)
+        .map(|module| v8::Local::new(scope, module));
+    if m.is_none() {
         tracing::warn!(%spec, "resolve: no stub for specifier");
     }
-    None
+    m
 }
 
-/// The (guarded setup script, backing-object expression) pair for a builtin
-/// specifier, or None if `spec` is not one. The setup materializes a lazy
-/// module's source at most once; the expression then names its global.
-fn builtin_source(spec: &str) -> Option<(String, String)> {
+/// The backing-object expression for a builtin specifier, or `None` if `spec`
+/// is not one. A lazy module is materialized from its external source first.
+fn builtin_source(scope: &mut v8::PinScope, spec: &str) -> Option<String> {
     if spec == "cloudflare:workers" {
-        return Some((String::new(), "globalThis.__cf".into()));
+        return Some("__celld.__cf".into());
+    }
+    if spec == "cloudflare:sockets" {
+        return Some("__celld.__cfSockets".into());
     }
     if spec == "cloudflare:workflows" {
-        return Some((String::new(), "globalThis.__cfWorkflows".into()));
+        return Some("__celld.__cfWorkflows".into());
     }
-    if let Some(m) = LAZY_MODULES.iter().find(|m| m.specs.contains(&spec)) {
-        return Some((
-            format!("if (!globalThis.{}) {{\n{}}}\n", m.global, m.source),
-            format!("globalThis.{}", m.global),
-        ));
+    if let Some(module) = install_lazy_module(scope, spec) {
+        return Some(format!("__celld.{}", module.global));
     }
     if let Some(global) = eager_module_global(spec) {
-        return Some((String::new(), global.to_string()));
+        return Some(global.to_string());
     }
-    is_external(spec).then(|| (String::new(), "globalThis.__nodeStub".to_string()))
+    is_external(spec).then(|| {
+        format!(
+            "__celld.__nodeStubFor({})",
+            serde_json::to_string(spec).unwrap()
+        )
+    })
 }
 
 /// Full-surface module source for a builtin: run the (guarded) setup, probe
@@ -865,18 +1094,17 @@ fn full_surface_source(
     spec: &str,
     extra: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
-    let (setup, expr) = builtin_source(spec)?;
-    let probe = format!("{setup}JSON.stringify(Object.keys(Object({expr})))");
-    let code = v8::String::new(scope, &probe)?;
-    let script = v8::Script::compile(scope, code, None)?;
-    let keys = script.run(scope)?.to_rust_string_lossy(scope);
+    let expr = builtin_source(scope, spec)?;
+    let probe = format!("return JSON.stringify(Object.keys(Object({expr})));");
+    let keys = run_internal_snippet(scope, &probe)?.to_rust_string_lossy(scope);
     let mut names: Vec<String> = serde_json::from_str(&keys).unwrap_or_default();
     for name in extra {
         if name != "*" && !names.contains(name) {
             names.push(name.clone());
         }
     }
-    let mut src = format!("const __b = {expr};\nexport default __b;\n");
+    let mut src = internals_import();
+    src.push_str(&format!("const __b = {expr};\nexport default __b;\n"));
     for (i, name) in names.iter().enumerate() {
         if name == "default" {
             continue;
@@ -900,55 +1128,46 @@ pub(super) fn op_builtin_module(
     if spec.starts_with("cloudflare:") {
         return; // not a node builtin
     }
-    let Some((setup, expr)) = builtin_source(&spec) else {
+    let Some(expr) = builtin_source(scope, &spec) else {
         return;
     };
-    let code = v8::String::new(scope, &format!("{setup}{expr}")).unwrap();
-    if let Some(script) = v8::Script::compile(scope, code, None) {
-        if let Some(value) = script.run(scope) {
-            rv.set(value);
-        }
+    if let Some(value) = run_internal_snippet(scope, &format!("return {expr};")) {
+        rv.set(value);
     }
 }
 
-/// Evaluate (once per isolate) a full-namespace module for a builtin
-/// specifier. Unlike the static stubs, whose exports are the statically
-/// scanned import names, this re-exports every enumerable key of the
-/// backing object — a dynamic import's consumer can reach for any of them.
-/// Cached in the isolate's module registry under a `dyn:` key so later
-/// import() calls are a
-/// table lookup.
-fn dynamic_namespace<'s>(
+/// Return a registered sibling, or compile a full-namespace builtin once per
+/// isolate. A `dyn:` key distinguishes both from a narrow static builtin stub.
+fn dynamic_module<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     spec: &str,
-) -> Result<v8::Local<'s, v8::Value>> {
+) -> Result<v8::Local<'s, v8::Module>> {
     let key = format!("dyn:{spec}");
     let registry = modreg(scope);
     let cached = registry
-        .0
+        .modules
         .lock()
         .unwrap()
         .get(&key)
-        .map(|g| v8::Local::new(scope, g));
-    if let Some(module) = cached {
-        return Ok(module.get_module_namespace());
+        .map(|module| v8::Local::new(scope, module));
+    let module = match cached {
+        Some(module) => module,
+        None => {
+            let src = full_surface_source(scope, spec, &Default::default())
+                .ok_or_else(|| anyhow!("dynamic import of \"{spec}\" is not supported"))?;
+            let module = compile_module(scope, spec, &src)
+                .ok_or_else(|| anyhow!("dynamic module for {spec} did not compile"))?;
+            modreg(scope).register(scope, [key], module, true);
+            module
+        }
+    };
+    if module.get_status() == v8::ModuleStatus::Uninstantiated {
+        module
+            .instantiate_module(scope, resolve_external)
+            .filter(|linked| *linked)
+            .ok_or_else(|| anyhow!("dynamic module for {spec} did not link"))?;
     }
-    let src = full_surface_source(scope, spec, &Default::default())
-        .ok_or_else(|| anyhow!("dynamic import of \"{spec}\" is not supported"))?;
-    let module = compile_module(scope, spec, &src)
-        .ok_or_else(|| anyhow!("dynamic module for {spec} did not compile"))?;
-    module
-        .instantiate_module(scope, resolve_external)
-        .ok_or_else(|| anyhow!("dynamic module for {spec} did not link"))?;
-    module
-        .evaluate(scope)
-        .ok_or_else(|| anyhow!("dynamic module for {spec} threw"))?;
-    if module.get_status() != v8::ModuleStatus::Evaluated {
-        return Err(anyhow!("dynamic module for {spec} failed to evaluate"));
-    }
-    let g = v8::Global::new(scope, module);
-    modreg(scope).0.lock().unwrap().insert(key, g);
-    Ok(module.get_module_namespace())
+    Ok(module)
 }
 
 fn referrer_module_name(scope: &mut v8::PinScope, resource: v8::Local<v8::Value>) -> String {
@@ -965,30 +1184,13 @@ fn load_sibling_dynamic<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     spec: &str,
     referrer: &str,
-) -> Result<v8::Local<'s, v8::Value>> {
+) -> Result<v8::Local<'s, v8::Module>> {
     let registry = modreg(scope);
     for candidate in module_lookup_candidates(referrer, spec) {
-        let Some(global) = registry.0.lock().unwrap().get(&candidate).cloned() else {
+        let Some(global) = registry.modules.lock().unwrap().get(&candidate).cloned() else {
             continue;
         };
-        let module = v8::Local::new(scope, global);
-        if module.get_status() == v8::ModuleStatus::Uninstantiated {
-            module
-                .instantiate_module(scope, resolve_external)
-                .ok_or_else(|| anyhow!("instantiate sibling module {candidate}"))?;
-        }
-        if module.get_status() == v8::ModuleStatus::Instantiated {
-            module
-                .evaluate(scope)
-                .ok_or_else(|| anyhow!("evaluate sibling module {candidate}"))?;
-        }
-        if module.get_status() == v8::ModuleStatus::Evaluated {
-            return Ok(module.get_module_namespace());
-        }
-        return Err(anyhow!(
-            "sibling module {candidate} failed to evaluate (status {:?})",
-            module.get_status()
-        ));
+        return Ok(v8::Local::new(scope, global));
     }
     Err(anyhow!("dynamic import of \"{spec}\" is not supported"))
 }
@@ -996,6 +1198,58 @@ fn load_sibling_dynamic<'s>(
 /// Dynamic `import()` host hook. Builtin specifiers resolve through the same
 /// table static imports use; relative/bare specifiers resolve to sibling modules
 /// registered for `no_bundle` multi-chunk workers.
+fn return_callback_data(
+    _scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    rv.set(args.data());
+}
+
+/// Evaluate a dynamic module and translate V8's evaluation promise into the
+/// namespace promise that import() requires. The chain preserves a top-level
+/// await delay and forwards its rejection.
+fn evaluate_dynamic_module<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    spec: &str,
+) -> Result<v8::Local<'s, v8::Promise>> {
+    let module = dynamic_module(scope, spec)?;
+    evaluate_module(scope, module, spec)
+}
+
+/// Link `module` if it is not linked yet, evaluate it, and answer the import()
+/// promise. A registered sibling arrives unlinked, because only the referring
+/// module's own linking pass would have linked it otherwise.
+fn evaluate_module<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    module: v8::Local<'s, v8::Module>,
+    spec: &str,
+) -> Result<v8::Local<'s, v8::Promise>> {
+    if module.get_status() == v8::ModuleStatus::Uninstantiated
+        && !module
+            .instantiate_module(scope, resolve_external)
+            .is_some_and(|linked| linked)
+    {
+        return Err(anyhow!("dynamic module for {spec} did not link"));
+    }
+    let evaluated = module
+        .evaluate(scope)
+        .ok_or_else(|| anyhow!("dynamic module for {spec} threw"))?
+        .try_cast::<v8::Promise>()
+        .map_err(|_| anyhow!("dynamic module for {spec} returned no promise"))?;
+    let namespace = module.get_module_namespace();
+    let return_namespace = v8::Function::builder(return_callback_data)
+        .data(namespace)
+        .build(scope)
+        .ok_or_else(|| anyhow!("dynamic module for {spec} created no namespace callback"))?;
+    evaluated
+        .then(scope, return_namespace)
+        .ok_or_else(|| anyhow!("dynamic module for {spec} created no namespace promise"))
+}
+
+/// Dynamic `import()` host hook. A loaded Worker's registered siblings resolve
+/// before builtins, so the lookup cannot escape into another Worker registry.
+/// Anything absent from both sources rejects.
 pub(super) fn host_import_module_dynamically<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     _host_defined_options: v8::Local<'s, v8::Data>,
@@ -1010,14 +1264,17 @@ pub(super) fn host_import_module_dynamically<'s>(
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let tc = &mut tc.init();
     let result = if is_external(&spec) {
-        dynamic_namespace(tc, &spec)
+        // A builtin: the full namespace is compiled on demand and evaluated
+        // through the promise chain import() requires.
+        evaluate_dynamic_module(tc, &spec)
     } else {
+        // A `no_bundle` sibling is already compiled and registered under its
+        // own specifier, so it only has to be linked and evaluated.
         load_sibling_dynamic(tc, &spec, &referrer)
+            .and_then(|module| evaluate_module(tc, module, &spec))
     };
     match result {
-        Ok(namespace) => {
-            resolver.resolve(tc, namespace);
-        }
+        Ok(import) => return Some(import),
         Err(error) => {
             let caught = tc.exception();
             tc.reset();
@@ -1134,10 +1391,13 @@ export const ok = 1;
     }
 
     #[test]
-    fn builtin_source_node_process_uses_real_process() {
-        let (setup, expr) = super::builtin_source("node:process").unwrap();
-        assert!(setup.is_empty());
+    fn eager_module_global_node_process_uses_real_process() {
+        let expr = super::eager_module_global("node:process").unwrap();
         assert_eq!(expr, "globalThis.process");
+        let fs = super::eager_module_global("node:fs").unwrap();
+        assert_eq!(fs, "__celld.__fs");
+        let promises = super::eager_module_global("node:fs/promises").unwrap();
+        assert_eq!(promises, "__celld.__fsPromises");
     }
 
     #[test]
@@ -1175,10 +1435,14 @@ export const ok = 1;
         let mut names = std::collections::BTreeSet::new();
         names.insert("setImmediate".into());
         let src = super::stub_source("node:timers", &names);
+        // The stub binds from the internals object, and `install_lazy_module`
+        // mirrors the shim's own `globalThis.__timersModule` onto it. The
+        // isolate test in `lib.rs` proves that path against a real context.
         assert_eq!(
-            src.matches("export const setImmediate = globalThis.__timersModule.setImmediate;")
+            src.matches("export const setImmediate = __celld.__timersModule.setImmediate;")
                 .count(),
-            1
+            1,
+            "{src}"
         );
     }
 
@@ -1204,13 +1468,13 @@ import { parse, fileURLToPath } from "node:url";"#;
             names.insert("pathToFileURL".into());
             names.insert("fileURLToPath".into());
             let src = super::stub_source(spec, &names);
-            assert!(src.contains("globalThis.__urlModule"), "{spec}: {src}");
-            assert!(!src.contains("= globalThis.__nodeStub"), "{spec}: {src}");
-            assert!(src.contains("export default globalThis.__urlModule;"));
+            assert!(src.contains("__celld.__urlModule"), "{spec}: {src}");
+            assert!(!src.contains("__nodeStubFor"), "{spec}: {src}");
+            assert!(src.contains("export default __celld.__urlModule;"));
             for name in ["parse", "format", "pathToFileURL", "fileURLToPath"] {
                 assert!(
                     src.contains(&format!(
-                        "export const {name} = globalThis.__urlModule.{name};"
+                        "export const {name} = __celld.__urlModule.{name};"
                     )),
                     "{spec} must export {name}: {src}"
                 );

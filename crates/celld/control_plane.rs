@@ -35,26 +35,8 @@ const MAX_EXPLORER_RESPONSE_BYTES: usize = 96 * 1024;
 const MAX_MANAGED_MODULES: usize = 64;
 const MAX_MANAGED_MODULE_BYTES: usize = 25 * 1024 * 1024;
 
-/// Whether a managed deployment still replaces the process image, as it did
-/// before nodes adopted deployments in place. Off by default: the exec cut
-/// in-flight requests and cold-restored every resident cell. Kept for one
-/// release as an escape hatch, then removed.
-fn restart_on_deployment_enabled() -> bool {
-    crate::env_vars::flag("CELLD_CLOUD_RESTART_ON_DEPLOY", false)
-        .expect("validated CELLD_CLOUD_RESTART_ON_DEPLOY")
-}
-
-/// React to a deployment the control plane says is current: nudge the
-/// pointer watcher, or under the escape hatch replace the process image.
-fn adopt_or_restart(reload: &crate::generation::ReloadSender) {
-    if restart_on_deployment_enabled() {
-        restart_for_deployment();
-    }
-    crate::generation::nudge(reload);
-}
-
 #[cfg(unix)]
-fn restart_process(trigger: &'static str) -> ! {
+fn restart_with_rotated_credentials() -> ! {
     use std::os::unix::process::CommandExt;
     use std::process::Command;
 
@@ -63,7 +45,7 @@ fn restart_process(trigger: &'static str) -> ! {
         Err(error) => {
             warn!(
                 event = "control_plane_restart_exec_failed",
-                trigger,
+                trigger = "credential_rotation",
                 %error,
                 "could not locate celld for process reload; exiting for an external supervisor"
             );
@@ -75,7 +57,7 @@ fn restart_process(trigger: &'static str) -> ! {
         Err(error) => {
             warn!(
                 event = "control_plane_restart_exec_failed",
-                trigger,
+                trigger = "credential_rotation",
                 %error,
                 "could not preserve process probe identity; exiting for an external supervisor"
             );
@@ -92,7 +74,7 @@ fn restart_process(trigger: &'static str) -> ! {
     let error = command.exec();
     warn!(
         event = "control_plane_restart_exec_failed",
-        trigger,
+        trigger = "credential_rotation",
         %error,
         "could not re-exec celld for process reload; exiting for an external supervisor"
     );
@@ -100,12 +82,8 @@ fn restart_process(trigger: &'static str) -> ! {
 }
 
 #[cfg(not(unix))]
-fn restart_process(_trigger: &'static str) -> ! {
+fn restart_with_rotated_credentials() -> ! {
     std::process::exit(75);
-}
-
-fn restart_for_deployment() -> ! {
-    restart_process("deployment")
 }
 
 static REEXEC_NODE_SESSION_ID: OnceLock<String> = OnceLock::new();
@@ -122,8 +100,8 @@ pub enum ManagedRuntimeState {
     ControlPlaneUnavailable,
     BucketUnavailable,
     CredentialRevoked,
-    /// The bucket answers, and the credential works, but the store does
-    /// not enforce the conditional write celld fences with. Distinct from
+    /// The bucket answers, and the credential works, but the store does not
+    /// support a required conditional write or ranged read. Distinct from
     /// `BucketUnavailable`, which a retry can clear: this one never does.
     StorageContractViolated,
 }
@@ -174,14 +152,13 @@ pub fn report_managed_runtime_state(state: ManagedRuntimeState) {
             "managed storage credential was rejected; restart celld to fetch a \
              fresh one, or run `celld credentials refresh` if a rotation is pending"
         ),
-        // No remedy on this node: the store itself cannot fence, so a
-        // restart repeats the refusal. Name the two exits an operator has.
+        // No remedy on this node: the store lacks a required operation, so a
+        // restart repeats the refusal. The operator needs a compatible store.
         ManagedRuntimeState::StorageContractViolated => warn!(
             event = "managed_runtime_state",
             managed_state,
-            "the fleet bucket does not enforce the conditional write celld fences \
-             with, so serving cannot start; move the fleet to a store that does, \
-             or set CELLD_STORAGE_PROBE=0 to start without this test"
+            "the fleet bucket does not support a storage operation celld requires, \
+             so serving cannot start; move the fleet to a compatible store"
         ),
     }
 }
@@ -853,7 +830,7 @@ fn restart_for_credential_rotation(previous_version: u64, credential_version: u6
         credential_version,
         "managed credential changed; restarting celld to rebuild every credentialed adapter"
     );
-    restart_process("credential_rotation")
+    restart_with_rotated_credentials()
 }
 
 /// Watch the durable installation record for the lifetime of the advisory
@@ -940,8 +917,6 @@ async fn presence_session(
         crate::env_vars::with_default("CELLD_PRESENCE_HEARTBEAT_MS", 30_000)
             .expect("validated CELLD_PRESENCE_HEARTBEAT_MS"),
     );
-    let shadow_presence = crate::env_vars::flag("CELLD_PRESENCE_SHADOW", false)
-        .expect("validated CELLD_PRESENCE_SHADOW");
     pump_presence(
         socket,
         heartbeat_period,
@@ -949,11 +924,6 @@ async fn presence_session(
             let snapshot = (runtime.snapshot)()
                 .await
                 .context("celld core stopped before presence snapshot")?;
-            let lease_shadow = if shadow_presence {
-                Some(lease_shadow_observation(runtime).await)
-            } else {
-                None
-            };
             let mut cells = snapshot
                 .cells
                 .iter()
@@ -972,7 +942,7 @@ async fn presence_session(
             let cells_truncated =
                 cells.len() < snapshot.cells.len() || cells.len() > MAX_PRESENCE_CELLS;
             cells.truncate(MAX_PRESENCE_CELLS);
-            let mut message = serde_json::json!({
+            let message = serde_json::json!({
                 "serving": snapshot.serving,
                 "owned_cells": snapshot.owned_cells(),
                 "cells": cells,
@@ -987,9 +957,6 @@ async fn presence_session(
                     "handoff_failed": snapshot.activity.handoff_failed,
                 },
             });
-            if let Some(observation) = lease_shadow {
-                message["lease_shadow"] = observation;
-            }
             Ok(message.to_string())
         },
         move |text| async move {
@@ -1013,10 +980,10 @@ async fn presence_session(
                         .await?
                         .is_some()
                     {
-                        adopt_or_restart(&runtime.reload);
+                        crate::generation::nudge(&runtime.reload);
                     }
                 }
-                Some("deployment_current") => adopt_or_restart(&runtime.reload),
+                Some("deployment_current") => crate::generation::nudge(&runtime.reload),
                 _ => {}
             }
             Ok(None)
@@ -1129,36 +1096,6 @@ where
     crate::asyncrt::select! {
         result = &mut beat => result,
         result = &mut read => result,
-    }
-}
-
-/// Independently observe bucket truth for rollout comparison. This is an
-/// off-by-default management diagnostic: it never feeds the lease record back
-/// into the core or changes whether the node serves.
-async fn lease_shadow_observation(runtime: &PresenceRuntime) -> serde_json::Value {
-    let checked_at_ms = crate::ownership_store::now_ms();
-    match crate::ownership_store::load_node_lease(&runtime.s3, &runtime.node_session_id).await {
-        Ok(Some(record)) => serde_json::json!({
-            "bucket_status": if record.expires_ms > checked_at_ms { "live" } else { "expired" },
-            "node": record.node,
-            "advertise": record.addr,
-            "expires_ms": record.expires_ms,
-            "checked_at_ms": checked_at_ms,
-        }),
-        Ok(None) => serde_json::json!({
-            "bucket_status": "missing",
-            "node": null,
-            "advertise": null,
-            "expires_ms": null,
-            "checked_at_ms": checked_at_ms,
-        }),
-        Err(_) => serde_json::json!({
-            "bucket_status": "unavailable",
-            "node": null,
-            "advertise": null,
-            "expires_ms": null,
-            "checked_at_ms": checked_at_ms,
-        }),
     }
 }
 
@@ -1638,7 +1575,7 @@ pub fn start_deploy_agent(bucket: Bucket, reload: crate::generation::ReloadSende
                         script_name = %applied.script_name,
                         "deployment applied to the fleet bucket; adopting it"
                     );
-                    adopt_or_restart(&reload);
+                    crate::generation::nudge(&reload);
                 }
                 Ok(None) => {
                     if consecutive_failures > 0 {
@@ -2042,7 +1979,9 @@ fn validate_managed_module_envelope(deployment: &AgentDeployment) -> anyhow::Res
     let mut manifest_modules = std::collections::BTreeMap::new();
     let mut total_bytes = 0_usize;
     for module in &deployment.manifest.modules {
-        if !valid_managed_module_name(&module.name) || !valid_lower_hex(&module.sha256, 16) {
+        if !valid_managed_module_name(&module.name)
+            || !(valid_lower_hex(&module.sha256, 16) || valid_lower_hex(&module.sha256, 64))
+        {
             return Err(anyhow!(
                 "control-plane manifest has an invalid module reference: {:?}",
                 module.name

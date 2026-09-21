@@ -215,6 +215,9 @@ pub(crate) fn reopen(spec: &ReopenSpec) -> Result<(), D1ImportFailure> {
         &spec.scope,
         &spec.db_path.to_string_lossy(),
         spec.epoch,
+        // An import reopen is a one-shot operator step over the local file.
+        false,
+        None,
         spec.sqlite_vec,
     )
     .map_err(|error| d1_import_error(error.to_string()))

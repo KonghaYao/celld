@@ -35,9 +35,9 @@ pub const FIRST_GENERATION: GenerationId = 1;
 
 /// Ask the node to adopt the deployment `deploy/current.json` names now.
 pub struct ReloadRequest {
-    /// Rebuild even when the pointer names the current deployment, so the
-    /// manifest and `CELLD_VARS_FILE` are read again. `POST /reload` sets it;
-    /// a poll tick and a managed nudge do not.
+    /// Rebuild even when the pointer names the current deployment, so a
+    /// memoised failure is retried and fresh isolates replace the serving
+    /// ones. `POST /reload` sets it; a poll tick and a managed nudge do not.
     pub force: bool,
     /// Where to report the outcome. A poll tick has nobody to tell.
     pub reply: Option<tokio::sync::oneshot::Sender<ReloadOutcome>>,
@@ -267,7 +267,6 @@ fn dependencies_of(loaded: &LoadedDeployment) -> VecDeque<Dependency> {
 
 /// Node-level inputs `Generation::build` needs beside the deployment itself.
 pub struct GenerationOptions {
-    pub loader_binding: Option<String>,
     pub node: String,
     pub region: String,
 }
@@ -293,11 +292,12 @@ pub struct Generation {
     pub(crate) cell_isolates: HashMap<String, Arc<crate::pool::Pool>>,
     pub(crate) default_do_class: Option<Arc<str>>,
     pub(crate) assets: HashMap<String, AssetResolver>,
-    /// `triggers.crons` of the primary script, so an adoption can tell
-    /// whether the schedule changed without re-reading the manifest.
-    #[allow(dead_code)]
-    pub(crate) crons: Vec<String>,
     pub(crate) native: Option<crate::native::NativeExecution>,
+    /// Every container class of every script in the graph.
+    pub(crate) containers: Vec<crate::container::ContainerSpec>,
+    /// See `Manifest::fence_image`; the first script's, they are all the
+    /// same image when one celld deployed them.
+    pub(crate) fence_image: Option<String>,
 }
 
 impl Generation {
@@ -410,6 +410,35 @@ impl Generation {
             pool.reap_empty();
         }
     }
+
+    /// The isolates this generation holds right now, for `/state`.
+    pub(crate) fn isolate_census(&self) -> IsolateCensus {
+        IsolateCensus {
+            stateless: self.stateless.isolates.census(),
+            services: self
+                .services
+                .iter()
+                .map(|(name, service)| (name.clone(), service.isolates.census()))
+                .collect(),
+            cells: self
+                .cell_isolates
+                .iter()
+                .map(|(script, pool)| (script.clone(), pool.census()))
+                .collect(),
+        }
+    }
+}
+
+/// The isolates one generation holds, by the pool they belong to, as
+/// `/state` reports them.
+#[derive(Debug, serde::Serialize)]
+pub struct IsolateCensus {
+    /// The pool that serves the primary script's stateless handlers.
+    pub stateless: crate::pool::PoolCensus,
+    /// The pools of the named services, by service name.
+    pub services: BTreeMap<String, crate::pool::PoolCensus>,
+    /// The pools the cells live in, by Worker script.
+    pub cells: BTreeMap<String, crate::pool::PoolCensus>,
 }
 
 /// The generation an isolate was built for, installed as an isolate slot by

@@ -1,4 +1,4 @@
-// CompressionStream / DecompressionStream — WHATWG Compression Streams,
+// CompressionStream / DecompressionStream -- WHATWG Compression Streams,
 // each a TransformStream over one stateful native zlib stream
 // (__zlib_stream_new / push / end / drop). Output streams chunk by chunk
 // as input is written; the terminal block arrives from flush() when the
@@ -7,7 +7,7 @@
 //
 // Compiled on first access (see LAZY_GLOBALS); a bundle that never names
 // either global never pays for this file.
-(() => {
+return (() => {
 
 // Per spec the chunk must be a BufferSource; anything else is a
 // TypeError, which errors both sides of the transform.

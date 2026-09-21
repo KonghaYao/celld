@@ -301,12 +301,16 @@ pub mod actor;
 mod conformance_core_loop_tests {
     include!(env!("CELLD_CONFORMANCE_CORE_LOOP_TESTS"));
 }
+#[cfg(all(test, celld_internal_tests))]
+mod conformance_facet_failure_tests {
+    include!(env!("CELLD_CONFORMANCE_FACET_FAILURE_TESTS"));
+}
 pub mod assets;
 #[cfg(not(celld_internal_tests))]
 pub mod asyncrt;
-// The corpus flag alone selects the simulated asyncrt, so the external
-// engine-tests crate (denoland/celld.dev#404) sees the same simulated
-// world the in-crate suites see. `test` must not be part of the gate:
+// The internal test flag alone selects the simulated asyncrt, so an external
+// test harness built with the flag sees the same simulated world the
+// in-crate suites see. `test` must not be part of the gate:
 // a dependency never has it, and the harness binary builds unflagged,
 // so the shipped and harness builds keep the real asyncrt.
 #[cfg(celld_internal_tests)]
@@ -324,6 +328,7 @@ pub(crate) mod cell_branch;
 pub mod cell_cli;
 pub mod cli_options;
 pub mod cli_output;
+pub mod container;
 pub mod control_plane;
 pub(crate) mod d1_branch;
 pub mod d1_cli;
@@ -331,6 +336,7 @@ pub(crate) mod d1_import;
 pub mod dead_node_gc;
 pub mod deploy;
 pub mod dev;
+pub mod docker;
 pub mod drain_token;
 pub mod env_vars;
 pub mod fetch_loopback;
@@ -362,6 +368,7 @@ pub mod peer_auth;
 pub mod peer_probe;
 pub mod pool;
 pub mod protocol;
+pub(crate) mod queue_batching;
 pub mod queue_cli;
 pub(crate) mod r2_branch;
 pub mod r2_cli;
@@ -372,7 +379,23 @@ pub mod startup;
 pub mod storage;
 pub mod telemetry;
 pub mod wake;
+pub mod wake_format;
 pub mod ws_client;
+
+#[cfg(all(test, celld_internal_tests))]
+mod composed_simulation {
+    include!(env!("CELLD_INTERNAL_COMPOSED_SIMULATION"));
+}
+
+#[cfg(all(test, celld_internal_tests))]
+mod simulation_reproduction {
+    include!(env!("CELLD_INTERNAL_SIMULATION_REPRODUCTION"));
+}
+
+#[cfg(all(test, celld_internal_tests))]
+mod token_lifecycle_tests {
+    include!(env!("CELLD_INTERNAL_TOKEN_PROBE"));
+}
 
 #[cfg(all(test, celld_internal_tests))]
 mod conformance_world_tests {
@@ -464,20 +487,57 @@ impl Drop for CellActivityGuard {
     }
 }
 
+/// A stateless entrypoint selected for one fetch request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkerFetchEntrypoint {
+    pub name: String,
+    /// The caller's `ctx.props` as V8 structured-clone bytes. An empty vector
+    /// represents an omitted or `undefined` props value.
+    pub props: Vec<u8>,
+}
+
+/// Resource limits selected by a Worker Loader stub for one invocation.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerInvocationLimits {
+    pub cpu_ms: Option<u32>,
+    pub sub_requests: Option<u32>,
+}
+
+/// One operation on a Worker entrypoint. A property read has no arguments,
+/// while a call owns its complete receiver path and structured-clone payload.
+pub enum WorkerRpcOperation {
+    Get { path: Vec<String> },
+    Call { path: Vec<String>, args: Vec<u8> },
+}
+
 pub enum WorkerJob {
     Fetch {
         queued_at: std::time::Instant,
+        /// An entrypoint dispatcher target, or the direct default export when
+        /// absent.
+        entrypoint: Option<WorkerFetchEntrypoint>,
+        invocation_limits: Option<WorkerInvocationLimits>,
         url: String,
         method: String,
         body: js::RequestBody,
         headers: Vec<(String, String)>,
         request_id: Option<js::RequestId>,
+        /// Receives one completed invocation report for Dynamic Worker tails.
+        /// Ordinary fetches leave this empty.
+        tail_report: Option<tokio::sync::oneshot::Sender<String>>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<js::HttpResponse>>,
     },
     Rpc {
         entrypoint: String,
-        method: String,
-        args: Vec<u8>,
+        operation: WorkerRpcOperation,
+        /// The caller's `ctx.props` as V8 structured-clone bytes, the same
+        /// encoding as `args`. It is empty when the caller sent none, which no
+        /// encoded value can be. A Worker Loader entrypoint or a transferred
+        /// Service Binding can set it.
+        props: Vec<u8>,
+        invocation_limits: Option<WorkerInvocationLimits>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
     },
     Queue {
@@ -613,6 +673,47 @@ export default { async fetch() { return new Response("ok"); } };
         });
 
         Worker::load_config(Arc::new(config)).expect("node url module should evaluate");
+    }
+
+    /// The `node:timers` shim is a lazy module: its own file publishes
+    /// `globalThis.__timersModule`, and the stub binds from the internals
+    /// object. Evaluation proves the mirror, and the calls prove the module is
+    /// the shim rather than the reject-at-first-use proxy.
+    #[test]
+    fn node_timers_set_immediate_is_callable_in_isolate() {
+        crate::runtime::init_v8();
+        let source = r#"
+import timers, { setImmediate, clearImmediate } from "node:timers";
+if (typeof timers.setImmediate !== "function") throw new Error("node:timers default has no setImmediate");
+if (typeof setImmediate !== "function") throw new Error("node:timers named setImmediate is not callable");
+if (typeof clearImmediate !== "function") throw new Error("node:timers named clearImmediate is not callable");
+// Scheduling is left to the handler: a timer op needs a live event, and
+// module evaluation has none. The bindings above already prove the module is
+// the shim (a miss would have thrown at link time, and the inert proxy is not
+// a function).
+if (timers.setImmediate !== setImmediate) throw new Error("named and default setImmediate disagree");
+export default { async fetch() { return new Response("ok"); } };
+"#;
+        let config = WorkerConfig::new(WorkerConfigOptions {
+            src: source.into(),
+            script_name: "node-timers-test".into(),
+            do_classes: Vec::new(),
+            bindings: Vec::new(),
+            r2_bindings: Vec::new(),
+            d1_bindings: Vec::new(),
+            kv_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
+            workflow_bindings: Vec::new(),
+            ai_binding: None,
+            images_bindings: Vec::new(),
+            vars: Vec::new(),
+            node: "test-node".into(),
+            modules: Vec::new(),
+            compat: worker_compat(&json!({ "compatibility_date": "2026-01-15" })),
+        });
+
+        Worker::load_config(Arc::new(config)).expect("node:timers module should evaluate");
     }
 
     #[test]
@@ -790,11 +891,14 @@ export default {{
             let (reply, receive) = tokio::sync::oneshot::channel();
             let job = super::WorkerJob::Fetch {
                 queued_at: Instant::now(),
+                entrypoint: None,
+                invocation_limits: None,
                 url: "https://example.test/binary-module".into(),
                 method: "GET".into(),
                 body: RequestBody::Bytes(bytes::Bytes::new()),
                 headers: Vec::new(),
                 request_id: Some(crate::js::next_request_id()),
+                tail_report: None,
                 reply,
             };
             let driving = tokio::spawn(crate::runtime::drive(slot, job, None));

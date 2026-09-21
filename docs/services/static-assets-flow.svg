@@ -1,0 +1,183 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 674" role="img" aria-labelledby="assetsFlowTitle assetsFlowDesc">
+  <title id="assetsFlowTitle">How celld decides between an asset and the Worker</title>
+  <desc id="assetsFlowDesc">A request reaches a node and passes down a column of tests. A method other
+than GET or HEAD leaves at once and the Worker answers. A path that
+run_worker_first matches also leaves, and no asset lookup happens. The
+_redirects rules run next, in file order, and the first match wins: status 301,
+302, 303, 307, or 308 gives a Location header with no body, and status 200
+restarts routing at the destination path. html_handling then looks for a file:
+the exact path gives 200 with the body, and another spelling gives 307 to the
+canonical path. After a miss the node re-reads the deployment pointer, at most
+once in five seconds, so a newer deployment can still answer. not_found_handling
+fabricates the last answer, but only for a navigation request or for a
+deployment with no Worker: single-page-application returns /index.html with 200,
+and 404-page returns the nearest 404.html with 404. When nothing matches the
+Worker answers, and a deployment with no Worker answers 404. A green outcome
+comes from the asset layer and a grey outcome comes from the Worker. Separately,
+a missing or corrupt asset body gives 502 and never falls through to the
+Worker.</desc>
+  <style>
+    /* GitHub renders this file as an image, so the diagram carries literal
+       colours here. The site rules in landing/src/style.css are more specific,
+       so the documentation theme tokens win there. SVG paints text black by
+       default, and a class that sets only `color` never reaches the fill, so
+       every label sets fill="currentColor" as well. */
+    svg { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    text { font-size: 12px; fill: currentColor; }
+    tspan { fill: currentColor; }
+    .sm { font-size: 11px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .d-ink { color: #121212; }
+    .d-soft { color: #3d3b37; }
+    .d-faint { color: #6e6a62; }
+    .d-acc { color: #10803f; }
+    .d-panel { color: #ffffff; }
+    .d-sunk { color: #f0eee8; }
+    .d-tint { color: #d6efdf; }
+    @media (prefers-color-scheme: dark) {
+      .d-ink { color: #efede7; }
+      .d-soft { color: #c9c6be; }
+      .d-faint { color: #928e85; }
+      .d-acc { color: #3fc472; }
+      .d-panel { color: #1a1a19; }
+      .d-sunk { color: #232321; }
+      .d-tint { color: #10301d; }
+    }
+  </style>
+  <defs>
+    <marker id="sa-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path class="d-soft" d="M0,1 L9,5 L0,9 z" fill="currentColor" />
+    </marker>
+    <marker id="sa-arrow-acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path class="d-acc" d="M0,1 L9,5 L0,9 z" fill="currentColor" />
+    </marker>
+  </defs>
+
+  <!-- One request enters the column of tests. -->
+  <rect class="d-panel" x="8" y="8" width="228" height="32" rx="6" fill="currentColor" />
+  <rect class="d-ink" x="8" y="8" width="228" height="32" rx="6" fill="none" stroke="currentColor" stroke-width="1.5" />
+  <text class="d-ink" x="122" y="29" fill="currentColor" text-anchor="middle">One request reaches a node</text>
+  <text class="d-faint sm" x="342" y="29" fill="currentColor" text-anchor="middle">who answers, and with what</text>
+
+  <path class="d-soft" d="M122,40 V62" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#sa-arrow)" />
+
+  <!-- The method test: only GET and HEAD can reach an asset. -->
+  <rect class="d-panel" x="8" y="62" width="228" height="40" rx="6" fill="currentColor" />
+  <rect class="d-faint" x="8" y="62" width="228" height="40" rx="6" fill="none" stroke="currentColor" />
+  <text class="d-ink" x="20" y="87" fill="currentColor">Method other than GET or HEAD</text>
+  <path class="d-soft" d="M236,82 H252" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#sa-arrow)" />
+  <rect class="d-sunk" x="252" y="62" width="180" height="40" rx="6" fill="currentColor" />
+  <rect class="d-soft" x="252" y="62" width="180" height="40" rx="6" fill="none" stroke="currentColor" />
+  <text class="d-ink sm" x="262" y="87" fill="currentColor">the Worker answers</text>
+
+  <path class="d-soft" d="M122,102 V124" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#sa-arrow)" />
+
+  <!-- run_worker_first inverts the order for the paths it names. -->
+  <rect class="d-panel" x="8" y="124" width="228" height="40" rx="6" fill="currentColor" />
+  <rect class="d-faint" x="8" y="124" width="228" height="40" rx="6" fill="none" stroke="currentColor" />
+  <text class="d-ink mono" x="20" y="143" fill="currentColor">run_worker_first</text>
+  <text class="d-faint sm" x="20" y="158" fill="currentColor">true, or up to 100 patterns</text>
+  <path class="d-soft" d="M236,144 H252" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#sa-arrow)" />
+  <rect class="d-sunk" x="252" y="124" width="180" height="40" rx="6" fill="currentColor" />
+  <rect class="d-soft" x="252" y="124" width="180" height="40" rx="6" fill="none" stroke="currentColor" />
+  <text class="d-ink sm" x="262" y="143" fill="currentColor">the Worker answers</text>
+  <text class="d-faint sm" x="262" y="158" fill="currentColor">no asset lookup at all</text>
+
+  <path class="d-soft" d="M122,164 V186" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#sa-arrow)" />
+
+  <!-- _redirects runs before any file lookup. -->
+  <rect class="d-panel" x="8" y="186" width="228" height="80" rx="6" fill="currentColor" />
+  <rect class="d-faint" x="8" y="186" width="228" height="80" rx="6" fill="none" stroke="currentColor" />
+  <text class="d-ink mono" x="20" y="218" fill="currentColor">_redirects</text>
+  <text class="d-faint sm" x="20" y="236" fill="currentColor">file order, first match wins</text>
+  <g class="d-acc" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M236,226 H244" />
+    <path d="M244,204 V248" />
+    <path d="M244,204 H252" marker-end="url(#sa-arrow-acc)" />
+    <path d="M244,248 H252" marker-end="url(#sa-arrow-acc)" />
+  </g>
+  <rect class="d-tint" x="252" y="186" width="180" height="36" rx="6" fill="currentColor" />
+  <rect class="d-acc" x="252" y="186" width="180" height="36" rx="6" fill="none" stroke="currentColor" />
+  <text class="d-ink sm" x="262" y="204" fill="currentColor">301 302 303 307 308</text>
+  <text class="d-faint sm" x="262" y="218" fill="currentColor">a Location, no body</text>
+  <rect class="d-tint" x="252" y="230" width="180" height="36" rx="6" fill="currentColor" />
+  <rect class="d-acc" x="252" y="230" width="180" height="36" rx="6" fill="none" stroke="currentColor" />
+  <text class="d-ink sm" x="262" y="248" fill="currentColor">200</text>
+  <text class="d-faint sm" x="262" y="262" fill="currentColor">restart at the destination</text>
+
+  <path class="d-soft" d="M122,266 V288" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#sa-arrow)" />
+  <path class="d-acc" d="M268,266 V282 H126" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#sa-arrow-acc)" />
+
+  <!-- html_handling chooses which file a path can reach. -->
+  <rect class="d-panel" x="8" y="288" width="228" height="80" rx="6" fill="currentColor" />
+  <rect class="d-faint" x="8" y="288" width="228" height="80" rx="6" fill="none" stroke="currentColor" />
+  <text class="d-ink mono" x="20" y="320" fill="currentColor">html_handling</text>
+  <text class="d-faint sm" x="20" y="338" fill="currentColor">auto, force, drop, or none</text>
+  <g class="d-acc" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M236,328 H244" />
+    <path d="M244,306 V350" />
+    <path d="M244,306 H252" marker-end="url(#sa-arrow-acc)" />
+    <path d="M244,350 H252" marker-end="url(#sa-arrow-acc)" />
+  </g>
+  <rect class="d-tint" x="252" y="288" width="180" height="36" rx="6" fill="currentColor" />
+  <rect class="d-acc" x="252" y="288" width="180" height="36" rx="6" fill="none" stroke="currentColor" />
+  <text class="d-ink sm" x="262" y="306" fill="currentColor">the canonical path</text>
+  <text class="d-faint sm" x="262" y="320" fill="currentColor">200 with the body</text>
+  <rect class="d-tint" x="252" y="332" width="180" height="36" rx="6" fill="currentColor" />
+  <rect class="d-acc" x="252" y="332" width="180" height="36" rx="6" fill="none" stroke="currentColor" />
+  <text class="d-ink sm" x="262" y="350" fill="currentColor">another spelling</text>
+  <text class="d-faint sm" x="262" y="364" fill="currentColor">307 to the canonical path</text>
+
+  <path class="d-soft" d="M122,368 V390" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#sa-arrow)" />
+
+  <!-- The step Cloudflare does not need: a rolling restart leaves nodes on
+       different indexes, so a miss re-reads the pointer. -->
+  <rect class="d-panel" x="8" y="390" width="228" height="44" rx="6" fill="currentColor" />
+  <rect class="d-faint" x="8" y="390" width="228" height="44" rx="6" fill="none" stroke="currentColor" />
+  <text class="d-ink" x="20" y="411" fill="currentColor">Miss: re-read the pointer</text>
+  <text class="d-faint sm" x="20" y="427" fill="currentColor">at most once in five seconds</text>
+  <path class="d-acc" d="M236,412 H252" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#sa-arrow-acc)" />
+  <rect class="d-tint" x="252" y="390" width="180" height="44" rx="6" fill="currentColor" />
+  <rect class="d-acc" x="252" y="390" width="180" height="44" rx="6" fill="none" stroke="currentColor" />
+  <text class="d-ink sm" x="262" y="411" fill="currentColor">a newer deployment has it</text>
+  <text class="d-faint sm" x="262" y="427" fill="currentColor">200 with the body</text>
+
+  <path class="d-soft" d="M122,434 V456" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#sa-arrow)" />
+
+  <!-- not_found_handling fabricates a response, but not for every request. -->
+  <rect class="d-panel" x="8" y="456" width="228" height="80" rx="6" fill="currentColor" />
+  <rect class="d-faint" x="8" y="456" width="228" height="80" rx="6" fill="none" stroke="currentColor" />
+  <text class="d-ink mono" x="20" y="488" fill="currentColor">not_found_handling</text>
+  <text class="d-faint sm" x="20" y="506" fill="currentColor">navigation, or no Worker</text>
+  <g class="d-acc" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M236,496 H244" />
+    <path d="M244,474 V518" />
+    <path d="M244,474 H252" marker-end="url(#sa-arrow-acc)" />
+    <path d="M244,518 H252" marker-end="url(#sa-arrow-acc)" />
+  </g>
+  <rect class="d-tint" x="252" y="456" width="180" height="36" rx="6" fill="currentColor" />
+  <rect class="d-acc" x="252" y="456" width="180" height="36" rx="6" fill="none" stroke="currentColor" />
+  <text class="d-ink sm" x="262" y="474" fill="currentColor">single-page-application</text>
+  <text class="d-faint sm" x="262" y="488" fill="currentColor">/index.html, 200</text>
+  <rect class="d-tint" x="252" y="500" width="180" height="36" rx="6" fill="currentColor" />
+  <rect class="d-acc" x="252" y="500" width="180" height="36" rx="6" fill="none" stroke="currentColor" />
+  <text class="d-ink sm" x="262" y="518" fill="currentColor">404-page</text>
+  <text class="d-faint sm" x="262" y="532" fill="currentColor">the nearest 404.html, 404</text>
+
+  <path class="d-soft" d="M122,536 V558" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#sa-arrow)" />
+
+  <!-- The asset layer has no answer left. -->
+  <rect class="d-panel" x="8" y="558" width="228" height="44" rx="6" fill="currentColor" />
+  <rect class="d-ink" x="8" y="558" width="228" height="44" rx="6" fill="none" stroke="currentColor" stroke-width="1.5" />
+  <text class="d-ink" x="20" y="585" fill="currentColor">Nothing matched</text>
+  <path class="d-soft" d="M236,580 H252" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#sa-arrow)" />
+  <rect class="d-sunk" x="252" y="558" width="180" height="44" rx="6" fill="currentColor" />
+  <rect class="d-soft" x="252" y="558" width="180" height="44" rx="6" fill="none" stroke="currentColor" />
+  <text class="d-ink sm" x="262" y="579" fill="currentColor">the Worker answers</text>
+  <text class="d-faint sm" x="262" y="595" fill="currentColor">no Worker: 404</text>
+
+  <!-- The one outcome that never reaches the Worker. -->
+  <rect class="d-faint" x="8" y="624" width="424" height="42" rx="6" fill="none" stroke="currentColor" stroke-dasharray="5 4" />
+  <text class="d-ink sm" x="20" y="644" fill="currentColor">A missing or corrupt asset body gives 502.</text>
+  <text class="d-faint sm" x="20" y="659" fill="currentColor">The request never falls through to the Worker.</text>
+</svg>

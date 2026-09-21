@@ -47,7 +47,7 @@ class ReadableStreamDefaultController {
     if (this.#stream._sizeFn) {
       try { size = this.#stream._sizeFn(chunk); }
       catch (e) { this.error(e); throw e; }
-      // Workerd's message for a non-number size —
+      // Workerd's message for a non-number size --
       // e.g. an async size() returning a promise.
       if (typeof size !== 'number') {
         const err = new TypeError(
@@ -272,7 +272,7 @@ class ReadableStream {
         ._setup(this, src, hwm);
       return;
     }
-    // Read each getter once per spec — extracting
+    // Read each getter once per spec -- extracting
     // pull/start/cancel algorithms happens at
     // construction, not on every invocation.
     const pullFn = src.pull;
@@ -414,7 +414,7 @@ class ReadableStream {
   get locked() { return this._locked; }
 
   _cancel(reason) {
-    // Spec §4.2.6: cancel discards queued chunks and
+    // Spec section 4.2.6: cancel discards queued chunks and
     // transitions to closed. Without this, read() hits
     // the `_queue.length > 0` branch before the `_closed`
     // check and keeps yielding stale values.
@@ -684,7 +684,7 @@ class ReadableStream {
     if (transform.writable._locked)
       throw new TypeError(
         "WritableStream is locked");
-    // Spec: mark the pipeTo promise as handled —
+    // Spec: mark the pipeTo promise as handled --
     // pipeTo already mirrors errors between the two
     // streams via the readable's error state, so a
     // rejection here would otherwise surface as an
@@ -708,14 +708,14 @@ class ReadableStream {
     } finally {
       // WHATWG Streams 4.5.3: the default async
       // iterator's return() must cancel the stream
-      // before releasing the reader lock — early
+      // before releasing the reader lock -- early
       // termination of the loop (break / return /
       // throw inside `for await`) was leaking the
       // upstream source. Cancel is a no-op once the
       // stream's `done` has been observed, so we
       // skip it on natural drain.
       if (!drained && !preventCancel) {
-        try { await reader.cancel(); } catch { /* swallow — cancel errors don't block release */ }
+        try { await reader.cancel(); } catch { /* swallow -- cancel errors don't block release */ }
       }
       reader.releaseLock();
     }
@@ -833,7 +833,7 @@ globalThis.ReadableStreamDefaultController =
 globalThis.CountQueuingStrategy = CountQueuingStrategy;
 globalThis.ByteLengthQueuingStrategy =
   ByteLengthQueuingStrategy;
-// Web IDL toStringTag — `Object.prototype.toString
+// Web IDL toStringTag -- `Object.prototype.toString
 // .call(rs)` returns "[object ReadableStream]"
 // instead of "[object Object]".
 for (const [cls, name] of [

@@ -1,19 +1,19 @@
 // URL polyfill.
 // Extracted module from the bootstrap.js IIFE. Captures one
-// host op ($$urlParse) and exposes `globalThis.URL` —
+// host op ($$urlParse) and exposes `globalThis.URL` --
 // constructor, accessors, searchParams (lazy
 // URLSearchParams binding), canParse / parse statics.
 //
 // Off the per-HTTP-request hot path on the std/http
 // serve binding (which passes `_skipValidate: true`
-// to skip the URL parse — see
+// to skip the URL parse -- see
 // doc/runtime_invariants.md rule 4 + the `_skipValidate`
 // machinery in src/js/request_response.js). User-side
 // `new URL(...)` and the fetch redirect loop both
 // depend on this class.
 //
 // The `searchParams` getter constructs a
-// `URLSearchParams` lazily — that class is defined
+// `URLSearchParams` lazily -- that class is defined
 // later in the concat (`src/js/url_search_params.js`),
 // which is fine because the getter is only triggered
 // at call time, after the whole snapshot has booted.
@@ -26,7 +26,7 @@
 // which broke any user code that mutates the URL
 // after construction (the search setter happened to
 // be wired correctly because it's used by the
-// internal `_updateSearch` plumbing — the rest were
+// internal `_updateSearch` plumbing -- the rest were
 // silent no-ops on href).
 (function () {
     const _urlParse = $$urlParse;
@@ -167,7 +167,7 @@
         set pathname(v) {
             v = String(v).replace(/[\t\n\r]/g, '');
             // Spec: special-scheme URLs always have an
-            // absolute path — prepend '/' if missing.
+            // absolute path -- prepend '/' if missing.
             if (v && !v.startsWith('/')) v = '/' + v;
             this.#pathname = v;
             this._rebuildHref();

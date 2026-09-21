@@ -11,7 +11,7 @@
 // Web APIs accept it naturally. Encoding, validation, and error-code
 // semantics follow Node's lib/buffer.js, with the argument dances
 // adapted from Deno's ext/node/polyfills/internal/buffer.mjs (MIT).
-if (!globalThis.__buffer) (() => {
+if (!__celld.__buffer) (() => {
   const __kMaxLength = 2147483647;
   const __kStringMaxLength = 536870888;
   const __bufErr = (E, code, msg) => {
@@ -74,7 +74,7 @@ if (!globalThis.__buffer) (() => {
     return lut;
   })();
   // Nibble value per code unit, -1 for anything else. Node's own table is
-  // 256 wide and indexed with `& 0xff`, so it decodes 'Ł' (U+0141) as 'A';
+  // 256 wide and indexed with `& 0xff`, so it decodes 'U+0141' (U+0141) as 'A';
   // a 128-entry table with the guard below rejects every non-ASCII code
   // unit instead, which is what the regex it replaces did.
   const __hexlut = (() => {
@@ -732,7 +732,7 @@ if (!globalThis.__buffer) (() => {
     throw __bufType("input",
       "an instance of ArrayBuffer or ArrayBufferView", input);
   };
-  globalThis.__buffer = {
+  __celld.__buffer = {
     Buffer: __bufferCallable,
     SlowBuffer,
     INSPECT_MAX_BYTES: 50,
@@ -794,5 +794,5 @@ if (!globalThis.__buffer) (() => {
     btoa: globalThis.btoa,
   };
 })();
-// Completion value for the lazy-global getter.
-({ Buffer: globalThis.__buffer.Buffer });
+// The lazy-global getter's exports.
+return { Buffer: __celld.__buffer.Buffer };

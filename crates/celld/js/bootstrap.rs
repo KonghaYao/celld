@@ -14,7 +14,111 @@ use super::*;
 /// largest slice of cold-wake latency. The first isolate compiles
 /// eagerly and publishes the cache; every later isolate consumes it and only
 /// executes.
+///
+/// Keyed by script name alone. Each script compiles as a function whose
+/// parameter list is `op_names()`, and V8's cache check does not cover that
+/// list, so a cache is only valid while the list is the same for every
+/// isolate of the process. `op_names()` is fixed at build time; an op that
+/// varies per worker would have to enter the key.
 type BootstrapCache = std::collections::HashMap<&'static str, std::sync::Arc<Vec<u8>>>;
+
+macro_rules! static_source {
+    ($name:ident, $file:literal) => {
+        static $name: v8::OneByteConst =
+            v8::String::create_external_onebyte_const(include_bytes!($file));
+    };
+}
+
+struct BootstrapSource {
+    name: &'static str,
+    source: &'static v8::OneByteConst,
+}
+
+static_source!(TEXT_ENCODING_SOURCE, "text_encoding.js");
+static_source!(URL_SEARCH_PARAMS_SOURCE, "url_search_params.js");
+static_source!(URL_SOURCE, "url.js");
+static_source!(ATOB_BTOA_SOURCE, "atob_btoa.js");
+static_source!(HEADERS_SOURCE, "headers.js");
+static_source!(STREAMS_SOURCE, "streams.js");
+static_source!(WRITABLE_STREAM_SOURCE, "writable_stream.js");
+static_source!(TEXT_ENCODING_STREAMS_SOURCE, "text_encoding_streams.js");
+static_source!(MESSAGE_CHANNEL_SOURCE, "message_channel.js");
+static_source!(EVENT_SOURCE_SOURCE, "event_source.js");
+static_source!(CACHE_SOURCE, "cache.js");
+static_source!(SOCKETS_SOURCE, "sockets.js");
+static_source!(HTML_REWRITER_SOURCE, "html_rewriter.js");
+static_source!(CRYPTO_SOURCE, "crypto.js");
+
+static PRELUDE: &[BootstrapSource] = &[
+    BootstrapSource {
+        name: "text_encoding.js",
+        source: &TEXT_ENCODING_SOURCE,
+    },
+    BootstrapSource {
+        name: "url_search_params.js",
+        source: &URL_SEARCH_PARAMS_SOURCE,
+    },
+    BootstrapSource {
+        name: "url.js",
+        source: &URL_SOURCE,
+    },
+    BootstrapSource {
+        name: "atob_btoa.js",
+        source: &ATOB_BTOA_SOURCE,
+    },
+    BootstrapSource {
+        name: "headers.js",
+        source: &HEADERS_SOURCE,
+    },
+    BootstrapSource {
+        name: "streams.js",
+        source: &STREAMS_SOURCE,
+    },
+    BootstrapSource {
+        name: "writable_stream.js",
+        source: &WRITABLE_STREAM_SOURCE,
+    },
+    BootstrapSource {
+        name: "text_encoding_streams.js",
+        source: &TEXT_ENCODING_STREAMS_SOURCE,
+    },
+];
+
+static POST_HARNESS: &[BootstrapSource] = &[
+    BootstrapSource {
+        name: "message_channel.js",
+        source: &MESSAGE_CHANNEL_SOURCE,
+    },
+    BootstrapSource {
+        name: "event_source.js",
+        source: &EVENT_SOURCE_SOURCE,
+    },
+    BootstrapSource {
+        name: "cache.js",
+        source: &CACHE_SOURCE,
+    },
+    BootstrapSource {
+        name: "sockets.js",
+        source: &SOCKETS_SOURCE,
+    },
+    BootstrapSource {
+        name: "html_rewriter.js",
+        source: &HTML_REWRITER_SOURCE,
+    },
+    BootstrapSource {
+        name: "crypto.js",
+        source: &CRYPTO_SOURCE,
+    },
+];
+
+// The harness is fixed process data, so copying its ~450 KiB source into every
+// isolate only gives V8 another owner for the same bytes. `OneByteConst` keeps
+// one external buffer in the binary and checks the ASCII requirement at
+// compile time. Compiled code and the objects created by the script remain
+// isolate-local; this shares only the original source buffer.
+#[cfg(any(not(celld_internal_tests), all(test, celld_internal_tests)))]
+static HARNESS_SOURCE: v8::OneByteConst =
+    v8::String::create_external_onebyte_const(include_bytes!("harness.js"));
 
 fn bootstrap_code_cache() -> &'static std::sync::Mutex<BootstrapCache> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<BootstrapCache>> =
@@ -22,19 +126,55 @@ fn bootstrap_code_cache() -> &'static std::sync::Mutex<BootstrapCache> {
     CACHE.get_or_init(Default::default)
 }
 
-fn run_bootstrap_script(scope: &mut v8::PinScope, name: &'static str, src: &str) -> Result<()> {
+#[cfg(celld_internal_tests)]
+fn run_bootstrap_script<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &'static str,
+    src: &str,
+    arguments: &InternalArguments<'s>,
+) -> Result<()> {
+    let code = v8::String::new(scope, src).unwrap();
+    run_internal_script(scope, Some(name), code, arguments)?;
+    Ok(())
+}
+
+fn run_bootstrap_static_script<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    source: &'static BootstrapSource,
+    arguments: &InternalArguments<'s>,
+) -> Result<()> {
+    let code = v8_strings::source(scope, source.source);
+    run_internal_script(scope, Some(source.name), code, arguments)?;
+    Ok(())
+}
+
+/// Compile an internal script as one function whose parameters are the
+/// internals object and the host ops, and run it. A script and not a
+/// module, because the harness is one scope shared by every prelude file;
+/// a function and not a global script, because a global script's top-level
+/// declarations become bindings user code can name, and its ops would have
+/// to be globals too. Returns what the body `return`s: a lazy global's
+/// exports, or undefined.
+pub(super) fn run_internal_script<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    cache: Option<&'static str>,
+    code: v8::Local<'s, v8::String>,
+    arguments: &InternalArguments<'s>,
+) -> Result<v8::Local<'s, v8::Value>> {
     use v8::script_compiler::CompileOptions;
     use v8::script_compiler::NoCacheReason;
-    let code = v8::String::new(scope, src).unwrap();
-    let cached = bootstrap_code_cache().lock().unwrap().get(name).cloned();
-    let unbound = match cached {
+    let name = cache.unwrap_or("lazy script");
+    let cached = cache.and_then(|name| bootstrap_code_cache().lock().unwrap().get(name).cloned());
+    let function = match cached {
         // `CachedData` borrows `bytes`; the Arc binding outlives the Source.
         Some(bytes) => {
             let data = v8::script_compiler::CachedData::new(&bytes);
             let mut source = v8::script_compiler::Source::new_with_cached_data(code, None, data);
-            let unbound = v8::script_compiler::compile_unbound_script(
+            let function = v8::script_compiler::compile_function(
                 scope,
                 &mut source,
+                &arguments.names,
+                &[],
                 CompileOptions::ConsumeCodeCache,
                 NoCacheReason::NoReason,
             )
@@ -43,58 +183,82 @@ fn run_bootstrap_script(scope: &mut v8::PinScope, name: &'static str, src: &str)
                 !source.get_cached_data().is_some_and(|data| data.rejected()),
                 "code cache rejected for {name}"
             );
-            unbound
+            function
         }
+        // Eager for a cached bootstrap script: a lazily-compiled cache would
+        // push function-body compile cost back into every consumer's first
+        // request. A lazy script keeps V8's lazy compile: most of a builtin
+        // module is never called.
         None => {
             let mut source = v8::script_compiler::Source::new(code, None);
-            // Eager: a lazily-compiled cache would push function-body compile
-            // cost back into every consumer's first request.
-            let unbound = v8::script_compiler::compile_unbound_script(
+            let options = match cache {
+                Some(_) => CompileOptions::EagerCompile,
+                None => CompileOptions::NoCompileOptions,
+            };
+            let function = v8::script_compiler::compile_function(
                 scope,
                 &mut source,
-                CompileOptions::EagerCompile,
+                &arguments.names,
+                &[],
+                options,
                 NoCacheReason::NoReason,
             )
             .ok_or_else(|| anyhow!("bootstrap compile {name}"))?;
-            if let Some(data) = unbound.create_code_cache() {
+            if let Some((name, data)) = cache.zip(function.create_code_cache()) {
                 bootstrap_code_cache()
                     .lock()
                     .unwrap()
                     .insert(name, std::sync::Arc::new(data.to_vec()));
             }
-            unbound
+            function
         }
     };
-    unbound
-        .bind_to_current_context(scope)
-        .run(scope)
-        .ok_or_else(|| anyhow!("bootstrap run {name}"))?;
-    Ok(())
+    // The global receiver keeps top-level `this` what a script had.
+    let receiver = scope.get_current_context().global(scope).into();
+    function
+        .call(scope, receiver, &arguments.values)
+        .ok_or_else(|| anyhow!("bootstrap run {name}"))
+}
+
+#[cfg(all(test, celld_internal_tests))]
+pub(super) fn harness_source_for_test<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> v8::Local<'s, v8::String> {
+    shipping_harness_source(scope)
+}
+
+#[cfg(all(test, celld_internal_tests))]
+pub(super) fn bootstrap_sources_for_test<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Vec<(&'static str, v8::Local<'s, v8::String>)> {
+    PRELUDE
+        .iter()
+        .chain(POST_HARNESS)
+        .map(|source| (source.name, v8_strings::source(scope, source.source)))
+        .collect()
+}
+
+#[cfg(any(not(celld_internal_tests), all(test, celld_internal_tests)))]
+fn shipping_harness_source<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::String> {
+    v8::String::new_from_onebyte_const(scope, &HARNESS_SOURCE).expect("static harness source")
 }
 
 /// WPT-conformant Web APIs: TextEncoder, URL/URLSearchParams, atob/btoa, and
 /// Headers. Run once per isolate before the Cells/Cloudflare-specific harness.
-pub(super) fn install_prelude(scope: &mut v8::PinScope) -> Result<()> {
-    const PRELUDE: &[(&str, &str)] = &[
-        ("text_encoding.js", include_str!("text_encoding.js")),
-        ("url_search_params.js", include_str!("url_search_params.js")),
-        ("url.js", include_str!("url.js")),
-        ("atob_btoa.js", include_str!("atob_btoa.js")),
-        ("headers.js", include_str!("headers.js")),
-        ("streams.js", include_str!("streams.js")),
-        ("writable_stream.js", include_str!("writable_stream.js")),
-        (
-            "text_encoding_streams.js",
-            include_str!("text_encoding_streams.js"),
-        ),
-    ];
-    for (name, src) in PRELUDE {
-        run_bootstrap_script(scope, name, src)?;
+pub(super) fn install_prelude<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    arguments: &InternalArguments<'s>,
+) -> Result<()> {
+    for source in PRELUDE {
+        run_bootstrap_static_script(scope, source, arguments)?;
     }
     Ok(())
 }
 
-pub(super) fn install_harness(scope: &mut v8::PinScope) -> Result<()> {
+pub(super) fn install_harness<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    arguments: &InternalArguments<'s>,
+) -> Result<()> {
     #[cfg(celld_internal_tests)]
     let harness = include_str!("harness.js")
         .replace(
@@ -106,8 +270,8 @@ pub(super) fn install_harness(scope: &mut v8::PinScope) -> Result<()> {
             "__test_workflow_meta_created();",
         )
         .replace(
-            "/*__CELLD_TEST_WORKFLOW_ALARM_DELETED__*/",
-            "__test_workflow_alarm_deleted();",
+            "/*__CELLD_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/",
+            "__test_workflow_terminal_alarm_set();",
         )
         .replace(
             "/*__CELLD_TEST_WORKFLOW_BEFORE_PAUSE_SETTLE__*/",
@@ -126,25 +290,32 @@ pub(super) fn install_harness(scope: &mut v8::PinScope) -> Result<()> {
             ),
         );
     #[cfg(celld_internal_tests)]
-    let harness = harness.as_str();
+    run_bootstrap_script(scope, "harness.js", harness.as_str(), arguments)?;
     #[cfg(not(celld_internal_tests))]
-    let harness = include_str!("harness.js");
-    run_bootstrap_script(scope, "harness.js", harness)?;
-    run_bootstrap_script(scope, "crypto.js", include_str!("crypto.js"))?;
+    {
+        let harness = shipping_harness_source(scope);
+        run_internal_script(scope, Some("harness.js"), harness, arguments)?;
+    }
+    // After the harness: both build on its EventTarget, and EventSource
+    // uses its fetch and timers.
+    for source in POST_HARNESS {
+        run_bootstrap_static_script(scope, source, arguments)?;
+    }
     // Resolving the event hooks belongs to installing the harness, not to the
     // first event: the harness is what defines them, and a caller that
     // installed the harness without them would silently fall back to nothing
-    // at all. `harness.js` has just run, so all three globals exist here.
+    // at all. `harness.js` has just run, so all four globals exist here.
     install_event_hooks(scope)
 }
 
 /// Resolve the per-event harness hooks once and hold them for the isolate.
-/// See [`EventHooks`] for why all three resolve together.
+/// See [`EventHooks`] for why all four resolve together.
 fn install_event_hooks(scope: &mut v8::PinScope) -> Result<()> {
     let hooks = EventHooks {
-        begin_event: global_function(scope, "__beginEvent")?,
-        end_event: global_function(scope, "__endEvent")?,
-        abort_incoming_request: global_function(scope, "__abortIncomingRequest")?,
+        begin_event: internal_global(scope, "__beginEvent")?,
+        end_event: internal_global(scope, "__endEvent")?,
+        advance_io_time: internal_global(scope, "__advanceIoTime")?,
+        abort_incoming_request: internal_global(scope, "__abortIncomingRequest")?,
     };
     actor_runtime_state(scope)
         .event_hooks
@@ -152,14 +323,8 @@ fn install_event_hooks(scope: &mut v8::PinScope) -> Result<()> {
         .map_err(|_| anyhow!("event hooks were already installed"))
 }
 
-fn global_function(scope: &mut v8::PinScope, name: &str) -> Result<v8::Global<v8::Function>> {
-    let global = scope.get_current_context().global(scope);
-    let key = v8::String::new(scope, name).unwrap();
-    let function: v8::Local<v8::Function> = global
-        .get(scope, key.into())
-        .ok_or_else(|| anyhow!("no {name}"))?
-        .try_into()
-        .map_err(|_| anyhow!("{name} is not a function"))?;
+fn internal_global(scope: &mut v8::PinScope, name: &str) -> Result<v8::Global<v8::Function>> {
+    let function = internal_function(scope, name)?;
     Ok(v8::Global::new(scope, function))
 }
 
@@ -168,14 +333,7 @@ pub(super) fn register_class(
     name: &str,
     cls: v8::Local<v8::Value>,
 ) -> Result<()> {
-    let ctx = scope.get_current_context();
-    let global = ctx.global(scope);
-    let ck = static_key(scope, &v8_strings::CELL);
-    let cell = global
-        .get(scope, ck.into())
-        .unwrap()
-        .to_object(scope)
-        .unwrap();
+    let cell = cell_state(scope)?;
     let clk = v8::String::new(scope, "classes").unwrap();
     let classes = cell
         .get(scope, clk.into())
@@ -196,21 +354,12 @@ pub(super) fn populate_cf_exports(
     ns: v8::Local<v8::Object>,
     do_classes: &[String],
 ) -> Result<()> {
-    let context = scope.get_current_context();
-    let global = context.global(scope);
-    let cf = global
-        .get(scope, v8::String::new(scope, "__cf").unwrap().into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing __cf runtime state"))?;
+    let cf = internal_object(scope, "__cf")?;
     let exports = cf
         .get(scope, v8::String::new(scope, "exports").unwrap().into())
         .and_then(|value| value.to_object(scope))
         .ok_or_else(|| anyhow!("missing __cf.exports"))?;
-    let cell_key = static_key(scope, &v8_strings::CELL);
-    let cell = global
-        .get(scope, cell_key.into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing __cell runtime state"))?;
+    let cell = cell_state(scope)?;
     let make_ns: v8::Local<v8::Function> = cell
         .get(
             scope,
@@ -248,13 +397,7 @@ pub(super) fn inject_namespace_keys(
     script_name: &str,
     do_classes: &[String],
 ) -> Result<()> {
-    let context = scope.get_current_context();
-    let global = context.global(scope);
-    let cell_key = static_key(scope, &v8_strings::CELL);
-    let cell = global
-        .get(scope, cell_key.into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing __cell runtime state"))?;
+    let cell = cell_state(scope)?;
     let keys_key = v8::String::new(scope, "namespaceKeys").unwrap();
     let keys = cell
         .get(scope, keys_key.into())
@@ -283,13 +426,7 @@ pub(super) fn inject_namespace_keys(
 /// an alarm the previous deployment armed. Absent `triggers.crons`, the list
 /// is empty and the cron cell retires itself.
 pub(super) fn inject_crons(scope: &mut v8::PinScope, crons: &[String]) -> Result<()> {
-    let context = scope.get_current_context();
-    let global = context.global(scope);
-    let cell_key = static_key(scope, &v8_strings::CELL);
-    let cell = global
-        .get(scope, cell_key.into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing __cell runtime state"))?;
+    let cell = cell_state(scope)?;
     let list = v8::Array::new(scope, crons.len() as i32);
     for (index, cron) in crons.iter().enumerate() {
         let value = v8::String::new(scope, cron).ok_or_else(|| anyhow!("cron expression"))?;
@@ -309,12 +446,7 @@ pub(super) fn inject_workflows(
     script_name: &str,
     workflow_bindings: &[WorkflowBinding],
 ) -> Result<()> {
-    let context = scope.get_current_context();
-    let global = context.global(scope);
-    let cell = global
-        .get(scope, v8::String::new(scope, "__cell").unwrap().into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing __cell runtime state"))?;
+    let cell = cell_state(scope)?;
     let map = v8::Object::new(scope);
     for binding in workflow_bindings {
         let key =
@@ -334,6 +466,26 @@ pub(super) fn inject_workflows(
     if !workflow_bindings.is_empty() {
         alias_workflow_class(scope, cell, script_name)?;
     }
+    Ok(())
+}
+
+/// `__cell.containers`: the classes whose objects get a `ctx.container`.
+/// A class outside this map gets none, which is what the
+/// `@cloudflare/containers` constructor checks.
+pub(super) fn inject_containers(
+    scope: &mut v8::PinScope,
+    containers: &[crate::container::ContainerSpec],
+) -> Result<()> {
+    let cell = cell_state(scope)?;
+    let map = v8::Object::new(scope);
+    for spec in containers {
+        let key =
+            v8::String::new(scope, &spec.class_name).ok_or_else(|| anyhow!("container class"))?;
+        let value = v8::Boolean::new(scope, true);
+        map.set(scope, key.into(), value.into());
+    }
+    let key = v8::String::new(scope, "containers").unwrap();
+    cell.set(scope, key.into(), map.into());
     Ok(())
 }
 
@@ -383,12 +535,7 @@ fn alias_workflow_class(
 /// this runs on every isolate load.
 pub(super) fn inject_kv_limits(scope: &mut v8::PinScope) -> Result<()> {
     use celld_logic::kv;
-    let context = scope.get_current_context();
-    let global = context.global(scope);
-    let cell = global
-        .get(scope, v8::String::new(scope, "__cell").unwrap().into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing __cell runtime state"))?;
+    let cell = cell_state(scope)?;
     let limits = v8::Object::new(scope);
     let set = |scope: &mut v8::PinScope, name: &str, value: f64| {
         let key = v8::String::new(scope, name).unwrap();
@@ -417,11 +564,6 @@ pub(super) fn inject_kv_limits(scope: &mut v8::PinScope) -> Result<()> {
     // These are test-only and they read the production environment rather than
     // sitting behind `cfg(celld_internal_tests)`, because the code they steer
     // is JavaScript in the harness and a cfg cannot reach it.
-    // `CELLD_TEST_OTEL_SWEEP_MS` is the existing precedent for a
-    // controlled-timing override living in production code. Collapsing them
-    // into one name keeps that surface at a single documented variable however
-    // many knobs the feature grows, rather than a new `CELLD_TEST_KV_*` for
-    // each -- which is what this had already become.
     //
     // What each is for, and why a test cannot do without it:
     //
@@ -553,13 +695,15 @@ pub(super) fn inject_process_env(scope: &mut v8::PinScope, config: &WorkerConfig
 /// OpenNext/unenv replace `globalThis.process` with a plain object that omits
 /// `setImmediate`. Harness installs a setter, but top-level module evaluation
 /// order can leave the live object unpatched until we run this explicitly.
-pub(super) fn patch_process_timers(scope: &mut v8::PinScope) -> Result<()> {
-    run_bootstrap_script(
-        scope,
-        "patch_process_timers",
-        "if (typeof __celldPatchProcessTimers === 'function') { \
-         __celldPatchProcessTimers(globalThis.process); }",
-    )
+pub(super) fn patch_process_timers<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    arguments: &InternalArguments<'s>,
+) -> Result<()> {
+    let source = "if (typeof __celldPatchProcessTimers === 'function') { \
+         __celldPatchProcessTimers(globalThis.process); }";
+    let code = v8::String::new(scope, source).unwrap();
+    run_internal_script(scope, Some("patch_process_timers"), code, arguments)?;
+    Ok(())
 }
 
 pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Result<()> {
@@ -577,16 +721,16 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
     let asset_binding = config.asset_binding.as_deref();
     // call the harness: for each binding, env[bindingName] = makeNamespace(className)
     let src = {
-        let mut lines = String::from("(() => { const e = __cell.env;\n");
+        let mut lines = String::from("const e = __celld.__cell.env;\n");
         for (bname, cname) in bindings {
             lines.push_str(&format!(
-                "e[{:?}] = __cell.makeNamespace({:?});\n",
+                "e[{:?}] = __celld.__cell.makeNamespace({:?});\n",
                 bname, cname
             ));
         }
         for (name, bucket) in r2_bindings {
             lines.push_str(&format!(
-                "e[{:?}] = __makeR2Bucket({:?}, {:?});\n",
+                "e[{:?}] = __celld.__makeR2Bucket({:?}, {:?});\n",
                 name, name, bucket
             ));
         }
@@ -599,7 +743,7 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
             // rather than fail. When shards outnumber one, this becomes a name
             // per shard and the choice moves here too.
             lines.push_str(&format!(
-                "e[{:?}] = __makeKvNamespace({:?}, {:?});\n",
+                "e[{:?}] = __celld.__makeKvNamespace({:?}, {:?});\n",
                 binding,
                 id,
                 celld_logic::kv::cell_name(id, 0),
@@ -607,7 +751,7 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         }
         for binding in queue_bindings {
             lines.push_str(&format!(
-                "e[{:?}] = __makeQueue({:?}, {:?}, {});\n",
+                "e[{:?}] = __celld.__makeQueue({:?}, {:?}, {});\n",
                 binding.environment,
                 binding.queue,
                 celld_logic::queue::cell_name(&binding.queue),
@@ -616,13 +760,13 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         }
         for (name, database) in d1_bindings {
             lines.push_str(&format!(
-                "e[{:?}] = __makeD1Database({:?});\n",
+                "e[{:?}] = __celld.__makeD1Database({:?});\n",
                 name, database
             ));
         }
         for binding in workflow_bindings {
             lines.push_str(&format!(
-                "e[{:?}] = __makeWorkflow({:?});\n",
+                "e[{:?}] = __celld.__makeWorkflow({:?});\n",
                 binding.environment, binding.workflow
             ));
         }
@@ -638,7 +782,7 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 None => "null".to_string(),
             };
             lines.push_str(&format!(
-                "e[{:?}] = __makeServiceBinding({:?}, {});\n",
+                "e[{:?}] = __celld.__makeServiceBinding({:?}, {});\n",
                 binding, script, entrypoint
             ));
         }
@@ -647,24 +791,45 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         }
         if let Some(name) = asset_binding {
             lines.push_str(&format!(
-                "e[{:?}] = __makeAssetsBinding({:?});\n",
+                "e[{:?}] = __celld.__makeAssetsBinding({:?});\n",
                 name, script_name
             ));
         }
-        if let Some(name) = config.loader_binding.as_deref() {
-            lines.push_str(&format!("e[{:?}] = __makeLoader();\n", name));
+        // One `__makeLoader()` call for each binding. Each call builds its own
+        // `byName` cache, so two loaders are two namespaces, as they are in
+        // workerd. Sharing one loader object between the names would merge the
+        // caches and return one Worker for two different `get()` calls.
+        for name in &config.loader_bindings {
+            lines.push_str(&format!("e[{:?}] = __celld.__makeLoader();\n", name));
         }
-        // A loaded worker's caller-supplied `env` (plain JSON values only in
-        // the walking skeleton) merges last, over the declared bindings.
-        if let Some(env) = config.loader_env.as_deref() {
-            lines.push_str(&format!("Object.assign(e, {});\n", env));
-        }
-        lines.push_str("})();");
         lines
     };
-    let code = v8::String::new(scope, &src).unwrap();
-    let s = v8::Script::compile(scope, code, None).ok_or_else(|| anyhow!("env compile"))?;
-    s.run(scope).ok_or_else(|| anyhow!("env run"))?;
+    run_internal_snippet(scope, &src).ok_or_else(|| anyhow!("env install failed"))?;
+    if let Some(env) = &config.loader_env {
+        let installer = internal_function(scope, "__installLoaderEnv")?;
+        // A flat [script, entrypoint, props, ...] array avoids one V8 array
+        // allocation for every capability that the parent transfers.
+        let routes = v8::Array::new(scope, env.routes.len().saturating_mul(3) as i32);
+        for (index, route) in env.routes.iter().enumerate() {
+            let offset = (index * 3) as u32;
+            let script = v8::String::new(scope, &route.script).unwrap();
+            routes.set_index(scope, offset, script.into());
+            let entrypoint: v8::Local<v8::Value> = match &route.entrypoint {
+                Some(name) => v8::String::new(scope, name).unwrap().into(),
+                None => v8::null(scope).into(),
+            };
+            routes.set_index(scope, offset + 1, entrypoint);
+            let props = super::bytes_value(scope, route.props.clone());
+            routes.set_index(scope, offset + 2, props);
+        }
+        let bytes = super::bytes_value(scope, env.bytes.clone());
+        let tc = std::pin::pin!(v8::TryCatch::new(scope));
+        let tc = &mut tc.init();
+        let receiver = v8::undefined(tc).into();
+        installer
+            .call(tc, receiver, &[bytes, routes.into()])
+            .ok_or_else(|| anyhow!("loader env install: {}", exc!(tc)))?;
+    }
     Ok(())
 }
 
@@ -685,7 +850,7 @@ thread_local! {
 }
 
 /// Measure lease expiry without waiting through the production handler budget.
-/// The override is thread-local because the private runtime corpus builds
+/// The override is thread-local because runtime tests build
 /// unrelated Workers in parallel, and a process environment variable would
 /// silently shorten their leases too.
 #[cfg(celld_internal_tests)]
@@ -761,12 +926,7 @@ fn effective_queue_batch_timeout(duration: i64) -> i64 {
 /// shared `__Queue` class cannot dispatch according to whichever producer
 /// registered the class first.
 pub(super) fn inject_queue_config(scope: &mut v8::PinScope, config: &WorkerConfig) -> Result<()> {
-    let context = scope.get_current_context();
-    let global = context.global(scope);
-    let cell = global
-        .get(scope, v8::String::new(scope, "__cell").unwrap().into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing __cell runtime state"))?;
+    let cell = cell_state(scope)?;
     let consumers = v8::Object::new(scope);
     for registration in &config.queue_consumers {
         let value = v8::Object::new(scope);
@@ -838,6 +998,11 @@ pub(super) fn inject_queue_config(scope: &mut v8::PinScope, config: &WorkerConfi
     );
     set_limit(
         scope,
+        "producerGroupMs",
+        crate::queue_batching::timing().producer_ms as f64,
+    );
+    set_limit(
+        scope,
         "maxConcurrency",
         celld_logic::queue::MAX_CONCURRENCY as f64,
     );
@@ -871,13 +1036,7 @@ pub(super) fn register_entrypoints(
     scope: &mut v8::PinScope,
     ns: v8::Local<v8::Object>,
 ) -> Result<()> {
-    let context = scope.get_current_context();
-    let global = context.global(scope);
-    let cell_key = static_key(scope, &v8_strings::CELL);
-    let cell = global
-        .get(scope, cell_key.into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing __cell runtime state"))?;
+    let cell = cell_state(scope)?;
     let key = v8::String::new(scope, "entrypoints").unwrap();
     let entrypoints = cell
         .get(scope, key.into())
@@ -893,11 +1052,12 @@ pub(super) fn register_entrypoints(
         .get(scope, key.into())
         .and_then(|value| value.to_object(scope))
         .ok_or_else(|| anyhow!("missing doExports registry"))?;
-    let cf_key = v8::String::new(scope, "__cf").unwrap();
-    let cf = global
-        .get(scope, cf_key.into())
+    let key = v8::String::new(scope, "classes").unwrap();
+    let classes = cell
+        .get(scope, key.into())
         .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing __cf"))?;
+        .ok_or_else(|| anyhow!("missing Durable Object class registry"))?;
+    let cf = internal_object(scope, "__cf")?;
     let key = v8::String::new(scope, "WorkerEntrypoint").unwrap();
     let entrypoint_base = cf
         .get(scope, key.into())
@@ -934,6 +1094,7 @@ pub(super) fn register_entrypoints(
             entrypoints.set(scope, name, value);
         } else if call_extends(scope, extends, value, durable_base)? {
             do_exports.set(scope, name, yes.into());
+            classes.set(scope, name, value);
         }
     }
     Ok(())
@@ -953,13 +1114,7 @@ pub(super) fn validate_workflow_classes(
     if workflow_bindings.is_empty() {
         return Ok(());
     }
-    let context = scope.get_current_context();
-    let global = context.global(scope);
-    let cf_key = v8::String::new(scope, "__cf").unwrap();
-    let cf = global
-        .get(scope, cf_key.into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing __cf"))?;
+    let cf = internal_object(scope, "__cf")?;
     let key = v8::String::new(scope, "WorkflowEntrypoint").unwrap();
     let base = cf
         .get(scope, key.into())
@@ -1022,24 +1177,20 @@ pub(super) fn inject_loopback_config(
     scope: &mut v8::PinScope,
     config: &crate::fetch_loopback::LoopbackConfig,
 ) -> Result<()> {
+    // `__cell` is the harness's own `const`, not a global: the runtime-state
+    // object is reachable as `__celld.__cell`, which is what every other host
+    // injector in this module writes through.
     let src = format!(
-        "(() => {{ __cell.canonicalInboundUrl = {:?}; __cell.loopbackEnabled = {}; }})();",
+        "__celld.__cell.canonicalInboundUrl = {:?}; __celld.__cell.loopbackEnabled = {};",
         config.canonical_inbound_url, config.loopback_enabled,
     );
-    let code = v8::String::new(scope, &src).unwrap();
-    let script =
-        v8::Script::compile(scope, code, None).ok_or_else(|| anyhow!("loopback config compile"))?;
-    script
-        .run(scope)
-        .ok_or_else(|| anyhow!("loopback config run"))?;
+    run_internal_snippet(scope, &src).ok_or_else(|| anyhow!("loopback config run"))?;
     Ok(())
 }
 
 pub(super) fn inject_routing(scope: &mut v8::PinScope, node: &str) -> Result<()> {
-    let src = format!("(() => {{ __cell.node = {node:?}; }})();");
-    let code = v8::String::new(scope, &src).unwrap();
-    let s = v8::Script::compile(scope, code, None).ok_or_else(|| anyhow!("routing compile"))?;
-    s.run(scope).ok_or_else(|| anyhow!("routing run"))?;
+    let src = format!("__celld.__cell.node = {node:?};");
+    run_internal_snippet(scope, &src).ok_or_else(|| anyhow!("routing install failed"))?;
     Ok(())
 }
 
@@ -1060,10 +1211,69 @@ pub(super) fn adopt_cell(
             cell,
             cell_storage.path,
             cell_storage.epoch,
+            cell_storage.replicated_wake,
+            cell_storage.vfs,
             compat.sqlite_vec,
         )
         .context("cell storage open failed")?;
     }
+    finish_cell_adoption(tc, cell, owned)
+}
+
+pub(super) struct EmbeddedStartup<'a> {
+    pub id: &'a str,
+    pub props_sc: Vec<u8>,
+    pub restored_image: Option<Vec<u8>>,
+}
+
+pub(super) fn adopt_embedded_cell(
+    tc: &mut v8::PinScope,
+    cell: &str,
+    parent: &storage::StorageIdentity,
+    name: &str,
+    startup: EmbeddedStartup<'_>,
+    compat: Compat,
+) -> Result<Option<i64>> {
+    storage::open_embedded(
+        cell,
+        parent,
+        name,
+        startup.restored_image,
+        compat.sqlite_vec,
+    )
+    .context("facet storage open failed")?;
+    let alarm = finish_cell_adoption(tc, cell, true)?;
+    let depth = parent.facet_path.len() + 1;
+    // Decode in the loaded isolate and install the value directly. A JSON
+    // source string flattened structured-clone types before the constructor
+    // could read them, and it represented absent props as an explicit null.
+    let cell_state = cell_state(tc)?;
+    let configs_key = v8::String::new(tc, "facetConfigs").unwrap();
+    let configs = cell_state
+        .get(tc, configs_key.into())
+        .and_then(|value| value.to_object(tc))
+        .ok_or_else(|| anyhow!("missing facet config registry"))?;
+    let config = v8::Object::new(tc);
+    let id_key = v8::String::new(tc, "id").unwrap();
+    let id_value = v8::String::new(tc, startup.id).unwrap();
+    config.set(tc, id_key.into(), id_value.into());
+    let props = if startup.props_sc.is_empty() {
+        v8::undefined(tc).into()
+    } else {
+        storage_ops::deserialize_storage_value(tc, storage::StoredValue::V8(startup.props_sc))
+            .ok_or_else(|| anyhow!("decode facet props"))?
+    };
+    let props_key = v8::String::new(tc, "props").unwrap();
+    config.set(tc, props_key.into(), props);
+    let depth_key = v8::String::new(tc, "depth").unwrap();
+    let depth_value = v8::Integer::new(tc, depth as i32);
+    config.set(tc, depth_key.into(), depth_value.into());
+    let cell_key = v8::String::new(tc, cell).unwrap();
+    configs.set(tc, cell_key.into(), config.into());
+    Ok(alarm)
+}
+
+fn finish_cell_adoption(tc: &mut v8::PinScope, cell: &str, owned: bool) -> Result<Option<i64>> {
     // Every cell dispatch goes out through the host and arrives as an ordinary
     // reentrant `CellJob::Fetch`. There is no same-isolate shortcut, and there
     // will not be one.
@@ -1087,10 +1297,8 @@ pub(super) fn adopt_cell(
     // The release loses nothing the cell needs back: `register_actor_name`
     // persists the id name before writing it here, so the take-in below reads
     // it back.
-    let source = format!("(() => {{ const s = {cell:?}; __cell.release(s); }})();");
-    let code = v8::String::new(tc, &source).unwrap();
-    let script = v8::Script::compile(tc, code, None).ok_or_else(|| anyhow!("adopt compile"))?;
-    script.run(tc).ok_or_else(|| anyhow!("adopt run"))?;
+    let source = format!("__celld.__cell.release({cell:?});");
+    run_internal_snippet(tc, &source).ok_or_else(|| anyhow!("adopt failed"))?;
     if !owned {
         storage::close(cell);
         return Ok(None);
@@ -1102,23 +1310,19 @@ pub(super) fn adopt_cell(
 
 pub(super) fn inject_storage_compatibility(scope: &mut v8::PinScope, compat: Compat) -> Result<()> {
     let source = format!(
-        "__cell.deleteAllDeletesAlarm = {};\n\
-         __cell.compat.jsRpc = {};\n\
-         __cell.compat.fetcherGetPutDelete = {};\n\
-         __cell.compat.websocketStandardBinaryType = {};\n\
-         __cell.compat.queueJsonMessages = {};",
+        "const c = __celld.__cell;\n\
+         c.deleteAllDeletesAlarm = {};\n\
+         c.compat.jsRpc = {};\n\
+         c.compat.fetcherGetPutDelete = {};\n\
+         c.compat.websocketStandardBinaryType = {};\n\
+         c.compat.queueJsonMessages = {};",
         compat.delete_all_deletes_alarm,
         compat.js_rpc,
         compat.fetcher_get_put_delete,
         compat.websocket_standard_binary_type,
         compat.queue_json_messages,
     );
-    let code = v8::String::new(scope, &source).unwrap();
-    let script =
-        v8::Script::compile(scope, code, None).ok_or_else(|| anyhow!("compatibility compile"))?;
-    script
-        .run(scope)
-        .ok_or_else(|| anyhow!("compatibility run"))?;
+    run_internal_snippet(scope, &source).ok_or_else(|| anyhow!("compatibility install failed"))?;
     Ok(())
 }
 
@@ -1133,14 +1337,7 @@ pub(super) fn inject_storage_compatibility(scope: &mut v8::PinScope, compat: Com
 pub(super) fn harness_env<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>> {
-    let ctx = scope.get_current_context();
-    let global = ctx.global(scope);
-    let ck = static_key(scope, &v8_strings::CELL);
-    let cell = global
-        .get(scope, ck.into())
-        .unwrap()
-        .to_object(scope)
-        .unwrap();
+    let cell = cell_state(scope)?;
     let ek = static_key(scope, &v8_strings::ENV);
     Ok(cell.get(scope, ek.into()).unwrap())
 }

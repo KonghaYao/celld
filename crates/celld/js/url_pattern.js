@@ -1,10 +1,10 @@
-// URLPattern — WHATWG URLPattern over the Rust `urlpattern` crate, split
+// URLPattern -- WHATWG URLPattern over the Rust `urlpattern` crate, split
 // the way Deno splits it: the host ops ($$urlPatternParse /
 // $$urlPatternMatchInput) do pattern parsing and match-input
 // canonicalization; the compiled component regexes execute here as plain
 // JS RegExp. Compiled on first access (see LAZY_GLOBALS); a bundle that
 // never names URLPattern never pays for this file.
-(() => {
+return (() => {
 
 const KEYS = ['protocol', 'username', 'password', 'hostname', 'port',
               'pathname', 'search', 'hash'];

@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 372" role="img">
+  <title>Several facets share one cell, one owner node, and one replication stream, while separate Durable Objects each take their own owner record and node</title>
+  <desc>Two arrangements of the same three application databases. On the left, a
+Worker calls one supervisor cell on node B at epoch e4. That single cell holds
+the supervisor's SQLite database and, in separate databases beside it, the
+facets app-a and app-b. One owner record and one stream under
+cells/acct-9/ltx/e4/ cover all of them, so the call takes one hop and one output
+gate. On the right, the same three databases are three separate Durable Object
+cells on nodes B, C, and A. Each cell holds its own owner record and its own
+epoch, and the three replicate under three prefixes, so a call takes a hop and
+an output gate for each object.</desc>
+  <style>
+    .d-ink { color: #121212 }
+    .d-soft { color: #3d3b37 }
+    .d-faint { color: #6e6a62 }
+    .d-acc { color: #10803f }
+    .d-panel { color: #ffffff }
+    .d-sunk { color: #f0eee8 }
+    .d-tint { color: #d6efdf }
+    text {
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      font-size: 13px;
+      fill: currentColor;
+    }
+    tspan { fill: currentColor; }
+    @media (prefers-color-scheme: dark) {
+      .d-ink { color: #efede7 }
+      .d-soft { color: #c9c6be }
+      .d-faint { color: #928e85 }
+      .d-acc { color: #3fc472 }
+      .d-panel { color: #1a1a19 }
+      .d-sunk { color: #232321 }
+      .d-tint { color: #10301d }
+    }
+  </style>
+  <defs>
+    <marker id="facet-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6"
+      markerHeight="6" orient="auto-start-reverse">
+      <path class="d-soft" fill="currentColor" d="M0 0 L10 5 L0 10 z" />
+    </marker>
+  </defs>
+
+  <!-- Column captions: one object with facets, against separate objects. -->
+  <text class="d-ink" fill="currentColor" x="110" y="14" text-anchor="middle">one object, two facets</text>
+  <text class="d-ink" fill="currentColor" x="330" y="14" text-anchor="middle">three separate objects</text>
+
+  <!-- The same caller in both arrangements. -->
+  <rect class="d-panel" fill="currentColor" x="6" y="24" width="208" height="32" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="6" y="24" width="208" height="32" rx="6" />
+  <text class="d-soft" fill="currentColor" x="110" y="45" text-anchor="middle">Worker</text>
+
+  <rect class="d-panel" fill="currentColor" x="226" y="24" width="208" height="32" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="226" y="24" width="208" height="32" rx="6" />
+  <text class="d-soft" fill="currentColor" x="330" y="45" text-anchor="middle">Worker</text>
+
+  <!-- One dispatch on the left; one dispatch for each object on the right. -->
+  <g class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M110 56 V74" marker-end="url(#facet-arrow)" />
+    <path d="M330 56 V66 H234 V219" />
+    <path d="M234 99 H246" marker-end="url(#facet-arrow)" />
+    <path d="M234 159 H246" marker-end="url(#facet-arrow)" />
+    <path d="M234 219 H246" marker-end="url(#facet-arrow)" />
+  </g>
+
+  <!-- One cell, one owner, one epoch, and two private databases inside it. -->
+  <rect class="d-tint" fill="currentColor" x="6" y="74" width="208" height="172" rx="6" />
+  <rect class="d-acc" fill="none" stroke="currentColor" stroke-width="2" x="6" y="74" width="208" height="172" rx="6" />
+  <text class="d-ink" fill="currentColor" x="110" y="95" text-anchor="middle">supervisor cell</text>
+  <text class="d-soft" fill="currentColor" x="110" y="112" text-anchor="middle">node B · epoch e4</text>
+
+  <rect class="d-sunk" fill="currentColor" x="16" y="122" width="188" height="34" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="16" y="122" width="188" height="34" rx="6" />
+  <text class="d-ink" fill="currentColor" x="110" y="144" text-anchor="middle">supervisor SQLite</text>
+
+  <g class="d-faint" fill="none" stroke="currentColor" stroke-dasharray="5 4">
+    <path d="M16 168 H46" />
+    <path d="M174 168 H204" />
+  </g>
+  <text class="d-faint" fill="currentColor" x="110" y="172" text-anchor="middle">separate databases</text>
+
+  <rect class="d-sunk" fill="currentColor" x="16" y="180" width="90" height="56" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="16" y="180" width="90" height="56" rx="6" />
+  <text class="d-ink" fill="currentColor" x="61" y="202" text-anchor="middle">facet app-a</text>
+  <text class="d-soft" fill="currentColor" x="61" y="221" text-anchor="middle">own SQLite</text>
+
+  <rect class="d-sunk" fill="currentColor" x="114" y="180" width="90" height="56" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="114" y="180" width="90" height="56" rx="6" />
+  <text class="d-ink" fill="currentColor" x="159" y="202" text-anchor="middle">facet app-b</text>
+  <text class="d-soft" fill="currentColor" x="159" y="221" text-anchor="middle">own SQLite</text>
+
+  <!-- The same three databases as three cells, each with its own owner. -->
+  <rect class="d-panel" fill="currentColor" x="246" y="74" width="176" height="50" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="246" y="74" width="176" height="50" rx="6" />
+  <text class="d-ink" fill="currentColor" x="334" y="95" text-anchor="middle">APP-A cell · node B</text>
+  <text class="d-soft" fill="currentColor" x="334" y="112" text-anchor="middle">own owner record · e4</text>
+
+  <rect class="d-panel" fill="currentColor" x="246" y="134" width="176" height="50" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="246" y="134" width="176" height="50" rx="6" />
+  <text class="d-ink" fill="currentColor" x="334" y="155" text-anchor="middle">APP-B cell · node C</text>
+  <text class="d-soft" fill="currentColor" x="334" y="172" text-anchor="middle">own owner record · e9</text>
+
+  <rect class="d-panel" fill="currentColor" x="246" y="194" width="176" height="50" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="246" y="194" width="176" height="50" rx="6" />
+  <text class="d-ink" fill="currentColor" x="334" y="215" text-anchor="middle">APP-C cell · node A</text>
+  <text class="d-soft" fill="currentColor" x="334" y="232" text-anchor="middle">own owner record · e2</text>
+
+  <!-- One stream against three streams. -->
+  <g class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M110 246 V272" marker-end="url(#facet-arrow)" />
+    <path d="M422 99 H428 V264 H330 V272" marker-end="url(#facet-arrow)" />
+    <path d="M422 159 H428" />
+    <path d="M422 219 H428" />
+  </g>
+
+  <rect class="d-sunk" fill="currentColor" x="6" y="272" width="208" height="52" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="6" y="272" width="208" height="52" rx="6" />
+  <text class="d-ink" fill="currentColor" x="110" y="293" text-anchor="middle">cells/acct-9/ltx/e4/</text>
+  <text class="d-soft" fill="currentColor" x="110" y="311" text-anchor="middle">one stream covers all</text>
+
+  <rect class="d-sunk" fill="currentColor" x="226" y="272" width="208" height="52" rx="6" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="226" y="272" width="208" height="52" rx="6" />
+  <text class="d-ink" fill="currentColor" x="330" y="293" text-anchor="middle">three bucket prefixes</text>
+  <text class="d-soft" fill="currentColor" x="330" y="311" text-anchor="middle">three epochs</text>
+
+  <text class="d-faint" fill="currentColor" x="110" y="348" text-anchor="middle">one hop, one gate, one proof</text>
+  <text class="d-faint" fill="currentColor" x="330" y="348" text-anchor="middle">a hop and a gate for each</text>
+</svg>

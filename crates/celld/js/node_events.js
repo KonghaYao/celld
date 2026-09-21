@@ -6,7 +6,7 @@
 // a handler that never fires.
 //
 // Ported from Workerd's `src/node/internal/events.ts` (Apache-2.0), itself
-// adapted from Node.js (Joyent/Node contributors, MIT) — including the
+// adapted from Node.js (Joyent/Node contributors, MIT) -- including the
 // Node-compatible `_events` / `_eventsCount` / `_maxListeners` internals and
 // the single-listener (bare function, no array) representation, which real
 // bundles poke at.
@@ -604,5 +604,5 @@
     },
   });
 
-  globalThis.__eventsModule = EventEmitter;
+  __celld.__eventsModule = EventEmitter;
 })();

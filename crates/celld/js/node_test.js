@@ -1,4 +1,4 @@
-// node:test for Cells — the `mock` surface only.
+// node:test for Cells -- the `mock` surface only.
 //
 // Injected lazily into the generated stub module, so an isolate that never
 // imports it pays nothing.
@@ -72,7 +72,7 @@
   };
 
   const test = notImplemented("test");
-  globalThis.__nodeTest = {
+  __celld.__nodeTest = {
     mock,
     test,
     default: test,

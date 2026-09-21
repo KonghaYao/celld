@@ -25,6 +25,52 @@ pub enum EvictionRestoreArtifact {
     L0Chain,
 }
 
+/// The one bit that lets a revocable eviction give the cell back.
+///
+/// The core sets it when a request arrives for a cell in `Phase::Cleaning`,
+/// after the runtime is gone and before the eviction has taken the database.
+/// `LtxRepl::evict` reads it at the points where it can still stop, which are
+/// the points before the handoff snapshot becomes visible.
+#[derive(Default)]
+pub struct EvictionAbandon(std::sync::atomic::AtomicBool);
+
+impl EvictionAbandon {
+    /// Ask the eviction to stop. Repeating the request changes nothing, so a
+    /// second waiting request costs no more than the first.
+    pub fn request(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn requested(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// The eviction stopped and left the cell resident at its own epoch.
+///
+/// This is an error so that it travels the path a failed release already
+/// takes, and it is a distinct type so that the shell tells it apart from a
+/// release that should be retried. Retrying an abandoned eviction would evict
+/// the cell the abandonment just saved.
+#[derive(Debug)]
+pub struct EvictionAbandoned {
+    pub cell: String,
+    pub epoch: u64,
+}
+
+impl std::fmt::Display for EvictionAbandoned {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "abandoned the eviction of {} epoch {}; a request arrived before \
+             the handoff snapshot became visible",
+            self.cell, self.epoch
+        )
+    }
+}
+
+impl std::error::Error for EvictionAbandoned {}
+
 /// Outcome of a blocking replication wait on one cell db.
 pub enum SyncWait {
     /// The latest local commit is in the bucket.
@@ -103,6 +149,12 @@ pub struct ActivationOptions<'a> {
 pub struct ActivationResult {
     pub path: PathBuf,
     pub restored: bool,
+    /// The paged VFS registered for this activation, when the restore paged
+    /// instead of downloading. The local main-db file is then sparse, so every
+    /// connection to `path` — the actor's included — must open through this
+    /// VFS; a plain open reads holes as zeros and SQLite reports a malformed
+    /// database (the 2026-09-01 cold-whale fleet failure).
+    pub vfs: Option<String>,
 }
 
 /// Is this a preserved eviction snapshot? `.hibernated` is the pre-2026-08-05

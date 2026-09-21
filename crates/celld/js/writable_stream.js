@@ -105,10 +105,10 @@ class WritableStreamDefaultWriter {
     // when ready is rejected by the erroring path and
     // the user never touched `writer.ready`. The
     // user awaiting writer.ready still sees the
-    // rejection — the promise is shared. Without
+    // rejection -- the promise is shared. Without
     // this, a writable whose sink throws on the
     // first write produced both the user-visible
-    // `await writer.write(…)` rejection AND a
+    // `await writer.write(...)` rejection AND a
     // ghost "Uncaught (in promise)" reported on
     // the freshly-reset ready promise (the
     // queueSize-just-hit-hwm case).
@@ -168,7 +168,7 @@ class WritableStreamDefaultWriter {
   releaseLock() {
     if (this.#released) return;
     const s = this.#stream;
-    // Spec §4.6.9: releasing rejects the writer's ready
+    // Spec section 4.6.9: releasing rejects the writer's ready
     // and (still-pending) closed promises with a fresh
     // TypeError, even while an abort is in flight.
     const err = new TypeError(
@@ -380,7 +380,7 @@ class WritableStream {
     this._state = 'errored';
     const err = this._storedError;
     // Reject queued writes in order, then settle abort,
-    // then reject close/closed — the spec's promise
+    // then reject close/closed -- the spec's promise
     // resolution order.
     for (const entry of this._queue) entry.reject(err);
     this._queue = [];
@@ -569,7 +569,7 @@ class TransformStreamDefaultController {
   get desiredSize() { return this.#rsc.desiredSize; }
 }
 
-// TransformStream — pairs a readable + writable
+// TransformStream -- pairs a readable + writable
 class TransformStream {
   readable;
   writable;
@@ -584,9 +584,9 @@ class TransformStream {
     const flushFn = transformer.flush;
     const cancelFn = transformer.cancel;
     let rsc;
-    // State for cross-side coordination. cancelled →
+    // State for cross-side coordination. cancelled ->
     // transformer.cancel already ran (or started). flushing
-    // → writable.close triggered flush(). Whichever fires
+    // -> writable.close triggered flush(). Whichever fires
     // first wins; the other side becomes a no-op.
     let cancelled = false;
     let flushing = false;
@@ -629,8 +629,8 @@ class TransformStream {
     const ctrl = new TransformStreamDefaultController(rsc, (e) => {
       if (readableError === null) readableError = e;
     });
-    // start runs once at construction per spec. A throw — sync or
-    // async — must error both sides rather than escape the
+    // start runs once at construction per spec. A throw -- sync or
+    // async -- must error both sides rather than escape the
     // constructor, so wrap it: the executor turns a sync throw into
     // a rejection, and handing that to the writable's own start gate
     // rejects every queued write and the close.

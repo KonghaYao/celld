@@ -8,7 +8,7 @@
 
 //! Production bucket deployment adapters reused by the clean-sheet host.
 
-use crate::bucket::{Bucket, CasVerdict};
+use crate::bucket::{Bucket, StorageProbeVerdict};
 use crate::deploy;
 use crate::js::{ModuleSource, WorkerConfigOptions};
 use crate::native::NativeExecution;
@@ -17,6 +17,7 @@ use crate::protocol::{
     DeployPointer, Manifest, ModuleKind, Rollout, EXECUTION_PROFILE_NATIVE_HTTP_V1,
 };
 use anyhow::{bail, Context};
+use std::collections::BTreeMap;
 use std::borrow::Cow;
 
 use crate::cli_output::Format;
@@ -110,7 +111,6 @@ impl Record for Check {
         })
     }
 }
-use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::info;
 
@@ -264,46 +264,57 @@ async fn probe_storage(out: &mut Output, bucket: &Bucket, read_only: bool) -> an
     }
 }
 
-/// Test the conditional write before a node serves, and refuse to start
-/// when the store proves it cannot fence.
+/// Test the required conditional writes and ranged reads before a node serves,
+/// and refuse to start when the store proves it cannot support celld.
 ///
 /// The two probe outcomes get different answers on purpose. A violation
-/// is a property of the store: it never clears, and a node that serves
-/// anyway can share a cell with a second owner. Refusing to start turns
-/// the restart loop such a store otherwise produces into one message.
+/// is a property of the store: it never clears. A node that serves anyway can
+/// share a cell with another owner or fail when it reads stored cell data.
+/// Refusing to start reports the permanent problem before either failure.
 ///
-/// An ambiguous error is not that. `put_cas` runs with retries off, so a
-/// single slow or dropped connection at boot answers `Err`. The lease
-/// machinery already handles a transient fault, and a node must not
-/// refuse to start over one.
+/// An ambiguous error is not that. `put_cas` runs with transport retries off,
+/// so a slow or dropped connection answers `Err`. The complete probe retries
+/// with a fresh key twice, then preserves the existing warn-and-serve result.
 ///
 /// `managed` reports the refusal to the Managed Control Plane, the way
 /// [`validate_managed_bucket`] reports its own failures. Without it an
 /// enrolled installation that refuses to serve leaves only local stderr
 /// behind, so the operator who most needs the reason cannot read it.
 pub async fn probe_storage_before_serving(bucket: &Bucket, managed: bool) -> anyhow::Result<()> {
-    match bucket.probe_cas_steps().await {
-        Ok(CasVerdict::Conformant) => Ok(()),
-        Ok(CasVerdict::Violation(reason)) => {
-            if managed {
-                crate::control_plane::report_managed_runtime_state(
-                    crate::control_plane::ManagedRuntimeState::StorageContractViolated,
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        match bucket.probe_startup_storage_steps().await {
+            Ok(StorageProbeVerdict::Conformant) => return Ok(()),
+            Ok(StorageProbeVerdict::Violation(reason)) => {
+                if managed {
+                    crate::control_plane::report_managed_runtime_state(
+                        crate::control_plane::ManagedRuntimeState::StorageContractViolated,
+                    );
+                }
+                bail!(
+                    "the bucket does not keep the storage contract, so celld cannot serve cells \
+                     safely on it: {reason}. Use a store that supports the required operations"
+                )
+            }
+            Err(error) if attempt < ATTEMPTS => {
+                tracing::warn!(
+                    attempt,
+                    attempts = ATTEMPTS,
+                    error = format!("{error:#}"),
+                    "could not verify the bucket storage contract; retrying"
                 );
             }
-            bail!(
-                "the bucket does not keep the conditional-write contract, so celld cannot own \
-                 cells safely on it: {reason}. Set CELLD_STORAGE_PROBE=0 to start without this \
-                 test"
-            )
-        }
-        Err(error) => {
-            tracing::warn!(
-                error = format!("{error:#}"),
-                "could not verify the bucket conditional write; starting anyway"
-            );
-            Ok(())
+            Err(error) => {
+                tracing::warn!(
+                    attempts = ATTEMPTS,
+                    error = format!("{error:#}"),
+                    "could not verify the bucket storage contract; starting anyway"
+                );
+                return Ok(());
+            }
         }
     }
+    unreachable!("the storage probe loop always returns on its last attempt")
 }
 
 pub async fn diagnose(
@@ -448,13 +459,18 @@ async fn diagnose_checks(
             .load
             .in_use_bytes
             .map_or_else(|| "unknown".to_string(), |bytes| bytes.to_string());
+        let owned_cells = node
+            .load
+            .owned_cells
+            .map_or_else(|| "unknown".to_string(), |cells| cells.to_string());
         out.row(&Check::ok(
             format!("peer {} at {}", node.node, node.addr),
             format!(
-                "(signed direct probe) protocol={} resident_cells={} \
+                "(signed direct probe) protocol={} owned_cells={} resident_cells={} \
                  websockets={} rss_bytes={} in_use_bytes={} cpu_percent={:.2} fds={}/{} \
                  pressured={} shed_cells={} restoring={} load_age_ms={}",
                 node.peer_protocol,
+                owned_cells,
                 node.load.resident_cells,
                 node.load.host_websockets,
                 rss_bytes,
@@ -538,7 +554,7 @@ pub(crate) fn resolve_storage_location(
             .filter(|value| !value.trim().is_empty())
     };
     if bucket.is_none() {
-        *bucket = env("CELLD_BUCKET").map(|value| value.trim_start_matches("s3://").to_string());
+        *bucket = crate::cli_options::bucket_from_environment();
     }
     if endpoint.is_none() {
         *endpoint = env("S3_ENDPOINT");
@@ -548,6 +564,11 @@ pub(crate) fn resolve_storage_location(
         .or_else(|| env("AWS_REGION"))
         .or_else(|| env("AWS_DEFAULT_REGION"))
         .unwrap_or_else(|| "us-east-1".to_string())
+}
+
+#[cfg(all(test, celld_internal_tests))]
+mod internal_tests {
+    include!(env!("CELLD_INTERNAL_FLEET_TESTS"));
 }
 
 pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
@@ -586,6 +607,7 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     let bucket = options.bucket.expect("validated deployment bucket");
     let store = bucket_client(&bucket, options.endpoint.as_deref(), &region)?;
     validate_bucket(&store).await?;
+    crate::wake_format::ensure_ready(&store).await?;
     let started = std::time::Instant::now();
     deploy::write(&store, &built).await?;
     let location = format!(
@@ -635,6 +657,36 @@ pub async fn load_current_worker(
     node: String,
 ) -> anyhow::Result<LoadedDeployment> {
     load_worker_from_pointer(bucket, CURRENT_POINTER_KEY, node).await
+}
+
+/// Block until the fleet-wide pointer exists, so a self-hosted node that
+/// starts before its first `celld deploy` idles instead of exiting.
+///
+/// The boot path reads `deploy/current.json` and treats "no such key" as
+/// fatal, so a node started against an empty bucket exits and systemd
+/// restarts it in a loop until a deployment appears. The pointer is the
+/// authority, so the node waits for it and then serves it, with no
+/// operator restart. A bucket or transport error still returns `Err`, so
+/// a misconfigured bucket fails the boot rather than waiting forever.
+pub async fn wait_for_deployment_pointer(bucket: &Bucket) -> anyhow::Result<()> {
+    let mut waited = false;
+    loop {
+        if bucket.get(CURRENT_POINTER_KEY).await?.is_some() {
+            if waited {
+                tracing::info!(event = "initial_deployment_found");
+            }
+            return Ok(());
+        }
+        if !waited {
+            waited = true;
+            tracing::info!(
+                event = "awaiting_initial_deployment",
+                "no deployment yet; run `celld deploy` and the node serves it \
+                 without a restart"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }
 
 /// Read the fleet-wide pointer without loading what it names. The watcher
@@ -730,19 +782,47 @@ async fn load_worker_at_pointer(
     crate::protocol::validate_required_features(&manifest.required_features)?;
     crate::protocol::validate_queue_manifest(&manifest)?;
     manifest.validate_execution()?;
-    let native = if manifest.execution_profile == EXECUTION_PROFILE_NATIVE_HTTP_V1 {
-        let descriptor = manifest
-            .native_component
-            .clone()
-            .context("native-http-v1 deployment is missing native_component")?;
-        let bytes = get_bytes(bucket, &format!("{}/{}", pointer.prefix, descriptor.path)).await?;
-        Some((descriptor, bytes))
+    let prefix = &pointer.prefix;
+    let mut fetched =
+        futures_util::future::try_join_all(manifest.modules.iter().map(|module| async move {
+            let key = format!("{prefix}/{}", module.name);
+            let bytes = get_bytes(bucket, &key).await?;
+            module.verify(&bytes)?;
+            anyhow::Ok((module, bytes))
+        }))
+        .await?;
+    // A `native-http-v1` deployment's component is not a JS module: its bytes
+    // belong to the Wasmtime engine, and leaving them in the module list made
+    // the JS loader try to compile a component as a Worker script. The profile
+    // decides this, not the descriptor's presence: a `js-v8` manifest that
+    // carries one is refused by `validate_execution`, and this keeps the engine
+    // unreachable even if a caller skipped that check.
+    // The profile decides this, not the descriptor's presence: a `js-v8`
+    // manifest that carries one is refused by `validate_execution`, and this
+    // keeps the engine unreachable even if a caller skipped that check.
+    let native_descriptor = if manifest.execution_profile == EXECUTION_PROFILE_NATIVE_HTTP_V1 {
+        Some(
+            manifest
+                .native_component
+                .as_ref()
+                .context("native-http-v1 deployment is missing native_component")?,
+        )
     } else {
         None
     };
+
     let src = match manifest.main_module.as_deref() {
-        Some(main) => get_string(bucket, &format!("{}/{main}", pointer.prefix)).await?,
-        None if manifest.assets.is_some() || native.is_some() => {
+        Some(main) => {
+            let position = fetched
+                .iter()
+                .position(|(module, _)| module.name == main)
+                .with_context(|| {
+                    format!("main module {main:?} is absent from the manifest module list")
+                })?;
+            let (_, bytes) = fetched.remove(position);
+            String::from_utf8(bytes.into()).context("deployment main module is not UTF-8")?
+        }
+        None if manifest.assets.is_some() || native_descriptor.is_some() => {
             // Ingress is handled by the immutable asset resolver. Keeping a
             // synthetic Worker makes the runtime construction path uniform
             // and is a fail-closed guard if an asset-only request escapes it.
@@ -751,25 +831,24 @@ async fn load_worker_at_pointer(
         }
         None => bail!("deployment has neither a main module nor assets"),
     };
-    let prefix = &pointer.prefix;
-    let native_component_path = manifest
-        .native_component
-        .as_ref()
-        .map(|component| component.path.as_str());
-    let fetched = futures_util::future::try_join_all(
-        manifest
-            .modules
-            .iter()
-            .filter(|module| {
-                manifest.main_module.as_deref() != Some(module.name.as_str())
-                    && native_component_path != Some(module.name.as_str())
-            })
-            .map(|module| async move {
-                let key = format!("{prefix}/{}", module.name);
-                anyhow::Ok((module, get_bytes(bucket, &key).await?))
-            }),
-    )
-    .await?;
+    // A `native-http-v1` deployment's component is not a JS module: its bytes
+    // belong to the Wasmtime engine, and leaving them in the module list made
+    // the JS loader try to compile a component as a Worker script. It is
+    // normally already in the manifest's module list; an older manifest that
+    // omits it is still read from the deployment prefix it names.
+    //
+    let native_bytes = match native_descriptor {
+        Some(descriptor) => Some(
+            match fetched
+                .iter()
+                .position(|(module, _)| module.name == descriptor.path)
+            {
+                Some(position) => fetched.remove(position).1,
+                None => get_bytes(bucket, &format!("{prefix}/{}", descriptor.path)).await?,
+            },
+        ),
+        None => None,
+    };
     let mut modules = Vec::new();
     for (module, bytes) in fetched {
         let entry = match module.kind {
@@ -849,7 +928,14 @@ async fn load_worker_at_pointer(
         bindings(&manifest, "ai")
             .find_map(|binding| binding.get("name")?.as_str().map(str::to_string)),
     );
+    // The local IMAGES binding. `images` is a celld extension, so the shapes
+    // it accepts are the ones this fork's deploy path validates.
     let images_bindings = bindings(&manifest, "images")
+        .filter_map(|binding| binding.get("name")?.as_str().map(str::to_string))
+        .collect();
+    // The `worker_loaders` key of the deployed config. Every entry becomes a
+    // binding of its own, because each loader caches the Workers it loaded.
+    let loader_bindings = bindings(&manifest, "worker_loader")
         .filter_map(|binding| binding.get("name")?.as_str().map(str::to_string))
         .collect();
     let services = service_bindings(&manifest);
@@ -884,8 +970,8 @@ async fn load_worker_at_pointer(
     let version = manifest.version.clone();
     let prefix = pointer.prefix.clone();
     let crons = manifest.crons.clone();
-    let native_execution = match native {
-        Some((descriptor, bytes)) => Some(NativeExecution::build(
+    let native_execution = match (native_descriptor.cloned(), native_bytes) {
+        (Some(descriptor), Some(bytes)) => Some(NativeExecution::build(
             &bytes,
             &descriptor,
             vars.clone(),
@@ -893,8 +979,10 @@ async fn load_worker_at_pointer(
             version.clone(),
             0,
         )?),
-        None => None,
+        _ => None,
     };
+    let containers = manifest.containers.clone();
+    let fence_image = manifest.fence_image.clone();
     Ok(LoadedDeployment {
         options: WorkerConfigOptions {
             src,
@@ -918,14 +1006,18 @@ async fn load_worker_at_pointer(
         version,
         prefix,
         asset_binding,
+        loader_bindings,
         assets,
         services,
         crons,
         native: native_execution,
+        containers,
+        fence_image,
     })
 }
 
-/// Apply celld's manifest-first precedence for the optional AI binding.
+/// The `ai` binding's env name: the deployment's own name, or the operator's
+/// `CELLD_AI_BINDING` / `CELLD_AI_URL` when the config names none.
 pub fn configured_ai_binding(manifest_binding: Option<String>) -> Option<String> {
     manifest_binding
         .or_else(|| std::env::var("CELLD_AI_BINDING").ok())
@@ -938,11 +1030,22 @@ pub struct LoadedDeployment {
     pub version: String,
     pub prefix: String,
     pub asset_binding: Option<String>,
+    /// `env` names of this script's Worker Loaders, from its
+    /// `worker_loaders` config. A script reaches no loader that it does not
+    /// declare, and each loader keeps a cache of its own loaded Workers.
+    pub loader_bindings: Vec<String>,
     pub assets: Option<crate::assets::AssetResolver>,
     pub services: Vec<(String, String, Option<String>)>,
     /// `triggers.crons` from the manifest, driving the reserved cron cell.
     pub crons: Vec<String>,
+    /// The experimental `native-http-v1` component this deployment serves, if
+    /// any. A native deployment never reaches the JS stateless pool.
     pub native: Option<crate::native::NativeExecution>,
+    /// `containers` from the manifest: the classes whose cells supervise a
+    /// container.
+    pub containers: Vec<crate::container::ContainerSpec>,
+    /// See `Manifest::fence_image`.
+    pub fence_image: Option<String>,
 }
 
 /// Map a non-main manifest module to how the JS runtime loads it.
@@ -992,17 +1095,49 @@ fn service_bindings(manifest: &Manifest) -> Vec<(String, String, Option<String>)
         .collect()
 }
 
+/// The Worker's `env` variables, layered from lowest to highest precedence:
+///
+/// 1. the deployment's `plain_text` bindings (the config's `vars`, or the
+///    manifest a `celld dev` run built from `.dev.vars`),
+/// 2. the file named by `CELLD_VARS_FILE`, which the cellp control plane
+///    writes per version,
+/// 3. one `CELLD_VAR_<NAME>` per variable, which cellp sets for every managed
+///    process (`CELLD_VAR_PROJECT_ID`, `CELLD_VAR_VERSION_ID`, ...).
+///
+/// Layers 2 and 3 are this fork's platform contract; upstream removed the
+/// readers, and dropping them leaves a managed version running without the
+/// variables it was deployed with. A value is never logged, and an error
+/// names only the path that could not be read.
 fn worker_vars(manifest: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
-    let mut vars = BTreeMap::new();
-    for binding in bindings(manifest, "plain_text") {
-        if let (Some(name), Some(value)) = (
-            binding.get("name").and_then(serde_json::Value::as_str),
-            binding.get("text").and_then(serde_json::Value::as_str),
-        ) {
-            vars.insert(name.to_string(), value.to_string());
-        }
-    }
-    if let Ok(path) = std::env::var("CELLD_VARS_FILE") {
+    let mut vars: BTreeMap<String, String> = bindings(manifest, "plain_text")
+        .filter_map(|binding| {
+            Some((
+                binding.get("name")?.as_str()?.to_string(),
+                binding.get("text")?.as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    apply_platform_vars(
+        &mut vars,
+        std::env::var("CELLD_VARS_FILE").ok(),
+        std::env::vars(),
+    )?;
+    Ok(vars.into_iter().collect())
+}
+
+/// Apply the node's Worker variables over `vars`.
+///
+/// The file is dotenv-shaped: `NAME=value` per line, blank lines and `#`
+/// comments skipped, a line without `=` skipped, and one layer of matching
+/// single or double quotes removed. An empty `CELLD_VARS_FILE` selects no
+/// file, so an operator who templated the name to an empty string gets the
+/// deployment's own vars rather than a read of the empty path.
+fn apply_platform_vars(
+    vars: &mut BTreeMap<String, String>,
+    vars_file: Option<String>,
+    environment: impl IntoIterator<Item = (String, String)>,
+) -> anyhow::Result<()> {
+    if let Some(path) = vars_file.filter(|path| !path.is_empty()) {
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("read Worker vars file {path}"))?;
         for line in contents.lines().map(str::trim) {
@@ -1028,7 +1163,7 @@ fn worker_vars(manifest: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
             vars.insert(name.to_string(), value.to_string());
         }
     }
-    for (name, value) in std::env::vars() {
+    for (name, value) in environment {
         if let Some(name) = name
             .strip_prefix("CELLD_VAR_")
             .filter(|name| !name.is_empty())
@@ -1036,5 +1171,89 @@ fn worker_vars(manifest: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
             vars.insert(name.to_string(), value);
         }
     }
-    Ok(vars.into_iter().collect())
+    Ok(())
+}
+
+#[cfg(test)]
+mod platform_vars_tests {
+    use super::apply_platform_vars;
+    use std::collections::BTreeMap;
+
+    fn vars() -> BTreeMap<String, String> {
+        BTreeMap::from([("PROJECT_ID".to_string(), "from-manifest".to_string())])
+    }
+
+    #[test]
+    fn environment_layer_wins_over_manifest_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("celld.vars");
+        std::fs::write(
+            &file,
+            "# a comment\nPROJECT_ID=from-file\nVERSION_ID=v-dev\nEMPTY=\nno-equals\n QUOTED = \" spaced \" \nSINGLE='one'\n",
+        )
+        .unwrap();
+        let mut vars = vars();
+        apply_platform_vars(
+            &mut vars,
+            Some(file.to_string_lossy().into_owned()),
+            vec![
+                ("PROJECT_ID".to_string(), "from-env".to_string()),
+                ("CELLD_VAR_PROJECT_ID".to_string(), "from-env".to_string()),
+                ("CELLD_VAR_VERSION_ID".to_string(), "v7".to_string()),
+                ("CELLD_VAR_".to_string(), "ignored".to_string()),
+                ("PATH".to_string(), "/usr/bin".to_string()),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(vars.get("PROJECT_ID").map(String::as_str), Some("from-env"));
+        assert_eq!(vars.get("VERSION_ID").map(String::as_str), Some("v7"));
+        // Only the surrounding quotes are removed: whitespace inside them is
+        // part of the value, exactly as the pre-upgrade reader behaved.
+        assert_eq!(vars.get("QUOTED").map(String::as_str), Some(" spaced "));
+        assert_eq!(vars.get("SINGLE").map(String::as_str), Some("one"));
+        assert_eq!(vars.get("EMPTY").map(String::as_str), Some(""));
+        assert!(!vars.contains_key("no-equals"));
+        assert!(!vars.contains_key("PATH"));
+        assert!(!vars.contains_key(""));
+    }
+
+    #[test]
+    fn file_layer_overrides_the_manifest_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("celld.vars");
+        std::fs::write(&file, "PROJECT_ID=from-file\n").unwrap();
+        let mut vars = vars();
+        apply_platform_vars(
+            &mut vars,
+            Some(file.to_string_lossy().into_owned()),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(vars.get("PROJECT_ID").map(String::as_str), Some("from-file"));
+    }
+
+    #[test]
+    fn empty_vars_file_selects_no_file() {
+        let mut vars = vars();
+        apply_platform_vars(&mut vars, Some(String::new()), Vec::new()).unwrap();
+        assert_eq!(
+            vars.get("PROJECT_ID").map(String::as_str),
+            Some("from-manifest")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_file_names_only_its_path() {
+        let mut vars = vars();
+        let error = apply_platform_vars(
+            &mut vars,
+            Some("/nonexistent/celld.vars".to_string()),
+            Vec::new(),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("read Worker vars file"), "{message}");
+        assert!(!message.contains("PROJECT_ID=from-manifest"), "{message}");
+    }
 }

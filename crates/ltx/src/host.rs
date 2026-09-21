@@ -75,6 +75,15 @@ impl HostFile {
 
 /// The complete local-file surface used by celld and the LTX engine.
 pub trait FileSystem: Send + Sync {
+    /// Opens an anonymous read/write scratch file. The handle owns its storage,
+    /// so cancellation and process exit cannot leave a compaction scratch file.
+    /// Custom filesystems must implement this to compact oversized sources.
+    fn temporary_file(&self, _directory: Option<&Path>) -> io::Result<HostFile> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the filesystem does not support scratch files",
+        ))
+    }
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
     fn read_dir(&self, path: &Path) -> io::Result<Vec<HostDirEntry>>;
     fn metadata(&self, path: &Path) -> io::Result<HostMetadata>;
@@ -136,6 +145,13 @@ impl HostFileIo for DirectFile {
 
 #[allow(clippy::disallowed_methods)]
 impl FileSystem for DirectFileSystem {
+    fn temporary_file(&self, directory: Option<&Path>) -> io::Result<HostFile> {
+        let file = match directory {
+            Some(directory) => tempfile::tempfile_in(directory)?,
+            None => tempfile::tempfile()?,
+        };
+        Ok(HostFile::from_io(DirectFile { file }))
+    }
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(path)
     }

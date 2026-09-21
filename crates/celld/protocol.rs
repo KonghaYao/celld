@@ -46,6 +46,17 @@ pub struct Manifest {
     /// consumers drive the broker and have no environment binding.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queue_consumers: Vec<QueueConsumerConfig>,
+    /// The container classes of this deployment: class, image id, and the
+    /// instance shape. Each image tar is at `deploy/images/<id>.tar`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub containers: Vec<crate::container::ContainerSpec>,
+    /// The `celld-fence` image `celld deploy` built beside the container
+    /// images: the node runs it once, privileged, to fence its container
+    /// bridges before any container starts. `None` in a deployment without
+    /// containers, and in one made by a celld that predates the fence,
+    /// which a node then refuses to start containers for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence_image: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_features: Vec<String>,
     /// wrangler's raw metadata, retained verbatim for anything we don't yet model.
@@ -154,6 +165,10 @@ struct ManifestWire {
     #[serde(default)]
     queue_consumers: Vec<QueueConsumerConfig>,
     #[serde(default)]
+    containers: Vec<crate::container::ContainerSpec>,
+    #[serde(default)]
+    fence_image: Option<String>,
+    #[serde(default)]
     required_features: Vec<String>,
     raw_metadata: serde_json::Value,
 }
@@ -175,6 +190,8 @@ impl TryFrom<ManifestWire> for Manifest {
             assets: wire.assets,
             crons: wire.crons,
             queue_consumers: wire.queue_consumers,
+            containers: wire.containers,
+            fence_image: wire.fence_image,
             required_features: wire.required_features,
             raw_metadata: wire.raw_metadata,
         };
@@ -204,6 +221,7 @@ fn legacy_manifest_schema_version() -> u32 {
 /// partially and fail (or misbehave) at worker load instead.
 pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_ASSETS_V1,
+    FEATURE_CONTAINERS_V1,
     FEATURE_CRON_V1,
     FEATURE_D1_V1,
     FEATURE_KV_V1,
@@ -218,6 +236,10 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
 ];
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
+/// A deployment with `containers`. Required because a build without the
+/// container engine would load the manifest, build a `ctx` with no
+/// `container`, and fail only when the object first touches it.
+pub const FEATURE_CONTAINERS_V1: &str = "containers-v1";
 /// A deployment with D1 databases. Required because a build without the
 /// reserved `__D1Database` class would load the manifest and then fail every
 /// `env.DB` call at request time, on a node the developer is not watching —
@@ -540,7 +562,10 @@ pub fn validate_required_features(required: &[String]) -> anyhow::Result<()> {
 pub struct ModuleRef {
     pub name: String,
     pub bytes: usize,
-    /// content hash of this module's bytes (hex, truncated)
+    /// Full SHA-256 of this module's exact bytes, as lowercase hexadecimal.
+    ///
+    /// The loader also accepts the 16-character prefix written by celld and
+    /// the managed control plane before full module digests were introduced.
     pub sha256: String,
     /// Absent means UTF-8 source. Non-`.js` siblings become Wrangler Text
     /// modules; `.js`/`.mjs`/`.cjs` siblings compile as ES modules (Wrangler
@@ -550,6 +575,36 @@ pub struct ModuleRef {
     /// (Wrangler's `Data` rule for `.bin` siblings).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<ModuleKind>,
+}
+
+impl ModuleRef {
+    pub(crate) fn verify(&self, body: &[u8]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            body.len() == self.bytes,
+            "deployment module size mismatch for {:?}: expected {}, got {}",
+            self.name,
+            self.bytes,
+            body.len()
+        );
+        anyhow::ensure!(
+            matches!(self.sha256.len(), 16 | 64)
+                && self
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "deployment module {:?} has an invalid SHA-256 digest",
+            self.name
+        );
+        let actual = format!("{:x}", Sha256::digest(body));
+        anyhow::ensure!(
+            actual.starts_with(&self.sha256),
+            "deployment module digest mismatch for {:?}: expected {}, got {}",
+            self.name,
+            self.sha256,
+            actual
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -786,4 +841,3 @@ mod native_manifest_tests {
         assert!(serde_json::from_value::<Manifest>(value).is_err());
     }
 }
-

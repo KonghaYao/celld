@@ -2,7 +2,7 @@
 // immediates in their own macrotask phase; a zero-delay timeout matches the
 // observable ordering Workers code relies on (after microtasks, before later
 // timers). Compiled lazily the first time a bundle reads either name.
-(() => {
+return (() => {
   const setImmediate = (callback, ...args) => {
     if (typeof callback !== "function") {
       const e = new TypeError(

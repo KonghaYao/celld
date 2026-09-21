@@ -177,6 +177,146 @@ pub fn allocator_slack_bytes() -> u64 {
     (resident as u64).saturating_sub(allocated as u64)
 }
 
+/// The allocator's own view of the heap, for `/state`.
+///
+/// RSS and `in_use_bytes` cannot say whether memory belongs to Rust or to
+/// V8: V8 maps its heaps itself, so both counts include it. `allocated` is
+/// what Rust code holds right now, `active` adds the pages jemalloc has
+/// given to size classes, `resident` adds the dirty pages it keeps for
+/// reuse, and `mapped` and `retained` are its address space. The residual
+/// a hibernated cell leaves (about 160 KB on GCE, measured 2026-09-03)
+/// is in `allocated` if it is a Rust structure and outside it if it is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct AllocatorStats {
+    pub allocated_bytes: u64,
+    pub active_bytes: u64,
+    pub resident_bytes: u64,
+    pub mapped_bytes: u64,
+    pub retained_bytes: u64,
+}
+
+/// The allocator statistics after one epoch advance, or `None` when jemalloc
+/// cannot answer, so a broken allocator does not break `/state`.
+pub fn allocator_stats() -> Option<AllocatorStats> {
+    tikv_jemalloc_ctl::epoch::advance().ok()?;
+    Some(AllocatorStats {
+        allocated_bytes: tikv_jemalloc_ctl::stats::allocated::read().ok()? as u64,
+        active_bytes: tikv_jemalloc_ctl::stats::active::read().ok()? as u64,
+        resident_bytes: tikv_jemalloc_ctl::stats::resident::read().ok()? as u64,
+        mapped_bytes: tikv_jemalloc_ctl::stats::mapped::read().ok()? as u64,
+        retained_bytes: tikv_jemalloc_ctl::stats::retained::read().ok()? as u64,
+    })
+}
+
+/// The C allocator's own view of its heap, for `/state`, on Linux only.
+///
+/// Rust allocates through jemalloc, but SQLite and V8's C++ side allocate
+/// through the system allocator, and glibc keeps a freed chunk in its
+/// arena until the top of that arena is free. `in_use` is what those
+/// callers hold and `free` is what glibc keeps for them; RSS counts both.
+/// The residual a hibernated cell left on GCE (2026-09-03) survived
+/// every isolate being freed, so this is the counter that decides whether
+/// it is glibc retention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LibcMallocStats {
+    pub in_use_bytes: u64,
+    pub free_bytes: u64,
+    pub mmap_bytes: u64,
+    pub arena_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+pub fn libc_malloc_stats() -> Option<LibcMallocStats> {
+    // `mallinfo2` exists from glibc 2.33, and the release binaries link
+    // against 2.31, so the symbol is resolved at run time: a node on an
+    // older libc reports null instead of the binary failing to link. The
+    // older `mallinfo` is not a fallback, because its fields are `int` and
+    // wrap above 2 GiB, which a 16 GB node reaches.
+    // SAFETY: `dlsym` on the default namespace takes a C string; the symbol
+    // has the documented signature, reads allocator statistics, and takes
+    // no pointer.
+    let info = unsafe {
+        let symbol = libc::dlsym(libc::RTLD_DEFAULT, c"mallinfo2".as_ptr());
+        if symbol.is_null() {
+            return None;
+        }
+        let mallinfo2: unsafe extern "C" fn() -> libc::mallinfo2 = std::mem::transmute(symbol);
+        mallinfo2()
+    };
+    Some(LibcMallocStats {
+        in_use_bytes: info.uordblks as u64,
+        free_bytes: info.fordblks as u64,
+        mmap_bytes: info.hblkhd as u64,
+        arena_bytes: info.arena as u64,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn libc_malloc_stats() -> Option<LibcMallocStats> {
+    None
+}
+
+/// Growth of the C allocator's free lists since the last trim that earns
+/// another one. A trim walks every free chunk of every arena, so it is not
+/// worth running for the churn of ordinary requests; 32 MiB is about a
+/// hundred evicted cells' storage caches, so a node hibernating cells
+/// trims within seconds of the first batch and a busy node with nothing
+/// freed never does.
+const C_HEAP_TRIM_THRESHOLD_BYTES: u64 = 32 << 20;
+
+/// The free-list size at the last trim, lowered whenever the lists shrink
+/// below it, so a trim answers memory freed since then and not the chunks a
+/// previous trim already gave back: `mallinfo2` keeps counting a trimmed
+/// chunk as free, because trimming decommits its pages and does not take it
+/// off the list.
+static C_HEAP_FREE_AT_TRIM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Give the kernel the pages the C allocator keeps for memory that SQLite
+/// and V8's C++ side freed, once enough has been freed since the last time.
+///
+/// glibc keeps a freed chunk in its arena until the top of that arena is
+/// free, and a cell's storage is freed in the middle of an arena when the
+/// cell stops. Every eviction therefore left about 300 KB on glibc's free
+/// lists: with 5,000 cells hibernated a node held 1.5 GB there and reported
+/// 1.6 GB of RSS, and one trim took it to 126 MB (GCE, 2026-09-04).
+/// jemalloc's background thread already does this for the Rust heap.
+///
+/// Returns the free-list size that earned the trim, for the log. The sample
+/// that follows sees the node without the retained pages, so the pressure
+/// classifier measures cells and not the allocator.
+pub fn trim_c_heap_if_retained() -> Option<u64> {
+    use std::sync::atomic::Ordering;
+    let free_bytes = libc_malloc_stats()?.free_bytes;
+    let floor = C_HEAP_FREE_AT_TRIM
+        .fetch_min(free_bytes, Ordering::Relaxed)
+        .min(free_bytes);
+    if free_bytes.saturating_sub(floor) < C_HEAP_TRIM_THRESHOLD_BYTES {
+        return None;
+    }
+    let started_ms = crate::asyncrt::mono_ms();
+    trim_c_heap();
+    C_HEAP_FREE_AT_TRIM.store(free_bytes, Ordering::Relaxed);
+    tracing::debug!(
+        event = "c_heap_trimmed",
+        free_bytes,
+        elapsed_ms = crate::asyncrt::mono_ms().saturating_sub(started_ms),
+        "returned the C allocator's retained free pages to the kernel"
+    );
+    Some(free_bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn trim_c_heap() {
+    // SAFETY: `malloc_trim` takes a pad size and touches only the
+    // allocator's own bookkeeping.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn trim_c_heap() {}
+
 /// Ask jemalloc to give freed pages back on a timer. Its 10-second decay runs
 /// only when a thread next calls the allocator, which a node that just shed its
 /// working set does not do. This repairs what RSS reports, not the decision.

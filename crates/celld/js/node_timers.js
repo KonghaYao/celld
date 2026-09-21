@@ -38,7 +38,7 @@
     }
   }
 
-  globalThis.__timersPromises = {
+  __celld.__timersPromises = {
     setTimeout: setTimeout_,
     setImmediate: setImmediate_,
     setInterval: setInterval_,

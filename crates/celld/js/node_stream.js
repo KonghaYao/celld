@@ -1,5 +1,5 @@
 // node:stream for celld. Copyright Joyent, Inc., Node.js contributors, and
-// the Deno authors (MIT) — readable-stream@4.2.0 (MIT, Node.js contributors),
+// the Deno authors (MIT) -- readable-stream@4.2.0 (MIT, Node.js contributors),
 // via the esbuild bundle Deno ships as ext/node/polyfills/_stream.mjs (MIT,
 // the Deno authors). Workerd's node:stream at commit
 // 191a27f941300dd8956f2afeb66c10a651108c0b is the same Readable/Writable/
@@ -5476,9 +5476,19 @@ var require_stream = __commonJS({
     "CountQueuingStrategy", "TextEncoderStream", "TextDecoderStream",
     "CompressionStream", "DecompressionStream",
   ]) {
+    // The getter keeps the class lazy, but a getter alone makes the export
+    // read-only, and a CommonJS dependency that swaps a stream class at module
+    // scope would take the Worker down at load. The setter replaces the
+    // accessor with a plain value, so the patch stays on this module object
+    // and does not reach the global.
     Object.defineProperty(web, name, {
       enumerable: true, configurable: true,
       get: () => globalThis[name],
+      set: (value) => {
+        Object.defineProperty(web, name, {
+          value, writable: true, enumerable: true, configurable: true,
+        });
+      },
     });
   }
 
@@ -5513,8 +5523,8 @@ var require_stream = __commonJS({
     },
   };
 
-  globalThis.__streamModule = Stream;
-  globalThis.__streamPromises = Stream.promises;
-  globalThis.__streamWeb = web;
-  globalThis.__streamConsumers = consumers;
+  __celld.__streamModule = Stream;
+  __celld.__streamPromises = Stream.promises;
+  __celld.__streamWeb = web;
+  __celld.__streamConsumers = consumers;
 })();

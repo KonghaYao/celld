@@ -110,9 +110,12 @@ fn accept_key(key: &str) -> String {
 /// to answer.
 pub async fn connect(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
     let url = url::Url::parse(url).context("parse WebSocket URL")?;
+    // `fetch("http://…", { headers: { Upgrade: "websocket" } })` is the
+    // Workers idiom for an outbound socket, and the only form a container
+    // port offers, so the HTTP schemes count as their WebSocket twins.
     let tls = match url.scheme() {
-        "ws" => false,
-        "wss" => true,
+        "ws" | "http" => false,
+        "wss" | "https" => true,
         scheme => return Err(anyhow!("not a WebSocket scheme: {scheme}").into()),
     };
     let host = url

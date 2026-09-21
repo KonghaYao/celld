@@ -93,12 +93,40 @@ impl<W: Write, R: Read> Compactor<W, R> {
     }
 
     pub fn compact(&mut self) -> Result<()> {
+        self.compact_inner(None)
+    }
+
+    /// A drained source can include transactions already in the destination.
+    /// Repeating its pages is safe, but repeating its transaction range would
+    /// break destination continuity. Validate every source key before changing
+    /// the output range; a rebased checksum cannot be inferred from the input.
+    pub(crate) fn compact_from(&mut self, min: TXID, ranges: &[(TXID, TXID)]) -> Result<()> {
+        self.compact_inner(Some((min, ranges)))
+    }
+
+    fn compact_inner(&mut self, range: Option<(TXID, &[(TXID, TXID)])>) -> Result<()> {
         if self.inputs.is_empty() {
             return Err(Error::LTXCorrupted);
         }
 
         for input in &mut self.inputs {
             input.decoder.decode_header()?;
+        }
+
+        if let Some((min, ranges)) = range {
+            let first = self.inputs[0].decoder.header;
+            if ranges.len() != self.inputs.len()
+                || min < first.min_txid
+                || min > first.max_txid
+                || (min != first.min_txid
+                    && self.header_flags & crate::ltx::HEADER_FLAG_NO_CHECKSUM == 0)
+                || self.inputs.iter().zip(ranges).any(|(input, expected)| {
+                    let header = input.decoder.header;
+                    (header.min_txid, header.max_txid) != *expected
+                })
+            {
+                return Err(Error::LTXCorrupted);
+            }
         }
 
         for index in 1..self.inputs.len() {
@@ -121,7 +149,7 @@ impl<W: Write, R: Read> Compactor<W, R> {
             flags: self.header_flags,
             page_size: first.page_size,
             commit: last.commit,
-            min_txid: first.min_txid,
+            min_txid: range.map_or(first.min_txid, |(min, _)| min),
             max_txid: last.max_txid,
             timestamp: last.timestamp,
             pre_apply_checksum: first.pre_apply_checksum,

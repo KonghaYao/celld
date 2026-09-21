@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 512" role="img" aria-labelledby="queuesFlowTitle queuesFlowDesc">
+  <title id="queuesFlowTitle">A batch closes on size or on timeout, and an unacknowledged message returns to the queue until the retry bound moves it to the dead-letter queue</title>
+  <desc id="queuesFlowDesc">The upper panel shows two batches under a consumer with max_batch_size 10 and
+max_batch_timeout 5 seconds. A busy queue reaches ten messages before the
+timeout, so the batch closes on size. A sparse queue reaches only three
+messages, so the batch closes on the timeout and the consumer receives a
+partial batch. The timeout runs from the oldest ready message, not from the
+last one. The lower panel shows the settlement cycle. One queue cell with one
+writer leases a batch to one call of queue(batch, env, ctx). A message that the
+handler acknowledges, or that a clean return leaves unsettled, is deleted. A
+message that calls retry, that a thrown handler abandons, or that no
+settlement reaches, returns to the queue as the same message with its attempts
+count raised by one, so a consumer can see a duplicate. When attempts pass
+max_retries, the message leaves the loop and moves to the dead-letter queue
+cell, which is itself a queue with its own consumer. celld deletes the message
+instead when no dead_letter_queue is configured.</desc>
+  <style>
+    svg { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    text { font-size: 13px; fill: currentColor; }
+    tspan { fill: currentColor; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .lead { font-weight: 600; }
+    .sm { font-size: 12px; }
+    .d-ink { color: #121212; }
+    .d-soft { color: #3d3b37; }
+    .d-faint { color: #6e6a62; }
+    .d-acc { color: #10803f; }
+    .d-panel { color: #ffffff; }
+    .d-sunk { color: #f0eee8; }
+    .d-tint { color: #d6efdf; }
+    @media (prefers-color-scheme: dark) {
+      .d-ink { color: #efede7; }
+      .d-soft { color: #c9c6be; }
+      .d-faint { color: #928e85; }
+      .d-acc { color: #3fc472; }
+      .d-panel { color: #1a1a19; }
+      .d-sunk { color: #232321; }
+      .d-tint { color: #10301d; }
+    }
+  </style>
+  <defs>
+    <marker id="queues-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6"
+      markerHeight="6" orient="auto-start-reverse">
+      <path class="d-soft" fill="currentColor" d="M0 0 L10 5 L0 10 z" />
+    </marker>
+  </defs>
+
+  <!-- Panel one: the batch window, where two limits race. -->
+  <rect class="d-sunk" fill="currentColor" x="8" y="8" width="424" height="170" rx="10" />
+  <rect class="d-faint" fill="none" stroke="currentColor" x="8" y="8" width="424" height="170" rx="10" />
+  <text class="d-ink lead" fill="currentColor" x="22" y="32">A batch closes on whichever limit arrives first</text>
+  <text class="d-faint mono" fill="currentColor" x="22" y="52">max_batch_size 10 · max_batch_timeout 5 s</text>
+
+  <path class="d-faint" fill="none" stroke="currentColor" stroke-dasharray="4 4" d="M300 62 V152" />
+
+  <!-- A busy queue fills the batch before the clock runs out. -->
+  <g class="d-acc" fill="currentColor">
+    <circle cx="24" cy="82" r="4" />
+    <circle cx="48" cy="82" r="4" />
+    <circle cx="72" cy="82" r="4" />
+    <circle cx="96" cy="82" r="4" />
+    <circle cx="120" cy="82" r="4" />
+    <circle cx="144" cy="82" r="4" />
+    <circle cx="168" cy="82" r="4" />
+    <circle cx="192" cy="82" r="4" />
+    <circle cx="216" cy="82" r="4" />
+    <circle cx="240" cy="82" r="4" />
+  </g>
+  <path class="d-acc" fill="none" stroke="currentColor" stroke-width="2.5" d="M252 68 V96" />
+  <text class="d-soft sm" fill="currentColor" x="24" y="105">closes on size, before the timeout</text>
+
+  <!-- A sparse queue reaches the clock with a partial batch. -->
+  <g class="d-acc" fill="currentColor">
+    <circle cx="24" cy="130" r="4" />
+    <circle cx="100" cy="130" r="4" />
+    <circle cx="184" cy="130" r="4" />
+  </g>
+  <path class="d-acc" fill="none" stroke="currentColor" stroke-width="2.5" d="M300 116 V144" />
+  <text class="d-soft sm" fill="currentColor" x="24" y="153">closes on the timeout, 3 messages</text>
+  <text class="d-faint sm" fill="currentColor" x="308" y="134">partial batch</text>
+  <text class="d-faint sm" fill="currentColor" x="290" y="170" text-anchor="middle">the timeout runs from the oldest message</text>
+
+  <!-- Panel two: the settlement cycle and the bound that ends it. -->
+  <text class="d-ink lead" fill="currentColor" x="22" y="204">An unacknowledged message returns to the queue</text>
+
+  <rect class="d-tint" fill="currentColor" x="24" y="216" width="146" height="62" rx="8" />
+  <rect class="d-acc" fill="none" stroke="currentColor" stroke-width="2" x="24" y="216" width="146" height="62" rx="8" />
+  <text class="d-ink" fill="currentColor" x="97" y="242" text-anchor="middle">JOBS queue cell</text>
+  <text class="d-soft sm" fill="currentColor" x="97" y="262" text-anchor="middle">one writer</text>
+
+  <rect class="d-panel" fill="currentColor" x="240" y="216" width="192" height="62" rx="8" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="240" y="216" width="192" height="62" rx="8" />
+  <text class="d-ink mono" fill="currentColor" x="336" y="242" text-anchor="middle">queue(batch, env, ctx)</text>
+  <text class="d-soft sm" fill="currentColor" x="336" y="262" text-anchor="middle">one batch, one lease</text>
+
+  <g class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M170 247 H232" marker-end="url(#queues-arrow)" />
+    <path d="M336 278 V336" marker-end="url(#queues-arrow)" />
+    <path d="M336 294 H97 V336" marker-end="url(#queues-arrow)" />
+    <path d="M24 366 H12 V247 H18" marker-end="url(#queues-arrow)" />
+    <path d="M97 406 V440" marker-end="url(#queues-arrow)" />
+  </g>
+  <text class="d-faint sm" fill="currentColor" x="201" y="237" text-anchor="middle">lease</text>
+  <text class="d-soft sm" fill="currentColor" x="108" y="311">retry(), a throw,</text>
+  <text class="d-soft sm" fill="currentColor" x="108" y="327">or no settlement</text>
+
+  <rect class="d-panel" fill="currentColor" x="24" y="336" width="146" height="70" rx="8" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="24" y="336" width="146" height="70" rx="8" />
+  <text class="d-ink" fill="currentColor" x="97" y="360" text-anchor="middle">back to the queue</text>
+  <text class="d-soft sm" fill="currentColor" x="97" y="379" text-anchor="middle">attempts + 1</text>
+  <text class="d-soft sm" fill="currentColor" x="97" y="396" text-anchor="middle">the same message</text>
+
+  <rect class="d-panel" fill="currentColor" x="240" y="336" width="192" height="70" rx="8" />
+  <rect class="d-soft" fill="none" stroke="currentColor" x="240" y="336" width="192" height="70" rx="8" />
+  <text class="d-ink" fill="currentColor" x="336" y="366" text-anchor="middle">deleted</text>
+  <text class="d-soft sm" fill="currentColor" x="336" y="387" text-anchor="middle">ack(), or a clean return</text>
+
+  <text class="d-acc mono" fill="currentColor" x="108" y="428">attempts &gt; max_retries</text>
+
+  <rect class="d-tint" fill="currentColor" x="24" y="444" width="250" height="58" rx="8" />
+  <rect class="d-acc" fill="none" stroke="currentColor" stroke-width="2" x="24" y="444" width="250" height="58" rx="8" />
+  <text class="d-ink" fill="currentColor" x="149" y="470" text-anchor="middle">dead-letter queue cell</text>
+  <text class="d-soft sm" fill="currentColor" x="149" y="490" text-anchor="middle">a queue with its own consumer</text>
+
+  <text class="d-faint sm mono" fill="currentColor" x="286" y="466">no dead_letter_queue</text>
+  <text class="d-faint sm" fill="currentColor" x="286" y="486">celld deletes it</text>
+</svg>

@@ -27,6 +27,36 @@ celld compiles each wasm module once for the whole process. Every
 isolate after the first one reuses the compiled module, so a cell
 activation does not pay the compilation again.
 
+## Example
+
+The [WebAssembly example](../examples/wasm) compiles a Rust Durable Object and
+imports its WebAssembly module.
+
+<!-- celld-example: wasm -->
+
+## Prebuilt Workers
+
+With `no_bundle: true`, celld preserves the entry JavaScript byte for byte.
+It applies Wrangler's default `**/*.wasm` and `**/*.wasm?module` patterns below
+the directory that contains `main`. For example, `main: "./dist/shim.mjs"` can
+import `"./add.wasm"` or `"./lib/add.wasm"` from `dist`. The module names keep
+these relative paths. The files use the same WASM metadata and feature gate as
+a bundled deploy.
+
+The default scan includes WASM files that the JavaScript does not import. Use
+a dedicated build output directory, so celld does not upload unrelated WASM.
+The scan excludes `.git`, `.celld`, `.wrangler`, and symbolic links to
+directories. It refuses a symbolic link whose name matches a WASM pattern.
+Copy the WASM file into the build output instead of linking to it or importing
+it from a parent directory.
+
+This mode matches Wrangler's default WASM discovery, but it does not implement
+all [Wrangler module discovery settings](https://developers.cloudflare.com/workers/wrangler/configuration/#find-additional-modules).
+celld does not discover additional JavaScript modules and does not accept
+`rules`, `base_dir`, or `find_additional_modules`. The JavaScript must already
+be bundled, and its WASM imports must be relative to the entry directory. This
+mode does not require an esbuild executable.
+
 ## Rust with workers-rs
 
 [workers-rs](https://github.com/cloudflare/workers-rs) compiles a Rust
@@ -54,7 +84,7 @@ The runtime surface that the application can use is the surface in
 [Cloudflare compatibility](cloudflare-compat.md); a workers-rs API
 that maps to a missing runtime feature does not work.
 
-## The Worker Loader
+## Dynamic Workers
 
 A dynamically loaded worker can also carry wasm. Pass the bytes in the
 `modules` map; a `BufferSource` value becomes a compiled-module import

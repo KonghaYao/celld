@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use celld_ltx::client::epochs::EpochChain;
 use celld_ltx::compaction_level::SNAPSHOT_LEVEL;
 use celld_ltx::replica::calc_restore_plan;
 use celld_ltx::ChainedReplicaClient;
@@ -174,5 +175,113 @@ async fn chained_write_rejects_parent_owned_txid() {
     assert!(
         message.contains("parent-owned"),
         "unexpected error: {message}"
+    );
+}
+
+/// The branch scenario end to end, with no object store: the parent's
+/// snapshot and tail live below the fork, the child's first epoch holds the
+/// delta the fork activation uploaded, and a later epoch holds the rows the
+/// next activation wrote. A restore must answer with the parent state **and**
+/// every later child epoch.
+#[tokio::test]
+async fn fork_restore_spans_later_child_epochs() {
+    let parent_store = Arc::new(Mutex::new(MockStore::default()));
+    parent_store
+        .lock()
+        .await
+        .insert(file(SNAPSHOT_LEVEL, 1, 10));
+    parent_store.lock().await.insert(file(0, 1, 10));
+
+    // e1: the branch epoch, with the delta the fork activation uploaded.
+    let child_e1 = Arc::new(Mutex::new(MockStore::default()));
+    child_e1.lock().await.insert(file(0, 11, 11));
+    // e2: the next activation's rows.
+    let child_e2 = Arc::new(Mutex::new(MockStore::default()));
+    child_e2.lock().await.insert(file(0, 12, 13));
+
+    let child_chain = EpochChain::build(vec![
+        (1, MockClient { store: child_e1 }),
+        (2, MockClient { store: child_e2 }),
+    ])
+    .await
+    .expect("child chain");
+
+    let chained = ChainedReplicaClient::new(
+        MockClient {
+            store: parent_store.clone(),
+        },
+        child_chain,
+        TXID(10),
+    );
+    let plan = calc_restore_plan(&chained, TXID(0)).await.expect("plan");
+    assert_eq!(
+        plan.iter().map(|file| file.max_txid.0).collect::<Vec<_>>(),
+        vec![10, 11, 13],
+        "the restore must read the parent tail and both child epochs"
+    );
+
+    // The regression: a fork-epoch-only client (the wiring this test exists
+    // for) sees the first delta and silently drops e2.
+    let fork_epoch_only = ChainedReplicaClient::new(
+        MockClient {
+            store: parent_store.clone(),
+        },
+        MockClient {
+            store: Arc::new(Mutex::new(MockStore::default())),
+        },
+        TXID(10),
+    );
+    let stale = calc_restore_plan(&fork_epoch_only, TXID(0))
+        .await
+        .expect("plan");
+    assert_eq!(
+        stale.iter().map(|file| file.max_txid.0).collect::<Vec<_>>(),
+        vec![10],
+        "an empty fork-epoch client cannot see the child's writes"
+    );
+}
+
+/// A child epoch that opens with a full snapshot is self-sufficient: reading
+/// it alone is complete, while wrapping it in the fork chain would filter the
+/// snapshot out (`min_txid > fork_txid`) and answer with older parent state.
+#[tokio::test]
+async fn child_snapshot_epoch_supersedes_the_parent_chain() {
+    let child_e3 = Arc::new(Mutex::new(MockStore::default()));
+    child_e3.lock().await.insert(file(SNAPSHOT_LEVEL, 1, 20));
+    child_e3.lock().await.insert(file(0, 1, 20));
+    let child_chain = EpochChain::build(vec![(
+        3,
+        MockClient {
+            store: child_e3.clone(),
+        },
+    )])
+    .await
+    .expect("child chain");
+    assert_eq!(
+        child_chain.spans().first().map(|(_, lo)| *lo),
+        Some(TXID(1))
+    );
+
+    let plan = calc_restore_plan(&child_chain, TXID(0))
+        .await
+        .expect("plan");
+    assert_eq!(plan.last().unwrap().max_txid, TXID(20));
+    assert_eq!(plan[0].level, SNAPSHOT_LEVEL);
+
+    let parent_store = Arc::new(Mutex::new(MockStore::default()));
+    parent_store.lock().await.insert(file(0, 1, 10));
+    let wrapped = ChainedReplicaClient::new(
+        MockClient {
+            store: parent_store,
+        },
+        EpochChain::build(vec![(3, MockClient { store: child_e3 })])
+            .await
+            .expect("child chain"),
+        TXID(10),
+    );
+    let filtered = calc_restore_plan(&wrapped, TXID(0)).await.expect("plan");
+    assert!(
+        filtered.iter().all(|file| file.max_txid.0 <= 10),
+        "a wrapped child snapshot is filtered out, so the parent alone shows: {filtered:?}"
     );
 }

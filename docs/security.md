@@ -10,6 +10,12 @@ nodes, and the operators. Application code can use its configured bindings and
 can consume shared node resources. Do not run code from mutually distrusting
 tenants in one fleet.
 
+The engine's host functions are not reachable from application code. An
+internal script receives them as function parameters, so a bundle cannot name
+a host function, and `globalThis` carries no `__`-prefixed property. A worker
+that the Worker Loader loads with `globalOutbound: null` therefore reaches the
+host only through the capabilities in its `env`.
+
 celld depends on two external security boundaries:
 
 - A trusted private network protects the internal listener. Use an encrypted
@@ -88,7 +94,7 @@ These routes do not authenticate the caller:
 
 - `/state` reports node state.
 - `/cell/<SCOPE>` resolves or activates a cell.
-- `/evict/<SCOPE>` evicts a resident cell.
+- `/evict/<SCOPE>` tries to evict a resident cell and reports the result.
 - `/do/<ID>` sends a direct request to an ordinary Durable Object.
 - `POST /shutdown` starts a graceful ownership handoff. The
   `handoff=preserve` query prepares a same-node reload.
@@ -101,6 +107,70 @@ data or change runtime state, so they use the HMAC-authenticated
 `/peer/probe` returns a signed diagnostic response. The peer protocol also
 uses other reserved internal paths. An operator must not call these paths
 directly.
+
+### Read an eviction result
+
+The eviction request waits for the accepted operation to finish. A refused
+request does not wait for an idle period or another lifecycle transition.
+An accepted request can join an eviction that is already running, and each
+waiting caller receives that operation's result.
+
+The Rust method `AppHandle::evict` returns `Result<EvictSuccess, EvictError>`.
+The success value `Evicted` confirms that the awaited eviction completes its
+runtime stop. The success value `AlreadyAbsent` confirms settled local absence
+when the Actor handles the request. A caller that requires a completed eviction
+must check for `Evicted`.
+
+Multiple callers can join one eviction and receive `Evicted`, so the successful
+call count does not measure the runtime stop count.
+The error distinguishes a refusal, a cancellation, and an execution failure.
+The Rust error methods `kind()` and `reason()` return the `kind` and `reason`
+strings of the HTTP error body.
+
+The response uses `application/json`. Both success values use status 200 with
+`{"ok":true}`, so the HTTP response does not distinguish them.
+It confirms a completed eviction or a settled local absence at the decision
+point. A later request can reactivate the cell before the response arrives.
+
+A missing cell or a settled `Inactive`, `Dormant`, or `Remote` cell counts
+as locally absent. A pending activation, stop, or ownership transfer prevents
+that result. The request does not evict a remote runtime. A dormant cell
+keeps its ownership and its hibernated host sockets.
+
+The node checks its availability before it reports local absence. The node
+refuses an eviction during preservation, reload, or local inventory
+confirmation, or when it lacks authority.
+
+Every eviction error has this structure:
+
+```json
+{"ok":false,"error":{"kind":"refused","reason":"cell_active"}}
+```
+
+The `kind` and `reason` values have these meanings:
+
+| Status | Kind | Reason | Cause |
+| --- | --- | --- | --- |
+| 409 | `refused` | `cell_active` | The cell has active work or a socket that requires a runtime. |
+| 409 | `refused` | `cell_transitioning` | The cell has another lifecycle transition. |
+| 409 | `refused` | `alarm_imminent` | The alarm residency policy retains the cell. |
+| 409 | `refused` | `alarm_uncovered` | The alarm coverage is unconfirmed, or a firing alarm blocks eviction during pressure shedding. |
+| 503 | `refused` | `node_unavailable` | The node cannot accept the eviction. |
+| 503 | `refused` | `eviction_limit` | The node has reached its eviction concurrency limit. |
+| 409 | `cancelled` | `new_activity` | A new request cancels an accepted eviction. |
+| 409 | `cancelled` | `alarm_activity` | An alarm observation or firing cancels an accepted eviction. |
+| 409 | `cancelled` | `node_fenced` | The node loses its authority during the eviction. |
+| 503 | `failed` | `actor_unavailable` | The request cannot reach the Actor. |
+| 500 | `failed` | `reply_lost` | A delivered request loses its reply, so its outcome is unknown. |
+| 500 | `failed` | `durability_failed` | The durability verification fails. |
+| 500 | `failed` | `durability_timeout` | The durability verification exceeds its operation deadline. |
+| 500 | `failed` | `runtime_stop_failed` | The runtime stop reports a failure. |
+
+The runtime stop has no overall timeout. A stop that does not return keeps
+the eviction request pending.
+
+An error does not prove that the runtime remains resident. A malformed scope
+still returns status 400 through the existing scope validation.
 
 ## Set the forwarded-header policy
 

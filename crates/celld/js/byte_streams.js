@@ -13,7 +13,7 @@
 // a source with no start() is started synchronously (mirroring the
 // writable's sink handling), and close() settles parked BYOB reads (see
 // _closeCommit) instead of leaving them for respond(0).
-(() => {
+return (() => {
 
 const _brand = Symbol('ReadableByteStreamController');
 const INVALIDATED =
@@ -573,7 +573,7 @@ class ReadableStreamBYOBReader {
   }
 
   // Workerd extension: resolve only once at least `min` bytes are in
-  // `view` (or the stream ends first — then with what arrived).
+  // `view` (or the stream ends first -- then with what arrived).
   readAtLeast(min, view) {
     return this.read(view, { min });
   }

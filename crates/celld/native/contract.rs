@@ -110,6 +110,7 @@ impl NativeError {
             headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
             websocket: None,
             write_position: None,
+            observed_position: None,
         }
     }
 }
@@ -130,7 +131,11 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
-    pub fn new(request_id: String, version_id: String, generation: u64) -> Result<Self, NativeError> {
+    pub fn new(
+        request_id: String,
+        version_id: String,
+        generation: u64,
+    ) -> Result<Self, NativeError> {
         if request_id.is_empty() || version_id.is_empty() || generation == 0 {
             return Err(NativeError::invalid_request());
         }
@@ -167,7 +172,11 @@ impl ResourceLimits {
                 "CELLP_NATIVE_CANCELLATION_GRACE_MS",
                 DEFAULT_CANCELLATION_GRACE,
             )?,
-            max_memory_bytes: u64_var(vars, "CELLP_NATIVE_MAX_MEMORY_BYTES", DEFAULT_MAX_MEMORY_BYTES)?,
+            max_memory_bytes: u64_var(
+                vars,
+                "CELLP_NATIVE_MAX_MEMORY_BYTES",
+                DEFAULT_MAX_MEMORY_BYTES,
+            )?,
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
             max_response_body_bytes: DEFAULT_MAX_RESPONSE_BODY_BYTES,
             max_hostcalls: u32_var(vars, "CELLP_NATIVE_MAX_HOSTCALLS", DEFAULT_MAX_HOSTCALLS)?,
@@ -183,7 +192,9 @@ fn duration_var(
     match vars.get(name) {
         None => Ok(default),
         Some(value) => {
-            let millis: u64 = value.parse().map_err(|_| NativeError::invalid_contract(name))?;
+            let millis: u64 = value
+                .parse()
+                .map_err(|_| NativeError::invalid_contract(name))?;
             if millis == 0 {
                 return Err(NativeError::invalid_contract(name));
             }
@@ -196,7 +207,9 @@ fn u64_var(vars: &BTreeMap<String, String>, name: &str, default: u64) -> Result<
     match vars.get(name) {
         None => Ok(default),
         Some(value) => {
-            let parsed = value.parse().map_err(|_| NativeError::invalid_contract(name))?;
+            let parsed = value
+                .parse()
+                .map_err(|_| NativeError::invalid_contract(name))?;
             if parsed == 0 {
                 return Err(NativeError::invalid_contract(name));
             }
@@ -209,7 +222,9 @@ fn u32_var(vars: &BTreeMap<String, String>, name: &str, default: u32) -> Result<
     match vars.get(name) {
         None => Ok(default),
         Some(value) => {
-            let parsed = value.parse().map_err(|_| NativeError::invalid_contract(name))?;
+            let parsed = value
+                .parse()
+                .map_err(|_| NativeError::invalid_contract(name))?;
             if parsed == 0 {
                 return Err(NativeError::invalid_contract(name));
             }

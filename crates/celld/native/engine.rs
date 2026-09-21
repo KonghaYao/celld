@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use http_body_util::BodyExt;
 use bytes::Bytes;
+use http_body_util::BodyExt;
 use http_body_util::Full;
 use sha2::{Digest, Sha256};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
@@ -95,7 +95,8 @@ impl NativeHttpEngine {
         config.epoch_interruption(true);
         config.wasm_component_model(true);
         let engine = Engine::new(&config).map_err(|_| NativeError::instantiate_failed())?;
-        let component = Component::new(&engine, bytes).map_err(|_| NativeError::instantiate_failed())?;
+        let component =
+            Component::new(&engine, bytes).map_err(|_| NativeError::instantiate_failed())?;
         Ok(Self { engine, component })
     }
 
@@ -211,16 +212,17 @@ async fn invoke_once(
             &mut linker,
             |state: &mut StoreState| state,
         )
-            .map_err(|_| NativeError::instantiate_failed())?;
+        .map_err(|_| NativeError::instantiate_failed())?;
         super::bindings::cellp::kv::kv::add_to_linker::<StoreState, HasSelf<StoreState>>(
             &mut linker,
             |state: &mut StoreState| state,
         )
-            .map_err(|_| NativeError::instantiate_failed())?;
+        .map_err(|_| NativeError::instantiate_failed())?;
 
-        let instance = super::bindings::NativeHttpV1::instantiate_async(&mut store, &component, &linker)
-            .await
-            .map_err(|_| NativeError::instantiate_failed())?;
+        let instance =
+            super::bindings::NativeHttpV1::instantiate_async(&mut store, &component, &linker)
+                .await
+                .map_err(|_| NativeError::instantiate_failed())?;
 
         let mut builder = hyper::Request::builder().method(method.as_str()).uri(&url);
         for (name, value) in headers {
@@ -343,6 +345,9 @@ async fn collect_response(
         headers,
         websocket: None,
         write_position: None,
+        // A native response is finished when it is returned; nothing downstream
+        // observes a write position for it.
+        observed_position: None,
     })
 }
 
@@ -353,7 +358,10 @@ impl ConfigHost for StoreState {
 }
 
 impl KvHost for StoreState {
-    async fn open(&mut self, binding: String) -> Result<wasmtime::component::Resource<Namespace>, AccessError> {
+    async fn open(
+        &mut self,
+        binding: String,
+    ) -> Result<wasmtime::component::Resource<Namespace>, AccessError> {
         self.charge()?;
         let namespace = match self.capabilities.kv_namespace(&binding) {
             Ok(namespace) => namespace.to_string(),
@@ -375,7 +383,12 @@ impl HostNamespace for StoreState {
         key: String,
     ) -> Result<Option<Vec<u8>>, KvError> {
         self.charge_kv()?;
-        let namespace = self.table.get(&self_).map_err(|_| KvError::Unavailable)?.id.clone();
+        let namespace = self
+            .table
+            .get(&self_)
+            .map_err(|_| KvError::Unavailable)?
+            .id
+            .clone();
         self.kv
             .call(namespace, KvOp::Get { key }, &self.cancel)
             .await
@@ -392,7 +405,12 @@ impl HostNamespace for StoreState {
             self.hostcall_failed = true;
             return Err(KvError::Unavailable);
         }
-        let namespace = self.table.get(&self_).map_err(|_| KvError::Unavailable)?.id.clone();
+        let namespace = self
+            .table
+            .get(&self_)
+            .map_err(|_| KvError::Unavailable)?
+            .id
+            .clone();
         self.kv
             .call(namespace, KvOp::Put { key, value }, &self.cancel)
             .await
@@ -405,7 +423,12 @@ impl HostNamespace for StoreState {
         key: String,
     ) -> Result<(), KvError> {
         self.charge_kv()?;
-        let namespace = self.table.get(&self_).map_err(|_| KvError::Unavailable)?.id.clone();
+        let namespace = self
+            .table
+            .get(&self_)
+            .map_err(|_| KvError::Unavailable)?
+            .id
+            .clone();
         self.kv
             .call(namespace, KvOp::Delete { key }, &self.cancel)
             .await

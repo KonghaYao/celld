@@ -1,24 +1,20 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! Alarm wake for inactive cells (on by default).
+//! Immutable alarm discovery publications and restart-safe reclamation.
 //!
-//! Committed alarm state is mirrored into the bucket as
-//! `wake/<YYYY-MM-DDTHH:MM>/<cell>` so a wake hint survives fence, crash,
-//! and deploy; the sweep evicts alarm-bearing cells behind a durable
-//! entry, a per-node heap plus boot scan re-activates them, and a per-fleet
-//! advisory waker revives orphans whose owner died.
-//!
-//! Invariants, verified by deterministic simulation:
-//! - arm durable ⟹ entry exists, within one sweep tick of the commit;
-//! - only completed activation or a durable consume deletes an entry — a
-//!   stale entry costs one spurious wake, a missing entry costs a lost wake;
-//! - the flusher never touches the request path: it reads the lock-free
-//!   `next_alarm_ms` mirror on the existing 5 s sweep tick.
+//! SQLite assigns each installation a writer epoch and sequence. A foreground
+//! PUT proves discovery before acknowledgment. Background work proves SQLite
+//! replication and ownership before it advances a monotone retirement record.
+//! Paginated, repeated LIST passes reclaim older objects, including mutations
+//! whose caller stopped waiting before their remote effect.
 use crate::bucket::Bucket;
+use crate::ownership_store::BucketOwnership;
+use celld_logic::wake::elected_hint_needed;
 use celld_logic::wake::parse_entry_key;
-use celld_logic::wake::Op;
-use celld_logic::wake::Step;
 use celld_logic::wake::WakeCore;
+use celld_logic::wake::{AlarmSnapshot, PublicationId, Retirement, ENTRY_PREFIX};
+use futures_util::stream::{self, StreamExt as _};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::time::Duration;
 use tracing::warn;
@@ -35,31 +31,55 @@ pub fn resident_ms() -> i64 {
 }
 
 /// Scan the due wake buckets: used by the boot-time orphan scan and the
-/// periodic waker tick. The whole `wake/` prefix is listed and filtered
-/// locally; entries are deleted as their alarms are consumed, so the listing
-/// stays O(armed entries) plus any entry that `parse_entry_key` rejects with
-/// the fleet-wide scope fence.
-/// Due entries as (cell, minute_ms). The minute is carried out so a reviving
-/// node can adopt the entry it acted on: without it, a cell whose restored
-/// truth has no alarm leaves the entry that woke it in the bucket forever.
+/// periodic waker tick.
 ///
-/// A rejected entry is skipped and never adopted, so nothing deletes it and
-/// every listing carries it. That is the intended trade: such an entry can only
-/// come from a bucket writer that bypassed every route, and deleting on a parse
-/// failure would let one bad listing reap live entries.
+/// A delimiter listing enumerates armed minutes, then opens only due minutes.
+/// Cleanup separately pages through all publications, including future ones.
+/// Parsing every prefix avoids relying on provider ordering for discovery.
+///
+/// The returned minute bounds an Actor wake hint; SQLite supplies the actual
+/// deadline and delivery authority. Malformed entries cannot reach ownership
+/// or cleanup, because deleting an unclassified name could destroy live work.
 pub async fn due_scan(bucket: &Bucket, now_ms: i64) -> Vec<(String, i64)> {
+    /// Bounded like every other fan-out against the store: a long outage can
+    /// leave one due bucket per minute of backlog, and opening them all at
+    /// once is the thundering herd the eviction bound exists to prevent.
+    const BUCKET_READ_CONCURRENCY: usize = 16;
+
     let mut due = Vec::new();
-    let objects = match bucket.list("wake/").await {
-        Ok(objects) => objects,
+    let minutes = match bucket.common_prefixes(ENTRY_PREFIX).await {
+        Ok(minutes) => minutes,
         Err(e) => {
-            warn!(error = %e, "wake due scan list failed");
+            warn!(error = %e, "wake due scan bucket listing failed");
             return due;
         }
     };
-    for object in objects {
-        if let Some((minute_ms, cell)) = parse_entry_key(object.location.as_ref()) {
-            if minute_ms <= now_ms {
-                due.push((cell, minute_ms));
+    let overdue: Vec<String> = minutes
+        .into_iter()
+        .filter(|minute| {
+            celld_logic::wake::parse_minute_prefix(minute).is_some_and(|ms| ms <= now_ms)
+        })
+        .collect();
+
+    let mut listings = futures_util::stream::iter(
+        overdue
+            .into_iter()
+            .map(|minute| async move { (bucket.list(&minute).await, minute) }),
+    )
+    .buffer_unordered(BUCKET_READ_CONCURRENCY);
+    while let Some((objects, minute)) = listings.next().await {
+        let objects = match objects {
+            Ok(objects) => objects,
+            Err(e) => {
+                warn!(error = %e, %minute, "wake due scan entry listing failed");
+                continue;
+            }
+        };
+        for object in objects {
+            if let Some(entry) = parse_entry_key(object.location.as_ref()) {
+                if entry.minute_ms <= now_ms {
+                    due.push((entry.cell, entry.minute_ms));
+                }
             }
         }
     }
@@ -68,247 +88,586 @@ pub async fn due_scan(bucket: &Bucket, now_ms: i64) -> Vec<(String, i64)> {
     due
 }
 
-/// Advisory waker-role lease: one holder per fleet to avoid N nodes polling.
-/// Correctness never depends on it — concurrent wakers race activation CAS
-/// harmlessly — so every failure path just returns false and skips a tick.
-pub async fn try_hold_waker(bucket: &Bucket, node: &str, now_ms: i64, ttl_ms: i64) -> bool {
-    const KEY: &str = "wake/waker.json";
-    let body =
-        |expires: i64| format!("{{\"node\":{node:?},\"expires_ms\":{expires}}}").into_bytes();
-    match bucket.get(KEY).await {
-        // absent (or unreadable): claim if absent
-        Ok(None) | Err(_) => matches!(
-            bucket.put_cas(KEY, body(now_ms + ttl_ms), None).await,
-            Ok(Some(_))
+/// Owner records the elected waker reads at once while it sorts the fleet's
+/// due entries. These reads are deliberately outside the activation queue:
+/// they hold no permit, so the node's own alarm wakes and cold requests never
+/// queue behind the fleet's due set, and 32 in flight clears a thousand
+/// entries in about a second of store latency.
+const ELECTED_PROBE_CONCURRENCY: usize = 32;
+
+/// The elected waker's pass over the due entries: the ones this node must
+/// hint with `WakeHintScope::Fleet`.
+///
+/// One owner read per entry, without an activation permit, decides through
+/// `elected_hint_needed` against the node leases the same tick's dead-node
+/// scan read. Before this pass existed, every due entry in the fleet went
+/// through the core's route on every node: an owner read under a permit,
+/// then `Remote`, for cells whose live owners were about to fire the alarm
+/// themselves. A read that fails keeps its entry, because the core's own
+/// resolution is the authority and an entry dropped here on a transient
+/// error would wait a whole tick.
+pub async fn elected_due(
+    ownership: &BucketOwnership,
+    node: &str,
+    live: &BTreeSet<String>,
+    due: Vec<(String, i64)>,
+) -> Vec<(String, i64)> {
+    probe_entries(ownership, node, live, true, due).await
+}
+
+/// Keep a persisted local owner even when this process has lost its in-memory
+/// cell. Only the elected scanner resolves dead or unknown foreign owners.
+/// An Owned hint alone cannot recover an unknown cell after a same-name restart.
+pub(crate) async fn probe_entries(
+    ownership: &BucketOwnership,
+    node: &str,
+    live: &BTreeSet<String>,
+    elected: bool,
+    entries: Vec<(String, i64)>,
+) -> Vec<(String, i64)> {
+    let probed: Vec<(
+        String,
+        i64,
+        anyhow::Result<Option<celld_logic::OwnerRecord>>,
+    )> = stream::iter(entries)
+        .map(|(cell, entry_ms)| async move {
+            let owner = ownership.read_owner(&cell).await;
+            (cell, entry_ms, owner)
+        })
+        .buffer_unordered(ELECTED_PROBE_CONCURRENCY)
+        .collect()
+        .await;
+    let mut failed = 0usize;
+    let mut hinted: Vec<(String, i64)> = probed
+        .into_iter()
+        .filter_map(|(cell, entry_ms, owner)| match owner {
+            Err(_) => {
+                failed += 1;
+                elected.then_some((cell, entry_ms))
+            }
+            Ok(record) => {
+                let owner = record.as_ref().and_then(|record| record.node.as_deref());
+                let owner_live = owner.is_some_and(|owner| live.contains(owner));
+                (owner == Some(node) || (elected && elected_hint_needed(owner, node, owner_live)))
+                    .then_some((cell, entry_ms))
+            }
+        })
+        .collect();
+    if failed > 0 {
+        warn!(
+            failed,
+            elected, "wake probe owner reads failed; only the elected scanner hints those entries"
+        );
+    }
+    hinted.sort();
+    hinted
+}
+
+/// Run the periodic wake scan after node authority and the boot scan complete.
+/// The interval, election, store reads, and Actor hints stay in one path so a
+/// caller cannot run a scan without delivering the entries it discovers.
+pub async fn run_periodic(
+    bucket: Bucket,
+    ownership: std::sync::Arc<BucketOwnership>,
+    node: String,
+    actor: tokio::sync::mpsc::UnboundedSender<crate::actor::Message>,
+    tick_ms: u64,
+) {
+    tokio::join!(
+        run_due_scans(
+            bucket.clone(),
+            ownership.clone(),
+            node.clone(),
+            actor.clone(),
+            tick_ms
         ),
-        Ok(Some((bytes, etag))) => {
-            let text = String::from_utf8_lossy(&bytes);
-            let held_by_us = text.contains(&format!("\"node\":{node:?}"));
-            let expires = text
-                .rsplit("\"expires_ms\":")
-                .next()
-                .and_then(|t| t.trim_end_matches('}').trim().parse::<i64>().ok())
-                .unwrap_or(0);
-            if celld_logic::wake::waker_may_claim(held_by_us, expires, now_ms) {
-                matches!(
-                    bucket
-                        .put_cas(KEY, body(now_ms + ttl_ms), Some(&etag))
-                        .await,
-                    Ok(Some(_))
-                )
-            } else {
-                false
+        run_cleanup(bucket, ownership, node, actor, tick_ms),
+    );
+}
+
+async fn run_cleanup(
+    bucket: Bucket,
+    ownership: std::sync::Arc<BucketOwnership>,
+    node: String,
+    actor: tokio::sync::mpsc::UnboundedSender<crate::actor::Message>,
+    tick_ms: u64,
+) {
+    let mut tick = crate::asyncrt::interval(Duration::from_millis(tick_ms));
+    tick.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);
+    let mut collector = Collector::default();
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let refresh = match collector.pass(&bucket).await {
+            Ok(refresh) => refresh,
+            Err(error) => {
+                warn!(%error, "wake cleanup page failed");
+                continue;
+            }
+        };
+        let now_ms = crate::asyncrt::wall_ms();
+        let elected = try_hold_waker(
+            &bucket,
+            &node,
+            now_ms,
+            tick_ms.saturating_mul(3).min(i64::MAX as u64) as i64,
+        )
+        .await;
+        let live = if elected {
+            crate::dead_node_gc::live_nodes(&bucket, now_ms.max(0) as u64).await
+        } else {
+            BTreeSet::new()
+        };
+        let refresh = probe_entries(&ownership, &node, &live, elected, refresh).await;
+        for (cell, entry_ms) in refresh {
+            if actor
+                .send(crate::actor::Message::MaintainWake { cell: cell.clone() })
+                .is_err()
+            {
+                return;
+            }
+            if actor
+                .send(crate::actor::Message::WakeHint {
+                    cell,
+                    entry_ms,
+                    // The probe excludes live foreign owners before admission.
+                    // Fleet also admits a persisted local owner absent from RAM.
+                    scope: celld_logic::WakeHintScope::Fleet,
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+        if actor.is_closed() {
+            return;
+        }
+    }
+}
+
+async fn run_due_scans(
+    bucket: Bucket,
+    ownership: std::sync::Arc<BucketOwnership>,
+    node: String,
+    actor: tokio::sync::mpsc::UnboundedSender<crate::actor::Message>,
+    tick_ms: u64,
+) {
+    let mut tick = crate::asyncrt::interval(Duration::from_millis(tick_ms));
+    tick.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);
+    tick.tick().await;
+    let mut dead_node_gc = crate::dead_node_gc::DeadNodeGc::default();
+    loop {
+        tick.tick().await;
+        let elected = dead_node_gc.run_elected_pass(&bucket, &node, tick_ms).await;
+        let due = due_scan(&bucket, crate::asyncrt::wall_ms()).await;
+        let (scope, due) = match elected {
+            Some(live) => (
+                celld_logic::WakeHintScope::Fleet,
+                elected_due(&ownership, &node, &live, due).await,
+            ),
+            None => (celld_logic::WakeHintScope::Owned, due),
+        };
+        for (cell, entry_ms) in due {
+            if actor
+                .send(crate::actor::Message::WakeHint {
+                    cell,
+                    entry_ms,
+                    scope,
+                })
+                .is_err()
+            {
+                return;
             }
         }
     }
 }
 
-/// Mirrors each resident cell's committed next-alarm into the bucket. One
-/// instance per node, driven from the eviction sweep tick. The pure transition
-/// (`decide` / `covered` / `due_cells` / `adopt`) is the sans-IO
-/// `celld_logic::wake::WakeCore`; this facade adds the lock, the async bucket
-/// executor, and the shadow-pin log.
-pub struct WakeFlusher {
-    pub core: Mutex<WakeCore>,
-    /// Signals each settled delete, so the `await_quiesce` waiters -- an arm
-    /// on its own key, a reconcile on the whole cell -- can re-check.
-    quiesce: tokio::sync::Notify,
+#[derive(serde::Deserialize)]
+struct WakerRoleLease {
+    node: String,
+    expires_ms: i64,
 }
 
-impl Default for WakeFlusher {
-    fn default() -> Self {
-        Self::new()
+async fn same_node_still_holds_waker(bucket: &Bucket, node: &str) -> bool {
+    let Ok(Some((bytes, _))) = bucket.get("wake/waker.json").await else {
+        return false;
+    };
+    let Ok(lease) = serde_json::from_slice::<WakerRoleLease>(&bytes) else {
+        return false;
+    };
+    lease.node == node && lease.expires_ms > crate::asyncrt::wall_ms()
+}
+
+/// Advisory waker-role lease: one holder per fleet to avoid N nodes polling.
+/// Correctness never depends on it — concurrent wakers race activation CAS
+/// harmlessly — so a caller skips the tick when another node holds the role.
+pub async fn try_hold_waker(bucket: &Bucket, node: &str, now_ms: i64, ttl_ms: i64) -> bool {
+    const KEY: &str = "wake/waker.json";
+    let body =
+        |expires: i64| format!("{{\"node\":{node:?},\"expires_ms\":{expires}}}").into_bytes();
+    let token = match bucket.get(KEY).await {
+        // absent (or unreadable): claim if absent
+        Ok(None) | Err(_) => None,
+        Ok(Some((bytes, etag))) => {
+            let lease = serde_json::from_slice::<WakerRoleLease>(&bytes).ok();
+            let held_by_us = lease.as_ref().is_some_and(|lease| lease.node == node);
+            let expires = lease.map_or(0, |lease| lease.expires_ms);
+            if !celld_logic::wake::waker_may_claim(held_by_us, expires, now_ms) {
+                return false;
+            }
+            Some(etag)
+        }
+    };
+    match bucket
+        .put_cas(KEY, body(now_ms + ttl_ms), token.as_deref())
+        .await
+    {
+        Ok(Some(_)) => true,
+        // The cleanup loop and the due-scan loop renew the same node's role.
+        // A clean CAS conflict can be their overlap, so check the winner
+        // before cancelling a GC pass and repeating its fleet-wide LIST.
+        Ok(None) => same_node_still_holds_waker(bucket, node).await,
+        Err(_) => false,
+    }
+}
+
+/// Per-node publication and retirement caches. Durable inventory belongs to
+/// LIST; an error or cancellation leaves no reservation for a later task.
+#[derive(Default)]
+pub struct WakeFlusher {
+    pub core: Mutex<WakeCore>,
+    settled: Mutex<BTreeMap<String, PublicationId>>,
+    #[cfg(all(test, celld_internal_tests))]
+    reuse_identity: std::sync::atomic::AtomicBool,
+}
+
+/// The alarm source and its replication proof belong to the same host.
+/// Keeping this boundary together prevents cleanup from proving a position
+/// through a replacement runtime that did not produce the snapshot.
+pub(crate) trait AlarmHost: Sync {
+    fn alarm_snapshot(&self, cell: &str) -> anyhow::Result<AlarmSnapshot>;
+    fn prove_alarm<'a>(
+        &'a self,
+        cell: &'a str,
+        epoch: u64,
+        position: u64,
+    ) -> impl std::future::Future<Output = anyhow::Result<(u64, celld_logic::ProofSource)>> + Send + 'a;
+}
+
+impl AlarmHost for crate::runtime::CellHost {
+    fn alarm_snapshot(&self, cell: &str) -> anyhow::Result<AlarmSnapshot> {
+        Ok(self.with_alarm(cell, |alarm, _| alarm))
+    }
+
+    fn prove_alarm<'a>(
+        &'a self,
+        cell: &'a str,
+        epoch: u64,
+        position: u64,
+    ) -> impl std::future::Future<Output = anyhow::Result<(u64, celld_logic::ProofSource)>> + Send + 'a
+    {
+        self.await_durable(cell, epoch, position)
     }
 }
 
 impl WakeFlusher {
     pub fn new() -> Self {
-        WakeFlusher {
-            core: Mutex::new(WakeCore::new()),
-            quiesce: tokio::sync::Notify::new(),
-        }
+        Self::default()
     }
 
-    /// Take responsibility for the entry a restored alarm implies.
-    ///
-    /// Hibernation forgets the cell, so whichever process revives it holds no
-    /// record of the entry its alarm still has in the bucket -- consuming the
-    /// alarm would delete nothing, and every later due scan would find the
-    /// entry and wake a cell with nothing to do. Only when nothing is tracked,
-    /// per `should_adopt_hint`: re-adopting what this process already knows
-    /// about resurrects an entry it is in the middle of deleting.
-    pub fn adopt(&self, cell: &str, due_ms: i64) {
-        let mut core = self.core.lock().unwrap();
-        if celld_logic::wake::should_adopt_hint(core.tracks(cell), due_ms) {
-            core.adopt(cell, due_ms);
-        }
-    }
-
-    /// Is this cell's entry state already known to this process?
-    pub fn tracks(&self, cell: &str) -> bool {
-        self.core.lock().unwrap().tracks(cell)
-    }
-
-    /// Reconcile one cell against the bucket — the async executor for `WakeCore::decide`.
-    /// Failed PUTs keep local state unchanged so the next tick retries (an entry
-    /// may be late, never silently absent); failed deletes drop matching state
-    /// anyway — a stale entry is one spurious wake. `consume_durable` gates the
-    /// final delete of a consumed alarm on the consuming commit's replication.
-    pub async fn reconcile(
+    /// Publish exactly the identity captured at the committed source. An old
+    /// PUT can finish after retirement, but can only recreate an obsolete key.
+    pub(crate) async fn publish(
         &self,
         bucket: &Bucket,
         cell: &str,
-        next_alarm_ms: i64,
-        consume_durable: bool,
-    ) {
-        // A PUT must never race an in-flight delete for the same cell: the
-        // bucket gives concurrent same-key writes no order, so the PUT can lose and
-        // leave a confirmed belief with no entry. Sequence behind any delete
-        // a previous reconcile still has on the wire.
-        self.await_no_inflight_delete(cell).await;
-        // The ordering rules -- abort the batch on a failed PUT, re-check a
-        // delete against the core immediately before issuing it -- live in
-        // `Reconcile`, so this executor performs steps and reports outcomes
-        // and cannot quietly diverge from the one the simulation drives.
-        let mut plan =
-            self.core
-                .lock()
-                .unwrap()
-                .reconcile_plan(cell, next_alarm_ms, consume_durable);
-        // Take each step with the lock held only long enough to choose it:
-        // a guard living in a `while let` scrutinee is not released until the
-        // end of the body, and the body locks again.
-        loop {
-            let step = {
-                let mut core = self.core.lock().unwrap();
-                plan.next(&mut core)
-            };
-            let Some(step) = step else { break };
-            match step {
-                Step::Put { key, due_ms, body } => {
-                    match bucket.put(&key, body.into_bytes()).await {
-                        Ok(()) => {
-                            plan.put_done(&mut self.core.lock().unwrap(), key, due_ms);
-                        }
-                        Err(e) => {
-                            warn!(%cell, %key, error = %e, "wake entry put failed");
-                            plan.put_failed();
-                        }
-                    }
-                }
-                Step::Delete { key } => {
-                    // A transient store error must not orphan the entry — a
-                    // dropped delete can produce an immortal orphan, so retry
-                    // briefly. A delete that
-                    // still fails drops the state anyway: a stale entry is
-                    // one spurious wake, and keeping it would block the arm
-                    // that replaces it.
-                    for attempt in 0..3u32 {
-                        match bucket.delete(&key).await {
-                            Ok(()) => break,
-                            Err(e) if attempt == 2 => {
-                                warn!(%cell, %key, error = %e, "wake entry delete failed");
-                            }
-                            Err(_) => {
-                                crate::asyncrt::sleep(Duration::from_millis(100 << attempt)).await;
-                            }
-                        }
-                    }
-                    self.settle_delete(&mut plan, &key);
-                }
+        alarm: AlarmSnapshot,
+    ) -> anyhow::Result<()> {
+        if alarm.at_ms().is_none() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            alarm.source().is_some_and(|source| source.id.epoch > 0)
+                && alarm.at_ms().is_some_and(|at| at >= 0),
+            "armed alarm has no committed wake identity"
+        );
+        let publication = self.core.lock().unwrap().publication(cell, alarm);
+        let Some(publication) = publication else {
+            return Ok(());
+        };
+        #[cfg(all(test, celld_internal_tests))]
+        let publication = if self
+            .reuse_identity
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            celld_logic::wake::Publication {
+                key: celld_logic::wake::entry_key(
+                    alarm.at_ms().unwrap(),
+                    cell,
+                    PublicationId {
+                        epoch: alarm.source().unwrap().id.epoch,
+                        sequence: 1,
+                    },
+                ),
+                alarm,
+            }
+        } else {
+            publication
+        };
+        let body = serde_json::to_vec(&serde_json::json!({
+            "format": 2, "cell": cell, "due_ms": alarm.at_ms(),
+            "identity": alarm.source().unwrap().id.to_string(),
+        }))?;
+        bucket.put(&publication.key, body).await?;
+        self.core.lock().unwrap().confirm(cell, alarm);
+        Ok(())
+    }
+
+    /// Bind the durability wait to the original writer and source snapshot.
+    /// The equality check rejects queued observations from a replaced runtime.
+    /// A subsequent arm is safe: this certificate cannot retire its larger ID.
+    pub(crate) async fn maintain(
+        &self,
+        bucket: &Bucket,
+        cell: &str,
+        alarm: AlarmSnapshot,
+        host: &impl AlarmHost,
+        ownership: &crate::actor::Ownership,
+        node: &str,
+    ) -> anyhow::Result<()> {
+        let Some(source) = alarm.source() else {
+            tracing::debug!(%cell, "wake maintenance has no resident source; awaiting discovery");
+            return Ok(());
+        };
+        if self
+            .settled
+            .lock()
+            .unwrap()
+            .get(cell)
+            .is_some_and(|id| *id >= source.id)
+        {
+            return Ok(());
+        }
+        if !host.alarm_snapshot(cell)?.same_installation(alarm) {
+            return Ok(());
+        }
+        self.publish(bucket, cell, alarm).await?;
+        let (durable, _) = host
+            .prove_alarm(cell, source.id.epoch, source.position)
+            .await?;
+        anyhow::ensure!(durable >= source.position, "wake retirement proof is short");
+        let owner = ownership
+            .read_owner(cell)
+            .await
+            .map_err(|_| anyhow::anyhow!("wake retirement ownership read failed"))?;
+        anyhow::ensure!(
+            owner.is_some_and(|owner| {
+                owner.epoch == source.id.epoch && owner.node.as_deref() == Some(node)
+            }),
+            "wake retirement lost writer authority"
+        );
+        let proof = RetirementProof(Retirement {
+            id: source.id,
+            at_ms: alarm.at_ms(),
+        });
+        let previous = publish_retirement(bucket, cell, &proof).await?;
+        // Normal churn must not wait behind the fleet's bounded LIST cursor.
+        // The same durable proof authorizes these exact immutable names. This
+        // advisory batch can be lost or cancelled without blocking later arms.
+        let mut obsolete: BTreeSet<_> = self
+            .core
+            .lock()
+            .unwrap()
+            .take_retired(cell, proof.0)
+            .into_iter()
+            .collect();
+        if let Some(previous) = previous {
+            if let Some(at_ms) = previous.at_ms.filter(|_| proof.0.retires(previous.id)) {
+                obsolete.insert(celld_logic::wake::entry_key(at_ms, cell, previous.id));
             }
         }
-    }
-
-    /// A delete left the wire -- it landed, or it failed past its retries.
-    /// Report it to the core and release the waits it held.
-    ///
-    /// One method rather than two calls at each site: a `delete_done` that
-    /// forgot the wakeup would park every later arm for the cell behind a
-    /// delete that is no longer on the wire, until some unrelated delete
-    /// happened to settle and released it.
-    #[doc(hidden)]
-    pub fn settle_delete(&self, plan: &mut celld_logic::wake::Reconcile, key: &str) {
-        plan.delete_done(&mut self.core.lock().unwrap(), key);
-        self.quiesce.notify_waiters();
-    }
-
-    /// Wait until no delete for `cell` is on the wire. A reconcile could name
-    /// its key -- every PUT `decide` plans is at `entry_key(next_alarm_ms,
-    /// cell)`, and a consume plans no PUT at all -- so this wait is wider than
-    /// the same-key race needs. That is deliberate. A reconcile runs on the
-    /// sweep tick with no response waiting on it, so the wider wait costs
-    /// nothing here; the arm gate holds a reply, which is why that one is
-    /// scoped to its key. And it hands `decide` a settled `deleting`, so the
-    /// reconcile path never leans on `decide`'s in-flight guards to answer
-    /// about a delete that is landing as it reads. See `reconcile`.
-    pub async fn await_no_inflight_delete(&self, cell: &str) {
-        self.await_quiesce(|core| core.delete_in_flight(cell)).await;
-    }
-
-    /// Wait until no delete of this exact key is on the wire. The arm gate
-    /// knows its key, and only a delete of THAT key can race its PUT, so it
-    /// waits on this and not on `await_no_inflight_delete`. Gating an arm on
-    /// the whole cell would park a response behind the routine move-delete
-    /// that every alarm-minute change performs, for a key it does not touch.
-    pub async fn await_key_deletable(&self, cell: &str, key: &str) {
-        self.await_quiesce(|core| core.key_delete_in_flight(cell, key))
-            .await;
-    }
-
-    /// Wait until `blocked` reads false, re-checking on each settled delete.
-    ///
-    /// The `Notified` is created BEFORE the check, because `notify_waiters`
-    /// reaches only the waiters that exist when it runs. A future created
-    /// after the check would miss a delete that settled during it, and the
-    /// wait would then hang until some unrelated delete settled — with the
-    /// arm gate holding the response behind it. Creation is enough: a
-    /// `Notified` records the `notify_waiters` count at that moment and
-    /// compares it on its first poll, so it needs no poll to observe one.
-    /// That caveat belongs to `notify_one`, which this type does not use, so
-    /// a switch of notifier would reintroduce it.
-    async fn await_quiesce(&self, blocked: impl Fn(&WakeCore) -> bool) {
-        loop {
-            let notified = self.quiesce.notified();
-            if !blocked(&self.core.lock().unwrap()) {
-                return;
+        for key in obsolete {
+            if let Err(error) = bucket.delete(&key).await {
+                warn!(%cell, %key, %error, "wake eager entry delete failed; collector will retry");
             }
-            notified.await;
         }
+        let mut settled = self.settled.lock().unwrap();
+        let id = settled.entry(cell.to_string()).or_insert(source.id);
+        *id = (*id).max(source.id);
+        Ok(())
     }
 
-    /// Arm-time decision — the PUT that must land before this arm is acked,
-    /// or `None` when the durable bound already covers it. Pure passthrough to
-    /// `WakeCore::arm`; the caller performs the PUT and then `confirm_arm`.
-    pub fn arm_op(&self, cell: &str, next_alarm_ms: i64) -> Option<Op> {
-        self.core.lock().unwrap().arm(cell, next_alarm_ms)
+    pub fn covered(&self, cell: &str, alarm: AlarmSnapshot) -> bool {
+        self.core.lock().unwrap().covered(cell, alarm)
     }
 
-    /// An arm-time PUT landed: record the proven entry.
-    pub fn confirm_arm(&self, cell: &str, due_ms: i64, key: String) {
-        self.core.lock().unwrap().confirm_put(cell, due_ms, key);
-    }
-
-    /// Is this exact committed alarm durably covered by a proven entry? The
-    /// fail-closed gate: eviction of an alarm-bearing cell requires it.
-    pub fn covered(&self, cell: &str, next_alarm_ms: i64) -> bool {
-        self.core.lock().unwrap().covered(cell, next_alarm_ms)
-    }
-
-    /// Entries whose cells this node evicted and whose due time has
-    /// arrived — the tier-2 wake heap, derived from flusher state.
-    pub fn due_cells(&self, now_ms: i64) -> Vec<String> {
-        self.core.lock().unwrap().due_cells(now_ms)
-    }
-
-    /// A wake for `cell` resolved to a remote owner: its alarm is no longer
-    /// this node's to track.
     pub fn forget(&self, cell: &str) {
         self.core.lock().unwrap().forget(cell);
+        self.settled.lock().unwrap().remove(cell);
+    }
+
+    // Reuse a retired name at the actual PUT boundary, so the independent
+    // store observer must catch a later DELETE destroying acknowledged work.
+    #[cfg(all(test, celld_internal_tests))]
+    pub(crate) fn reuse_publication_identity_for_tooth(&self) {
+        self.reuse_identity
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-// The arm gate's executor half: which wait a caller gets, and what releases
-// it. The core's predicates are pinned separately; these cover the wiring
-// on top of them, where an arm that asks the wrong question still answers
-// correctly and only answers late.
+// Only `maintain` constructs this after all three remote proofs. A bare
+// boolean from an alarm notification cannot authorize destructive cleanup.
+struct RetirementProof(Retirement);
+
+fn retirement_key(cell: &str) -> String {
+    format!("wake/retired/{cell}.json")
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetirementRecord {
+    format: u8,
+    identity: String,
+    at_ms: Option<i64>,
+}
+
+impl RetirementRecord {
+    fn decode(bytes: &[u8]) -> anyhow::Result<Retirement> {
+        let record: Self = serde_json::from_slice(bytes)?;
+        anyhow::ensure!(record.format == 2, "unsupported wake retirement format");
+        let id = PublicationId::parse(&record.identity)
+            .ok_or_else(|| anyhow::anyhow!("invalid wake retirement identity"))?;
+        anyhow::ensure!(
+            id.epoch > 0 && record.at_ms.is_none_or(|at| at >= 0),
+            "invalid wake retirement record"
+        );
+        Ok(Retirement {
+            id,
+            at_ms: record.at_ms,
+        })
+    }
+}
+
+async fn publish_retirement(
+    bucket: &Bucket,
+    cell: &str,
+    proof: &RetirementProof,
+) -> anyhow::Result<Option<Retirement>> {
+    let retirement = proof.0;
+    let key = retirement_key(cell);
+    let body = serde_json::to_vec(&RetirementRecord {
+        format: 2,
+        identity: retirement.id.to_string(),
+        at_ms: retirement.at_ms,
+    })?;
+    // Each retry retains the same source identity. An ambiguous CAS can have
+    // applied; reading it back is sufficient, without reassigning its token
+    // to current intent or falling back to an unconditional overwrite.
+    for _ in 0..3 {
+        let observed = bucket.get(&key).await?;
+        let previous = observed
+            .as_ref()
+            .map(|(bytes, _)| RetirementRecord::decode(bytes))
+            .transpose()?;
+        if let Some(old) = previous {
+            if old.id == retirement.id {
+                anyhow::ensure!(
+                    old == retirement,
+                    "wake identity reused for a different alarm"
+                );
+                return Ok(previous);
+            }
+            if old.id > retirement.id {
+                return Ok(previous);
+            }
+        }
+        let token = observed.as_ref().map(|(_, token)| token.as_str());
+        if bucket.put_cas(&key, body.clone(), token).await?.is_some() {
+            return Ok(previous);
+        }
+    }
+    anyhow::bail!("wake retirement CAS remained contended")
+}
+
+/// One bounded pass through the provider's opaque LIST continuation token.
+/// Keep the next token only on success, and wrap after the last page: a late
+/// PUT can appear behind any cursor, even after a successful DELETE.
+#[derive(Default)]
+pub(crate) struct Collector {
+    cursor: Option<String>,
+}
+
+impl Collector {
+    pub(crate) async fn pass(&mut self, bucket: &Bucket) -> anyhow::Result<Vec<(String, i64)>> {
+        const PAGE_SIZE: usize = 128;
+        const CONCURRENCY: usize = 8;
+        let now_ms = crate::asyncrt::wall_ms();
+        let page = match bucket
+            .objects_page(ENTRY_PREFIX, self.cursor.clone(), PAGE_SIZE)
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                // Provider tokens can expire. Retrying the same invalid token
+                // forever would make a finite interruption strand all cleanup.
+                self.cursor = None;
+                return Err(error);
+            }
+        };
+        let mut cells: BTreeMap<String, Vec<(String, celld_logic::wake::ListedEntry)>> =
+            BTreeMap::new();
+        for object in page.objects {
+            let key = object.location.to_string();
+            if let Some(entry) = parse_entry_key(&key) {
+                cells
+                    .entry(entry.cell.clone())
+                    .or_default()
+                    .push((key, entry));
+            }
+        }
+        let mut pending = stream::iter(cells)
+            .map(|(cell, entries)| async move {
+                let record = match bucket.get(&retirement_key(&cell)).await {
+                    Ok(Some((bytes, _))) => match RetirementRecord::decode(&bytes) {
+                        Ok(record) => Some(record),
+                        Err(error) => {
+                            warn!(%cell, %error, "wake retirement record rejected");
+                            return None;
+                        }
+                    },
+                    Ok(None) => None,
+                    Err(error) => {
+                        warn!(%cell, %error, "wake retirement read failed");
+                        return None;
+                    }
+                };
+                let mut refresh = None;
+                for (key, entry) in entries {
+                    if record.is_some_and(|record| record.retires(entry.id)) {
+                        // No mutation completion changes eligibility. Failure,
+                        // timeout, or task cancellation is retried by another LIST.
+                        if let Err(error) = bucket.delete(&key).await {
+                            warn!(%cell, %key, %error, "wake obsolete entry delete failed");
+                        }
+                    } else if entry.minute_ms <= now_ms {
+                        // Even a matching certificate can trail an unreported
+                        // consume. A bounded truth refresh also repairs that cut
+                        // after the former owner and its callback inventory vanish.
+                        // Future entries wait until their minute: refreshing them
+                        // now would reactivate every sleeping cell on each sweep.
+                        refresh = Some(refresh.unwrap_or(entry.minute_ms).min(entry.minute_ms));
+                    }
+                }
+                refresh.map(|minute| (cell, minute))
+            })
+            .buffer_unordered(CONCURRENCY);
+        let mut refresh = Vec::new();
+        while let Some(cell) = pending.next().await {
+            if let Some(cell) = cell {
+                refresh.push(cell);
+            }
+        }
+        self.cursor = page.page_token;
+        Ok(refresh)
+    }
+}

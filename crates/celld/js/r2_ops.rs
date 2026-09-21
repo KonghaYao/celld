@@ -63,13 +63,14 @@ const STREAM_PART: usize = 8 << 20;
 const PART_BACKLOG: usize = 256 << 20;
 
 /// The user-metadata name the R2 object record lives under. See
-/// [`Envelope`].
+/// [`Envelope`]. The bucket stores it as `celld_r2` on Azure, which
+/// refuses a hyphen in a metadata name.
 const ENVELOPE: &str = "celld-r2";
 
 /// The key space one binding owns inside the fleet bucket. `bucket_name`
 /// comes from the deployment manifest, which validates it, so the prefix
 /// cannot escape into the fleet's own keys.
-fn blob_key(bucket_name: &str, key: &str) -> String {
+pub(crate) fn blob_key(bucket_name: &str, key: &str) -> String {
     format!("r2/{bucket_name}/{key}")
 }
 
@@ -152,10 +153,8 @@ impl Envelope {
     /// headers and stay right even for an object written by another tool.
     fn read(attributes: &BlobAttributes) -> Self {
         let mut envelope = attributes
-            .metadata
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(ENVELOPE))
-            .and_then(|(_, value)| serde_json::from_str::<Self>(value).ok())
+            .metadata_value(ENVELOPE)
+            .and_then(|value| serde_json::from_str::<Self>(value).ok())
             .unwrap_or_else(|| Self {
                 custom: attributes
                     .metadata
@@ -212,7 +211,11 @@ fn ascii_json<T: Serialize>(value: &T) -> String {
 
 /// One R2 object, in the shape `__makeR2Bucket` turns into an `R2Object`.
 /// `range` is present only on the answer to a `get`.
-fn object_json(key: &str, meta: &BlobMeta, range: Option<(u64, u64)>) -> serde_json::Value {
+pub(crate) fn object_json(
+    key: &str,
+    meta: &BlobMeta,
+    range: Option<(u64, u64)>,
+) -> serde_json::Value {
     let envelope = Envelope::read(&meta.attributes);
     let mut json = serde_json::json!({
         "key": key,
@@ -421,6 +424,28 @@ fn verify(
 
 // ---- reads ---------------------------------------------------------------
 
+/// One object's record, or `None` when the key does not exist.
+///
+/// Shared with `celld r2 head`: an operator and a Worker must not be able
+/// to disagree about which key an object lives under, and the answer is
+/// only right because both sides scope the key the same way.
+pub(crate) async fn head(bucket_name: &str, key: &str) -> Result<Option<BlobMeta>, String> {
+    let store = store()?;
+    ensure_overlay(bucket_name).await?;
+    // A branch reads through its overlay: a tombstone hides the parent's
+    // object and the child's own write wins over it. Both are invisible to a
+    // plain head against the child bucket.
+    if overlay_active(bucket_name).await? {
+        return crate::r2_overlay::overlay_head_blob(store, bucket_name, key)
+            .await
+            .map_err(|error| error.to_string());
+    }
+    store
+        .head_blob(&blob_key(bucket_name, key))
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// `__r2_head(bucketName, key)`. Resolves to the object's record, or to
 /// `{"state":"miss"}` when there is no such key.
 pub(super) fn op_r2_head(
@@ -431,18 +456,7 @@ pub(super) fn op_r2_head(
     let bucket_name = args.get(0).to_rust_string_lossy(scope);
     let key = args.get(1).to_rust_string_lossy(scope);
     let id = asyncrt::enqueue(async move {
-        let store = store()?;
-        ensure_overlay(&bucket_name).await?;
-        let meta = if overlay_active(&bucket_name).await? {
-            crate::r2_overlay::overlay_head_blob(store, &bucket_name, &key)
-                .await
-                .map_err(|error| error.to_string())?
-        } else {
-            store
-                .head_blob(&blob_key(&bucket_name, &key))
-                .await
-                .map_err(|error| error.to_string())?
-        };
+        let meta = head(&bucket_name, &key).await?;
         Ok(match meta {
             None => serde_json::json!({ "state": "miss" }).to_string(),
             Some(meta) => serde_json::json!({
@@ -453,6 +467,29 @@ pub(super) fn op_r2_head(
         })
     });
     rv.set(promise_for(scope, id));
+}
+
+/// One conditional read, with the body still on the wire.
+///
+/// Shared with `celld r2 get`, which drains the body to stdout instead of
+/// handing it to an isolate.
+pub(crate) async fn read(
+    bucket_name: &str,
+    key: &str,
+    range: BlobRange,
+    conditions: &BlobConditions,
+) -> Result<BlobRead, String> {
+    let store = store()?;
+    ensure_overlay(bucket_name).await?;
+    if overlay_active(bucket_name).await? {
+        return crate::r2_overlay::overlay_get_blob(store, bucket_name, key, range, conditions)
+            .await
+            .map_err(|error| error.to_string());
+    }
+    store
+        .get_blob(&blob_key(bucket_name, key), range, conditions)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// `__r2_get(bucketName, key, requestJson)`. Resolves to a JSON envelope;
@@ -469,6 +506,7 @@ pub(super) fn op_r2_get(
     let key = args.get(1).to_rust_string_lossy(scope);
     let request = serde_json::from_str::<GetRequest>(&args.get(2).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 get options: {error}"));
+    let stream_service = http_stream_service();
     let id = asyncrt::enqueue(async move {
         let request = request?;
         let range = request
@@ -476,16 +514,7 @@ pub(super) fn op_r2_get(
             .map(BlobRange::from)
             .unwrap_or(BlobRange::Whole);
         let conditions = BlobConditions::from(request.only_if.unwrap_or_default());
-        let read = if overlay_active(&bucket_name).await? {
-            crate::r2_overlay::overlay_get_blob(store()?, &bucket_name, &key, range, &conditions)
-                .await
-                .map_err(|error| error.to_string())?
-        } else {
-            store()?
-                .get_blob(&blob_key(&bucket_name, &key), range, &conditions)
-                .await
-                .map_err(|error| error.to_string())?
-        };
+        let read = read(&bucket_name, &key, range, &conditions).await?;
         Ok(match read {
             BlobRead::Missing => serde_json::json!({ "state": "miss" }).to_string(),
             BlobRead::Unmet(meta) => serde_json::json!({
@@ -494,8 +523,9 @@ pub(super) fn op_r2_get(
             })
             .to_string(),
             BlobRead::Hit(blob) => {
-                let stream_id = NEXT_HTTP_STREAM_ID.fetch_add(1, Ordering::Relaxed);
-                register_http_stream(stream_id, HttpStreamSource::Stream(blob.body));
+                let stream_id = stream_service
+                    .register_source(HttpStreamSource::Stream(blob.body))
+                    .ok_or_else(|| format!("R2 get: {HTTP_STREAM_REGISTRATION_CLOSED}"))?;
                 serde_json::json!({
                     "state": "hit",
                     "object": object_json(&key, &blob.meta, Some(blob.range)),
@@ -518,34 +548,45 @@ pub(super) fn op_r2_delete(
     let bucket_name = args.get(0).to_rust_string_lossy(scope);
     let keys = serde_json::from_str::<Vec<String>>(&args.get(1).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 delete key list: {error}"));
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let keys = keys?;
-        let store = store()?;
-        ensure_overlay(&bucket_name).await?;
-        if overlay_active(&bucket_name).await? {
-            for key in &keys {
-                crate::r2_overlay::write_tombstone(store, &bucket_name, key)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
-            return Ok(String::new());
-        }
-        let keys = keys
-            .iter()
-            .map(|key| blob_key(&bucket_name, key))
-            .collect::<Vec<_>>();
-        // `delete_many` reports what went; anything left is a failure the
-        // caller must see, because R2's delete either applies or throws.
-        let gone = store.delete_many(&keys).await.len();
-        if gone != keys.len() {
-            return Err(format!(
-                "R2 delete removed {gone} of {} keys; the rest failed",
-                keys.len()
-            ));
-        }
+        await_egress_gate(gate).await?;
+        delete(&bucket_name, &keys).await?;
         Ok(String::new())
     });
     rv.set(promise_for(scope, id));
+}
+
+/// Remove every named key. Shared with `celld r2 delete`.
+pub(crate) async fn delete(bucket_name: &str, keys: &[String]) -> Result<(), String> {
+    let store = store()?;
+    ensure_overlay(bucket_name).await?;
+    // A branch deletes a key by hiding it: the parent's object must survive
+    // for every sibling branch, so the child records a tombstone instead of
+    // removing bytes it does not own.
+    if overlay_active(bucket_name).await? {
+        for key in keys {
+            crate::r2_overlay::write_tombstone(store, bucket_name, key)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        return Ok(());
+    }
+    let keys = keys
+        .iter()
+        .map(|key| blob_key(bucket_name, key))
+        .collect::<Vec<_>>();
+    // `delete_many` reports what went; anything left is a failure the
+    // caller must see, because R2's delete either applies or throws.
+    let gone = store.delete_many(&keys).await.len();
+    if gone != keys.len() {
+        return Err(format!(
+            "R2 delete removed {gone} of {} keys; the rest failed",
+            keys.len()
+        ));
+    }
+    Ok(())
 }
 
 /// `__r2_list(bucketName, requestJson)`. An absent cursor starts at the
@@ -557,103 +598,132 @@ pub(super) fn op_r2_list(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let bucket_name = args.get(0).to_rust_string_lossy(scope);
-    let request = serde_json::from_str::<ListRequest>(&args.get(1).to_rust_string_lossy(scope))
-        .map_err(|error| format!("invalid R2 list options: {error}"));
-    let id = asyncrt::enqueue(async move {
-        let request = request?;
-        let store = store()?;
-        ensure_overlay(&bucket_name).await?;
-        let limit = match request.limit.unwrap_or(0) {
-            limit if limit > 0 => (limit as usize).min(LIST_LIMIT),
-            _ => LIST_LIMIT,
-        };
-        let scoped = blob_key(&bucket_name, &request.prefix);
-        let after = request
-            .cursor
-            .filter(|cursor| !cursor.is_empty())
-            .or(request.start_after)
-            .filter(|after| !after.is_empty())
-            .map(|after| blob_key(&bucket_name, &after));
-        let page = if overlay_active(&bucket_name).await? {
-            crate::r2_overlay::list_overlay_page(
-                store,
-                &bucket_name,
+    let request_json = args.get(1).to_rust_string_lossy(scope);
+    let id =
+        asyncrt::enqueue(async move { Ok(list(&bucket_name, &request_json).await?.to_string()) });
+    rv.set(promise_for(scope, id));
+}
+
+/// One listing page, in the shape `__makeR2Bucket` turns into an
+/// `R2Objects`. `request_json` is R2's `R2ListOptions`, normalized by the
+/// harness.
+///
+/// Shared with `celld r2 list`, so an operator's listing applies the same
+/// prefix scoping, the same cursor rule, and the same page bound as a
+/// Worker's.
+pub(crate) async fn list(
+    bucket_name: &str,
+    request_json: &str,
+) -> Result<serde_json::Value, String> {
+    let request = serde_json::from_str::<ListRequest>(request_json)
+        .map_err(|error| format!("invalid R2 list options: {error}"))?;
+    let store = store()?;
+    ensure_overlay(bucket_name).await?;
+    let overlay = overlay_active(bucket_name).await?;
+    let limit = match request.limit.unwrap_or(0) {
+        limit if limit > 0 => (limit as usize).min(LIST_LIMIT),
+        _ => LIST_LIMIT,
+    };
+    let scoped = blob_key(bucket_name, &request.prefix);
+    // R2 resumes from the cursor when it has one and ignores
+    // `startAfter`, which is the same knob for a first page.
+    let after = request
+        .cursor
+        .filter(|cursor| !cursor.is_empty())
+        .or(request.start_after)
+        .filter(|after| !after.is_empty());
+    // The overlay listing scopes and resumes from the caller's own keys, so
+    // it is handed the unscoped ones; the plain listing is handed the scoped.
+    let page = if overlay {
+        crate::r2_overlay::list_overlay_page(
+            store,
+            bucket_name,
+            &request.prefix,
+            after.as_deref(),
+            limit,
+        )
+        .await
+        .map_err(|error| error.to_string())?
+    } else {
+        let scoped_after = after.as_deref().map(|after| blob_key(bucket_name, after));
+        store
+            .list_page(
                 &scoped,
-                after.as_deref(),
+                scoped_after.as_deref(),
                 limit,
+                request.delimiter.as_deref(),
             )
             .await
             .map_err(|error| error.to_string())?
-        } else {
-            store
-                .list_page(
-                    &scoped,
-                    after.as_deref(),
-                    limit,
-                    request.delimiter.as_deref(),
-                )
-                .await
-                .map_err(|error| error.to_string())?
-        };
-        // The binding's key space is the caller's: strip the reserved
-        // prefix back off, so a listed key is one the caller can `get`.
-        let strip = blob_key(&bucket_name, "");
-        let unscope = |key: &str| key.strip_prefix(&strip).unwrap_or(key).to_string();
-        // A listing carries no metadata on any object store; `include` is
-        // R2 saying it is worth one head per object to have it, and those
-        // heads go out together rather than one after another.
-        let objects = match request.include {
-            false => page
+    };
+    // The binding's key space is the caller's: strip the reserved
+    // prefix back off, so a listed key is one the caller can `get`.
+    let strip = blob_key(bucket_name, "");
+    let unscope = |key: &str| key.strip_prefix(&strip).unwrap_or(key).to_string();
+    // A listing carries no metadata on any object store; `include` is
+    // R2 saying it is worth one head per object to have it, and those
+    // heads go out together rather than one after another.
+    let objects = match request.include {
+        false => page
+            .objects
+            .iter()
+            .map(|entry| {
+                let meta = BlobMeta {
+                    size: entry.size,
+                    etag: entry.etag.clone(),
+                    version: entry.version.clone(),
+                    cas: None,
+                    uploaded_ms: entry.uploaded_ms,
+                    attributes: BlobAttributes::default(),
+                };
+                object_json(&unscope(&entry.key), &meta, None)
+            })
+            .collect::<Vec<_>>(),
+        true => {
+            let keys = page
                 .objects
                 .iter()
-                .map(|entry| {
-                    let meta = BlobMeta {
-                        size: entry.size,
-                        etag: entry.etag.clone(),
-                        version: entry.version.clone(),
-                        cas: None,
-                        uploaded_ms: entry.uploaded_ms,
-                        attributes: BlobAttributes::default(),
-                    };
-                    object_json(&unscope(&entry.key), &meta, None)
-                })
-                .collect::<Vec<_>>(),
-            true => {
-                let keys = page
-                    .objects
-                    .iter()
-                    .map(|entry| entry.key.clone())
-                    .collect::<Vec<_>>();
-                let heads = futures_util::stream::iter(keys)
-                    .map(|key| async move {
-                        store
-                            .head_blob(&key)
-                            .await
-                            .map_err(|error| error.to_string())
-                    })
-                    .buffered(LIST_HEADS)
-                    .collect::<Vec<_>>()
-                    .await;
-                let mut objects = Vec::with_capacity(heads.len());
-                for (entry, head) in page.objects.iter().zip(heads) {
-                    // A key deleted between the listing and the head is one
-                    // R2 would not have listed either.
-                    if let Some(meta) = head? {
-                        objects.push(object_json(&unscope(&entry.key), &meta, None));
+                .map(|entry| entry.key.clone())
+                .collect::<Vec<_>>();
+            let heads = futures_util::stream::iter(keys)
+                .map(|key| {
+                    let logical = key.strip_prefix(&strip).unwrap_or(&key).to_string();
+                    async move {
+                        // One head per object carries the record, so under an
+                        // overlay it must read through it: the child's own
+                        // write or a parent object a tombstone has not hidden.
+                        if overlay {
+                            crate::r2_overlay::overlay_head_blob(store, bucket_name, &logical)
+                                .await
+                                .map_err(|error| error.to_string())
+                        } else {
+                            store
+                                .head_blob(&key)
+                                .await
+                                .map_err(|error| error.to_string())
+                        }
                     }
+                })
+                .buffered(LIST_HEADS)
+                .collect::<Vec<_>>()
+                .await;
+            let mut objects = Vec::with_capacity(heads.len());
+            for (entry, head) in page.objects.iter().zip(heads) {
+                // A key deleted between the listing and the head is one
+                // R2 would not have listed either.
+                if let Some(meta) = head? {
+                    objects.push(object_json(&unscope(&entry.key), &meta, None));
                 }
-                objects
             }
-        };
-        Ok(serde_json::json!({
-            "objects": objects,
-            "prefixes": page.prefixes.iter().map(|prefix| unscope(prefix)).collect::<Vec<_>>(),
-            "truncated": page.truncated,
-            "cursor": page.cursor.as_deref().map(unscope),
-        })
-        .to_string())
-    });
-    rv.set(promise_for(scope, id));
+            objects
+        }
+    };
+    Ok(serde_json::json!({
+        "objects": objects,
+        "prefixes": page.prefixes.iter().map(|prefix| unscope(prefix)).collect::<Vec<_>>(),
+        "truncated": page.truncated,
+        "cursor": page.cursor.as_deref().map(unscope),
+    }))
 }
 
 // ---- writes --------------------------------------------------------------
@@ -738,11 +808,13 @@ pub(super) fn op_r2_put(
     let body = view_bytes(args.get(2));
     let request = serde_json::from_str::<PutRequest>(&args.get(3).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 put options: {error}"));
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let request = request?;
         let Some(body) = body else {
             return Err("R2 put: the body must be an ArrayBuffer view".to_string());
         };
+        await_egress_gate(gate).await?;
         put_once(bucket_name, key, body, request).await
     });
     rv.set(promise_for(scope, id));
@@ -751,7 +823,7 @@ pub(super) fn op_r2_put(
 /// A `put` whose body is a `ReadableStream`: the isolate hands over one
 /// chunk at a time and the host decides, at the first part boundary,
 /// whether this is one request or a multipart upload.
-struct PutStream {
+pub(crate) struct PutStream {
     bucket_name: String,
     key: String,
     request: PutRequest,
@@ -765,9 +837,41 @@ struct PutStream {
     touched: Instant,
 }
 
+/// Open a streaming write. `request_json` is R2's `R2PutOptions`,
+/// normalized by the harness.
+///
+/// This is the one constructor, so `celld r2 put` and a Worker's
+/// `env.BUCKET.put()` cannot store a different record for the same input:
+/// the checksum set, the envelope, and the single-request/multipart choice
+/// are all decided here and in [`PutStream::finish`].
+pub(crate) fn open_put(
+    bucket_name: String,
+    key: String,
+    request_json: &str,
+) -> Result<PutStream, String> {
+    let request = serde_json::from_str::<PutRequest>(request_json)
+        .map_err(|error| format!("invalid R2 put options: {error}"))?;
+    // Fail before a byte moves if there is no bucket at all.
+    store()?;
+    let digests = Digests::wanted(&request.verify, true);
+    Ok(PutStream {
+        bucket_name,
+        key,
+        request,
+        // Set by the open path once the branch overlay is known; a write with
+        // no branch behind it has none.
+        overlay: false,
+        digests,
+        buffered: Vec::new(),
+        size: 0,
+        upload: None,
+        touched: Instant::now(),
+    })
+}
+
 impl PutStream {
     /// Take in one chunk, handing the store every whole part it makes.
-    async fn push(&mut self, chunk: Vec<u8>) -> Result<(), String> {
+    pub(crate) async fn push(&mut self, chunk: Vec<u8>) -> Result<(), String> {
         self.digests.update(&chunk);
         self.size += chunk.len() as u64;
         self.buffered.extend_from_slice(&chunk);
@@ -821,7 +925,7 @@ impl PutStream {
 
     /// Close the stream out: one request if nothing was ever parted off,
     /// the multipart completion otherwise.
-    async fn finish(&mut self) -> Result<String, String> {
+    pub(crate) async fn finish(&mut self) -> Result<String, String> {
         let Some(mut upload) = self.upload.take() else {
             return put_once(
                 std::mem::take(&mut self.bucket_name),
@@ -936,31 +1040,19 @@ pub(super) fn op_r2_put_begin(
 ) {
     let bucket_name = args.get(0).to_rust_string_lossy(scope);
     let key = args.get(1).to_rust_string_lossy(scope);
-    let request = serde_json::from_str::<PutRequest>(&args.get(2).to_rust_string_lossy(scope))
-        .map_err(|error| format!("invalid R2 put options: {error}"));
+    let request_json = args.get(2).to_rust_string_lossy(scope);
     let id = asyncrt::enqueue(async move {
-        let request = request?;
+        let mut put = open_put(bucket_name, key, &request_json)?;
+        // Fail before a byte moves if a declared branch overlay cannot be
+        // opened: the flag decides whether the commit clears the child's
+        // tombstone for this key.
+        put.overlay = overlay_active(&put.bucket_name).await?;
         reap_puts();
-        // Fail before a byte moves if there is no bucket or a declared branch
-        // overlay cannot be opened.
-        store()?;
-        let overlay = overlay_active(&bucket_name).await?;
-        let digests = Digests::wanted(&request.verify, true);
         let put_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        puts().lock().unwrap().insert(
-            put_id,
-            Arc::new(tokio::sync::Mutex::new(PutStream {
-                bucket_name,
-                key,
-                request,
-                overlay,
-                digests,
-                buffered: Vec::new(),
-                size: 0,
-                upload: None,
-                touched: Instant::now(),
-            })),
-        );
+        puts()
+            .lock()
+            .unwrap()
+            .insert(put_id, Arc::new(tokio::sync::Mutex::new(put)));
         Ok(put_id.to_string())
     });
     rv.set(promise_for(scope, id));
@@ -976,10 +1068,12 @@ pub(super) fn op_r2_put_chunk(
 ) {
     let put_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let chunk = view_bytes(args.get(1));
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let Some(chunk) = chunk else {
             return Err("R2 put: a body chunk must be an ArrayBuffer view".to_string());
         };
+        await_egress_gate(gate).await?;
         let put = puts()
             .lock()
             .unwrap()
@@ -1004,8 +1098,13 @@ pub(super) fn op_r2_put_end(
 ) {
     let put_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let abort = args.get(1).boolean_value(scope);
-    let put = puts().lock().unwrap().remove(&put_id);
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
+        // Keep the entry registered until the proof succeeds. If the gate
+        // refuses the effect, the normal cleanup path can abort a live multipart
+        // upload instead of dropping its handle and orphaning its parts.
+        await_egress_gate(gate).await?;
+        let put = puts().lock().unwrap().remove(&put_id);
         let Some(put) = put else {
             return Err(format!("R2 streaming write {put_id} is not open"));
         };
@@ -1121,8 +1220,10 @@ pub(super) fn op_r2_mp_begin(
     let key = args.get(1).to_rust_string_lossy(scope);
     let request = serde_json::from_str::<PutRequest>(&args.get(2).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 multipart options: {error}"));
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let request = request?;
+        await_egress_gate(gate).await?;
         reap_uploads();
         // A multipart object carries no md5, on R2 or here, so nothing is
         // computed over parts that were never seen whole.
@@ -1209,12 +1310,14 @@ pub(super) fn op_r2_mp_part(
     let upload_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let part_number = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u32;
     let bytes = view_bytes(args.get(2));
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let Some(bytes) = bytes else {
             return Err(format!(
                 "R2 multipart part {part_number} of upload {upload_id} must be an ArrayBuffer view"
             ));
         };
+        await_egress_gate(gate).await?;
         let entry = uploads()
             .lock()
             .unwrap()
@@ -1275,8 +1378,12 @@ pub(super) fn op_r2_mp_complete(
     let upload_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let claimed = serde_json::from_str::<Vec<u32>>(&args.get(1).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 multipart part list: {error}"));
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let claimed = claimed?;
+        // Keep the upload reachable until the proof succeeds, so a refused
+        // completion leaves a handle that `reap_uploads` can abort.
+        await_egress_gate(gate).await?;
         let Some(entry) = uploads().lock().unwrap().remove(&upload_id) else {
             return Err(format!("R2 multipart upload {upload_id} is not open"));
         };
@@ -1351,9 +1458,21 @@ pub(super) fn op_r2_mp_abort(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let upload_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    let entry = uploads().lock().unwrap().remove(&upload_id);
+    let gate = uploads()
+        .lock()
+        .unwrap()
+        .contains_key(&upload_id)
+        .then(|| egress_gate_request(&event_context(scope), celld_logic::Channel::R2));
     let id =
         asyncrt::enqueue(async move {
+            // An absent upload changes nothing. A live upload stays in the
+            // registry until the proof succeeds, so a refusal cannot orphan
+            // parts by dropping its only handle.
+            let Some(gate) = gate else {
+                return Ok(String::new());
+            };
+            await_egress_gate(gate).await?;
+            let entry = uploads().lock().unwrap().remove(&upload_id);
             if let Some(entry) = entry {
                 entry.lock().await.upload.abort().await.map_err(|error| {
                     format!("R2 multipart abort of upload {upload_id}: {error}")

@@ -2,7 +2,8 @@
 
 celld can record traces and logs for the requests it serves. The
 feature is off by default, and the off state costs nothing. Set
-`CELLD_OTEL=1` to turn it on.
+`CELLD_OTEL=1` to write telemetry to the fleet bucket.
+Set `CELLD_OTEL=http://collector:4318` to send telemetry to an OTLP collector.
 
 The default sink is the fleet bucket. celld writes Parquet files under
 the `telemetry/` prefix, so a fleet with a bucket has observability
@@ -11,24 +12,35 @@ alternative sink sends the same data to an OpenTelemetry collector.
 
 The schema is version `v0-unstable`. The column names can change
 before a stable release, and each file carries the schema version in
-its object metadata.
+its object metadata under the name `celld-schema`. Azure Blob Storage
+does not accept a hyphen in a metadata name, so on an `az://` bucket
+the name is `celld_schema`.
 
 ## Configuration
 
 | variable | default | effect |
 | --- | --- | --- |
-| `CELLD_OTEL` | `0` | Set this value to `1` to enable telemetry. |
-| `CELLD_OTEL_SINK` | `bucket` | `bucket` writes Parquet to the fleet bucket. `otlp` sends OTLP/HTTP protobuf to a collector instead. |
+| `CELLD_OTEL` | `0` | `0` disables telemetry. `1` writes Parquet to the fleet bucket. An HTTP(S) collector base URL selects OTLP/HTTP protobuf. |
 | `CELLD_OTEL_BUCKET` | the fleet bucket | A different bucket for the Parquet files, on the same endpoint and credentials. |
 | `CELLD_OTEL_RETENTION` | `30d` | celld deletes telemetry files older than this. `none` disables the deletion, so your own lifecycle rules can control the data. |
 | `CELLD_OTEL_FLUSH_MS` | `300000` | celld writes a Parquet file after this many milliseconds of buffered events. |
-| `CELLD_OTEL_FLUSH_BYTES` | `5242880` | celld writes a Parquet file after the buffered events reach this many bytes. celld uses the limit it reaches first. |
+| `CELLD_OTEL_FLUSH_BYTES` | `5242880` | The estimated buffered bytes that trigger a flush before the interval ends. |
 | `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | A standard sampler name. `traceidratio` with `OTEL_TRACES_SAMPLER_ARG` records a fraction of the traces. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` | The collector base URL, for the `otlp` sink. `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TIMEOUT` also apply. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | unset | A comma-separated list of `name=value` headers for the collector. |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | `10000` | The collector request timeout in milliseconds. |
 | `OTEL_SERVICE_NAME` | `celld` | The service name in the exported resource. |
 
 The `bucket` sink requires the node to have a fleet bucket
 (`CELLD_BUCKET`). The `otlp` sink works on a node without one.
+
+Use a full HTTP(S) collector base URL without a query or a fragment.
+celld adds `/v1/traces` and `/v1/logs` to its path for the two signals.
+`CELLD_OTEL` supplies the collector address, so celld does not read
+`OTEL_EXPORTER_OTLP_ENDPOINT`.
+
+`CELLD_OTEL_SINK` is removed. Remove this setting before starting the node.
+For a collector, copy its full base URL into `CELLD_OTEL`. For the fleet bucket, keep `CELLD_OTEL=1`.
+
 
 ## What celld records
 
@@ -47,11 +59,20 @@ survives `await`.
 celld reads the W3C `traceparent` header on incoming requests, so its
 spans join the trace of the system in front of it. celld sends a
 `traceparent` header on outbound `fetch()`, so downstream systems can
-join too. A Worker call to a Durable Object stays in one trace.
+join too. celld ignores a malformed header and starts a new trace. A
+Worker call to a Durable Object stays in one trace.
 
 The sampler decides at the start of a request. An unsampled request
 records nothing and costs almost nothing. Under load, telemetry sheds
 before requests do, and celld counts what it sheds.
+
+A sampling ratio of `0` records no traces, and a ratio of `1` records
+every trace. An intermediate ratio makes the same trace-id decision on
+each node.
+
+celld keeps a valid incoming context when the sampler rejects it. An
+outbound `fetch()` or Durable Object call keeps the trace id, uses a new
+span id, and keeps the sampled flag clear.
 
 celld records no metrics yet. The spans carry the durations and the
 queue waits, so many questions a metric answers have an answer in the
@@ -91,23 +112,38 @@ that reads one day therefore touches only that day's files.
 ## File size and compaction
 
 celld writes one Parquet file for each flush, on a time limit or a
-size limit, whichever it reaches first. The defaults are 5 minutes
-(`CELLD_OTEL_FLUSH_MS=300000`) and 5 MB (`CELLD_OTEL_FLUSH_BYTES=5242880`).
+size target, whichever it reaches first. The default interval is 5 minutes
+(`CELLD_OTEL_FLUSH_MS=300000`). The default size target is 5 MiB of estimated
+buffered events (`CELLD_OTEL_FLUSH_BYTES=5242880`). The event that reaches
+the target can take the batch past it.
 
 Keep the defaults if you run no compaction job. They make files large
-enough for a fast query with no other moving part. A query sees an
-event up to 5 minutes after the request, so the default suits an
-investigation after the fact.
+enough for a fast query with no other moving part. The default batching
+delay can reach 5 minutes, so the default suits an investigation after the fact.
 
-Set `CELLD_OTEL_FLUSH_MS=10000` for a near-live view, such as a
-dashboard or an active debug session: a query then sees an event
-within 10 seconds. A short flush makes many small files, and DuckDB
+Set `CELLD_OTEL_FLUSH_MS=5000` for a five-second batching interval.
+An upload, a retry, or collector processing can add a delivery delay.
+A short flush makes many small files, and DuckDB
 opens every file a query reads, so you must also run the compaction
 job below. Turn on the compaction job first, then shorten the flush,
 or queries grow slow within hours.
 
 The `otlp` sink is the other route to a near-live view. It sends each
 batch to a collector, so set the same short `CELLD_OTEL_FLUSH_MS`.
+
+The `otlp` sink makes no more than five attempts for a batch when a
+transient failure occurs. It uses exponential backoff with jitter, and it
+uses an applicable `Retry-After` value from the collector. The exporter caps
+each delay at 30 seconds, so a collector cannot suspend a batch indefinitely.
+HTTP 408, 429, 502, 503, and 504 responses are transient failures. A
+permanent refusal drops the batch immediately.
+
+The exporter owns one retrying batch, and the input channel holds 8192
+new events. An outage cannot make either bound grow. celld drops and counts
+new telemetry when the channel is full, so request handling continues.
+
+The retention sweep runs at startup and six hours after each completed sweep. It deletes expired
+objects and preserves objects within the configured retention window.
 
 ## Compaction
 

@@ -206,6 +206,10 @@ pub(crate) fn reopen(spec: &ReopenSpec) -> Result<(), BranchFailure> {
         &spec.scope,
         &spec.db_path.to_string_lossy(),
         spec.epoch,
+        // A branch reopen is a local operator action, not a wake-driven
+        // activation, and it opens through the same SQLite file it just wrote.
+        false,
+        None,
         spec.sqlite_vec,
     )
     .map_err(|error| branch_error(error.to_string()))

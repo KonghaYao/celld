@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 464" role="img" aria-labelledby="d1FlowTitle d1FlowDesc">
+  <title id="d1FlowTitle">A D1 database is one cell, so every statement crosses a node boundary</title>
+  <desc id="d1FlowDesc">Worker A runs three prepared statements against the binding DB and pays three
+round trips. Worker B sends the same three statements as one batch and pays one
+round trip. Both cross a node boundary, because celld routes every statement to
+the node that owns the cell. The guestbook database is one cell owned by node C.
+It holds one SQLite file and has one writer, so the three separate statements
+take three cell turns while the batch runs inside one BEGIN IMMEDIATE and COMMIT
+in a single turn, all or nothing. Below the cell, a read answers from the cell's
+own SQLite file and touches no bucket, while a write commits and then replicates
+to the fleet bucket as LTX, and the acknowledgement waits for that write. A
+second database is a second cell with its own owner node and its own writer, so
+more write capacity comes from more databases and not from a bigger one.</desc>
+  <style>
+    svg { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    text { font-size: 13px; fill: currentColor; }
+    tspan { fill: currentColor; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .lead { font-weight: 600; }
+    .d-ink { color: #121212; }
+    .d-soft { color: #3d3b37; }
+    .d-faint { color: #6e6a62; }
+    .d-acc { color: #10803f; }
+    .d-panel { color: #ffffff; }
+    .d-sunk { color: #f0eee8; }
+    .d-tint { color: #d6efdf; }
+    @media (prefers-color-scheme: dark) {
+      .d-ink { color: #efede7; }
+      .d-soft { color: #c9c6be; }
+      .d-faint { color: #928e85; }
+      .d-acc { color: #3fc472; }
+      .d-panel { color: #1a1a19; }
+      .d-sunk { color: #232321; }
+      .d-tint { color: #10301d; }
+    }
+  </style>
+  <defs>
+    <marker id="d1-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6"
+      markerHeight="6" orient="auto-start-reverse">
+      <path class="d-soft" fill="currentColor" d="M0 0 L10 5 L0 10 z" />
+    </marker>
+  </defs>
+
+  <!-- The same three statements, sent two ways. -->
+  <rect class="d-panel" fill="currentColor" x="6" y="8" width="196" height="68" rx="8" />
+  <rect class="d-faint" fill="none" stroke="currentColor" x="6" y="8" width="196" height="68" rx="8" />
+  <text class="d-faint" fill="currentColor" x="18" y="30">Worker · node A</text>
+  <text class="d-ink mono" fill="currentColor" x="18" y="52">prepare(…).run() ×3</text>
+  <text class="d-acc" fill="currentColor" x="18" y="70">three round trips</text>
+
+  <rect class="d-panel" fill="currentColor" x="238" y="8" width="196" height="68" rx="8" />
+  <rect class="d-faint" fill="none" stroke="currentColor" x="238" y="8" width="196" height="68" rx="8" />
+  <text class="d-faint" fill="currentColor" x="250" y="30">Worker · node B</text>
+  <text class="d-ink mono" fill="currentColor" x="250" y="52">batch([a, b, c])</text>
+  <text class="d-acc" fill="currentColor" x="250" y="70">one round trip</text>
+
+  <!-- The boundary every statement crosses. -->
+  <rect class="d-faint" fill="none" stroke="currentColor" stroke-dasharray="5 4"
+    x="6" y="90" width="428" height="40" rx="8" />
+  <text class="d-soft" fill="currentColor" x="220" y="110" text-anchor="middle">node boundary</text>
+  <text class="d-faint" fill="currentColor" x="220" y="126" text-anchor="middle">celld routes each call to the owner</text>
+
+  <g class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M30 76 V144" marker-end="url(#d1-arrow)" />
+    <path d="M60 76 V144" marker-end="url(#d1-arrow)" />
+    <path d="M90 76 V144" marker-end="url(#d1-arrow)" />
+    <path d="M396 76 V144" marker-end="url(#d1-arrow)" />
+  </g>
+
+  <!-- One database, one cell, one SQLite file, one writer. -->
+  <rect class="d-tint" fill="currentColor" x="16" y="144" width="408" height="134" rx="10" />
+  <rect class="d-acc" fill="none" stroke="currentColor" stroke-width="2" x="16" y="144" width="408" height="134" rx="10" />
+  <text class="d-ink lead" fill="currentColor" x="32" y="170">guestbook database = one cell · owner: node C</text>
+  <text class="d-soft" fill="currentColor" x="32" y="190">one SQLite file, one writer — statements never overlap</text>
+
+  <rect class="d-sunk" fill="currentColor" x="30" y="204" width="184" height="60" rx="8" />
+  <rect class="d-faint" fill="none" stroke="currentColor" x="30" y="204" width="184" height="60" rx="8" />
+  <text class="d-ink mono" fill="currentColor" x="122" y="228" text-anchor="middle">run · run · run</text>
+  <text class="d-soft" fill="currentColor" x="122" y="248" text-anchor="middle">three cell turns</text>
+
+  <rect class="d-sunk" fill="currentColor" x="226" y="204" width="184" height="60" rx="8" />
+  <rect class="d-faint" fill="none" stroke="currentColor" x="226" y="204" width="184" height="60" rx="8" />
+  <text class="d-ink mono" fill="currentColor" x="318" y="228" text-anchor="middle">BEGIN … COMMIT</text>
+  <text class="d-soft" fill="currentColor" x="318" y="248" text-anchor="middle">one turn, all or nothing</text>
+
+  <!-- A read stops at the cell; a write goes on to the bucket. -->
+  <g class="d-soft" fill="none" stroke="currentColor" stroke-width="1.5">
+    <path d="M100 278 V308" marker-end="url(#d1-arrow)" />
+    <path d="M330 278 V308" marker-end="url(#d1-arrow)" />
+  </g>
+  <text class="d-faint" fill="currentColor" x="108" y="300">read</text>
+  <text class="d-faint" fill="currentColor" x="338" y="300">write</text>
+
+  <rect class="d-sunk" fill="currentColor" x="16" y="312" width="196" height="76" rx="8" />
+  <rect class="d-faint" fill="none" stroke="currentColor" x="16" y="312" width="196" height="76" rx="8" />
+  <text class="d-ink" fill="currentColor" x="30" y="336">answered here</text>
+  <text class="d-soft" fill="currentColor" x="30" y="356">from the cell's SQLite</text>
+  <text class="d-faint" fill="currentColor" x="30" y="376">no bucket round trip</text>
+
+  <rect class="d-sunk" fill="currentColor" x="228" y="312" width="196" height="76" rx="8" />
+  <rect class="d-faint" fill="none" stroke="currentColor" x="228" y="312" width="196" height="76" rx="8" />
+  <text class="d-ink" fill="currentColor" x="242" y="336">commits, then LTX</text>
+  <text class="d-soft" fill="currentColor" x="242" y="356">to the fleet bucket</text>
+  <text class="d-faint" fill="currentColor" x="242" y="376">the ack waits for it</text>
+
+  <!-- Scale comes from more cells, not a bigger one. -->
+  <rect class="d-faint" fill="none" stroke="currentColor" stroke-dasharray="5 4"
+    x="16" y="404" width="408" height="50" rx="8" />
+  <text class="d-soft" fill="currentColor" x="32" y="426">orders database = a second cell, a second owner node</text>
+  <text class="d-faint" fill="currentColor" x="32" y="446">a second writer, so capacity comes from more databases</text>
+</svg>

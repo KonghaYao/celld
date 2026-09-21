@@ -9,7 +9,12 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
-wasmtime = { workspace = true, features = ["wat"] }
+# `wat` compiles the fixtures; `anyhow` is what lets this crate convert a
+# `wasmtime::Error` into `anyhow::Error` (wasmtime 48 deliberately does not
+# implement `std::error::Error` for it). Neither was declared before, so the
+# crate only compiled because nothing had built it: the workspace entry sets
+# `default-features = false`, and the feature is off unless it is named here.
+wasmtime = { workspace = true, features = ["wat", "anyhow"] }
 wasmtime-wasi.workspace = true
 
 [dev-dependencies]

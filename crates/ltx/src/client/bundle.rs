@@ -42,6 +42,22 @@ pub trait BundleFetcher: Send + Sync {
         &'a self,
         located: &'a LocatedRow,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
+
+    /// Reads a range within one row. Hosts with remote bundles override this
+    /// method so oversized compaction does not buffer the complete bundle.
+    fn fetch_range<'a>(
+        &'a self,
+        located: &'a LocatedRow,
+        offset: u64,
+        len: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>> {
+        Box::pin(async move {
+            let bytes = self.fetch(located).await?;
+            let start = offset.min(bytes.len() as u64) as usize;
+            let end = offset.saturating_add(len).min(bytes.len() as u64) as usize;
+            Ok(bytes[start..end].to_vec())
+        })
+    }
 }
 
 pub struct BundleOverlayClient<C: ReplicaClient> {
@@ -69,7 +85,11 @@ impl<C: ReplicaClient> ReplicaClient for BundleOverlayClient<C> {
         if level == 0 {
             for located in self.overlay_rows().await? {
                 let txid = located.row.txid();
-                if txid < seek || files.iter().any(|f| f.min_txid == txid) {
+                if txid < seek
+                    || files
+                        .iter()
+                        .any(|f| f.min_txid == txid && f.max_txid == txid)
+                {
                     continue;
                 }
                 files.push(FileInfo {
@@ -82,8 +102,11 @@ impl<C: ReplicaClient> ReplicaClient for BundleOverlayClient<C> {
                     created_at: None,
                 });
             }
-            files.sort_by_key(|f| f.min_txid);
-            files.dedup_by_key(|f| f.min_txid);
+            // A single row and a later direct drain can share a minimum txid.
+            // Only identical ranges are duplicates; hiding the wider range
+            // loses its tail when the individual bundle rows leave the index.
+            files.sort_by_key(|f| (f.min_txid, f.max_txid));
+            files.dedup_by_key(|f| (f.min_txid, f.max_txid));
         }
         Ok(files)
     }
@@ -117,6 +140,44 @@ impl<C: ReplicaClient> ReplicaClient for BundleOverlayClient<C> {
     ) -> Result<FileInfo> {
         self.inner
             .write_ltx_file(level, min_txid, max_txid, data)
+            .await
+    }
+
+    async fn read_range(
+        &self,
+        level: i32,
+        min: TXID,
+        max: TXID,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>> {
+        match self.inner.read_range(level, min, max, offset, len).await {
+            Ok(bytes) => Ok(bytes),
+            Err(inner_error) => {
+                if level == 0 && min == max {
+                    for located in self.overlay_rows().await? {
+                        if located.row.txid() == min {
+                            if let Some(fetcher) = &self.fetcher {
+                                return fetcher.fetch_range(&located, offset, len).await;
+                            }
+                        }
+                    }
+                }
+                Err(inner_error)
+            }
+        }
+    }
+
+    async fn write_ltx_file_from_file(
+        &self,
+        level: i32,
+        min_txid: TXID,
+        max_txid: TXID,
+        file: crate::host::HostFile,
+        host: crate::LtxHost,
+    ) -> Result<FileInfo> {
+        self.inner
+            .write_ltx_file_from_file(level, min_txid, max_txid, file, host)
             .await
     }
 

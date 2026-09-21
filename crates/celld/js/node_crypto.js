@@ -1,4 +1,4 @@
-// node:crypto for celld — a port of Workerd's implementation at commit
+// node:crypto for celld -- a port of Workerd's implementation at commit
 // 191a27f941300dd8956f2afeb66c10a651108c0b. Copyright (c) 2017-2022
 // Cloudflare, Inc. (Apache-2.0), itself adapted from Node.js (Joyent and
 // Node.js contributors, MIT). Ported files:
@@ -16,7 +16,7 @@
 // $$digest / $$hmacSign / $$pbkdf2 / $$scrypt / $$hkdf / $$randomValues /
 // $$timingSafeEqual host ops, with hash state buffered on the JS side (digest
 // runs once, at finalization).
-// checkPrime/generatePrime are pure-JS BigInt Miller–Rabin, mirroring
+// checkPrime/generatePrime are pure-JS BigInt Miller-Rabin, mirroring
 // Workerd's src/workerd/api/crypto/prime.c++ semantics (8192-bit cap, the
 // {12,11}/{24,23}/{60,59} add/rem allowlist, top-two-bits-set candidates).
 // Asymmetric key parsing/generation (PEM/DER/JWK) is not implemented; those
@@ -618,34 +618,58 @@
   const isKeyObject = (obj) =>
     obj != null && typeof obj === "object" && kHandle in obj;
 
-  // The host normalizes every accepted input to one DER — PKCS#8 for
-  // private keys, SPKI for public — and reports the type and details beside
+  // The host normalizes every accepted input to one DER -- PKCS#8 for
+  // private keys, SPKI for public -- and reports the type and details beside
   // it. Everything below reads that one shape.
   const keyOp = (operation, input) => {
     try {
       return JSON.parse(__crypto_operation(operation, JSON.stringify(input)));
     } catch (error) {
       // The host namespaces every throw with "crypto: ". node:crypto callers
-      // match on Node's own message text — `throws(fn, { message })` compares
-      // it exactly — so the namespace is stripped at this boundary.
+      // match on Node's own message text -- `throws(fn, { message })` compares
+      // it exactly -- so the namespace is stripped at this boundary.
       throw new Error(
         String(error?.message ?? error).replace(/^crypto: /, ""));
     }
   };
   const asymmetricMaterial = (key) => key.__celldMaterial ?? {};
-  // Node names the Web Crypto algorithm, not the key type, on the CryptoKey.
-  // Node accepts several spellings of the same curve; celld generates P-256
-  // only, so the table doubles as the supported-curve check.
-  const EC_CURVE_ALIASES = {
-    "prime256v1": "P-256",
-    "secp256r1": "P-256",
-    "P-256": "P-256",
-  };
+  // The generation op does not carry a curve yet, so it always generates
+  // P-256. Keep that limitation separate from imported-key conversion, which
+  // accepts every curve that the shared Web Crypto implementation parses.
+  const GENERATED_EC_CURVES = new Set([
+    "prime256v1", "secp256r1", "P-256",
+  ]);
   const WEB_CRYPTO_ALGORITHM = {
     rsa: "RSASSA-PKCS1-v1_5",
     ec: "ECDSA",
     ed25519: "Ed25519",
     x25519: "X25519",
+  };
+  // Keep each algorithm's key type and legal usages together. A converted
+  // key that carries only one of these values can pass a library's surface
+  // checks and then authorize the wrong Web Crypto operation.
+  const WEB_CRYPTO_KEY_CONTRACT = {
+    "RSASSA-PKCS1-V1_5": {
+      keyType: "rsa", private: ["sign"], public: ["verify"],
+    },
+    "RSA-PSS": { keyType: "rsa", private: ["sign"], public: ["verify"] },
+    "RSA-OAEP": {
+      keyType: "rsa",
+      private: ["decrypt", "unwrapKey"],
+      public: ["encrypt", "wrapKey"],
+    },
+    "ECDSA": { keyType: "ec", private: ["sign"], public: ["verify"] },
+    "ECDH": {
+      keyType: "ec", private: ["deriveKey", "deriveBits"], public: [],
+    },
+    "ED25519": {
+      keyType: "ed25519", private: ["sign"], public: ["verify"],
+    },
+    "X25519": {
+      keyType: "x25519",
+      private: ["deriveKey", "deriveBits"],
+      public: [],
+    },
   };
 
   function asymmetricKeyObject(result, visibility) {
@@ -654,12 +678,13 @@
       keyType: result.keyType,
       details: result.details,
     };
-    const algorithm = { name: WEB_CRYPTO_ALGORITHM[result.keyType] };
-    if (result.keyType === "ec") algorithm.namedCurve = "P-256";
-    if (result.keyType === "rsa") {
-      algorithm.modulusLength = result.details.modulusLength;
-      algorithm.hash = { name: "SHA-256" };
-    }
+    // The same builder Web Crypto's own importKey uses, so a key that
+    // arrives through node:crypto reports what the same key reports after
+    // crypto.subtle.importKey(). There is no request dictionary here, so
+    // an RSA key takes the SHA-256 that builder defaults to.
+    const algorithm = __celld.$$keyAlgorithm(
+      WEB_CRYPTO_ALGORITHM[result.keyType], null, result.keyType,
+      result.details);
     return KeyObject.from(
       new CryptoKey(visibility, algorithm, true, [], material));
   }
@@ -676,11 +701,47 @@
     get asymmetricKeyType() {
       return asymmetricMaterial(this[kHandle]).keyType;
     }
-    // The handle already *is* a CryptoKey; Node's contract is only that the
-    // result is usable with Web Crypto, and this key was built with the
-    // algorithm Web Crypto expects.
-    toCryptoKey() {
-      return this[kHandle];
+    toCryptoKey(algorithm, extractable, usages) {
+      const material = asymmetricMaterial(this[kHandle]);
+      const requestedName = typeof algorithm === "string"
+        ? algorithm
+        : algorithm?.name;
+      const contract = WEB_CRYPTO_KEY_CONTRACT[
+        String(requestedName ?? "").toUpperCase()
+      ];
+      if (contract?.keyType !== material.keyType) {
+        throw new DOMException("Invalid key type", "DataError");
+      }
+      if (material.keyType === "ec" && typeof algorithm === "object" &&
+          algorithm?.namedCurve !== undefined) {
+        const requestedCurve = __celld.$$canonicalEcCurve(
+          algorithm.namedCurve);
+        const keyCurve = __celld.$$canonicalEcCurve(
+          material.details?.namedCurve);
+        if (requestedCurve === undefined || requestedCurve !== keyCurve) {
+          throw new DOMException("Named curve mismatch", "DataError");
+        }
+      }
+
+      // `toCryptoKey()` is synchronous, so it cannot call subtle.importKey().
+      // Build a new view over the normalized material instead. Returning the
+      // KeyObject's storage handle loses all three requested values and makes
+      // libraries such as jose reject a valid private key before signing.
+      const requestedUsages = Array.from(usages);
+      const allowedUsages = contract[this.type];
+      if (requestedUsages.some((usage) => !allowedUsages.includes(usage)) ||
+          (this.type === "private" && requestedUsages.length === 0)) {
+        throw new DOMException(
+          `Invalid ${this.type} key usages`, "SyntaxError");
+      }
+      return new CryptoKey(
+        this.type,
+        __celld.$$keyAlgorithm(
+          requestedName, algorithm, material.keyType, material.details),
+        extractable,
+        requestedUsages,
+        material,
+      );
     }
   }
   class PublicKeyObject extends AsymmetricKeyObject {
@@ -711,7 +772,7 @@
   function createSecretKey(key, encoding) {
     validateKeyData(key, "key");
     // Always copy: Buffer.from(string) may live in the shared pool, and view
-    // inputs stay owned by the caller — key material must be immutable.
+    // inputs stay owned by the caller -- key material must be immutable.
     const bytes = copyU8(
       typeof key === "string" ? Buffer.from(key, encoding) : key);
     const handle = new CryptoKey(
@@ -922,7 +983,7 @@
           `generateKeyPairSync rsa with publicExponent ${publicExponent}`);
       }
     }
-    if (type === "ec" && EC_CURVE_ALIASES[namedCurve] === undefined) {
+    if (type === "ec" && !GENERATED_EC_CURVES.has(namedCurve)) {
       throw ERR_METHOD_NOT_IMPLEMENTED(
         `generateKeyPairSync ec ${namedCurve}`);
     }
@@ -1006,11 +1067,8 @@
         return Buffer.from(
           keyOp("rsa-pkcs1-sign", { key: der, data: input, hash }).bytes);
       case "ec":
-        if (material.details.namedCurve !== "prime256v1")
-          throw ERR_METHOD_NOT_IMPLEMENTED(
-            `sign with ${material.details.namedCurve}`);
         return Buffer.from(
-          keyOp("p256-sign-der", { key: der, data: input }).bytes);
+          keyOp("ec-sign-der", { key: der, data: input, hash }).bytes);
       default:
         throw ERR_METHOD_NOT_IMPLEMENTED(`sign with ${material.keyType}`);
     }
@@ -1033,11 +1091,10 @@
         return keyOp(
           "rsa-pkcs1-verify", { key: der, data: input, signature: sig, hash }).ok;
       case "ec":
-        if (material.details.namedCurve !== "prime256v1")
-          throw ERR_METHOD_NOT_IMPLEMENTED(
-            `verify with ${material.details.namedCurve}`);
         return keyOp(
-          "p256-verify-der", { key: der, data: input, signature: sig }).ok;
+          "ec-verify-der", {
+            key: der, data: input, signature: sig, hash,
+          }).ok;
       default:
         throw ERR_METHOD_NOT_IMPLEMENTED(`verify with ${material.keyType}`);
     }
@@ -1421,7 +1478,7 @@
         n = n - (n % add) + rem;
         step = add;
       } else if (safe) {
-        if (n % 4n === 1n) n += 2n; // n is odd; force n ≡ 3 (mod 4)
+        if (n % 4n === 1n) n += 2n; // n is odd; force n is congruent to 3 (mod 4)
         step = 4n;
       }
       for (let i = 0; i < 4096; i++, n += step) {
@@ -1615,7 +1672,7 @@
     KeyObject, SecretKeyObject, PublicKeyObject, PrivateKeyObject,
     createSecretKey, createPrivateKey, createPublicKey,
     generateKey, generateKeySync, generateKeyPair, generateKeyPairSync,
-    // Sign/Verify, ciphers, DH, certs: not implemented — loud, not silent.
+    // Sign/Verify, ciphers, DH, certs: not implemented -- loud, not silent.
     createSign: notImplemented("createSign"),
     createVerify: notImplemented("createVerify"),
     sign, verify,
@@ -1646,11 +1703,7 @@
   };
   cryptoModule.default = cryptoModule;
 
-  Object.defineProperty(globalThis, "__cryptoModule", {
-    value: cryptoModule, configurable: true, writable: true,
-  });
+  __celld.__cryptoModule = cryptoModule;
   // node:util's types.isKeyObject checks against this class if it exists.
-  Object.defineProperty(globalThis, "__nodeKeyObjectClass", {
-    value: KeyObject, configurable: true, writable: true,
-  });
+  __celld.__nodeKeyObjectClass = KeyObject;
 })();

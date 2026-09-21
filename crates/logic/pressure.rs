@@ -90,6 +90,16 @@ pub struct Load {
     /// limit constrains, including charges that process RSS does not contain.
     /// `None` outside a readable Linux memory cgroup.
     pub cgroup_current_bytes: Option<u64>,
+    /// Memory the node commits to its containers, outside this process.
+    ///
+    /// A container runs in its own cgroup, a sibling of the node's, so its
+    /// memory is in neither the process RSS nor the node's cgroup charge. It
+    /// is real memory on the machine all the same, and a container can grow
+    /// to its instance-type cap at any moment, so the node counts each
+    /// running container's cap as committed. Both measurements add it: the
+    /// ordinary ceiling so the node stops taking cells before the machine
+    /// fills, and the hard cap so the absolute limit sees the whole charge.
+    pub container_reserved_bytes: u64,
 }
 
 impl Load {
@@ -104,13 +114,17 @@ impl Load {
             .cgroup_working_set_bytes
             .unwrap_or_default()
             .saturating_sub(allocator_slack);
-        self.in_use_bytes.max(cgroup_in_use)
+        self.in_use_bytes
+            .max(cgroup_in_use)
+            .saturating_add(self.container_reserved_bytes)
     }
 
     /// The hard pressure measurement. `memory.current` is authoritative when
     /// present because the cgroup limit constrains it, not process RSS.
     pub fn hard_bytes(self) -> u64 {
-        self.cgroup_current_bytes.unwrap_or(self.rss_bytes)
+        self.cgroup_current_bytes
+            .unwrap_or(self.rss_bytes)
+            .saturating_add(self.container_reserved_bytes)
     }
 
     pub fn metric_bytes(self, metric: Metric) -> u64 {
@@ -198,7 +212,7 @@ impl PressureConfig {
     /// The latches are carried separately and not derived from the reported
     /// reason. Sharing them lets one crossing hold the node against the other's
     /// watermark, in either direction: a crossing of the ordinary ceiling then
-    /// holds the node on a resident-set watermark, which is issue #36 again,
+    /// holds the node on a resident-set watermark it did not cross,
     /// and a hard-cap crossing then holds it on a ceiling it never crossed.
     pub fn classify(self, s: Load, was: Latches) -> (Latches, Option<&'static str>) {
         let over = |ceiling: Option<u64>, sample: u64, latched: bool| {
