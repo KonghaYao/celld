@@ -92,6 +92,12 @@ fn resource(node: &str, region: &str, service: &str) -> Vec<u8> {
     );
     key_value(&mut out, 1, "service.instance.id", any_string(node));
     key_value(&mut out, 1, "celld.region", any_string(region));
+    if let Ok(Some(project)) = crate::env_vars::value("CELLD_VAR_PROJECT_ID") {
+        key_value(&mut out, 1, "cellp.project", any_string(&project));
+    }
+    if let Ok(Some(version)) = crate::env_vars::value("CELLD_VAR_VERSION_ID") {
+        key_value(&mut out, 1, "cellp.version", any_string(&version));
+    }
     out
 }
 
